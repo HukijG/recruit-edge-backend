@@ -1,4 +1,3 @@
-// RF-Dialpad Sync Middleware - Main Worker Entry Point
 import { verifyJWT } from './auth.js';
 
 export default {
@@ -12,13 +11,11 @@ export default {
       'Access-Control-Allow-Headers': 'Content-Type, X-RF-Webhook-Token',
     };
 
-    // Handle preflight requests
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
     }
 
     try {
-      // Route requests
       if (url.pathname === '/health') {
         return new Response('RF-Dialpad Sync Middleware - OK', { 
           status: 200,
@@ -51,8 +48,6 @@ export default {
 
 async function handleRecriterflowWebhook(request, env) {
   try {
-    // RF uses custom headers for auth (e.g., API tokens) - no webhook secret needed
-    // Authentication will be configured in the RF webhook setup
     
     const payload = await request.json();
     const candidate = payload.candidate;
@@ -83,7 +78,6 @@ async function handleRecriterflowWebhook(request, env) {
       });
     }
 
-    // TODO: Add Dialpad API integration here
     console.log('Would sync to Dialpad:', {
       name: candidate.name,
       phone: candidate.phone_number,
@@ -117,38 +111,36 @@ async function handleRecriterflowWebhook(request, env) {
 async function handleDialpadWebhook(request, env) {
   try {
     const body = await request.text();
-    
-    // Verify JWT signature from Dialpad
+
+    // Verify JWT signature Dialpad
     const payload = await verifyJWT(body, env.DIALPAD_WEBHOOK_SECRET);
     if (!payload) {
-      console.error('Dialpad JWT verification failed');
       return new Response('Unauthorized', { status: 401 });
     }
 
     console.log('Dialpad webhook received:', {
       event: payload.event,
       contactId: payload.contact?.id,
-      contactName: payload.contact?.display_name
+      contactName: payload.contact?.display_name,
     });
 
-    // TODO: Add actual sync logic here
-    return new Response(JSON.stringify({ 
+    return new Response(JSON.stringify({
       success: true,
       message: 'Dialpad webhook processed successfully',
-      event: payload.event 
+      event: payload.event,
     }), {
       status: 200,
-      headers: { 'Content-Type': 'application/json' }
+      headers: { 'Content-Type': 'application/json' },
     });
 
   } catch (error) {
     console.error('Dialpad webhook error:', error);
-    return new Response(JSON.stringify({ 
+    return new Response(JSON.stringify({
       error: 'Processing failed',
-      message: error.message 
+      message: error.message,
     }), {
       status: 500,
-      headers: { 'Content-Type': 'application/json' }
+      headers: { 'Content-Type': 'application/json' },
     });
   }
 }
