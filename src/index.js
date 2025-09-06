@@ -48,99 +48,105 @@ export default {
 
 async function handleRecriterflowWebhook(request, env) {
   try {
+    // Verify webhook signature if needed
+    const webhookSecret = env.RF_WEBHOOK_SECRET;
+    if (webhookSecret) {
+      const signature = request.headers.get('X-RF-Webhook-Token');
+      if (!signature || signature !== webhookSecret) {
+        console.log('Webhook signature verification failed');
+        return new Response('Unauthorized', { status: 401 });
+      }
+    }
     
     const payload = await request.json();
-    const candidate = payload.candidate;
     
     console.log('RF webhook received:', {
       eventTime: payload.event_time,
-      candidateId: candidate.id,
-      name: candidate.name,
-      hasPhone: !!candidate.phone_number && candidate.phone_number !== "",
-      hasEmail: !!candidate.email || !!candidate.email_1,
-      organization: candidate.current_organization,
-      title: candidate.current_title
+      candidateId: payload.candidate.id,
+      candidateName: payload.candidate.name,
+      hasEmail: !!payload.candidate.email && payload.candidate.email !== "",
+      hasPhone: !!payload.candidate.phone_number && payload.candidate.phone_number !== "",
+      linkedinProfile: payload.candidate.linkedin_profile,
+      currentOrg: payload.candidate.current_organization,
+      currentTitle: payload.candidate.current_title,
+      addedBy: payload.candidate.added_by.name,
+      source: payload.candidate.source
     });
 
-    // Check if candidate has data worth syncing to Dialpad
-    const hasContactInfo = (candidate.phone_number && candidate.phone_number !== "") || 
-                          candidate.email || candidate.email_1;
+    // Process the candidate data
+    await processCandidateData(payload.candidate, env);
     
-    if (!hasContactInfo) {
-      console.log('Candidate has no phone or email - skipping sync');
-      return new Response(JSON.stringify({ 
-        success: true,
-        message: 'Candidate skipped - no contact info',
-        candidateId: candidate.id 
-      }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    console.log('Would sync to Dialpad:', {
-      name: candidate.name,
-      phone: candidate.phone_number,
-      email: candidate.email || candidate.email_1,
-      company: candidate.current_organization,
-      title: candidate.current_title
-    });
-
-    return new Response(JSON.stringify({ 
-      success: true,
-      message: 'RF webhook processed successfully',
-      candidateId: candidate.id,
-      action: 'ready_for_dialpad_sync'
-    }), {
+    return new Response('Webhook processed successfully', { 
       status: 200,
       headers: { 'Content-Type': 'application/json' }
     });
-
+    
   } catch (error) {
     console.error('RF webhook error:', error);
     return new Response(JSON.stringify({ 
-      error: 'Processing failed',
+      error: 'Internal Server Error',
       message: error.message 
-    }), {
+    }), { 
       status: 500,
       headers: { 'Content-Type': 'application/json' }
     });
   }
 }
 
+async function processCandidateData(candidate, env) {
+  console.log('Processing candidate:', {
+    id: candidate.id,
+    name: candidate.name,
+    organization: candidate.current_organization,
+    title: candidate.current_title,
+    hasContactInfo: !!(candidate.email || candidate.phone_number),
+    linkedinProfile: candidate.linkedin_profile
+  });
+
+  // For now, just log the candidate data
+  // TODO: Add Dialpad contact creation logic here
+  
+  // Validate required fields for future Dialpad sync
+  const validation = validateCandidateForDialpad(candidate);
+  console.log('Candidate validation for Dialpad sync:', validation);
+  
+  // Store any additional processing logic here
+  console.log('Candidate processing completed');
+}
+
+function validateCandidateForDialpad(candidate) {
+  const validation = {
+    hasName: !!(candidate.first_name && candidate.last_name) || !!candidate.name,
+    hasEmail: !!candidate.email && candidate.email !== "",
+    hasPhone: !!candidate.phone_number && candidate.phone_number !== "",
+    hasLinkedIn: !!candidate.linkedin_profile,
+    hasOrganization: !!candidate.current_organization,
+    hasTitle: !!candidate.current_title,
+    isValidForSync: false
+  };
+
+  // Determine if candidate is ready for Dialpad sync
+  // For now, require at least name and either email or phone
+  validation.isValidForSync = validation.hasName && (validation.hasEmail || validation.hasPhone);
+  
+  return validation;
+}
+
 async function handleDialpadWebhook(request, env) {
   try {
-    const body = await request.text();
-
-    // Verify JWT signature Dialpad
-    const payload = await verifyJWT(body, env.DIALPAD_WEBHOOK_SECRET);
-    if (!payload) {
-      return new Response('Unauthorized', { status: 401 });
-    }
-
+    const payload = await request.json();
+    
     console.log('Dialpad webhook received:', {
-      event: payload.event,
-      contactId: payload.contact?.id,
-      contactName: payload.contact?.display_name,
+      eventType: payload.event_type,
+      timestamp: new Date().toISOString()
     });
-
-    return new Response(JSON.stringify({
-      success: true,
-      message: 'Dialpad webhook processed successfully',
-      event: payload.event,
-    }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-
+    
+    // Placeholder for future Dialpad webhook processing
+    
+    return new Response('Dialpad webhook received', { status: 200 });
+    
   } catch (error) {
     console.error('Dialpad webhook error:', error);
-    return new Response(JSON.stringify({
-      error: 'Processing failed',
-      message: error.message,
-    }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return new Response('Internal Server Error', { status: 500 });
   }
 }
