@@ -252,8 +252,6 @@ async function processNewCandidate(candidate, env) {
 function validateCandidateForDialpad(candidate) {
   const validation = {
     hasName: !!(candidate.first_name && candidate.last_name) || !!candidate.name,
-    hasEmail: !!candidate.email && candidate.email !== "",
-    hasPhone: !!candidate.phone_number && candidate.phone_number !== "",
     hasOrganization: !!candidate.current_organization,
     hasTitle: !!candidate.current_title,
     isValidForSync: false
