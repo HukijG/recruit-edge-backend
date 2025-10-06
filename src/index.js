@@ -258,7 +258,7 @@ function validateCandidateForDialpad(candidate) {
   };
 
   // Require at least name and email for Dialpad contact creation
-  validation.isValidForSync = validation.hasName && validation.hasEmail;
+  validation.isValidForSync = validation.hasName && validation.hasOrganization && validation.hasTitle;
   
   return validation;
 }
