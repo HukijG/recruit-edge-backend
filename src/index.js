@@ -85,6 +85,12 @@ async function handleRecriterflowWebhook(request, env) {
       console.log('Unhandled event type:', eventType);
     }
     
+    if (eventType === 'Updated') {
+      await processCandidateUpdate(payload.candidate, env);
+    } else {
+      console.log('Unhandled event type:', eventType);
+    }
+
     return new Response('Webhook processed successfully', { 
       status: 200,
       headers: { 'Content-Type': 'application/json' }
@@ -220,7 +226,7 @@ async function processDialpadContactUpdate(contact, env) {
   }
 }
 
-async function processNewCandidate(candidate, env) {
+async function processCandidateUpdate(candidate, env) {
   console.log('Processing new candidate for Dialpad sync:', {
     id: candidate.id,
     name: candidate.name,
@@ -234,6 +240,35 @@ async function processNewCandidate(candidate, env) {
   const validation = validateCandidateForDialpad(candidate);
   console.log('Candidate validation for Dialpad sync:', validation);
   
+  if (!validation.isValidForSync) {
+    console.log('Candidate not valid for Dialpad sync, skipping');
+    return;
+  }
+
+  try {
+    // Create contact in Dialpad
+    const dialpadResult = await createOrUpdateDialpadContact(candidate, env);
+    console.log('Dialpad contact created/updated:', dialpadResult);
+  } catch (error) {
+    console.error('Failed to sync candidate to Dialpad:', error);
+    throw error;
+  }
+}
+
+async function processNewCandidate(candidate, env) {
+  console.log('Processing new candidate for Dialpad sync:', {
+    id: candidate.id,
+    name: candidate.name,
+    organization: candidate.current_organization,
+    title: candidate.current_title,
+    email: candidate.email,
+    phone: candidate.phone_number
+  });
+
+  // Validate required fields for Dialpad sync
+  const validation = validateCandidateForDialpad(candidate);
+  console.log('Candidate validation for Dialpad sync:', validation);
+
   if (!validation.isValidForSync) {
     console.log('Candidate not valid for Dialpad sync, skipping');
     return;
