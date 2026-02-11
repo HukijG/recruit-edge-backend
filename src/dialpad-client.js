@@ -27,11 +27,12 @@ export async function createOrUpdateDialpadContact(candidate, env) {
   });
 
   try {
-    const response = await fetch(`${dialpadBaseUrl}/contacts?apikey=${dialpadApiKey}`, {
+    const response = await fetch(`${dialpadBaseUrl}/contacts`, {
       method: 'PUT',
       headers: {
-        'accept': 'application/json',
-        'content-type': 'application/json'
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${dialpadApiKey}`
       },
       body: JSON.stringify(contactData)
     });
