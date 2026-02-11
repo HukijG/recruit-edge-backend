@@ -8,17 +8,17 @@ const DIALPAD_COMPANY_ID = '0000000000000000';
 export async function createOrUpdateDialpadContact(candidate, env) {
   const dialpadApiKey = env.DIALPAD_API_KEY;
   const dialpadBaseUrl = env.DIALPAD_API_BASE_URL || 'https://dialpad.com/api/v2';
-  
+
   if (!dialpadApiKey) {
     throw new Error('DIALPAD_API_KEY environment variable is required');
   }
 
   // Generate the UID using RF + candidate ID
   const uid = `RF${candidate.id}`;
-  
+
   // Prepare contact data for Dialpad API
   const contactData = prepareContactData(candidate, uid);
-  
+
   console.log('Creating/updating Dialpad contact:', {
     uid,
     name: `${candidate.first_name} ${candidate.last_name}`,
@@ -42,10 +42,10 @@ export async function createOrUpdateDialpadContact(candidate, env) {
     }
 
     const result = await response.json();
-    
+
     // The contact ID will be in format: shared_contact_pool_Company:0000000000000000_uid_RF{id}
     const expectedContactId = `shared_contact_pool_Company:${DIALPAD_COMPANY_ID}_uid_${uid}`;
-    
+
     console.log('Dialpad contact operation successful:', {
       contactId: expectedContactId,
       uid: uid,
@@ -66,10 +66,19 @@ export async function createOrUpdateDialpadContact(candidate, env) {
 }
 
 function prepareContactData(candidate, uid) {
+  // Fall back to splitting combined name field if first/last not provided
+  let firstName = candidate.first_name || '';
+  let lastName = candidate.last_name || '';
+  if (!firstName && !lastName && candidate.name) {
+    const parts = candidate.name.trim().split(/\s+/);
+    firstName = parts[0] || '';
+    lastName = parts.slice(1).join(' ') || '';
+  }
+
   const contactData = {
     uid: uid,
-    first_name: candidate.first_name || '',
-    last_name: candidate.last_name || '',
+    first_name: firstName,
+    last_name: lastName,
     emails: [],
     phones: [],
     company_name: candidate.current_organization || '',
@@ -93,23 +102,4 @@ function prepareContactData(candidate, uid) {
   }
 
   return contactData;
-}
-
-/**
- * Utility function to generate contact ID for future lookups
- * @param {number} rfCandidateId - RF candidate ID
- * @returns {string} - Dialpad contact ID
- */
-export function generateDialpadContactId(rfCandidateId) {
-  return `shared_contact_pool_Company:${DIALPAD_COMPANY_ID}_uid_RF${rfCandidateId}`;
-}
-
-/**
- * Utility function to extract RF candidate ID from Dialpad contact ID
- * @param {string} dialpadContactId - Dialpad contact ID
- * @returns {number|null} - RF candidate ID or null if not found
- */
-export function extractRfCandidateId(dialpadContactId) {
-  const match = dialpadContactId.match(/uid_RF(\d+)$/);
-  return match ? parseInt(match[1]) : null;
 }

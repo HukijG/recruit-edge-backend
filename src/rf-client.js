@@ -32,7 +32,7 @@ export async function updateRFCandidate(candidateId, updateData, env) {
   const url = `${rfBaseUrl}/candidate/update`;
   
   const payload = {
-    id: parseInt(candidateId),
+    id: parseInt(candidateId, 10),
     ...updateData
   };
 
@@ -76,18 +76,26 @@ export function convertDialpadContactToRFUpdate(dialpadContact) {
 
   // Handle emails
   if (dialpadContact.emails && dialpadContact.emails.length > 0) {
-    updateData.email = dialpadContact.emails.map((email, index) => ({
+    updateData.email = dialpadContact.emails.map((email) => ({
       email: email,
-      is_primary: index === 0 || email === dialpadContact.primary_email ? 1 : 0
+      is_primary: email === dialpadContact.primary_email ? 1 : 0
     }));
   }
 
   // Handle phone numbers
   if (dialpadContact.phones && dialpadContact.phones.length > 0) {
     updateData.phone_number = dialpadContact.phones.map((phone, index) => ({
-      phone_number: phone, // Keep the + prefix
-      type: 1 // Default to type 1, you may want to adjust this based on your needs
+      phone_number: phone,
+      type: 1
     }));
+  }
+
+  // Handle LinkedIn URL from Dialpad's urls array
+  if (dialpadContact.urls && dialpadContact.urls.length > 0) {
+    const linkedinUrl = dialpadContact.urls.find(url => url.includes('linkedin.com'));
+    if (linkedinUrl) {
+      updateData.linkedin_profile = linkedinUrl;
+    }
   }
 
   return updateData;

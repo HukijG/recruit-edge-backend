@@ -8,18 +8,14 @@
     "enabled": true
   },
   "vars": {
-    "ENVIRONMENT": "development",
     "DIALPAD_API_BASE_URL": "https://dialpad.com/api/v2",
     "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external"
   },
-  "env": {
-    "production": {
-      "name": "rf-dialpad-sync-prod",
-      "vars": {
-        "ENVIRONMENT": "production",
-        "DIALPAD_API_BASE_URL": "https://dialpad.com/api/v2",
-        "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external"
-      }
+  "kv_namespaces": [
+    {
+      "binding": "SYNC_STATE",
+      "id": "REDACTED_KV_NAMESPACE_ID",
+      "preview_id": "REDACTED_KV_PREVIEW_NAMESPACE_ID"
     }
-  }
+  ]
 }
