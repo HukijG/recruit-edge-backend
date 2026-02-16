@@ -1,6 +1,9 @@
 import { createOrUpdateDialpadContact } from './dialpad-client.js';
 import { verifyJWT } from './auth.js';
-import { extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate } from './rf-client.js';
+import {
+  extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
+  isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn
+} from './rf-client.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -10,7 +13,7 @@ export default {
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, X-RF-Webhook-Token, RF-Event-Type, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, X-RF-Webhook-Token, X-Calendar-Webhook-Token, RF-Event-Type, Authorization',
     };
 
     if (request.method === 'OPTIONS') {
@@ -232,14 +235,29 @@ async function processDialpadContactUpdate(contact, env) {
   }
 }
 
-// Phase 1: Dummy calendar webhook handler — logs full payload for testing Apps Script delivery.
-// Will be replaced with auth + validation + processing in Phase 2/3.
 async function handleCalendarWebhook(request, env) {
   try {
+    // Verify webhook secret — fail closed if not configured
+    const webhookSecret = env.CALENDAR_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      console.error('CALENDAR_WEBHOOK_SECRET not configured, rejecting request');
+      return new Response('Unauthorized', { status: 401 });
+    }
+    const token = request.headers.get('X-Calendar-Webhook-Token');
+    if (!token || token !== webhookSecret) {
+      console.log('Calendar webhook auth failed');
+      return new Response('Unauthorized', { status: 401 });
+    }
+
     const payload = await request.json();
 
-    console.log('Calendar webhook received — full payload:', JSON.stringify(payload, null, 2));
-    console.log('Calendar webhook fields:', {
+    // Validate required fields
+    if (!payload.attendee_email) {
+      console.log('Calendar webhook missing attendee_email, rejecting');
+      return new Response('Bad Request — missing attendee_email', { status: 400 });
+    }
+
+    console.log('Calendar webhook received:', {
       event_id: payload.event_id,
       event_title: payload.event_title,
       event_start: payload.event_start,
@@ -248,10 +266,9 @@ async function handleCalendarWebhook(request, env) {
       linkedin_answer: payload.linkedin_answer,
     });
 
-    return new Response(JSON.stringify({
-      status: 'received',
-      payload
-    }), {
+    await processCalendarEvent(payload, env);
+
+    return new Response('Calendar webhook processed', {
       status: 200,
       headers: { 'Content-Type': 'application/json' }
     });
@@ -260,6 +277,104 @@ async function handleCalendarWebhook(request, env) {
     console.error('Calendar webhook error:', error);
     return new Response('Internal Server Error', { status: 500 });
   }
+}
+
+async function processCalendarEvent(payload, env) {
+  const { attendee_email, attendee_name, linkedin_answer } = payload;
+
+  // Step 1: Find the RF candidate
+  let candidateId = null;
+
+  if (isValidLinkedInUrl(linkedin_answer)) {
+    const normalized = normalizeLinkedInUrl(linkedin_answer);
+    console.log('Valid LinkedIn URL, searching RF:', { original: linkedin_answer, normalized });
+
+    // TODO Phase 4: Check KV cache first (Tier 1)
+
+    // Tier 2: Search RF API directly
+    const searchResult = await searchRFCandidateByLinkedIn(linkedin_answer, env);
+    if (searchResult) {
+      candidateId = searchResult.id;
+    }
+  } else {
+    console.log('LinkedIn answer is not a valid URL, skipping LinkedIn lookup:', linkedin_answer);
+    // TODO Phase 4: Name-based fallback (Tier 3)
+  }
+
+  if (!candidateId) {
+    console.log('No RF candidate found, skipping calendar event processing');
+    return;
+  }
+
+  console.log('Found RF candidate:', candidateId);
+
+  // Step 2: GET current candidate data (RF update REPLACES arrays, doesn't append)
+  const currentCandidate = await getRFCandidate(candidateId, env);
+
+  // Step 3: Merge email into existing array
+  const existingEmails = Array.isArray(currentCandidate.email)
+    ? currentCandidate.email
+    : [];
+
+  const emailAlreadyExists = existingEmails.some(
+    e => e.email?.toLowerCase() === attendee_email.toLowerCase()
+  );
+
+  if (emailAlreadyExists) {
+    console.log('Email already exists on candidate, skipping update:', attendee_email);
+    return;
+  }
+
+  const isPrimary = existingEmails.length === 0 ? 1 : 0;
+  const mergedEmails = [...existingEmails, { email: attendee_email, is_primary: isPrimary }];
+
+  console.log('Merging email into candidate:', {
+    candidateId,
+    newEmail: attendee_email,
+    isPrimary,
+    totalEmails: mergedEmails.length
+  });
+
+  // Step 4: Update RF candidate with merged emails
+  await updateRFCandidate(candidateId, { email: mergedEmails }, env);
+
+  // Step 5: Set debounce flag to prevent RF→Dialpad webhook loop
+  const syncKey = `sync:RF${candidateId}`;
+  await env.SYNC_STATE.put(syncKey, 'true', { expirationTtl: 60 });
+  console.log('Set sync debounce flag:', syncKey);
+
+  // Step 6: Upsert Dialpad contact directly (RF webhook takes 6-7 hours)
+  try {
+    // Extract primary email string for the Dialpad client
+    const primaryEmail = mergedEmails.find(e => e.is_primary === 1)?.email || attendee_email;
+    // Extract primary phone string (RF might store as array of objects)
+    let phoneStr = '';
+    if (Array.isArray(currentCandidate.phone_number) && currentCandidate.phone_number.length > 0) {
+      phoneStr = currentCandidate.phone_number[0]?.phone_number || '';
+    } else if (typeof currentCandidate.phone_number === 'string') {
+      phoneStr = currentCandidate.phone_number;
+    }
+
+    const dialpadCandidate = {
+      id: candidateId,
+      first_name: currentCandidate.first_name || '',
+      last_name: currentCandidate.last_name || '',
+      name: currentCandidate.name || '',
+      email: primaryEmail,
+      phone_number: phoneStr,
+      current_organization: currentCandidate.current_organization || '',
+      current_title: currentCandidate.current_title || '',
+      linkedin_profile: currentCandidate.linkedin_profile || ''
+    };
+
+    const dialpadResult = await createOrUpdateDialpadContact(dialpadCandidate, env);
+    console.log('Dialpad contact updated with email:', dialpadResult);
+  } catch (error) {
+    // Dialpad failure is non-fatal — RF update already succeeded
+    console.error('Failed to update Dialpad contact (non-fatal):', error.message);
+  }
+
+  console.log('Calendar event processed successfully:', { candidateId, emailAdded: attendee_email });
 }
 
 async function syncCandidateToDialpad(candidate, env) {
