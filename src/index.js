@@ -536,10 +536,12 @@ async function handleKrispWebhook(request, env) {
       participants: meeting.participants?.length || 0,
     });
 
-    await processKrispMeetingNotes(meeting, content, env);
+    const notePosted = await processKrispMeetingNotes(meeting, content, env);
 
-    // Write deduplication flag (5-minute TTL)
-    await env.SYNC_STATE.put(dedupeKey, 'true', { expirationTtl: 300 });
+    // Only write dedup flag if a note was actually posted
+    if (notePosted) {
+      await env.SYNC_STATE.put(dedupeKey, 'true', { expirationTtl: 300 });
+    }
 
     return new Response('Krisp webhook processed', {
       status: 200,
@@ -557,38 +559,46 @@ async function processKrispMeetingNotes(meeting, content, env) {
   const candidateEmail = extractCandidateEmail(meeting.participants);
   if (!candidateEmail) {
     console.log('No candidate email found in Krisp meeting participants, skipping');
-    return;
+    return false;
+  }
+
+  // Step 2: Validate content exists
+  if (!Array.isArray(content) || content.length === 0) {
+    console.log('Krisp webhook has no content sections, skipping');
+    return false;
   }
 
   console.log('Extracted candidate email from Krisp meeting:', candidateEmail);
 
-  // Step 2: Look up RF candidate — cache first, then RF search API fallback
+  // Step 3: Look up RF candidate — cache first, then RF search API fallback
   let candidateId = await lookupByEmail(candidateEmail, env);
 
   if (!candidateId) {
     console.log('Cache miss for email, falling back to RF search API:', candidateEmail);
     const searchResult = await searchRFCandidateByEmail(candidateEmail, env);
     if (searchResult) {
-      candidateId = searchResult.id;
+      candidateId = String(searchResult.id);
       await cacheCandidate(searchResult, env);
     }
   }
 
   if (!candidateId) {
     console.log('No RF candidate found for email, skipping Krisp notes:', candidateEmail);
-    return;
+    return false;
   }
 
   console.log('Found RF candidate for Krisp notes:', { candidateId, candidateEmail });
 
-  // Step 3: Format notes as HTML
+  // Step 4: Format notes as HTML
   const htmlContent = formatKrispNotesAsHtml(meeting, content);
 
-  // Step 4: Post note to RF candidate
+  // Step 5: Post note to RF candidate
   await addRFCandidateNote(candidateId, htmlContent, env);
 
   console.log('Krisp meeting notes posted to RF candidate:', {
     candidateId,
     meetingTitle: meeting.title,
   });
+
+  return true;
 }
