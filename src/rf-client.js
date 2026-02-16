@@ -204,6 +204,129 @@ export async function searchRFCandidateByLinkedIn(linkedinUrl, env) {
 }
 
 /**
+ * Search RF for a candidate by email address.
+ * Returns the candidate object or null if not found.
+ */
+export async function searchRFCandidateByEmail(email, env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const url = `${rfBaseUrl}/candidate/search`;
+
+  console.log('Searching RF for candidate by email:', { email, url });
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'RF-Api-Key': rfApiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        filters: [
+          {
+            conjunction: 'in',
+            values: [email],
+            key: 'email'
+          }
+        ],
+        conjunction: 'match-all',
+        current_page: 1,
+        items_per_page: 5
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('RF search API error:', { status: response.status, error: errorText });
+      console.error('RF search API response body (for debugging):', errorText);
+      return null;
+    }
+
+    const result = await response.json();
+    console.log('RF search API raw response shape:', {
+      isArray: Array.isArray(result),
+      keys: typeof result === 'object' ? Object.keys(result) : 'n/a'
+    });
+
+    const candidates = Array.isArray(result) ? result : (result.candidates || result.data || result.results || []);
+
+    if (candidates.length === 0) {
+      console.log('No RF candidate found for email:', email);
+      return null;
+    }
+
+    if (candidates.length > 1) {
+      console.log('Multiple RF candidates found for email, using first:', { count: candidates.length, email });
+    }
+
+    return candidates[0];
+  } catch (error) {
+    console.error('RF search API request failed:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Add a note to an RF candidate.
+ * POST /candidate/notes/add
+ * @param {string|number} candidateId - RF candidate ID
+ * @param {string} htmlContent - Note content (HTML)
+ * @param {Object} env - Environment variables
+ * @returns {Object} - API response
+ */
+export async function addRFCandidateNote(candidateId, htmlContent, env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const url = `${rfBaseUrl}/candidate/notes/add`;
+
+  const payload = {
+    created_by: 900001,
+    id: parseInt(candidateId, 10),
+    mentions: [],
+    value: htmlContent
+  };
+
+  console.log('Adding note to RF candidate:', {
+    candidateId,
+    url,
+    contentLength: htmlContent.length
+  });
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'RF-Api-Key': rfApiKey,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('RF add note API error:', {
+      status: response.status,
+      statusText: response.statusText,
+      error: errorText
+    });
+    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+  }
+
+  const result = await response.json();
+  console.log('RF note added successfully:', result);
+  return result;
+}
+
+/**
  * Convert Dialpad contact to RF update format for email and phone
  * @param {Object} dialpadContact - Dialpad contact object
  * @returns {Object} - RF update payload
