@@ -165,6 +165,7 @@ export async function searchRFCandidateByLinkedIn(linkedinUrl, env) {
             key: 'linkedin_profile'
           }
         ],
+        conjunction: 'match-all',
         current_page: 1,
         items_per_page: 5
       })
