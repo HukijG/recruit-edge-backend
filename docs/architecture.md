@@ -2,20 +2,21 @@
 
 ## System Overview
 
-A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact records in sync across RecruiterFlow (RF), Dialpad, and Google Calendar. RF is the source of truth for candidate records. A KV-backed cache provides fast lookups for integrations that don't have an RF candidate ID.
+A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact records in sync across RecruiterFlow (RF), Dialpad, Google Calendar, and Krisp. RF is the source of truth for candidate records. A KV-backed cache provides fast lookups for integrations that don't have an RF candidate ID.
 
 ```
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ RecruiterFlow │    │   Dialpad    │    │   Google     │    │   Future     │
-│  (RF)        │    │              │    │  Calendar    │    │ Integrations │
-│              │    │              │    │  + Reclaim   │    │ (Krisp, etc) │
+│ RecruiterFlow │    │   Dialpad    │    │   Google     │    │    Krisp     │
+│  (RF)        │    │              │    │  Calendar    │    │              │
+│              │    │              │    │  + Reclaim   │    │              │
 └──────┬───────┘    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
-       │ webhook           │ webhook           │ Apps Script        │
+       │ webhook           │ webhook           │ Apps Script        │ webhook
        ▼                   ▼                   ▼                   ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                    Cloudflare Worker (rf-dialpad-sync-dev)              │
 │                                                                         │
-│  /webhook/recruiterflow  /webhook/dialpad  /webhook/calendar   /health  │
+│  /webhook/recruiterflow  /webhook/dialpad  /webhook/calendar            │
+│  /webhook/krisp          /health                                        │
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │                    KV: SYNC_STATE                                │    │
@@ -24,6 +25,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 │  │  email:{addr}      → rfId                        (60-day TTL)   │    │
 │  │  name:{first}:{last} → rfId or AMBIGUOUS         (60-day TTL)   │    │
 │  │  sync:RF{id}       → "true"                      (60-sec TTL)   │    │
+│  │  krisp:note:{hash} → "true"                      (24-hour TTL)  │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -38,6 +40,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `src/cache.js` | KV candidate cache: canonical records, index keys (linkedin, email, name), lookup functions |
 | `src/rf-client.js` | RF API client: candidate search/get/update, LinkedIn URL validation & normalization, Dialpad↔RF data conversion |
 | `src/dialpad-client.js` | Dialpad API client: contact PUT (create/update), data preparation from RF candidate format |
+| `src/krisp.js` | Krisp helpers: note formatting (HTML), candidate email extraction from meeting participants |
 | `src/auth.js` | JWT verification for Dialpad webhooks (HS256 via `jose`) |
 | `scripts/calendar-sync.gs` | Google Apps Script: detects Reclaim bookings on Google Calendar, extracts candidate data, posts to worker |
 | `wrangler.jsonc` | Worker config: KV binding, env vars, compatibility settings |
@@ -53,6 +56,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `/webhook/recruiterflow` | POST | `X-RF-Webhook-Token` header | RF candidate Created/Updated events |
 | `/webhook/dialpad` | POST | JWT Bearer (HS256) | Dialpad contact Updated events |
 | `/webhook/calendar` | POST | `X-Calendar-Webhook-Token` header | Calendar booking events (from Apps Script) |
+| `/webhook/krisp` | POST | `X-Krisp-Webhook-Token` header | Krisp meeting note webhooks |
 
 ---
 
@@ -135,6 +139,30 @@ Apps Script → POST /webhook/calendar
 
 ---
 
+## Data Flow: Krisp → RF
+
+**Trigger**: Krisp fires `summary_generated` webhook after a meeting ends and the AI summary is ready.
+
+```
+Krisp webhook (summary_generated)
+  → POST /webhook/krisp
+  → Verify X-Krisp-Webhook-Token (fail closed)
+  → Check KV dedup: krisp:note:{hash} — skip if already processed (24-hour TTL)
+  → Extract non-Joel email from meeting participants
+  → Find RF candidate (two-tier lookup):
+      Tier 1: Email cache lookup
+      Tier 2: RF search API (by email)
+  → Format meeting content as HTML note (summary, action items, key points, etc.)
+  → POST /candidate/notes/add to RF
+  → Set dedup flag: krisp:note:{hash} = "true" (24-hour TTL)
+```
+
+**Scope**: One-way, read-only integration. Krisp data flows to RF as candidate notes only. No data flows back to Krisp, no Dialpad sync triggered, no cache updates needed.
+
+**Dedup**: Uses a hash of meeting ID + candidate email to generate the KV dedup key. The 24-hour TTL prevents reprocessing if Krisp retries the webhook.
+
+---
+
 ## Loop Prevention
 
 Both RF→Dialpad and Dialpad→RF sync directions write a KV debounce flag (`sync:RF{id}`, 60-second TTL) after a successful sync. The opposite direction checks for this flag before proceeding. This prevents infinite loops:
@@ -153,7 +181,7 @@ The calendar handler also sets this flag after updating RF, preventing the subse
 
 ### Purpose
 
-A general-purpose cache that stores candidate records and provides O(1) lookups by LinkedIn URL, email address, or name. Designed so any integration without an RF candidate ID (calendar events, future Krisp webhooks, etc.) can quickly find the RF ID.
+A general-purpose cache that stores candidate records and provides O(1) lookups by LinkedIn URL, email address, or name. Designed so any integration without an RF candidate ID (calendar events, Krisp webhooks, etc.) can quickly find the RF ID.
 
 ### Key Structure
 
@@ -164,10 +192,11 @@ A general-purpose cache that stores candidate records and provides O(1) lookups 
 | `email:{lowercase_address}` | RF candidate ID string (one key per email in array) | 60 days |
 | `name:{first_lower}:{last_lower}` | RF candidate ID string, or `"AMBIGUOUS"` | 60 days |
 | `sync:RF{id}` | `"true"` | 60 seconds |
+| `krisp:note:{hash}` | `"true"` | 24 hours |
 
 ### Cache Freshness
 
-All four webhook flows keep the cache up to date:
+All webhook flows keep the cache up to date (Krisp is the exception — it only reads the cache for lookups, does not write):
 
 | Webhook | When cache is written |
 |---------|----------------------|
@@ -204,6 +233,7 @@ Example: `https://www.LinkedIn.com/in/John-Smith/?utm_source=share` → `linkedi
 | `DIALPAD_WEBHOOK_SECRET` | JWT verification for Dialpad webhooks |
 | `RF_WEBHOOK_SECRET` | Shared secret verification for RF webhooks |
 | `CALENDAR_WEBHOOK_SECRET` | Shared secret verification for calendar webhooks |
+| `KRISP_WEBHOOK_SECRET` | Shared secret verification for Krisp webhooks |
 
 ### Vars (in `wrangler.jsonc`)
 
@@ -229,6 +259,7 @@ Example: `https://www.LinkedIn.com/in/John-Smith/?utm_source=share` → `linkedi
 - **Search**: `POST /candidate/search` with `filters[]`, `conjunction: "match-all"`, `current_page: 1`, `items_per_page: N`
 - **Get**: `GET /candidate/get?id=X`
 - **Update**: `POST /candidate/update` with `{id, ...fields}` — **REPLACES arrays, does not append**. Always GET first to merge.
+- **Add note**: `POST /candidate/notes/add` with `{candidate_id, notes}` — used by Krisp integration to attach meeting notes as HTML.
 - **Webhook delay**: RF webhooks can take ~2 hours to fire after a candidate edit. Delivery is fast once they fire.
 
 ### Dialpad API
