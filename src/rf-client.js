@@ -164,7 +164,9 @@ export async function searchRFCandidateByLinkedIn(linkedinUrl, env) {
             values: [linkedinUrl],
             key: 'linkedin_profile'
           }
-        ]
+        ],
+        current_page: 1,
+        items_per_page: 5
       })
     });
 
