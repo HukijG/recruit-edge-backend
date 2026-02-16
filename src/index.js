@@ -6,6 +6,7 @@ import {
   searchRFCandidateByEmail, addRFCandidateNote
 } from './rf-client.js';
 import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName } from './cache.js';
+import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -15,7 +16,7 @@ export default {
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, X-RF-Webhook-Token, X-Calendar-Webhook-Token, RF-Event-Type, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, X-RF-Webhook-Token, X-Calendar-Webhook-Token, X-Krisp-Webhook-Token, RF-Event-Type, Authorization',
     };
 
     if (request.method === 'OPTIONS') {
@@ -40,6 +41,10 @@ export default {
 
       if (url.pathname === '/webhook/calendar' && request.method === 'POST') {
         return await handleCalendarWebhook(request, env);
+      }
+
+      if (url.pathname === '/webhook/krisp' && request.method === 'POST') {
+        return await handleKrispWebhook(request, env);
       }
 
       return new Response('Not Found', {
@@ -485,4 +490,105 @@ function validateCandidateForDialpad(candidate) {
   validation.isValidForSync = validation.hasName && validation.hasOrganization && validation.hasTitle;
 
   return validation;
+}
+
+async function handleKrispWebhook(request, env) {
+  try {
+    // Verify webhook secret — fail closed if not configured
+    const webhookSecret = env.KRISP_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      console.error('KRISP_WEBHOOK_SECRET not configured, rejecting request');
+      return new Response('Unauthorized', { status: 401 });
+    }
+    const token = request.headers.get('X-Krisp-Webhook-Token');
+    if (!token || token !== webhookSecret) {
+      console.log('Krisp webhook auth failed');
+      return new Response('Unauthorized', { status: 401 });
+    }
+
+    const payload = await request.json();
+
+    // Only process summary_generated events
+    if (payload.event !== 'summary_generated') {
+      console.log('Ignoring Krisp event type:', payload.event);
+      return new Response('OK', { status: 200 });
+    }
+
+    const meeting = payload.data?.meeting;
+    const content = payload.data?.content;
+
+    if (!meeting || !meeting.id) {
+      console.log('Malformed Krisp webhook payload — missing meeting data');
+      return new Response('Bad Request', { status: 400 });
+    }
+
+    // Deduplication: skip if we already processed this meeting
+    const dedupeKey = `krisp:${meeting.id}`;
+    const alreadyProcessed = await env.SYNC_STATE.get(dedupeKey);
+    if (alreadyProcessed) {
+      console.log('Krisp meeting already processed, skipping:', meeting.id);
+      return new Response('OK', { status: 200 });
+    }
+
+    console.log('Krisp webhook received:', {
+      meeting_id: meeting.id,
+      title: meeting.title,
+      participants: meeting.participants?.length || 0,
+    });
+
+    await processKrispMeetingNotes(meeting, content, env);
+
+    // Write deduplication flag (5-minute TTL)
+    await env.SYNC_STATE.put(dedupeKey, 'true', { expirationTtl: 300 });
+
+    return new Response('Krisp webhook processed', {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+
+  } catch (error) {
+    console.error('Krisp webhook error:', error);
+    return new Response('Internal Server Error', { status: 500 });
+  }
+}
+
+async function processKrispMeetingNotes(meeting, content, env) {
+  // Step 1: Extract candidate email from participants
+  const candidateEmail = extractCandidateEmail(meeting.participants);
+  if (!candidateEmail) {
+    console.log('No candidate email found in Krisp meeting participants, skipping');
+    return;
+  }
+
+  console.log('Extracted candidate email from Krisp meeting:', candidateEmail);
+
+  // Step 2: Look up RF candidate — cache first, then RF search API fallback
+  let candidateId = await lookupByEmail(candidateEmail, env);
+
+  if (!candidateId) {
+    console.log('Cache miss for email, falling back to RF search API:', candidateEmail);
+    const searchResult = await searchRFCandidateByEmail(candidateEmail, env);
+    if (searchResult) {
+      candidateId = searchResult.id;
+      await cacheCandidate(searchResult, env);
+    }
+  }
+
+  if (!candidateId) {
+    console.log('No RF candidate found for email, skipping Krisp notes:', candidateEmail);
+    return;
+  }
+
+  console.log('Found RF candidate for Krisp notes:', { candidateId, candidateEmail });
+
+  // Step 3: Format notes as HTML
+  const htmlContent = formatKrispNotesAsHtml(meeting, content);
+
+  // Step 4: Post note to RF candidate
+  await addRFCandidateNote(candidateId, htmlContent, env);
+
+  console.log('Krisp meeting notes posted to RF candidate:', {
+    candidateId,
+    meetingTitle: meeting.title,
+  });
 }
