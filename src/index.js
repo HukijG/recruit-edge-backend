@@ -33,6 +33,10 @@ export default {
         return await handleDialpadWebhook(request, env);
       }
 
+      if (url.pathname === '/webhook/calendar' && request.method === 'POST') {
+        return await handleCalendarWebhook(request, env);
+      }
+
       return new Response('Not Found', {
         status: 404,
         headers: corsHeaders
@@ -225,6 +229,36 @@ async function processDialpadContactUpdate(contact, env) {
       contact: contact
     });
     throw error;
+  }
+}
+
+// Phase 1: Dummy calendar webhook handler — logs full payload for testing Apps Script delivery.
+// Will be replaced with auth + validation + processing in Phase 2/3.
+async function handleCalendarWebhook(request, env) {
+  try {
+    const payload = await request.json();
+
+    console.log('Calendar webhook received — full payload:', JSON.stringify(payload, null, 2));
+    console.log('Calendar webhook fields:', {
+      event_id: payload.event_id,
+      event_title: payload.event_title,
+      event_start: payload.event_start,
+      attendee_email: payload.attendee_email,
+      attendee_name: payload.attendee_name,
+      linkedin_answer: payload.linkedin_answer,
+    });
+
+    return new Response(JSON.stringify({
+      status: 'received',
+      payload
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+
+  } catch (error) {
+    console.error('Calendar webhook error:', error);
+    return new Response('Internal Server Error', { status: 500 });
   }
 }
 
