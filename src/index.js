@@ -4,6 +4,7 @@ import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn
 } from './rf-client.js';
+import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName } from './cache.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -96,6 +97,8 @@ async function handleRecruiterflowWebhook(request, env) {
     // Process based on event type
     if (eventType === 'Created' || eventType === 'Updated') {
       await syncCandidateToDialpad(candidate, env);
+      // Passively build candidate cache from RF webhook traffic
+      await cacheCandidate(candidate, env);
     } else {
       console.log('Unhandled event type:', eventType);
     }
@@ -225,6 +228,31 @@ async function processDialpadContactUpdate(contact, env) {
       updatedFields: Object.keys(updateData)
     });
 
+    // Update cache with Dialpad changes
+    const cached = await getCachedCandidate(rfCandidateId, env);
+    if (cached) {
+      // Merge Dialpad changes into cached record
+      const merged = {
+        id: parseInt(rfCandidateId, 10),
+        first_name: cached.first_name,
+        last_name: cached.last_name,
+        email: updateData.email || cached.emails || cached.email,
+        phone_number: updateData.phone_number || cached.phone_number,
+        linkedin_profile: updateData.linkedin_profile || cached.linkedin_profile,
+        current_organization: cached.current_organization,
+        current_title: cached.current_title,
+      };
+      await cacheCandidate(merged, env);
+    } else {
+      // Cache miss — fetch fresh from RF to populate cache
+      try {
+        const fresh = await getRFCandidate(rfCandidateId, env);
+        await cacheCandidate(fresh, env);
+      } catch (e) {
+        console.error('Failed to fetch RF candidate for cache warming:', e.message);
+      }
+    }
+
   } catch (error) {
     console.error('Failed to sync Dialpad contact to RF:', {
       rfCandidateId,
@@ -285,20 +313,50 @@ async function processCalendarEvent(payload, env) {
   // Step 1: Find the RF candidate
   let candidateId = null;
 
+  // Tier 1: LinkedIn lookup (cache, then RF search API)
   if (isValidLinkedInUrl(linkedin_answer)) {
     const normalized = normalizeLinkedInUrl(linkedin_answer);
     console.log('Valid LinkedIn URL, searching RF:', { original: linkedin_answer, normalized });
 
-    // TODO Phase 4: Check KV cache first (Tier 1)
-
-    // Tier 2: Search RF API directly
-    const searchResult = await searchRFCandidateByLinkedIn(linkedin_answer, env);
-    if (searchResult) {
-      candidateId = searchResult.id;
+    const cachedId = await lookupByLinkedIn(linkedin_answer, env);
+    if (cachedId) {
+      console.log('Cache hit for LinkedIn:', { normalized, candidateId: cachedId });
+      candidateId = cachedId;
+    } else {
+      console.log('Cache miss for LinkedIn, falling back to RF search API');
+      const searchResult = await searchRFCandidateByLinkedIn(linkedin_answer, env);
+      if (searchResult) {
+        candidateId = searchResult.id;
+        await cacheCandidate(searchResult, env);
+      }
     }
   } else {
     console.log('LinkedIn answer is not a valid URL, skipping LinkedIn lookup:', linkedin_answer);
-    // TODO Phase 4: Name-based fallback (Tier 3)
+  }
+
+  // Tier 2: Email fallback (cache only)
+  if (!candidateId && attendee_email) {
+    const emailId = await lookupByEmail(attendee_email, env);
+    if (emailId) {
+      console.log('Cache hit for email:', { email: attendee_email, candidateId: emailId });
+      candidateId = emailId;
+    }
+  }
+
+  // Tier 3: Name fallback (cache only)
+  if (!candidateId && attendee_name) {
+    const parts = attendee_name.trim().split(/\s+/);
+    const firstName = parts[0] || '';
+    const lastName = parts.slice(1).join(' ') || '';
+    if (firstName && lastName) {
+      const nameId = await lookupByName(firstName, lastName, env);
+      if (nameId) {
+        console.log('Cache hit for name:', { firstName, lastName, candidateId: nameId });
+        candidateId = nameId;
+      } else {
+        console.log('No unambiguous cache match for name:', { firstName, lastName });
+      }
+    }
   }
 
   if (!candidateId) {
@@ -373,6 +431,9 @@ async function processCalendarEvent(payload, env) {
     // Dialpad failure is non-fatal — RF update already succeeded
     console.error('Failed to update Dialpad contact (non-fatal):', error.message);
   }
+
+  // Update cache with the new email data
+  await cacheCandidate({ ...currentCandidate, email: mergedEmails }, env);
 
   console.log('Calendar event processed successfully:', { candidateId, emailAdded: attendee_email });
 }
