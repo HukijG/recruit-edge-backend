@@ -43,6 +43,10 @@ export default {
         return await handleCalendarWebhook(request, env);
       }
 
+      if (url.pathname === '/webhook/recruiterflow/manual' && request.method === 'POST') {
+        return await handleManualRFWebhook(request, env, url);
+      }
+
       if (url.pathname === '/webhook/krisp' && request.method === 'POST') {
         return await handleKrispWebhook(request, env);
       }
@@ -116,6 +120,49 @@ async function handleRecruiterflowWebhook(request, env) {
 
   } catch (error) {
     console.error('RF webhook error:', error);
+    return new Response('Internal Server Error', { status: 500 });
+  }
+}
+
+async function handleManualRFWebhook(request, env, url) {
+  try {
+    // Auth via query param — RF's webhook integration doesn't support custom headers
+    const webhookSecret = env.RF_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      console.error('RF_WEBHOOK_SECRET not configured, rejecting request');
+      return new Response('Unauthorized', { status: 401 });
+    }
+    const token = url.searchParams.get('token');
+    if (!token || token !== webhookSecret) {
+      console.log('Manual RF webhook auth failed');
+      return new Response('Unauthorized', { status: 401 });
+    }
+
+    // Payload IS the candidate (flat, no { candidate: ... } wrapper)
+    const candidate = await request.json();
+
+    if (!candidate || !candidate.id) {
+      console.log('Malformed manual RF webhook payload — missing candidate ID');
+      return new Response('Bad Request', { status: 400 });
+    }
+
+    console.log('Manual RF webhook received:', {
+      candidateId: candidate.id,
+      candidateName: candidate.name,
+      currentOrg: candidate.current_organization,
+      currentTitle: candidate.current_title,
+    });
+
+    await syncCandidateToDialpad(candidate, env);
+    await cacheCandidate(candidate, env);
+
+    return new Response('Manual webhook processed successfully', {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+
+  } catch (error) {
+    console.error('Manual RF webhook error:', error);
     return new Response('Internal Server Error', { status: 500 });
   }
 }

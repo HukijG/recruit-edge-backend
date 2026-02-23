@@ -54,6 +54,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 |-------|--------|------|---------|
 | `/health` | GET | None | Health check |
 | `/webhook/recruiterflow` | POST | `X-RF-Webhook-Token` header | RF candidate Created/Updated events |
+| `/webhook/recruiterflow/manual` | POST | `?token=` query param (`RF_WEBHOOK_SECRET`) | Manual RF candidate sync (flat payload) |
 | `/webhook/dialpad` | POST | JWT Bearer (HS256) | Dialpad contact Updated events |
 | `/webhook/calendar` | POST | `X-Calendar-Webhook-Token` header | Calendar booking events (from Apps Script) |
 | `/webhook/krisp` | POST | `X-Krisp-Webhook-Token` header | Krisp meeting note webhooks |

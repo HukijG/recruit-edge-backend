@@ -23,6 +23,75 @@ describe('RF-Dialpad Sync Worker', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Manual RF webhook handler tests
+// ---------------------------------------------------------------------------
+
+describe('Manual RF webhook handler', () => {
+	it('returns 401 without token query param', async () => {
+		const request = new Request('http://example.com/webhook/recruiterflow/manual', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ id: 123, name: 'Test User' }),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(401);
+	});
+
+	it('returns 401 with wrong token', async () => {
+		const request = new Request('http://example.com/webhook/recruiterflow/manual?token=wrong', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ id: 123, name: 'Test User' }),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(401);
+	});
+
+	it('returns 400 when payload missing candidate ID', async () => {
+		const request = new Request(
+			`http://example.com/webhook/recruiterflow/manual?token=${env.RF_WEBHOOK_SECRET}`,
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ name: 'No ID' }),
+			}
+		);
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(400);
+	});
+
+	it('returns 200 and skips Dialpad sync for candidate missing required fields', async () => {
+		const request = new Request(
+			`http://example.com/webhook/recruiterflow/manual?token=${env.RF_WEBHOOK_SECRET}`,
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					id: 99999,
+					name: 'Test User',
+					first_name: 'Test',
+					last_name: 'User',
+					email: '',
+					phone_number: '',
+					current_organization: '',
+					current_title: '',
+				}),
+			}
+		);
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(200);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // Krisp helper unit tests
 // ---------------------------------------------------------------------------
 
