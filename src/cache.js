@@ -13,14 +13,12 @@ const CACHE_TTL = 60 * 24 * 60 * 60; // 60 days in seconds
 
 /**
  * Write canonical record + all index keys for a candidate.
- * Call this after any RF webhook or successful RF API lookup.
  */
 export async function cacheCandidate(candidate, env) {
   if (!candidate?.id) return;
 
   const rfId = String(candidate.id);
 
-  // Build canonical record with key fields
   const record = {
     id: candidate.id,
     first_name: candidate.first_name || '',
@@ -36,12 +34,12 @@ export async function cacheCandidate(candidate, env) {
 
   const writes = [];
 
-  // 1. Canonical record
+  // Canonical record
   writes.push(
     env.SYNC_STATE.put(`candidate:${rfId}`, JSON.stringify(record), { expirationTtl: CACHE_TTL })
   );
 
-  // 2. LinkedIn index
+  // LinkedIn index
   if (record.linkedin_profile && isValidLinkedInUrl(record.linkedin_profile)) {
     const normalized = normalizeLinkedInUrl(record.linkedin_profile);
     if (normalized) {
@@ -51,7 +49,7 @@ export async function cacheCandidate(candidate, env) {
     }
   }
 
-  // 3. Email indexes — one key per email in the array
+  // Email indexes — one key per email in the array
   if (record.emails.length > 0) {
     for (const entry of record.emails) {
       const addr = (entry.email || '').toLowerCase().trim();
@@ -62,7 +60,6 @@ export async function cacheCandidate(candidate, env) {
       }
     }
   } else if (record.email) {
-    // Fallback: single string email
     const addr = record.email.toLowerCase().trim();
     if (addr) {
       writes.push(
@@ -71,28 +68,24 @@ export async function cacheCandidate(candidate, env) {
     }
   }
 
-  // 4. Name index (with ambiguity detection)
+  // Name index (with ambiguity detection)
   const first = (record.first_name || '').toLowerCase().trim();
   const last = (record.last_name || '').toLowerCase().trim();
   if (first && last) {
     const nameKey = `name:${first}:${last}`;
     const existing = await env.SYNC_STATE.get(nameKey);
     if (existing === null) {
-      // First candidate with this name — claim the key
       writes.push(
         env.SYNC_STATE.put(nameKey, rfId, { expirationTtl: CACHE_TTL })
       );
     } else if (existing !== rfId && existing !== 'AMBIGUOUS') {
-      // Different candidate — mark ambiguous
       writes.push(
         env.SYNC_STATE.put(nameKey, 'AMBIGUOUS', { expirationTtl: CACHE_TTL })
       );
     }
-    // If existing === rfId, no update needed (same candidate re-cached)
   }
 
   await Promise.all(writes);
-  console.log('Cache populated for candidate:', rfId);
 }
 
 /**

@@ -1,6 +1,5 @@
 /**
  * Dialpad API Client for Cloudflare Workers
- * Handles contact creation and updates
  */
 
 const DIALPAD_COMPANY_ID = '0000000000000000';
@@ -13,18 +12,8 @@ export async function createOrUpdateDialpadContact(candidate, env) {
     throw new Error('DIALPAD_API_KEY environment variable is required');
   }
 
-  // Generate the UID using RF + candidate ID
   const uid = `RF${candidate.id}`;
-
-  // Prepare contact data for Dialpad API
   const contactData = prepareContactData(candidate, uid);
-
-  console.log('Creating/updating Dialpad contact:', {
-    uid,
-    name: `${candidate.first_name} ${candidate.last_name}`,
-    email: candidate.email,
-    company: candidate.current_organization
-  });
 
   try {
     const response = await fetch(`${dialpadBaseUrl}/contacts`, {
@@ -43,15 +32,7 @@ export async function createOrUpdateDialpadContact(candidate, env) {
     }
 
     const result = await response.json();
-
-    // The contact ID will be in format: shared_contact_pool_Company:0000000000000000_uid_RF{id}
     const expectedContactId = `shared_contact_pool_Company:${DIALPAD_COMPANY_ID}_uid_${uid}`;
-
-    console.log('Dialpad contact operation successful:', {
-      contactId: expectedContactId,
-      uid: uid,
-      rfCandidateId: candidate.id
-    });
 
     return {
       success: true,
@@ -61,13 +42,12 @@ export async function createOrUpdateDialpadContact(candidate, env) {
     };
 
   } catch (error) {
-    console.error('Dialpad API request failed:', error);
+    console.error('Dialpad API error:', error.message);
     throw error;
   }
 }
 
 function prepareContactData(candidate, uid) {
-  // Fall back to splitting combined name field if first/last not provided
   let firstName = candidate.first_name || '';
   let lastName = candidate.last_name || '';
   if (!firstName && !lastName && candidate.name) {
@@ -87,17 +67,14 @@ function prepareContactData(candidate, uid) {
     urls: []
   };
 
-  // Add email if present
   if (candidate.email && candidate.email.trim() !== '') {
     contactData.emails.push(candidate.email.trim());
   }
 
-  // Add phone if present
   if (candidate.phone_number && candidate.phone_number.trim() !== '') {
     contactData.phones.push(candidate.phone_number.trim());
   }
 
-  // Add LinkedIn profile if present
   if (candidate.linkedin_profile && candidate.linkedin_profile.trim() !== '') {
     contactData.urls.push(candidate.linkedin_profile.trim());
   }
