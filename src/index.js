@@ -70,7 +70,7 @@ async function handleRecruiterflowWebhook(request, env) {
   try {
     const webhookSecret = env.RF_WEBHOOK_SECRET;
     if (!webhookSecret) {
-      console.error('[RF] RF_WEBHOOK_SECRET not configured');
+      console.error({ message: '[RF] secret not configured', source: 'rf' });
       return new Response('Unauthorized', { status: 401 });
     }
     const signature = request.headers.get('X-RF-Webhook-Token');
@@ -86,14 +86,32 @@ async function handleRecruiterflowWebhook(request, env) {
       return new Response('Bad Request', { status: 400 });
     }
 
-    console.log(`[RF] ${eventType} candidate=${candidate.id} "${candidate.name}" org=${candidate.current_organization || '—'}`);
+    console.log({
+      message: `[RF] ${eventType} candidate=${candidate.id} "${candidate.name}"`,
+      source: 'rf',
+      event: eventType,
+      candidateId: candidate.id,
+      name: candidate.name,
+      firstName: candidate.first_name,
+      lastName: candidate.last_name,
+      email: candidate.email,
+      phone: candidate.phone_number,
+      org: candidate.current_organization,
+      title: candidate.current_title,
+      linkedin: candidate.linkedin_profile,
+    });
 
     if (eventType === 'Created' || eventType === 'Updated') {
       const synced = await syncCandidateToDialpad(candidate, env);
       await cacheCandidate(candidate, env);
-      console.log(`[RF] → ${synced ? 'Dialpad upsert + cached' : 'skipped Dialpad (validation), cached'} candidate=${candidate.id}`);
+      console.log({
+        message: `[RF] → ${synced ? 'Dialpad upsert + cached' : 'skipped Dialpad (validation), cached'} candidate=${candidate.id}`,
+        source: 'rf',
+        action: synced ? 'dialpad_upsert' : 'skipped_validation',
+        candidateId: candidate.id,
+      });
     } else {
-      console.log(`[RF] → ignored event: ${eventType}`);
+      console.log({ message: `[RF] → ignored event: ${eventType}`, source: 'rf', event: eventType });
     }
 
     return new Response('Webhook processed successfully', {
@@ -102,7 +120,7 @@ async function handleRecruiterflowWebhook(request, env) {
     });
 
   } catch (error) {
-    console.error('[RF] error:', error);
+    console.error({ message: '[RF] error', source: 'rf', error: error.message });
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -111,7 +129,7 @@ async function handleManualRFWebhook(request, env, url) {
   try {
     const webhookSecret = env.RF_WEBHOOK_SECRET;
     if (!webhookSecret) {
-      console.error('[RF/manual] RF_WEBHOOK_SECRET not configured');
+      console.error({ message: '[RF/manual] secret not configured', source: 'rf-manual' });
       return new Response('Unauthorized', { status: 401 });
     }
     const token = url.searchParams.get('token');
@@ -125,11 +143,30 @@ async function handleManualRFWebhook(request, env, url) {
       return new Response('Bad Request', { status: 400 });
     }
 
-    console.log(`[RF/manual] candidate=${candidate.id} "${candidate.name}" org=${candidate.current_organization || '—'}`);
+    console.log({
+      message: `[RF/manual] candidate=${candidate.id} "${candidate.name}"`,
+      source: 'rf-manual',
+      candidateId: candidate.id,
+      name: candidate.name,
+      firstName: candidate.first_name,
+      lastName: candidate.last_name,
+      email: candidate.email,
+      phone: candidate.phone_number,
+      org: candidate.current_organization,
+      title: candidate.current_title,
+      linkedin: candidate.linkedin_profile,
+      rfLink: candidate.rf_link,
+    });
 
     const synced = await syncCandidateToDialpad(candidate, env);
     await cacheCandidate(candidate, env);
-    console.log(`[RF/manual] → ${synced ? 'Dialpad upsert + cached' : 'skipped Dialpad (validation), cached'} candidate=${candidate.id}`);
+
+    console.log({
+      message: `[RF/manual] → ${synced ? 'Dialpad upsert + cached' : 'skipped Dialpad (validation), cached'} candidate=${candidate.id}`,
+      source: 'rf-manual',
+      action: synced ? 'dialpad_upsert' : 'skipped_validation',
+      candidateId: candidate.id,
+    });
 
     return new Response('Manual webhook processed successfully', {
       status: 200,
@@ -137,7 +174,7 @@ async function handleManualRFWebhook(request, env, url) {
     });
 
   } catch (error) {
-    console.error('[RF/manual] error:', error);
+    console.error({ message: '[RF/manual] error', source: 'rf-manual', error: error.message });
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -165,12 +202,28 @@ async function handleDialpadWebhook(request, env) {
     }
 
     const contact = payload.contact;
-    console.log(`[Dialpad] ${payload.event} contact="${contact?.display_name}" id=${contact?.id}`);
+
+    console.log({
+      message: `[Dialpad] ${payload.event} contact="${contact?.display_name}"`,
+      source: 'dialpad',
+      event: payload.event,
+      contactId: contact?.id,
+      displayName: contact?.display_name,
+      firstName: contact?.first_name,
+      lastName: contact?.last_name,
+      primaryEmail: contact?.primary_email,
+      primaryPhone: contact?.primary_phone,
+      companyName: contact?.company_name,
+      jobTitle: contact?.job_title,
+      emails: contact?.emails,
+      phones: contact?.phones,
+      urls: contact?.urls,
+    });
 
     if (payload.event === 'Updated') {
       await processDialpadContactUpdate(contact, env);
     } else {
-      console.log(`[Dialpad] → ignored event: ${payload.event}`);
+      console.log({ message: `[Dialpad] → ignored event: ${payload.event}`, source: 'dialpad', event: payload.event });
     }
 
     return new Response('Dialpad webhook processed successfully', {
@@ -179,7 +232,7 @@ async function handleDialpadWebhook(request, env) {
     });
 
   } catch (error) {
-    console.error('[Dialpad] error:', error);
+    console.error({ message: '[Dialpad] error', source: 'dialpad', error: error.message });
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -188,14 +241,14 @@ async function processDialpadContactUpdate(contact, env) {
   const rfCandidateId = extractRFIdFromDialpadContact(contact.id);
 
   if (!rfCandidateId) {
-    console.log('[Dialpad] → skipped: no RF ID in contact');
+    console.log({ message: '[Dialpad] → skipped: no RF ID in contact', source: 'dialpad', contactId: contact.id });
     return;
   }
 
   const syncKey = `sync:RF${rfCandidateId}`;
   const recentSync = await env.SYNC_STATE.get(syncKey);
   if (recentSync) {
-    console.log(`[Dialpad] → skipped candidate=${rfCandidateId}: debounce active`);
+    console.log({ message: `[Dialpad] → skipped: debounce active`, source: 'dialpad', candidateId: rfCandidateId });
     return;
   }
 
@@ -203,7 +256,7 @@ async function processDialpadContactUpdate(contact, env) {
     const updateData = convertDialpadContactToRFUpdate(contact);
 
     if (Object.keys(updateData).length === 0) {
-      console.log(`[Dialpad] → skipped candidate=${rfCandidateId}: no email/phone/linkedin data`);
+      console.log({ message: `[Dialpad] → skipped: no syncable data`, source: 'dialpad', candidateId: rfCandidateId });
       return;
     }
 
@@ -229,14 +282,21 @@ async function processDialpadContactUpdate(contact, env) {
         const fresh = await getRFCandidate(rfCandidateId, env);
         await cacheCandidate(fresh, env);
       } catch (e) {
-        console.error(`[Dialpad] cache warming failed for candidate=${rfCandidateId}:`, e.message);
+        console.error({ message: '[Dialpad] cache warming failed', source: 'dialpad', candidateId: rfCandidateId, error: e.message });
       }
     }
 
-    console.log(`[Dialpad] → RF update [${Object.keys(updateData).join(',')}] + cached candidate=${rfCandidateId}`);
+    console.log({
+      message: `[Dialpad] → RF update + cached candidate=${rfCandidateId}`,
+      source: 'dialpad',
+      action: 'rf_update',
+      candidateId: rfCandidateId,
+      updatedFields: Object.keys(updateData),
+      updateData,
+    });
 
   } catch (error) {
-    console.error(`[Dialpad] error syncing candidate=${rfCandidateId}:`, error.message);
+    console.error({ message: `[Dialpad] sync error`, source: 'dialpad', candidateId: rfCandidateId, error: error.message });
     throw error;
   }
 }
@@ -245,7 +305,7 @@ async function handleCalendarWebhook(request, env) {
   try {
     const webhookSecret = env.CALENDAR_WEBHOOK_SECRET;
     if (!webhookSecret) {
-      console.error('[Calendar] CALENDAR_WEBHOOK_SECRET not configured');
+      console.error({ message: '[Calendar] secret not configured', source: 'calendar' });
       return new Response('Unauthorized', { status: 401 });
     }
     const token = request.headers.get('X-Calendar-Webhook-Token');
@@ -259,7 +319,16 @@ async function handleCalendarWebhook(request, env) {
       return new Response('Bad Request — missing attendee_email', { status: 400 });
     }
 
-    console.log(`[Calendar] attendee="${payload.attendee_name}" email=${payload.attendee_email} linkedin=${payload.linkedin_answer || '—'}`);
+    console.log({
+      message: `[Calendar] attendee="${payload.attendee_name}" email=${payload.attendee_email}`,
+      source: 'calendar',
+      eventId: payload.event_id,
+      eventTitle: payload.event_title,
+      eventStart: payload.event_start,
+      attendeeEmail: payload.attendee_email,
+      attendeeName: payload.attendee_name,
+      linkedin: payload.linkedin_answer,
+    });
 
     await processCalendarEvent(payload, env);
 
@@ -269,7 +338,7 @@ async function handleCalendarWebhook(request, env) {
     });
 
   } catch (error) {
-    console.error('[Calendar] error:', error);
+    console.error({ message: '[Calendar] error', source: 'calendar', error: error.message });
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -321,11 +390,9 @@ async function processCalendarEvent(payload, env) {
   }
 
   if (!candidateId) {
-    console.log(`[Calendar] → no candidate found for ${attendee_email}, skipping`);
+    console.log({ message: `[Calendar] → no candidate found, skipping`, source: 'calendar', attendeeEmail: attendee_email, attendeeName: attendee_name });
     return;
   }
-
-  console.log(`[Calendar] → found candidate=${candidateId} via ${lookupMethod}`);
 
   // GET current candidate data (RF update REPLACES arrays, doesn't append)
   const currentCandidate = await getRFCandidate(candidateId, env);
@@ -339,7 +406,7 @@ async function processCalendarEvent(payload, env) {
   );
 
   if (emailAlreadyExists) {
-    console.log(`[Calendar] → skipped: email ${attendee_email} already on candidate=${candidateId}`);
+    console.log({ message: `[Calendar] → skipped: email already exists`, source: 'calendar', candidateId, attendeeEmail: attendee_email });
     return;
   }
 
@@ -379,12 +446,21 @@ async function processCalendarEvent(payload, env) {
     await createOrUpdateDialpadContact(dialpadCandidate, env);
   } catch (error) {
     dialpadOk = false;
-    console.error(`[Calendar] Dialpad upsert failed (non-fatal):`, error.message);
+    console.error({ message: '[Calendar] Dialpad upsert failed (non-fatal)', source: 'calendar', candidateId, error: error.message });
   }
 
   await cacheCandidate({ ...currentCandidate, email: mergedEmails }, env);
 
-  console.log(`[Calendar] → RF email merge (${mergedEmails.length} total)${dialpadOk ? ' + Dialpad upsert' : ''} + cached candidate=${candidateId}`);
+  console.log({
+    message: `[Calendar] → RF email merge${dialpadOk ? ' + Dialpad upsert' : ''} + cached candidate=${candidateId}`,
+    source: 'calendar',
+    action: 'email_merge',
+    candidateId,
+    lookupMethod,
+    attendeeEmail: attendee_email,
+    totalEmails: mergedEmails.length,
+    dialpadOk,
+  });
 }
 
 /**
@@ -397,7 +473,7 @@ async function syncCandidateToDialpad(candidate, env) {
     return false;
   }
 
-  const dialpadResult = await createOrUpdateDialpadContact(candidate, env);
+  await createOrUpdateDialpadContact(candidate, env);
 
   // Write debounce flag to KV to prevent loop (60s TTL)
   const syncKey = `sync:RF${candidate.id}`;
@@ -423,7 +499,7 @@ async function handleKrispWebhook(request, env) {
   try {
     const webhookSecret = env.KRISP_WEBHOOK_SECRET;
     if (!webhookSecret) {
-      console.error('[Krisp] KRISP_WEBHOOK_SECRET not configured');
+      console.error({ message: '[Krisp] secret not configured', source: 'krisp' });
       return new Response('Unauthorized', { status: 401 });
     }
     const token = request.headers.get('X-Krisp-Webhook-Token');
@@ -434,7 +510,7 @@ async function handleKrispWebhook(request, env) {
     const payload = await request.json();
 
     if (payload.event !== 'summary_generated') {
-      console.log(`[Krisp] → ignored event: ${payload.event}`);
+      console.log({ message: `[Krisp] → ignored event: ${payload.event}`, source: 'krisp', event: payload.event });
       return new Response('OK', { status: 200 });
     }
 
@@ -448,11 +524,21 @@ async function handleKrispWebhook(request, env) {
     const dedupeKey = `krisp:${meeting.id}`;
     const alreadyProcessed = await env.SYNC_STATE.get(dedupeKey);
     if (alreadyProcessed) {
-      console.log(`[Krisp] → skipped: already processed meeting=${meeting.id}`);
+      console.log({ message: `[Krisp] → skipped: already processed`, source: 'krisp', meetingId: meeting.id });
       return new Response('OK', { status: 200 });
     }
 
-    console.log(`[Krisp] meeting=${meeting.id} "${meeting.title}" participants=${meeting.participants?.length || 0}`);
+    console.log({
+      message: `[Krisp] meeting="${meeting.title}"`,
+      source: 'krisp',
+      meetingId: meeting.id,
+      meetingTitle: meeting.title,
+      meetingUrl: meeting.url,
+      startDate: meeting.start_date,
+      duration: meeting.duration,
+      participants: meeting.participants,
+      contentSections: content?.length || 0,
+    });
 
     const notePosted = await processKrispMeetingNotes(meeting, content, env);
 
@@ -466,7 +552,7 @@ async function handleKrispWebhook(request, env) {
     });
 
   } catch (error) {
-    console.error('[Krisp] error:', error);
+    console.error({ message: '[Krisp] error', source: 'krisp', error: error.message });
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -474,12 +560,18 @@ async function handleKrispWebhook(request, env) {
 async function processKrispMeetingNotes(meeting, content, env) {
   const candidateEmail = extractCandidateEmail(meeting.participants);
   if (!candidateEmail) {
-    console.log('[Krisp] → skipped: no candidate email in participants');
+    console.log({
+      message: '[Krisp] → skipped: no candidate email in participants',
+      source: 'krisp',
+      meetingId: meeting.id,
+      meetingTitle: meeting.title,
+      participants: meeting.participants,
+    });
     return false;
   }
 
   if (!Array.isArray(content) || content.length === 0) {
-    console.log('[Krisp] → skipped: no content sections');
+    console.log({ message: '[Krisp] → skipped: no content sections', source: 'krisp', meetingId: meeting.id });
     return false;
   }
 
@@ -497,14 +589,23 @@ async function processKrispMeetingNotes(meeting, content, env) {
   }
 
   if (!candidateId) {
-    console.log(`[Krisp] → no candidate found for ${candidateEmail}, skipping`);
+    console.log({ message: `[Krisp] → no candidate found, skipping`, source: 'krisp', candidateEmail, meetingId: meeting.id });
     return false;
   }
 
   const htmlContent = formatKrispNotesAsHtml(meeting, content);
   await addRFCandidateNote(candidateId, htmlContent, env);
 
-  console.log(`[Krisp] → RF note posted for candidate=${candidateId} (${lookupMethod}) meeting="${meeting.title}"`);
+  console.log({
+    message: `[Krisp] → RF note posted for candidate=${candidateId}`,
+    source: 'krisp',
+    action: 'note_posted',
+    candidateId,
+    candidateEmail,
+    lookupMethod,
+    meetingId: meeting.id,
+    meetingTitle: meeting.title,
+  });
 
   return true;
 }

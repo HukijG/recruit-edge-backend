@@ -5,7 +5,11 @@
   "compatibility_date": "2025-09-02",
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "logs": {
+      "invocation_logs": false,
+      "head_sampling_rate": 1
+    }
   },
   "vars": {
     "DIALPAD_API_BASE_URL": "https://dialpad.com/api/v2",
