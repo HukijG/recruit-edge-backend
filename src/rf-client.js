@@ -243,3 +243,32 @@ export function convertDialpadContactToRFUpdate(dialpadContact) {
 
   return updateData;
 }
+
+/**
+ * Create a custom activity on an RF candidate.
+ */
+export async function createRFCustomActivity(activityData, env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const response = await fetch(`${rfBaseUrl}/custom-activity/create`, {
+    method: 'POST',
+    headers: {
+      'RF-Api-Key': rfApiKey,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(activityData)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`RF custom activity error: ${response.status}`, errorText);
+    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+  }
+
+  return await response.json();
+}

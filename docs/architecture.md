@@ -5,29 +5,30 @@
 A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact records in sync across RecruiterFlow (RF), Dialpad, Google Calendar, and Krisp. RF is the source of truth for candidate records. A KV-backed cache provides fast lookups for integrations that don't have an RF candidate ID.
 
 ```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ RecruiterFlow │    │   Dialpad    │    │   Google     │    │    Krisp     │
-│  (RF)        │    │              │    │  Calendar    │    │              │
-│              │    │              │    │  + Reclaim   │    │              │
-└──────┬───────┘    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
-       │ webhook           │ webhook           │ Apps Script        │ webhook
-       ▼                   ▼                   ▼                   ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Cloudflare Worker (rf-dialpad-sync-dev)              │
-│                                                                         │
-│  /webhook/recruiterflow  /webhook/dialpad  /webhook/calendar            │
-│  /webhook/krisp          /health                                        │
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                    KV: SYNC_STATE                                │    │
-│  │  candidate:{rfId}  → JSON canonical record       (60-day TTL)   │    │
-│  │  linkedin:{url}    → rfId                        (60-day TTL)   │    │
-│  │  email:{addr}      → rfId                        (60-day TTL)   │    │
-│  │  name:{first}:{last} → rfId or AMBIGUOUS         (60-day TTL)   │    │
-│  │  sync:RF{id}       → "true"                      (60-sec TTL)   │    │
-│  │  krisp:note:{hash} → "true"                      (24-hour TTL)  │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│ RecruiterFlow │    │   Dialpad    │    │  Dialpad     │    │   Google     │    │    Krisp     │
+│  (RF)        │    │  (contacts)  │    │  (calls)     │    │  Calendar    │    │              │
+│              │    │              │    │              │    │  + Reclaim   │    │              │
+└──────┬───────┘    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
+       │ webhook           │ webhook           │ webhook           │ Apps Script        │ webhook
+       ▼                   ▼                   ▼                   ▼                   ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                          Cloudflare Worker (rf-dialpad-sync-dev)                                 │
+│                                                                                                  │
+│  /webhook/recruiterflow  /webhook/dialpad  /webhook/dialpad/calls  /webhook/calendar             │
+│  /webhook/krisp          /health                                                                 │
+│                                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────┐     │
+│  │                    KV: SYNC_STATE                                                        │     │
+│  │  candidate:{rfId}    → JSON canonical record       (60-day TTL)                          │     │
+│  │  linkedin:{url}      → rfId                        (60-day TTL)                          │     │
+│  │  email:{addr}        → rfId                        (60-day TTL)                          │     │
+│  │  name:{first}:{last} → rfId or AMBIGUOUS           (60-day TTL)                          │     │
+│  │  sync:RF{id}         → "true"                      (60-sec TTL)                          │     │
+│  │  krisp:note:{hash}   → "true"                      (24-hour TTL)                         │     │
+│  │  coldcall:{call_id}  → "true"                      (5-min TTL)                           │     │
+│  └─────────────────────────────────────────────────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -41,6 +42,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `src/rf-client.js` | RF API client: candidate search/get/update, LinkedIn URL validation & normalization, Dialpad↔RF data conversion |
 | `src/dialpad-client.js` | Dialpad API client: contact PUT (create/update), data preparation from RF candidate format |
 | `src/krisp.js` | Krisp helpers: note formatting (HTML), candidate email extraction from meeting participants |
+| `src/cold-call.js` | Cold call detection: Dialpad transcript fetch, Workers AI classification (Llama 3.3 70B), RF custom activity + source update |
 | `src/auth.js` | JWT verification for Dialpad webhooks (HS256 via `jose`) |
 | `scripts/calendar-sync.gs` | Google Apps Script: detects Reclaim bookings on Google Calendar, extracts candidate data, posts to worker |
 | `wrangler.jsonc` | Worker config: KV binding, env vars, compatibility settings |
@@ -58,6 +60,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `/webhook/dialpad` | POST | JWT Bearer (HS256) | Dialpad contact Updated events |
 | `/webhook/calendar` | POST | `X-Calendar-Webhook-Token` header | Calendar booking events (from Apps Script) |
 | `/webhook/krisp` | POST | `X-Krisp-Webhook-Token` header | Krisp meeting note webhooks |
+| `/webhook/dialpad/calls` | POST | JWT Bearer (HS256) | Dialpad call transcription/voicemail webhooks |
 
 ---
 
@@ -164,6 +167,38 @@ Krisp webhook (summary_generated)
 
 ---
 
+## Data Flow: Dialpad Calls → RF (Cold Call Detection)
+
+**Trigger**: Dialpad fires `call_transcription` or `transcription` (voicemail) webhook event after a call ends and the transcript is ready.
+
+```
+Dialpad call event (call_transcription or transcription state)
+  → POST /webhook/dialpad/calls
+  → Verify JWT (HS256, existing DIALPAD_WEBHOOK_SECRET)
+  → Filter: target.id must be Joel (8000000000000001)
+  → Filter: direction must be "outbound"
+  → Extract RF candidate ID from contact.id (uid_RF regex)
+  → Check KV dedup: coldcall:{call_id} — skip if already processed (5-min TTL)
+  → Get transcript:
+      - transcription state: transcription_text from payload (voicemails)
+      - call_transcription state: GET /api/v2/transcripts/{call_id}
+  → Truncate to 5,000 chars
+  → Classify via CF Workers AI (Llama 3.3 70B fp8 fast)
+  → If not cold call → log + done
+  → If cold call:
+      1. POST /api/external/custom-activity/create (activity_type_id=1002)
+      2. POST /api/external/candidate/update (source="Cold Call")
+  → Set dedup: coldcall:{call_id} = "true" (5-min TTL)
+```
+
+**LLM Classification**: No keyword matching. System prompt describes cold call characteristics conceptually — first contact, introducing yourself, unfamiliar tone. Model returns JSON with `is_cold_call` boolean and reasoning. Uses `@cf/meta/llama-3.3-70b-instruct-fp8-fast` via Workers AI binding.
+
+**Scope**: Joel's calls only (Dialpad user ID 8000000000000001). Activity logged under RF user 900001. Hardcoded — will add team member IDs when rolling out.
+
+**Neuron budget**: ~61 neurons per full call (5k chars), ~25 per voicemail. At worst case ~215 calls/day = ~5,915 neurons (59% of free 10k/day).
+
+---
+
 ## Loop Prevention
 
 Both RF→Dialpad and Dialpad→RF sync directions write a KV debounce flag (`sync:RF{id}`, 60-second TTL) after a successful sync. The opposite direction checks for this flag before proceeding. This prevents infinite loops:
@@ -194,6 +229,7 @@ A general-purpose cache that stores candidate records and provides O(1) lookups 
 | `name:{first_lower}:{last_lower}` | RF candidate ID string, or `"AMBIGUOUS"` | 60 days |
 | `sync:RF{id}` | `"true"` | 60 seconds |
 | `krisp:note:{hash}` | `"true"` | 24 hours |
+| `coldcall:{call_id}` | `"true"` | 5 minutes |
 
 ### Cache Freshness
 

@@ -7,6 +7,7 @@ import {
 } from './rf-client.js';
 import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
+import { processCallEvent } from './cold-call.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -49,6 +50,10 @@ export default {
 
       if (url.pathname === '/webhook/krisp' && request.method === 'POST') {
         return await handleKrispWebhook(request, env);
+      }
+
+      if (url.pathname === '/webhook/dialpad/calls' && request.method === 'POST') {
+        return await handleDialpadCallWebhook(request, env);
       }
 
       return new Response('Not Found', {
@@ -608,4 +613,59 @@ async function processKrispMeetingNotes(meeting, content, env) {
   });
 
   return true;
+}
+
+async function handleDialpadCallWebhook(request, env) {
+  try {
+    const authHeader = request.headers.get('Authorization');
+    const bodyText = await request.text();
+
+    let token;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.substring(7);
+    } else {
+      token = bodyText;
+    }
+
+    if (!token) {
+      return new Response('Unauthorized - No token', { status: 401 });
+    }
+
+    const payload = await verifyJWT(token, env.DIALPAD_WEBHOOK_SECRET);
+    if (!payload) {
+      return new Response('Unauthorized - Invalid token', { status: 401 });
+    }
+
+    console.log({
+      message: `[Dialpad/calls] ${payload.state} call_id=${payload.call_id}`,
+      source: 'dialpad-calls',
+      state: payload.state,
+      callId: payload.call_id,
+      direction: payload.direction,
+      contactId: payload.contact?.id,
+      contactName: payload.contact?.name,
+      targetId: payload.target?.id,
+      targetName: payload.target?.name,
+    });
+
+    const result = await processCallEvent(payload, env);
+
+    console.log({
+      message: `[Dialpad/calls] → ${result.isColdCall ? 'COLD CALL tracked' : result.reason}`,
+      source: 'dialpad-calls',
+      callId: payload.call_id,
+      processed: result.processed,
+      isColdCall: result.isColdCall,
+      reason: result.reason,
+    });
+
+    return new Response('Call webhook processed', {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+
+  } catch (error) {
+    console.error({ message: '[Dialpad/calls] error', source: 'dialpad-calls', error: error.message });
+    return new Response('Internal Server Error', { status: 500 });
+  }
 }

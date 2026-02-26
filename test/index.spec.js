@@ -2,6 +2,10 @@ import { env, createExecutionContext, waitOnExecutionContext, SELF } from 'cloud
 import { describe, it, expect } from 'vitest';
 import worker from '../src';
 import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
+import { createRFCustomActivity } from '../src/rf-client.js';
+import {
+	isJoelsCall, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall
+} from '../src/cold-call.js';
 
 describe('RF-Dialpad Sync Worker', () => {
 	it('/health returns 200 with status message', async () => {
@@ -263,5 +267,182 @@ describe('Krisp webhook handler', () => {
 		const response = await worker.fetch(request, env, ctx);
 		await waitOnExecutionContext(ctx);
 		expect(response.status).toBe(200);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Dialpad call webhook handler tests
+// ---------------------------------------------------------------------------
+
+describe('Dialpad call webhook handler', () => {
+	it('returns 401 without auth token', async () => {
+		const request = new Request('http://example.com/webhook/dialpad/calls', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ state: 'call_transcription' }),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(401);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// RF custom activity tests
+// ---------------------------------------------------------------------------
+
+describe('createRFCustomActivity', () => {
+	it('throws when RF_API_KEY is missing', async () => {
+		const env = { RF_API_BASE_URL: 'https://api.recruiterflow.com/api/external' };
+		await expect(
+			createRFCustomActivity({ activity_text: 'test' }, env)
+		).rejects.toThrow('RF_API_KEY environment variable is required');
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Cold call helper unit tests
+// ---------------------------------------------------------------------------
+
+describe('isJoelsCall', () => {
+	it('returns true for Joel Dialpad user ID', () => {
+		expect(isJoelsCall('8000000000000001')).toBe(true);
+	});
+
+	it('returns false for other user IDs', () => {
+		expect(isJoelsCall('9999999999999999')).toBe(false);
+	});
+
+	it('returns false for undefined', () => {
+		expect(isJoelsCall(undefined)).toBe(false);
+	});
+});
+
+describe('isOutboundCall', () => {
+	it('returns true for outbound', () => {
+		expect(isOutboundCall('outbound')).toBe(true);
+	});
+
+	it('returns false for inbound', () => {
+		expect(isOutboundCall('inbound')).toBe(false);
+	});
+});
+
+describe('truncateTranscript', () => {
+	it('returns text unchanged when under limit', () => {
+		expect(truncateTranscript('short text', 5000)).toBe('short text');
+	});
+
+	it('truncates text exceeding limit', () => {
+		const long = 'a'.repeat(6000);
+		const result = truncateTranscript(long, 5000);
+		expect(result.length).toBe(5000);
+	});
+
+	it('returns empty string for null input', () => {
+		expect(truncateTranscript(null)).toBe('');
+	});
+
+	it('returns empty string for undefined input', () => {
+		expect(truncateTranscript(undefined)).toBe('');
+	});
+});
+
+describe('formatActivityTime', () => {
+	it('formats unix ms timestamp to RF ISO format', () => {
+		const result = formatActivityTime(1772101800000);
+		expect(result).toBe('2026-02-26T10:30:00+0000');
+	});
+
+	it('formats ISO string input', () => {
+		const result = formatActivityTime('2026-02-26T10:30:00.000Z');
+		expect(result).toBe('2026-02-26T10:30:00+0000');
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Cold call LLM classification tests (mocked AI)
+// ---------------------------------------------------------------------------
+
+describe('classifyColdCall', () => {
+	it('returns is_cold_call false when transcript is empty', async () => {
+		const mockEnv = { AI: { run: async () => ({}) } };
+		const result = await classifyColdCall('', mockEnv);
+		expect(result.is_cold_call).toBe(false);
+		expect(result.reasoning).toBe('No transcript text available');
+	});
+
+	it('returns is_cold_call false when transcript is null', async () => {
+		const mockEnv = { AI: { run: async () => ({}) } };
+		const result = await classifyColdCall(null, mockEnv);
+		expect(result.is_cold_call).toBe(false);
+	});
+
+	it('parses valid cold call JSON response from LLM', async () => {
+		const mockEnv = {
+			AI: {
+				run: async () => ({
+					response: '{"is_cold_call": true, "reasoning": "Caller introduced themselves as a headhunter"}'
+				})
+			}
+		};
+		const result = await classifyColdCall('Hi, I am Joel, a global headhunter...', mockEnv);
+		expect(result.is_cold_call).toBe(true);
+		expect(result.reasoning).toContain('headhunter');
+	});
+
+	it('parses valid non-cold-call JSON response from LLM', async () => {
+		const mockEnv = {
+			AI: {
+				run: async () => ({
+					response: '{"is_cold_call": false, "reasoning": "Familiar greeting, scheduled follow-up"}'
+				})
+			}
+		};
+		const result = await classifyColdCall('Hey mate, thanks for booking time...', mockEnv);
+		expect(result.is_cold_call).toBe(false);
+	});
+
+	it('handles LLM response with extra text around JSON', async () => {
+		const mockEnv = {
+			AI: {
+				run: async () => ({
+					response: 'Here is my analysis:\n{"is_cold_call": true, "reasoning": "First contact"}\nDone.'
+				})
+			}
+		};
+		const result = await classifyColdCall('Hi, I am Joel from...', mockEnv);
+		expect(result.is_cold_call).toBe(true);
+	});
+
+	it('returns false when LLM returns unparseable response', async () => {
+		const mockEnv = {
+			AI: {
+				run: async () => ({
+					response: 'I cannot determine this.'
+				})
+			}
+		};
+		const result = await classifyColdCall('Some transcript...', mockEnv);
+		expect(result.is_cold_call).toBe(false);
+		expect(result.reasoning).toBe('LLM response could not be parsed');
+	});
+
+	it('truncates long transcripts before sending to LLM', async () => {
+		let capturedMessages = null;
+		const mockEnv = {
+			AI: {
+				run: async (_model, opts) => {
+					capturedMessages = opts.messages;
+					return { response: '{"is_cold_call": false, "reasoning": "test"}' };
+				}
+			}
+		};
+		const longText = 'a'.repeat(10000);
+		await classifyColdCall(longText, mockEnv);
+		const userMessage = capturedMessages.find(m => m.role === 'user');
+		// "Transcript:\n\n" prefix = 13 chars + 5000 truncated = 5013
+		expect(userMessage.content.length).toBeLessThanOrEqual(5013);
 	});
 });
