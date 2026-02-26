@@ -56,6 +56,20 @@ export function formatActivityTime(timestamp) {
   return date.toISOString().replace(/\.\d{3}Z$/, '+0000');
 }
 
+/** Strip non-digits, return last 10 digits (US numbers). */
+export function normalizePhone(phone) {
+  if (!phone) return null;
+  const digits = String(phone).replace(/\D/g, '');
+  if (digits.length >= 10) return digits.slice(-10);
+  return digits.length >= 7 ? digits : null;
+}
+
+/** True if the string is mostly digits — Dialpad uses the phone number as the contact name for unassociated calls. */
+export function looksLikePhoneNumber(str) {
+  if (!str || typeof str !== 'string') return false;
+  return str.replace(/\D/g, '').length >= 7;
+}
+
 // --- API functions ---
 
 export async function fetchCallTranscript(callId, env) {
@@ -144,6 +158,22 @@ export async function processCallEvent(payload, env) {
 
   const rfCandidateId = extractRFIdFromDialpadContact(payload.contact?.id);
   if (!rfCandidateId) {
+    // Contact not yet associated — if name looks like a phone number,
+    // store for deferred processing when Joel adds the number to the contact
+    if (looksLikePhoneNumber(payload.contact?.name)) {
+      const phone = normalizePhone(payload.contact.name);
+      if (phone) {
+        const pending = {
+          call_id: callId,
+          state,
+          transcription_text: payload.transcription_text || '',
+          date_started: payload.date_started,
+          event_timestamp: payload.event_timestamp,
+        };
+        await env.SYNC_STATE.put(`pending_coldcall:${phone}`, JSON.stringify(pending), { expirationTtl: 300 });
+        return { processed: false, isColdCall: false, reason: `deferred: stored for phone ${payload.contact.name}` };
+      }
+    }
     return { processed: false, isColdCall: false, reason: 'no RF candidate' };
   }
 
@@ -214,4 +244,98 @@ export async function processCallEvent(payload, env) {
   }
 
   return { processed: true, isColdCall: true, reason: classification.reasoning };
+}
+
+/**
+ * Check if a contact update matches a pending cold call stored by phone number.
+ * Called from the Dialpad contact update handler when a contact with an RF ID gets new phones.
+ * Returns { processed, isColdCall, reason, callId } or null if no pending call.
+ */
+export async function checkPendingColdCall(contactPhones, rfCandidateId, contactName, env) {
+  if (!Array.isArray(contactPhones) || contactPhones.length === 0) return null;
+
+  for (const phone of contactPhones) {
+    const normalized = normalizePhone(phone);
+    if (!normalized) continue;
+
+    const pendingJson = await env.SYNC_STATE.get(`pending_coldcall:${normalized}`);
+    if (!pendingJson) continue;
+
+    let pending;
+    try {
+      pending = JSON.parse(pendingJson);
+    } catch { continue; }
+
+    // Clean up pending key
+    await env.SYNC_STATE.delete(`pending_coldcall:${normalized}`);
+
+    // Dedup check (in case it was already processed another way)
+    const dedupeKey = `coldcall:${pending.call_id}`;
+    const alreadyProcessed = await env.SYNC_STATE.get(dedupeKey);
+    if (alreadyProcessed) return null;
+    await env.SYNC_STATE.put(dedupeKey, 'true', { expirationTtl: 300 });
+
+    console.log({
+      message: `[ColdCall/deferred] processing pending call_id=${pending.call_id} for candidate=${rfCandidateId}`,
+      source: 'cold-call',
+      callId: pending.call_id,
+      rfCandidateId,
+      phone: normalized,
+    });
+
+    // Get transcript
+    let transcriptText = '';
+    if (pending.state === 'transcription') {
+      transcriptText = pending.transcription_text || '';
+    } else if (pending.state === 'call_transcription') {
+      try {
+        const transcript = await fetchCallTranscript(pending.call_id, env);
+        transcriptText = typeof transcript === 'string'
+          ? transcript
+          : (transcript.text || transcript.transcription || JSON.stringify(transcript));
+      } catch (error) {
+        console.error({ message: `[ColdCall/deferred] transcript fetch failed: ${error.message}`, source: 'cold-call', callId: pending.call_id });
+        return null;
+      }
+    }
+
+    if (!transcriptText) return null;
+
+    // Classify
+    let classification;
+    try {
+      classification = await classifyColdCall(transcriptText, env);
+    } catch (error) {
+      console.error({ message: `[ColdCall/deferred] AI classification failed: ${error.message}`, source: 'cold-call', callId: pending.call_id });
+      return null;
+    }
+
+    if (!classification.is_cold_call) {
+      return { processed: true, isColdCall: false, reason: classification.reasoning, callId: pending.call_id };
+    }
+
+    // Cold call detected — update RF
+    const callTimestamp = pending.date_started || pending.event_timestamp || Date.now();
+    const activityTime = formatActivityTime(callTimestamp);
+
+    try {
+      await createRFCustomActivity({
+        activity_text: `Cold call with ${contactName || 'Unknown'}`,
+        activity_time: activityTime,
+        activity_type_id: COLD_CALL_ACTIVITY_TYPE_ID,
+        activity_user_id: JOEL_RF_USER_ID,
+        associated_entities: { candidates: [parseInt(rfCandidateId, 10)] },
+        mentions: []
+      }, env);
+
+      await updateRFCandidate(rfCandidateId, { source: 'Cold Call' }, env);
+    } catch (error) {
+      console.error({ message: `[ColdCall/deferred] RF update failed: ${error.message}`, source: 'cold-call', callId: pending.call_id, rfCandidateId });
+      return { processed: true, isColdCall: true, reason: `classified but RF update failed: ${error.message}`, callId: pending.call_id };
+    }
+
+    return { processed: true, isColdCall: true, reason: classification.reasoning, callId: pending.call_id };
+  }
+
+  return null;
 }

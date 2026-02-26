@@ -7,7 +7,7 @@ import {
 } from './rf-client.js';
 import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
-import { processCallEvent } from './cold-call.js';
+import { processCallEvent, checkPendingColdCall } from './cold-call.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -248,6 +248,28 @@ async function processDialpadContactUpdate(contact, env) {
   if (!rfCandidateId) {
     console.log({ message: '[Dialpad] → skipped: no RF ID in contact', source: 'dialpad', contactId: contact.id });
     return;
+  }
+
+  // Check for deferred cold calls — runs regardless of sync debounce
+  if (contact.phones && contact.phones.length > 0) {
+    try {
+      const coldCallResult = await checkPendingColdCall(
+        contact.phones, rfCandidateId,
+        contact.display_name || `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
+        env
+      );
+      if (coldCallResult) {
+        console.log({
+          message: `[Dialpad] → deferred cold call: ${coldCallResult.isColdCall ? 'COLD CALL tracked' : coldCallResult.reason}`,
+          source: 'dialpad',
+          candidateId: rfCandidateId,
+          callId: coldCallResult.callId,
+          isColdCall: coldCallResult.isColdCall,
+        });
+      }
+    } catch (error) {
+      console.error({ message: `[Dialpad] deferred cold call check failed: ${error.message}`, source: 'dialpad', candidateId: rfCandidateId });
+    }
   }
 
   const syncKey = `sync:RF${rfCandidateId}`;
