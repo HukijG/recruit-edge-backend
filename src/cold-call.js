@@ -98,14 +98,19 @@ export async function classifyColdCall(transcriptText, env) {
 
   try {
     const text = response.response || '';
-    const jsonMatch = text.match(/\{[\s\S]*?\}/);
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
-      console.error({ message: '[ColdCall] LLM response not parseable', source: 'cold-call', raw: text });
+      console.error({ message: `[ColdCall] LLM response not parseable: ${text.substring(0, 200)}`, source: 'cold-call' });
       return { is_cold_call: false, reasoning: 'LLM response could not be parsed' };
     }
-    return JSON.parse(jsonMatch[0]);
-  } catch {
-    console.error({ message: '[ColdCall] JSON parse failed', source: 'cold-call', raw: response.response });
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (typeof parsed.is_cold_call !== 'boolean') {
+      console.error({ message: `[ColdCall] LLM JSON missing is_cold_call field: ${jsonMatch[0].substring(0, 200)}`, source: 'cold-call' });
+      return { is_cold_call: false, reasoning: 'LLM response missing is_cold_call field' };
+    }
+    return parsed;
+  } catch (err) {
+    console.error({ message: `[ColdCall] JSON parse failed: ${(response.response || '').substring(0, 200)}`, source: 'cold-call' });
     return { is_cold_call: false, reasoning: 'LLM response could not be parsed' };
   }
 }
@@ -186,16 +191,21 @@ export async function processCallEvent(payload, env) {
   const callTimestamp = payload.date_started || payload.event_timestamp || Date.now();
   const activityTime = formatActivityTime(callTimestamp);
 
-  await createRFCustomActivity({
-    activity_text: `Cold call with ${candidateName}`,
-    activity_time: activityTime,
-    activity_type_id: COLD_CALL_ACTIVITY_TYPE_ID,
-    activity_user_id: JOEL_RF_USER_ID,
-    associated_entities: { candidates: [parseInt(rfCandidateId, 10)] },
-    mentions: []
-  }, env);
+  try {
+    await createRFCustomActivity({
+      activity_text: `Cold call with ${candidateName}`,
+      activity_time: activityTime,
+      activity_type_id: COLD_CALL_ACTIVITY_TYPE_ID,
+      activity_user_id: JOEL_RF_USER_ID,
+      associated_entities: { candidates: [parseInt(rfCandidateId, 10)] },
+      mentions: []
+    }, env);
 
-  await updateRFCandidate(rfCandidateId, { source: 'Cold Call' }, env);
+    await updateRFCandidate(rfCandidateId, { source: 'Cold Call' }, env);
+  } catch (error) {
+    console.error({ message: `[ColdCall] RF update failed: ${error.message}`, source: 'cold-call', callId, rfCandidateId });
+    return { processed: true, isColdCall: true, reason: `classified as cold call but RF update failed: ${error.message}` };
+  }
 
   return { processed: true, isColdCall: true, reason: classification.reasoning };
 }

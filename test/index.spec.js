@@ -2,7 +2,7 @@ import { env, createExecutionContext, waitOnExecutionContext, SELF } from 'cloud
 import { describe, it, expect } from 'vitest';
 import worker from '../src';
 import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
-import { createRFCustomActivity } from '../src/rf-client.js';
+import { createRFCustomActivity, extractRFIdFromDialpadContact } from '../src/rf-client.js';
 import {
 	isJoelsCall, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall
 } from '../src/cold-call.js';
@@ -448,5 +448,82 @@ describe('classifyColdCall', () => {
 		const userMessage = capturedMessages.find(m => m.role === 'user');
 		// "Transcript:\n\n" prefix = 13 chars + 5000 truncated = 5013
 		expect(userMessage.content.length).toBeLessThanOrEqual(5013);
+	});
+
+	it('parses JSON when LLM includes curly braces in reasoning text', async () => {
+		const mockEnv = {
+			AI: {
+				run: async () => ({
+					response: '{"is_cold_call": true, "reasoning": "Caller used {name} introduction pattern typical of cold outreach"}'
+				})
+			}
+		};
+		const result = await classifyColdCall('Hi, this is Joel...', mockEnv);
+		expect(result.is_cold_call).toBe(true);
+		expect(result.reasoning).toContain('{name}');
+	});
+
+	it('parses JSON wrapped in markdown code blocks', async () => {
+		const mockEnv = {
+			AI: {
+				run: async () => ({
+					response: '```json\n{"is_cold_call": false, "reasoning": "Scheduled follow-up call"}\n```'
+				})
+			}
+		};
+		const result = await classifyColdCall('Hey, thanks for hopping on...', mockEnv);
+		expect(result.is_cold_call).toBe(false);
+		expect(result.reasoning).toContain('follow-up');
+	});
+
+	it('returns false when LLM response has no JSON at all', async () => {
+		const mockEnv = {
+			AI: {
+				run: async () => ({
+					response: 'I cannot determine from this transcript whether it is a cold call.'
+				})
+			}
+		};
+		const result = await classifyColdCall('Some transcript...', mockEnv);
+		expect(result.is_cold_call).toBe(false);
+		expect(result.reasoning).toBe('LLM response could not be parsed');
+	});
+
+	it('returns false when LLM returns empty response', async () => {
+		const mockEnv = {
+			AI: { run: async () => ({ response: '' }) }
+		};
+		const result = await classifyColdCall('Some transcript...', mockEnv);
+		expect(result.is_cold_call).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// extractRFIdFromDialpadContact tests
+// ---------------------------------------------------------------------------
+
+describe('extractRFIdFromDialpadContact', () => {
+	it('extracts RF ID from full Dialpad contact string', () => {
+		expect(extractRFIdFromDialpadContact('shared_contact_pool_Company:0000000000000000_uid_RF12345')).toBe('12345');
+	});
+
+	it('returns null for contact without RF UID', () => {
+		expect(extractRFIdFromDialpadContact('shared_contact_pool_Company:0000000000000000')).toBeNull();
+	});
+
+	it('returns null for null input', () => {
+		expect(extractRFIdFromDialpadContact(null)).toBeNull();
+	});
+
+	it('returns null for undefined input', () => {
+		expect(extractRFIdFromDialpadContact(undefined)).toBeNull();
+	});
+
+	it('handles numeric contact ID without crashing', () => {
+		expect(extractRFIdFromDialpadContact(4670000000000000)).toBeNull();
+	});
+
+	it('returns null for empty string', () => {
+		expect(extractRFIdFromDialpadContact('')).toBeNull();
 	});
 });

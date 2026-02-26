@@ -665,7 +665,7 @@ async function handleDialpadCallWebhook(request, env) {
     });
 
   } catch (error) {
-    console.error({ message: '[Dialpad/calls] error', source: 'dialpad-calls', error: error.message });
+    console.error({ message: `[Dialpad/calls] unhandled error: ${error.message}`, source: 'dialpad-calls', stack: error.stack });
     return new Response('Internal Server Error', { status: 500 });
   }
 }

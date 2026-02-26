@@ -9,7 +9,7 @@
  */
 export function extractRFIdFromDialpadContact(dialpadContactId) {
   if (!dialpadContactId) return null;
-  const match = dialpadContactId.match(/uid_RF(\d+)$/);
+  const match = String(dialpadContactId).match(/uid_RF(\d+)$/);
   return match ? match[1] : null;
 }
 
