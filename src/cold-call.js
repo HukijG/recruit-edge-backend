@@ -38,7 +38,7 @@ or
 // --- Pure helpers ---
 
 export function isJoelsCall(targetId) {
-  return targetId === JOEL_DIALPAD_USER_ID;
+  return String(targetId) === JOEL_DIALPAD_USER_ID;
 }
 
 export function isOutboundCall(direction) {

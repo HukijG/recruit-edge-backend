@@ -306,8 +306,12 @@ describe('createRFCustomActivity', () => {
 // ---------------------------------------------------------------------------
 
 describe('isJoelsCall', () => {
-	it('returns true for Joel Dialpad user ID', () => {
+	it('returns true for Joel Dialpad user ID as string', () => {
 		expect(isJoelsCall('8000000000000001')).toBe(true);
+	});
+
+	it('returns true for Joel Dialpad user ID as number', () => {
+		expect(isJoelsCall(8000000000000001)).toBe(true);
 	});
 
 	it('returns false for other user IDs', () => {
