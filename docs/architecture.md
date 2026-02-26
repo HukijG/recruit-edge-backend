@@ -27,6 +27,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 │  │  sync:RF{id}         → "true"                      (60-sec TTL)                          │     │
 │  │  krisp:note:{hash}   → "true"                      (24-hour TTL)                         │     │
 │  │  coldcall:{call_id}  → "true"                      (5-min TTL)                           │     │
+│  │  pending_coldcall:{phone} → JSON call data         (5-min TTL)                           │     │
 │  └─────────────────────────────────────────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -42,7 +43,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `src/rf-client.js` | RF API client: candidate search/get/update, LinkedIn URL validation & normalization, Dialpad↔RF data conversion |
 | `src/dialpad-client.js` | Dialpad API client: contact PUT (create/update), data preparation from RF candidate format |
 | `src/krisp.js` | Krisp helpers: note formatting (HTML), candidate email extraction from meeting participants |
-| `src/cold-call.js` | Cold call detection: Dialpad transcript fetch, Workers AI classification (Llama 3.3 70B), RF custom activity + source update |
+| `src/cold-call.js` | Cold call detection: Dialpad transcript fetch, Workers AI classification (Llama 3.3 70B), RF custom activity + source update, deferred processing via phone-number KV queue |
 | `src/auth.js` | JWT verification for Dialpad webhooks (HS256 via `jose`) |
 | `scripts/calendar-sync.gs` | Google Apps Script: detects Reclaim bookings on Google Calendar, extracts candidate data, posts to worker |
 | `wrangler.jsonc` | Worker config: KV binding, env vars, compatibility settings |
@@ -94,6 +95,9 @@ Dialpad webhook (Updated only)
   → POST /webhook/dialpad
   → Verify JWT (HS256) from Authorization header or raw body
   → Extract RF candidate ID from Dialpad contact ID (regex: /uid_RF(\d+)$/)
+  → Check for pending cold calls (by phone number, before debounce check)
+      For each phone on the contact → check KV pending_coldcall:{phone}
+      If found → process deferred cold call (transcript + AI + RF activity)
   → Check debounce: if sync:RF{id} exists → skip (RF just synced this)
   → Convert Dialpad data to RF format (email, phone, LinkedIn only)
   → POST /candidate/update to RF
@@ -171,14 +175,16 @@ Krisp webhook (summary_generated)
 
 **Trigger**: Dialpad fires `call_transcription` or `transcription` (voicemail) webhook event after a call ends and the transcript is ready.
 
+### Immediate processing (contact already RF-linked)
+
 ```
 Dialpad call event (call_transcription or transcription state)
   → POST /webhook/dialpad/calls
   → Verify JWT (HS256, existing DIALPAD_WEBHOOK_SECRET)
   → Filter: target.id must be Joel (8000000000000001)
   → Filter: direction must be "outbound"
-  → Extract RF candidate ID from contact.id (uid_RF regex)
-  → Check KV dedup: coldcall:{call_id} — skip if already processed (5-min TTL)
+  → Extract RF candidate ID from contact.id (uid_RF regex, String() coerced)
+  → Set KV dedup: coldcall:{call_id} = "true" (5-min TTL) BEFORE AI call
   → Get transcript:
       - transcription state: transcription_text from payload (voicemails)
       - call_transcription state: GET /api/v2/transcripts/{call_id}
@@ -188,14 +194,37 @@ Dialpad call event (call_transcription or transcription state)
   → If cold call:
       1. POST /api/external/custom-activity/create (activity_type_id=1002)
       2. POST /api/external/candidate/update (source="Cold Call")
-  → Set dedup: coldcall:{call_id} = "true" (5-min TTL)
 ```
 
-**LLM Classification**: No keyword matching. System prompt describes cold call characteristics conceptually — first contact, introducing yourself, unfamiliar tone. Model returns JSON with `is_cold_call` boolean and reasoning. Uses `@cf/meta/llama-3.3-70b-instruct-fp8-fast` via Workers AI binding.
+### Deferred processing (contact not yet associated)
+
+Joel's typical workflow: call a number → hang up → add the number to the Dialpad contact (which is RF-synced). The transcript webhook arrives before the contact is associated, so `contact.id` has no RF UID. Dialpad uses the phone number as the `contact.name` when the contact is unassociated.
+
+```
+Dialpad call event → no RF candidate ID
+  → contact.name looks like a phone number? (≥7 digits)
+  → Normalize phone: strip non-digits, take last 10 (US numbers)
+  → Store in KV: pending_coldcall:{phone} = {call_id, state, transcription_text, timestamps}
+    (5-min TTL — expires if Joel doesn't associate the number)
+  → Return "deferred"
+
+Later: Joel adds phone to Dialpad contact → contact Updated webhook fires
+  → processDialpadContactUpdate checks contact.phones against pending_coldcall:{phone}
+  → Match found → fetch transcript → classify → create RF activity if cold call
+  → Runs before debounce check (independent of normal Dialpad→RF sync)
+```
+
+### Key design decisions
+
+**LLM Classification**: No keyword matching. System prompt describes cold call characteristics conceptually — first contact, introducing yourself, unfamiliar tone. Model returns JSON with `is_cold_call` boolean and reasoning. Uses `@cf/meta/llama-3.3-70b-instruct-fp8-fast` via Workers AI binding. Workers AI may return the response as an already-parsed object or a JSON string — code handles both.
+
+**Dedup before AI**: The dedup flag is set immediately after the dedup check, before transcript fetch or AI classification. This prevents Dialpad retry storms from re-hitting Workers AI on failures.
 
 **Scope**: Joel's calls only (Dialpad user ID 8000000000000001). Activity logged under RF user 900001. Hardcoded — will add team member IDs when rolling out.
 
-**Neuron budget**: ~61 neurons per full call (5k chars), ~25 per voicemail. At worst case ~215 calls/day = ~5,915 neurons (59% of free 10k/day).
+**Numeric IDs**: Dialpad sends `target.id` and `contact.id` as numbers in call webhooks. Both `isJoelsCall()` and `extractRFIdFromDialpadContact()` use `String()` coercion.
+
+**Neuron budget**: ~35-40 neurons per classification. Dedup-before-AI ensures each call only hits AI once regardless of Dialpad retries.
 
 ---
 
@@ -230,6 +259,7 @@ A general-purpose cache that stores candidate records and provides O(1) lookups 
 | `sync:RF{id}` | `"true"` | 60 seconds |
 | `krisp:note:{hash}` | `"true"` | 24 hours |
 | `coldcall:{call_id}` | `"true"` | 5 minutes |
+| `pending_coldcall:{phone}` | JSON: `{call_id, state, transcription_text, date_started, event_timestamp}` | 5 minutes |
 
 ### Cache Freshness
 
@@ -238,8 +268,9 @@ All webhook flows keep the cache up to date (Krisp is the exception — it only 
 | Webhook | When cache is written |
 |---------|----------------------|
 | RF (Created/Updated) | After Dialpad sync — caches full candidate data from RF payload |
-| Dialpad (Updated) | After RF update — merges email/phone/LinkedIn changes into cached record. Cache miss → fetches fresh from RF API |
+| Dialpad (Updated) | After RF update — merges email/phone/LinkedIn changes into cached record. Cache miss → fetches fresh from RF API. Also checks pending cold calls by phone |
 | Calendar | After RF search API hit (warms cache). After successful email merge (updates cached emails) |
+| Dialpad Calls | Writes `coldcall:{call_id}` dedup. If no RF candidate, writes `pending_coldcall:{phone}` for deferred processing |
 
 ### Name Ambiguity
 
