@@ -147,12 +147,13 @@ export async function processCallEvent(payload, env) {
     return { processed: false, isColdCall: false, reason: 'no RF candidate' };
   }
 
-  // Dedup
+  // Dedup — set BEFORE expensive operations to prevent retry storms hitting AI
   const dedupeKey = `coldcall:${callId}`;
   const alreadyProcessed = await env.SYNC_STATE.get(dedupeKey);
   if (alreadyProcessed) {
     return { processed: false, isColdCall: false, reason: 'already processed' };
   }
+  await env.SYNC_STATE.put(dedupeKey, 'true', { expirationTtl: 300 });
 
   // --- Get transcript ---
 
@@ -167,7 +168,7 @@ export async function processCallEvent(payload, env) {
         ? transcript
         : (transcript.text || transcript.transcription || JSON.stringify(transcript));
     } catch (error) {
-      console.error({ message: '[ColdCall] transcript fetch failed', source: 'cold-call', callId, error: error.message });
+      console.error({ message: `[ColdCall] transcript fetch failed: ${error.message}`, source: 'cold-call', callId });
       return { processed: false, isColdCall: false, reason: 'transcript fetch failed' };
     }
   }
@@ -182,13 +183,9 @@ export async function processCallEvent(payload, env) {
   try {
     classification = await classifyColdCall(transcriptText, env);
   } catch (error) {
-    console.error({ message: '[ColdCall] AI classification failed', source: 'cold-call', callId, error: error.message });
-    await env.SYNC_STATE.put(dedupeKey, 'true', { expirationTtl: 300 });
+    console.error({ message: `[ColdCall] AI classification failed: ${error.message}`, source: 'cold-call', callId });
     return { processed: false, isColdCall: false, reason: 'AI classification error' };
   }
-
-  // Set dedup regardless of result
-  await env.SYNC_STATE.put(dedupeKey, 'true', { expirationTtl: 300 });
 
   if (!classification.is_cold_call) {
     return { processed: true, isColdCall: false, reason: classification.reasoning };
