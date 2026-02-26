@@ -97,20 +97,29 @@ export async function classifyColdCall(transcriptText, env) {
   });
 
   try {
-    const text = response.response || '';
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      console.error({ message: `[ColdCall] LLM response not parseable: ${text.substring(0, 200)}`, source: 'cold-call' });
-      return { is_cold_call: false, reasoning: 'LLM response could not be parsed' };
+    const raw = response.response;
+
+    // Workers AI may return response as already-parsed object or as a string
+    let parsed;
+    if (raw && typeof raw === 'object') {
+      parsed = raw;
+    } else {
+      const text = raw || '';
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        console.error({ message: `[ColdCall] LLM response not parseable: ${text.substring(0, 200)}`, source: 'cold-call' });
+        return { is_cold_call: false, reasoning: 'LLM response could not be parsed' };
+      }
+      parsed = JSON.parse(jsonMatch[0]);
     }
-    const parsed = JSON.parse(jsonMatch[0]);
+
     if (typeof parsed.is_cold_call !== 'boolean') {
-      console.error({ message: `[ColdCall] LLM JSON missing is_cold_call field: ${jsonMatch[0].substring(0, 200)}`, source: 'cold-call' });
+      console.error({ message: `[ColdCall] LLM JSON missing is_cold_call field: ${JSON.stringify(parsed).substring(0, 200)}`, source: 'cold-call' });
       return { is_cold_call: false, reasoning: 'LLM response missing is_cold_call field' };
     }
-    return parsed;
+    return { is_cold_call: parsed.is_cold_call, reasoning: parsed.reasoning || '' };
   } catch (err) {
-    console.error({ message: `[ColdCall] JSON parse failed: ${(response.response || '').substring(0, 200)}`, source: 'cold-call' });
+    console.error({ message: `[ColdCall] JSON parse failed: ${JSON.stringify(response.response).substring(0, 200)}`, source: 'cold-call' });
     return { is_cold_call: false, reasoning: 'LLM response could not be parsed' };
   }
 }

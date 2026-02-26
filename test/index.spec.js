@@ -408,6 +408,31 @@ describe('classifyColdCall', () => {
 		expect(result.is_cold_call).toBe(false);
 	});
 
+	it('handles Workers AI returning response as already-parsed object', async () => {
+		const mockEnv = {
+			AI: {
+				run: async () => ({
+					response: { is_cold_call: true, reasoning: 'First contact introduction via LinkedIn' }
+				})
+			}
+		};
+		const result = await classifyColdCall('Hi, I am Joel from...', mockEnv);
+		expect(result.is_cold_call).toBe(true);
+		expect(result.reasoning).toContain('LinkedIn');
+	});
+
+	it('handles Workers AI returning non-cold-call as already-parsed object', async () => {
+		const mockEnv = {
+			AI: {
+				run: async () => ({
+					response: { is_cold_call: false, reasoning: 'Scheduled follow-up' }
+				})
+			}
+		};
+		const result = await classifyColdCall('Hey, thanks for booking...', mockEnv);
+		expect(result.is_cold_call).toBe(false);
+	});
+
 	it('handles LLM response with extra text around JSON', async () => {
 		const mockEnv = {
 			AI: {
