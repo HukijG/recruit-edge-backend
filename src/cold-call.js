@@ -15,35 +15,35 @@ const JOEL_RF_USER_ID = 900001;
 const COLD_CALL_ACTIVITY_TYPE_ID = 1002;
 const TRANSCRIPT_MAX_CHARS = 5000;
 const AI_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
-export const BACKFILL_AI_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 const VALID_OUTCOMES = ['voicemail', 'connected_positive', 'connected_negative'];
 
-const COLD_CALL_SYSTEM_PROMPT = `You classify recruiter phone calls. This is a recruiter cold-calling candidates about job opportunities.
+const COLD_CALL_SYSTEM_PROMPT = `You are a call transcript classifier for a recruiting firm. Analyze this transcript and determine:
+1. Whether this is a COLD CALL (first-ever outbound contact with a candidate)
+2. If it is a cold call, what was the OUTCOME
 
-DEFAULT ASSUMPTION: This IS a cold call. Almost all calls you will see are cold calls. Only mark is_cold_call=false if you see CLEAR, UNAMBIGUOUS evidence below.
+COLD CALL definition:
+- First-ever contact with someone who doesn't know the caller
+- Caller introduces themselves and their role/reason for reaching out
+- Unfamiliar, formal tone — not a follow-up, scheduled call, or catch-up
+- May be a connected conversation OR a voicemail left for a stranger
+- The caller typically mentions reaching out via LinkedIn, a specific job role, or an opportunity
 
-The ONLY reasons to mark is_cold_call=false:
-- They explicitly reference a PREVIOUS PHONE CONVERSATION (e.g., "good talking to you yesterday", "as we discussed on our last call")
-- It is a scheduled/booked meeting (e.g., "thanks for booking time", "for our 2pm call")
-- They are colleagues or know each other personally
-
-Everything else is a cold call, INCLUDING:
-- Mentioning a LinkedIn message, InMail, email, or any written outreach — this is the first PHONE contact
-- Saying "following up" on a message — still a cold call (following up on a MESSAGE, not a prior call)
-- Leaving a voicemail for someone they've never spoken to
-- Introducing themselves and explaining why they're calling
-- Any formal or first-contact tone
+NOT a cold call:
+- Conversation with someone already spoken to before
+- Scheduled call, follow-up, prep call, or update
+- Familiar tone — "Hey, how's it going?", "Thanks for booking time", etc.
+- Internal calls between colleagues
 
 OUTCOME (only when is_cold_call is true):
-- "voicemail": No live conversation, caller left a message
-- "connected_positive": Candidate engaged, showed interest, or agreed to follow up
-- "connected_negative": Candidate declined, wasn't interested, or no engagement
+- "voicemail": Caller left a voicemail, no live conversation occurred
+- "connected_positive": Candidate engaged, showed interest, was open to hearing more, or agreed to follow up
+- "connected_negative": Candidate declined, wasn't interested, was dismissive, or call ended with no engagement
 
 Respond with ONLY valid JSON, no other text:
-{"is_cold_call": true, "outcome": "voicemail", "reasoning": "one sentence"}
-{"is_cold_call": true, "outcome": "connected_positive", "reasoning": "one sentence"}
-{"is_cold_call": true, "outcome": "connected_negative", "reasoning": "one sentence"}
-{"is_cold_call": false, "outcome": null, "reasoning": "one sentence"}`;
+{"is_cold_call": true, "outcome": "voicemail", "reasoning": "one sentence explanation"}
+{"is_cold_call": true, "outcome": "connected_positive", "reasoning": "one sentence explanation"}
+{"is_cold_call": true, "outcome": "connected_negative", "reasoning": "one sentence explanation"}
+{"is_cold_call": false, "outcome": null, "reasoning": "one sentence explanation"}`;
 
 // --- Pure helpers ---
 
@@ -62,16 +62,7 @@ export function truncateTranscript(text, maxChars = TRANSCRIPT_MAX_CHARS) {
 }
 
 export function formatActivityTime(timestamp) {
-  let ts = timestamp;
-  // Epoch seconds → ms (numbers under 10^12 are seconds)
-  if (typeof ts === 'number' && ts > 0 && ts < 1e12) {
-    ts = ts * 1000;
-  }
-  const date = new Date(typeof ts === 'number' ? ts : Date.parse(ts));
-  if (isNaN(date.getTime())) {
-    // Fallback to now rather than throwing
-    return new Date().toISOString().replace(/\.\d{3}Z$/, '+0000');
-  }
+  const date = new Date(typeof timestamp === 'number' ? timestamp : Date.parse(timestamp));
   return date.toISOString().replace(/\.\d{3}Z$/, '+0000');
 }
 
@@ -125,7 +116,7 @@ export async function fetchCallTranscript(callId, env) {
   return await response.json();
 }
 
-export async function classifyColdCall(transcriptText, env, callState, modelOverride) {
+export async function classifyColdCall(transcriptText, env, callState) {
   const truncated = truncateTranscript(transcriptText);
 
   if (!truncated) {
@@ -135,7 +126,7 @@ export async function classifyColdCall(transcriptText, env, callState, modelOver
   const callTypeHint = callState === 'transcription' ? 'Voicemail' : 'Connected call';
   const userMessage = `Call type: ${callTypeHint}\n\nTranscript:\n\n${truncated}`;
 
-  const response = await env.AI.run(modelOverride || AI_MODEL, {
+  const response = await env.AI.run(AI_MODEL, {
     messages: [
       { role: 'system', content: COLD_CALL_SYSTEM_PROMPT },
       { role: 'user', content: userMessage }

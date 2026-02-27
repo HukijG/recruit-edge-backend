@@ -215,62 +215,6 @@ export async function addRFCandidateNote(candidateId, htmlContent, env) {
 }
 
 /**
- * List activities for an RF candidate.
- */
-export async function listRFCandidateActivities(candidateId, env) {
-  const rfApiKey = env.RF_API_KEY;
-  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
-
-  if (!rfApiKey) {
-    throw new Error('RF_API_KEY environment variable is required');
-  }
-
-  const response = await fetch(
-    `${rfBaseUrl}/candidate/activity/list?id=${candidateId}&items_per_page=50&current_page=1&include_count=true`,
-    {
-      method: 'GET',
-      headers: { 'RF-Api-Key': rfApiKey }
-    }
-  );
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`RF activity list error: ${response.status}`, errorText);
-    throw new Error(`RF API error: ${response.status} - ${errorText}`);
-  }
-
-  return await response.json();
-}
-
-/**
- * Check if a cold call activity already exists for a candidate near the given call time.
- * Uses a same-day window to avoid duplicates.
- */
-export function hasExistingColdCallActivity(activities, callTimestamp) {
-  if (!Array.isArray(activities) || activities.length === 0) return false;
-
-  const callDate = new Date(callTimestamp);
-  const callDayStart = new Date(callDate.getFullYear(), callDate.getMonth(), callDate.getDate()).getTime();
-  const callDayEnd = callDayStart + 86400000; // +24 hours
-
-  return activities.some(activity => {
-    const isTypeMatch = activity.activity_type_id === 1002;
-    const isTextMatch = typeof activity.activity_text === 'string' && activity.activity_text.includes('Cold call');
-
-    if (!isTypeMatch && !isTextMatch) return false;
-
-    // Check time proximity (same-day window)
-    if (activity.activity_time) {
-      const activityTime = new Date(activity.activity_time).getTime();
-      return activityTime >= callDayStart && activityTime < callDayEnd;
-    }
-
-    // If no time on the activity, match by type/text alone
-    return isTypeMatch || isTextMatch;
-  });
-}
-
-/**
  * Convert Dialpad contact to RF update format for email and phone
  */
 export function convertDialpadContactToRFUpdate(dialpadContact) {
