@@ -882,6 +882,7 @@ async function handleColdCallBackfill(request, env, url) {
           : (activitiesResponse.activities || activitiesResponse.data || activitiesResponse.results || []);
 
         const callTimestamp = call.date_started || call.started_at || Date.now();
+        console.log({ message: `[Backfill] call_id=${callId} raw timestamp: date_started=${call.date_started} (${typeof call.date_started}), started_at=${call.started_at} (${typeof call.started_at})`, source: 'backfill', step: 'timestamp', callId });
 
         if (hasExistingColdCallActivity(activities, callTimestamp)) {
           summary.already_logged++;

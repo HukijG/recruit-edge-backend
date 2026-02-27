@@ -18,33 +18,32 @@ const AI_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 export const BACKFILL_AI_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 const VALID_OUTCOMES = ['voicemail', 'connected_positive', 'connected_negative'];
 
-const COLD_CALL_SYSTEM_PROMPT = `You are a call transcript classifier for a recruiting firm. Determine if this is a COLD CALL and what the outcome was.
+const COLD_CALL_SYSTEM_PROMPT = `You classify recruiter phone calls. This is a recruiter cold-calling candidates about job opportunities.
 
-A COLD CALL is the first-ever PHONE conversation with a candidate. It IS a cold call if:
-- Caller introduces themselves, their company, and why they're calling
-- Caller references a LinkedIn message, InMail, or email they sent previously — this is STILL a cold call because it's the first PHONE contact
-- Formal/unfamiliar tone — the two people have never spoken before
-- Caller mentions a specific job role, opportunity, or reason for reaching out
-- May be a live conversation OR a voicemail left for someone they've never spoken to
+DEFAULT ASSUMPTION: This IS a cold call. Almost all calls you will see are cold calls. Only mark is_cold_call=false if you see CLEAR, UNAMBIGUOUS evidence below.
 
-It is NOT a cold call if:
-- They have spoken on the phone before (e.g., "great talking to you last week")
-- It's a scheduled call, booked meeting, or calendar invite follow-up
-- Familiar tone — "Hey, how's it going?", "Thanks for booking time"
-- Internal call between colleagues
+The ONLY reasons to mark is_cold_call=false:
+- They explicitly reference a PREVIOUS PHONE CONVERSATION (e.g., "good talking to you yesterday", "as we discussed on our last call")
+- It is a scheduled/booked meeting (e.g., "thanks for booking time", "for our 2pm call")
+- They are colleagues or know each other personally
 
-IMPORTANT: Saying "I sent you a message on LinkedIn" or "following up on my LinkedIn message" means this IS a cold call. The caller sent a written message first and is now calling for the first time. That is cold outreach by phone.
+Everything else is a cold call, INCLUDING:
+- Mentioning a LinkedIn message, InMail, email, or any written outreach — this is the first PHONE contact
+- Saying "following up" on a message — still a cold call (following up on a MESSAGE, not a prior call)
+- Leaving a voicemail for someone they've never spoken to
+- Introducing themselves and explaining why they're calling
+- Any formal or first-contact tone
 
 OUTCOME (only when is_cold_call is true):
-- "voicemail": Caller left a voicemail, no live conversation occurred
-- "connected_positive": Candidate engaged, showed interest, was open to hearing more, or agreed to follow up
-- "connected_negative": Candidate declined, wasn't interested, was dismissive, or call ended with no engagement
+- "voicemail": No live conversation, caller left a message
+- "connected_positive": Candidate engaged, showed interest, or agreed to follow up
+- "connected_negative": Candidate declined, wasn't interested, or no engagement
 
 Respond with ONLY valid JSON, no other text:
-{"is_cold_call": true, "outcome": "voicemail", "reasoning": "one sentence explanation"}
-{"is_cold_call": true, "outcome": "connected_positive", "reasoning": "one sentence explanation"}
-{"is_cold_call": true, "outcome": "connected_negative", "reasoning": "one sentence explanation"}
-{"is_cold_call": false, "outcome": null, "reasoning": "one sentence explanation"}`;
+{"is_cold_call": true, "outcome": "voicemail", "reasoning": "one sentence"}
+{"is_cold_call": true, "outcome": "connected_positive", "reasoning": "one sentence"}
+{"is_cold_call": true, "outcome": "connected_negative", "reasoning": "one sentence"}
+{"is_cold_call": false, "outcome": null, "reasoning": "one sentence"}`;
 
 // --- Pure helpers ---
 
@@ -63,7 +62,16 @@ export function truncateTranscript(text, maxChars = TRANSCRIPT_MAX_CHARS) {
 }
 
 export function formatActivityTime(timestamp) {
-  const date = new Date(typeof timestamp === 'number' ? timestamp : Date.parse(timestamp));
+  let ts = timestamp;
+  // Epoch seconds → ms (numbers under 10^12 are seconds)
+  if (typeof ts === 'number' && ts > 0 && ts < 1e12) {
+    ts = ts * 1000;
+  }
+  const date = new Date(typeof ts === 'number' ? ts : Date.parse(ts));
+  if (isNaN(date.getTime())) {
+    // Fallback to now rather than throwing
+    return new Date().toISOString().replace(/\.\d{3}Z$/, '+0000');
+  }
   return date.toISOString().replace(/\.\d{3}Z$/, '+0000');
 }
 
