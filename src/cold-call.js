@@ -2,6 +2,7 @@
  * Cold Call Detection Module
  *
  * Classifies Dialpad call transcripts as cold calls using Cloudflare Workers AI,
+ * determines call outcome (voicemail, connected positive/negative),
  * and logs detected cold calls as RF custom activities.
  */
 
@@ -14,26 +15,35 @@ const JOEL_RF_USER_ID = 900001;
 const COLD_CALL_ACTIVITY_TYPE_ID = 1002;
 const TRANSCRIPT_MAX_CHARS = 5000;
 const AI_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+const VALID_OUTCOMES = ['voicemail', 'connected_positive', 'connected_negative'];
 
-const COLD_CALL_SYSTEM_PROMPT = `You are a call transcript classifier for a recruiting firm. Determine whether this transcript is from a COLD CALL or not.
+const COLD_CALL_SYSTEM_PROMPT = `You are a call transcript classifier for a recruiting firm. Analyze this transcript and determine:
+1. Whether this is a COLD CALL (first-ever outbound contact with a candidate)
+2. If it is a cold call, what was the OUTCOME
 
-A cold call is:
-- The first-ever contact with someone who doesn't know the caller
-- The caller introduces themselves, their role, and why they are reaching out
-- The tone is unfamiliar and formal — not a follow-up, not a scheduled call, not a catch-up
-- Could be a connected conversation or a voicemail left for a stranger
+COLD CALL definition:
+- First-ever contact with someone who doesn't know the caller
+- Caller introduces themselves and their role/reason for reaching out
+- Unfamiliar, formal tone — not a follow-up, scheduled call, or catch-up
+- May be a connected conversation OR a voicemail left for a stranger
 - The caller typically mentions reaching out via LinkedIn, a specific job role, or an opportunity
 
-A non-cold call is:
-- A conversation with someone the caller has already spoken to
-- A scheduled call, follow-up, prep call, or update call
-- The tone is familiar — greetings like "Hey, how are you?", "Thanks for booking time", etc.
+NOT a cold call:
+- Conversation with someone already spoken to before
+- Scheduled call, follow-up, prep call, or update
+- Familiar tone — "Hey, how's it going?", "Thanks for booking time", etc.
 - Internal calls between colleagues
 
+OUTCOME (only when is_cold_call is true):
+- "voicemail": Caller left a voicemail, no live conversation occurred
+- "connected_positive": Candidate engaged, showed interest, was open to hearing more, or agreed to follow up
+- "connected_negative": Candidate declined, wasn't interested, was dismissive, or call ended with no engagement
+
 Respond with ONLY valid JSON, no other text:
-{"is_cold_call": true, "reasoning": "one sentence explanation"}
-or
-{"is_cold_call": false, "reasoning": "one sentence explanation"}`;
+{"is_cold_call": true, "outcome": "voicemail", "reasoning": "one sentence explanation"}
+{"is_cold_call": true, "outcome": "connected_positive", "reasoning": "one sentence explanation"}
+{"is_cold_call": true, "outcome": "connected_negative", "reasoning": "one sentence explanation"}
+{"is_cold_call": false, "outcome": null, "reasoning": "one sentence explanation"}`;
 
 // --- Pure helpers ---
 
@@ -70,6 +80,16 @@ export function looksLikePhoneNumber(str) {
   return str.replace(/\D/g, '').length >= 7;
 }
 
+/** Convert outcome enum to display label for RF activity text. */
+export function formatOutcomeLabel(outcome) {
+  switch (outcome) {
+    case 'voicemail': return 'Voicemail';
+    case 'connected_positive': return 'Connected (Positive)';
+    case 'connected_negative': return 'Connected (Negative)';
+    default: return null;
+  }
+}
+
 // --- API functions ---
 
 export async function fetchCallTranscript(callId, env) {
@@ -96,17 +116,20 @@ export async function fetchCallTranscript(callId, env) {
   return await response.json();
 }
 
-export async function classifyColdCall(transcriptText, env) {
+export async function classifyColdCall(transcriptText, env, callState) {
   const truncated = truncateTranscript(transcriptText);
 
   if (!truncated) {
-    return { is_cold_call: false, reasoning: 'No transcript text available' };
+    return { is_cold_call: false, outcome: null, reasoning: 'No transcript text available' };
   }
+
+  const callTypeHint = callState === 'transcription' ? 'Voicemail' : 'Connected call';
+  const userMessage = `Call type: ${callTypeHint}\n\nTranscript:\n\n${truncated}`;
 
   const response = await env.AI.run(AI_MODEL, {
     messages: [
       { role: 'system', content: COLD_CALL_SYSTEM_PROMPT },
-      { role: 'user', content: `Transcript:\n\n${truncated}` }
+      { role: 'user', content: userMessage }
     ]
   });
 
@@ -122,46 +145,67 @@ export async function classifyColdCall(transcriptText, env) {
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (!jsonMatch) {
         console.error({ message: `[ColdCall] LLM response not parseable: ${text.substring(0, 200)}`, source: 'cold-call' });
-        return { is_cold_call: false, reasoning: 'LLM response could not be parsed' };
+        return { is_cold_call: false, outcome: null, reasoning: 'LLM response could not be parsed' };
       }
       parsed = JSON.parse(jsonMatch[0]);
     }
 
     if (typeof parsed.is_cold_call !== 'boolean') {
       console.error({ message: `[ColdCall] LLM JSON missing is_cold_call field: ${JSON.stringify(parsed).substring(0, 200)}`, source: 'cold-call' });
-      return { is_cold_call: false, reasoning: 'LLM response missing is_cold_call field' };
+      return { is_cold_call: false, outcome: null, reasoning: 'LLM response missing is_cold_call field' };
     }
-    return { is_cold_call: parsed.is_cold_call, reasoning: parsed.reasoning || '' };
+
+    const outcome = parsed.is_cold_call && VALID_OUTCOMES.includes(parsed.outcome) ? parsed.outcome : null;
+    return { is_cold_call: parsed.is_cold_call, outcome, reasoning: parsed.reasoning || '' };
   } catch (err) {
     console.error({ message: `[ColdCall] JSON parse failed: ${JSON.stringify(response.response).substring(0, 200)}`, source: 'cold-call' });
-    return { is_cold_call: false, reasoning: 'LLM response could not be parsed' };
+    return { is_cold_call: false, outcome: null, reasoning: 'LLM response could not be parsed' };
   }
 }
 
 /**
  * Process a Dialpad call event and track cold calls on RF.
- * Returns { processed: bool, isColdCall: bool, reason: string }
+ * Returns { processed: bool, isColdCall: bool, outcome: string|null, reason: string }
  */
 export async function processCallEvent(payload, env) {
   const state = payload.state;
   const callId = payload.call_id;
+  const contactId = payload.contact?.id;
+  const contactName = payload.contact?.name;
+
+  console.log({
+    message: `[ColdCall] processing call_id=${callId}`,
+    source: 'cold-call',
+    step: 'enter',
+    callId,
+    state,
+    direction: payload.direction,
+    contactId,
+    contactName,
+    targetId: payload.target?.id,
+    targetName: payload.target?.name,
+    dateStarted: payload.date_started,
+    hasTranscriptionText: !!payload.transcription_text,
+  });
 
   // --- Pre-LLM filters ---
 
   if (!isJoelsCall(payload.target?.id)) {
-    return { processed: false, isColdCall: false, reason: 'not target user' };
+    console.log({ message: `[ColdCall] skipped: not Joel's call (target=${payload.target?.id})`, source: 'cold-call', step: 'filter', callId });
+    return { processed: false, isColdCall: false, outcome: null, reason: 'not target user' };
   }
 
   if (!isOutboundCall(payload.direction)) {
-    return { processed: false, isColdCall: false, reason: 'not outbound' };
+    console.log({ message: `[ColdCall] skipped: inbound call`, source: 'cold-call', step: 'filter', callId });
+    return { processed: false, isColdCall: false, outcome: null, reason: 'not outbound' };
   }
 
-  const rfCandidateId = extractRFIdFromDialpadContact(payload.contact?.id);
+  const rfCandidateId = extractRFIdFromDialpadContact(contactId);
   if (!rfCandidateId) {
     // Contact not yet associated — if name looks like a phone number,
     // store for deferred processing when Joel adds the number to the contact
-    if (looksLikePhoneNumber(payload.contact?.name)) {
-      const phone = normalizePhone(payload.contact.name);
+    if (looksLikePhoneNumber(contactName)) {
+      const phone = normalizePhone(contactName);
       if (phone) {
         const pending = {
           call_id: callId,
@@ -171,19 +215,34 @@ export async function processCallEvent(payload, env) {
           event_timestamp: payload.event_timestamp,
         };
         await env.SYNC_STATE.put(`pending_coldcall:${phone}`, JSON.stringify(pending), { expirationTtl: 300 });
-        return { processed: false, isColdCall: false, reason: `deferred: stored for phone ${payload.contact.name}` };
+        console.log({
+          message: `[ColdCall] deferred: stored pending call for phone=${phone}`,
+          source: 'cold-call',
+          step: 'defer',
+          callId,
+          phone,
+          contactName,
+          state,
+          ttlSeconds: 300,
+        });
+        return { processed: false, isColdCall: false, outcome: null, reason: `deferred: stored for phone ${contactName}` };
       }
     }
-    return { processed: false, isColdCall: false, reason: 'no RF candidate' };
+    console.log({ message: `[ColdCall] skipped: no RF candidate ID (contact=${contactId})`, source: 'cold-call', step: 'filter', callId, contactId });
+    return { processed: false, isColdCall: false, outcome: null, reason: 'no RF candidate' };
   }
+
+  console.log({ message: `[ColdCall] matched RF candidate=${rfCandidateId}`, source: 'cold-call', step: 'match', callId, rfCandidateId, contactName });
 
   // Dedup — set BEFORE expensive operations to prevent retry storms hitting AI
   const dedupeKey = `coldcall:${callId}`;
   const alreadyProcessed = await env.SYNC_STATE.get(dedupeKey);
   if (alreadyProcessed) {
-    return { processed: false, isColdCall: false, reason: 'already processed' };
+    console.log({ message: `[ColdCall] skipped: already processed (dedup key exists)`, source: 'cold-call', step: 'dedup', callId });
+    return { processed: false, isColdCall: false, outcome: null, reason: 'already processed' };
   }
   await env.SYNC_STATE.put(dedupeKey, 'true', { expirationTtl: 300 });
+  console.log({ message: `[ColdCall] dedup key set`, source: 'cold-call', step: 'dedup', callId });
 
   // --- Get transcript ---
 
@@ -191,45 +250,62 @@ export async function processCallEvent(payload, env) {
 
   if (state === 'transcription') {
     transcriptText = payload.transcription_text || '';
+    console.log({ message: `[ColdCall] transcript source=voicemail_payload (${transcriptText.length} chars)`, source: 'cold-call', step: 'transcript', callId, transcriptLength: transcriptText.length });
   } else if (state === 'call_transcription') {
     try {
       const transcript = await fetchCallTranscript(callId, env);
       transcriptText = typeof transcript === 'string'
         ? transcript
         : (transcript.text || transcript.transcription || JSON.stringify(transcript));
+      console.log({ message: `[ColdCall] transcript source=dialpad_api (${transcriptText.length} chars)`, source: 'cold-call', step: 'transcript', callId, transcriptLength: transcriptText.length });
     } catch (error) {
-      console.error({ message: `[ColdCall] transcript fetch failed: ${error.message}`, source: 'cold-call', callId });
-      return { processed: false, isColdCall: false, reason: 'transcript fetch failed' };
+      console.error({ message: `[ColdCall] transcript fetch failed: ${error.message}`, source: 'cold-call', step: 'transcript', callId });
+      return { processed: false, isColdCall: false, outcome: null, reason: 'transcript fetch failed' };
     }
   }
 
   if (!transcriptText) {
-    return { processed: false, isColdCall: false, reason: 'no transcript text' };
+    console.log({ message: `[ColdCall] skipped: no transcript text available`, source: 'cold-call', step: 'transcript', callId, state });
+    return { processed: false, isColdCall: false, outcome: null, reason: 'no transcript text' };
   }
 
   // --- LLM classification ---
 
   let classification;
   try {
-    classification = await classifyColdCall(transcriptText, env);
+    classification = await classifyColdCall(transcriptText, env, state);
+    console.log({
+      message: `[ColdCall] classified: is_cold_call=${classification.is_cold_call} outcome=${classification.outcome} — "${classification.reasoning}"`,
+      source: 'cold-call',
+      step: 'classify',
+      callId,
+      rfCandidateId,
+      contactName,
+      isColdCall: classification.is_cold_call,
+      outcome: classification.outcome,
+      reasoning: classification.reasoning,
+    });
   } catch (error) {
-    console.error({ message: `[ColdCall] AI classification failed: ${error.message}`, source: 'cold-call', callId });
-    return { processed: false, isColdCall: false, reason: 'AI classification error' };
+    console.error({ message: `[ColdCall] AI classification failed: ${error.message}`, source: 'cold-call', step: 'classify', callId });
+    return { processed: false, isColdCall: false, outcome: null, reason: 'AI classification error' };
   }
 
   if (!classification.is_cold_call) {
-    return { processed: true, isColdCall: false, reason: classification.reasoning };
+    return { processed: true, isColdCall: false, outcome: null, reason: classification.reasoning };
   }
 
   // --- Cold call detected: update RF ---
 
-  const candidateName = payload.contact?.name || 'Unknown';
   const callTimestamp = payload.date_started || payload.event_timestamp || Date.now();
   const activityTime = formatActivityTime(callTimestamp);
+  const outcomeLabel = formatOutcomeLabel(classification.outcome);
+  const activityText = outcomeLabel
+    ? `Cold call with ${contactName || 'Unknown'} — ${outcomeLabel}`
+    : `Cold call with ${contactName || 'Unknown'}`;
 
   try {
     await createRFCustomActivity({
-      activity_text: `Cold call with ${candidateName}`,
+      activity_text: activityText,
       activity_time: activityTime,
       activity_type_id: COLD_CALL_ACTIVITY_TYPE_ID,
       activity_user_id: JOEL_RF_USER_ID,
@@ -238,18 +314,29 @@ export async function processCallEvent(payload, env) {
     }, env);
 
     await updateRFCandidate(rfCandidateId, { source: 'Cold Call' }, env);
+
+    console.log({
+      message: `[ColdCall] RF updated: activity="${activityText}" + source=Cold Call`,
+      source: 'cold-call',
+      step: 'rf_update',
+      callId,
+      rfCandidateId,
+      contactName,
+      activityText,
+      outcome: classification.outcome,
+    });
   } catch (error) {
-    console.error({ message: `[ColdCall] RF update failed: ${error.message}`, source: 'cold-call', callId, rfCandidateId });
-    return { processed: true, isColdCall: true, reason: `classified as cold call but RF update failed: ${error.message}` };
+    console.error({ message: `[ColdCall] RF update failed: ${error.message}`, source: 'cold-call', step: 'rf_update', callId, rfCandidateId });
+    return { processed: true, isColdCall: true, outcome: classification.outcome, reason: `classified as cold call but RF update failed: ${error.message}` };
   }
 
-  return { processed: true, isColdCall: true, reason: classification.reasoning };
+  return { processed: true, isColdCall: true, outcome: classification.outcome, reason: classification.reasoning };
 }
 
 /**
  * Check if a contact update matches a pending cold call stored by phone number.
  * Called from the Dialpad contact update handler when a contact with an RF ID gets new phones.
- * Returns { processed, isColdCall, reason, callId } or null if no pending call.
+ * Returns { processed, isColdCall, outcome, reason, callId } or null if no pending call.
  */
 export async function checkPendingColdCall(contactPhones, rfCandidateId, contactName, env) {
   if (!Array.isArray(contactPhones) || contactPhones.length === 0) return null;
@@ -269,58 +356,84 @@ export async function checkPendingColdCall(contactPhones, rfCandidateId, contact
     // Clean up pending key
     await env.SYNC_STATE.delete(`pending_coldcall:${normalized}`);
 
+    console.log({
+      message: `[ColdCall/deferred] found pending call for phone=${normalized}, candidate=${rfCandidateId} "${contactName}"`,
+      source: 'cold-call',
+      step: 'deferred_match',
+      callId: pending.call_id,
+      rfCandidateId,
+      contactName,
+      phone: normalized,
+      state: pending.state,
+    });
+
     // Dedup check (in case it was already processed another way)
     const dedupeKey = `coldcall:${pending.call_id}`;
     const alreadyProcessed = await env.SYNC_STATE.get(dedupeKey);
-    if (alreadyProcessed) return null;
+    if (alreadyProcessed) {
+      console.log({ message: `[ColdCall/deferred] skipped: already processed (dedup key exists)`, source: 'cold-call', step: 'dedup', callId: pending.call_id });
+      return null;
+    }
     await env.SYNC_STATE.put(dedupeKey, 'true', { expirationTtl: 300 });
-
-    console.log({
-      message: `[ColdCall/deferred] processing pending call_id=${pending.call_id} for candidate=${rfCandidateId}`,
-      source: 'cold-call',
-      callId: pending.call_id,
-      rfCandidateId,
-      phone: normalized,
-    });
 
     // Get transcript
     let transcriptText = '';
     if (pending.state === 'transcription') {
       transcriptText = pending.transcription_text || '';
+      console.log({ message: `[ColdCall/deferred] transcript source=stored_payload (${transcriptText.length} chars)`, source: 'cold-call', step: 'transcript', callId: pending.call_id, transcriptLength: transcriptText.length });
     } else if (pending.state === 'call_transcription') {
       try {
         const transcript = await fetchCallTranscript(pending.call_id, env);
         transcriptText = typeof transcript === 'string'
           ? transcript
           : (transcript.text || transcript.transcription || JSON.stringify(transcript));
+        console.log({ message: `[ColdCall/deferred] transcript source=dialpad_api (${transcriptText.length} chars)`, source: 'cold-call', step: 'transcript', callId: pending.call_id, transcriptLength: transcriptText.length });
       } catch (error) {
-        console.error({ message: `[ColdCall/deferred] transcript fetch failed: ${error.message}`, source: 'cold-call', callId: pending.call_id });
+        console.error({ message: `[ColdCall/deferred] transcript fetch failed: ${error.message}`, source: 'cold-call', step: 'transcript', callId: pending.call_id });
         return null;
       }
     }
 
-    if (!transcriptText) return null;
+    if (!transcriptText) {
+      console.log({ message: `[ColdCall/deferred] skipped: no transcript text`, source: 'cold-call', step: 'transcript', callId: pending.call_id });
+      return null;
+    }
 
     // Classify
     let classification;
     try {
-      classification = await classifyColdCall(transcriptText, env);
+      classification = await classifyColdCall(transcriptText, env, pending.state);
+      console.log({
+        message: `[ColdCall/deferred] classified: is_cold_call=${classification.is_cold_call} outcome=${classification.outcome} — "${classification.reasoning}"`,
+        source: 'cold-call',
+        step: 'classify',
+        callId: pending.call_id,
+        rfCandidateId,
+        contactName,
+        isColdCall: classification.is_cold_call,
+        outcome: classification.outcome,
+        reasoning: classification.reasoning,
+      });
     } catch (error) {
-      console.error({ message: `[ColdCall/deferred] AI classification failed: ${error.message}`, source: 'cold-call', callId: pending.call_id });
+      console.error({ message: `[ColdCall/deferred] AI classification failed: ${error.message}`, source: 'cold-call', step: 'classify', callId: pending.call_id });
       return null;
     }
 
     if (!classification.is_cold_call) {
-      return { processed: true, isColdCall: false, reason: classification.reasoning, callId: pending.call_id };
+      return { processed: true, isColdCall: false, outcome: null, reason: classification.reasoning, callId: pending.call_id };
     }
 
     // Cold call detected — update RF
     const callTimestamp = pending.date_started || pending.event_timestamp || Date.now();
     const activityTime = formatActivityTime(callTimestamp);
+    const outcomeLabel = formatOutcomeLabel(classification.outcome);
+    const activityText = outcomeLabel
+      ? `Cold call with ${contactName || 'Unknown'} — ${outcomeLabel}`
+      : `Cold call with ${contactName || 'Unknown'}`;
 
     try {
       await createRFCustomActivity({
-        activity_text: `Cold call with ${contactName || 'Unknown'}`,
+        activity_text: activityText,
         activity_time: activityTime,
         activity_type_id: COLD_CALL_ACTIVITY_TYPE_ID,
         activity_user_id: JOEL_RF_USER_ID,
@@ -329,12 +442,23 @@ export async function checkPendingColdCall(contactPhones, rfCandidateId, contact
       }, env);
 
       await updateRFCandidate(rfCandidateId, { source: 'Cold Call' }, env);
+
+      console.log({
+        message: `[ColdCall/deferred] RF updated: activity="${activityText}" + source=Cold Call`,
+        source: 'cold-call',
+        step: 'rf_update',
+        callId: pending.call_id,
+        rfCandidateId,
+        contactName,
+        activityText,
+        outcome: classification.outcome,
+      });
     } catch (error) {
-      console.error({ message: `[ColdCall/deferred] RF update failed: ${error.message}`, source: 'cold-call', callId: pending.call_id, rfCandidateId });
-      return { processed: true, isColdCall: true, reason: `classified but RF update failed: ${error.message}`, callId: pending.call_id };
+      console.error({ message: `[ColdCall/deferred] RF update failed: ${error.message}`, source: 'cold-call', step: 'rf_update', callId: pending.call_id, rfCandidateId });
+      return { processed: true, isColdCall: true, outcome: classification.outcome, reason: `classified but RF update failed: ${error.message}`, callId: pending.call_id };
     }
 
-    return { processed: true, isColdCall: true, reason: classification.reasoning, callId: pending.call_id };
+    return { processed: true, isColdCall: true, outcome: classification.outcome, reason: classification.reasoning, callId: pending.call_id };
   }
 
   return null;

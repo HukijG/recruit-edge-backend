@@ -56,6 +56,10 @@ export default {
         return await handleDialpadCallWebhook(request, env);
       }
 
+      if (url.pathname === '/test/coldcall' && request.method === 'POST') {
+        return await handleTestColdCall(request, env, url);
+      }
+
       return new Response('Not Found', {
         status: 404,
         headers: corsHeaders
@@ -259,12 +263,15 @@ async function processDialpadContactUpdate(contact, env) {
         env
       );
       if (coldCallResult) {
+        const outcomeStr = coldCallResult.outcome ? ` [${coldCallResult.outcome}]` : '';
         console.log({
-          message: `[Dialpad] → deferred cold call: ${coldCallResult.isColdCall ? 'COLD CALL tracked' : coldCallResult.reason}`,
+          message: `[Dialpad] → deferred cold call: ${coldCallResult.isColdCall ? `COLD CALL tracked${outcomeStr}` : coldCallResult.reason}`,
           source: 'dialpad',
           candidateId: rfCandidateId,
           callId: coldCallResult.callId,
           isColdCall: coldCallResult.isColdCall,
+          outcome: coldCallResult.outcome,
+          reason: coldCallResult.reason,
         });
       }
     } catch (error) {
@@ -668,16 +675,25 @@ async function handleDialpadCallWebhook(request, env) {
       contactName: payload.contact?.name,
       targetId: payload.target?.id,
       targetName: payload.target?.name,
+      dateStarted: payload.date_started,
+      eventTimestamp: payload.event_timestamp,
+      duration: payload.duration,
+      externalNumber: payload.external_number,
+      internalNumber: payload.internal_number,
+      hasTranscriptionText: !!payload.transcription_text,
+      transcriptionPreview: payload.transcription_text ? payload.transcription_text.substring(0, 200) : null,
     });
 
     const result = await processCallEvent(payload, env);
 
+    const outcomeStr = result.outcome ? ` [${result.outcome}]` : '';
     console.log({
-      message: `[Dialpad/calls] → ${result.isColdCall ? 'COLD CALL tracked' : result.reason}`,
+      message: `[Dialpad/calls] → ${result.isColdCall ? `COLD CALL tracked${outcomeStr}` : result.reason}`,
       source: 'dialpad-calls',
       callId: payload.call_id,
       processed: result.processed,
       isColdCall: result.isColdCall,
+      outcome: result.outcome,
       reason: result.reason,
     });
 
@@ -689,5 +705,63 @@ async function handleDialpadCallWebhook(request, env) {
   } catch (error) {
     console.error({ message: `[Dialpad/calls] unhandled error: ${error.message}`, source: 'dialpad-calls', stack: error.stack });
     return new Response('Internal Server Error', { status: 500 });
+  }
+}
+
+async function handleTestColdCall(request, env, url) {
+  try {
+    const webhookSecret = env.RF_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+    const token = url.searchParams.get('token');
+    if (!token || token !== webhookSecret) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+
+    const payload = await request.json();
+
+    if (!payload.call_id) {
+      return new Response(JSON.stringify({ error: 'missing call_id' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    console.log({
+      message: `[Test/coldcall] processing call_id=${payload.call_id} contact="${payload.contact?.name}"`,
+      source: 'test-coldcall',
+      callId: payload.call_id,
+      state: payload.state,
+      direction: payload.direction,
+      contactId: payload.contact?.id,
+      contactName: payload.contact?.name,
+      targetId: payload.target?.id,
+      hasTranscriptionText: !!payload.transcription_text,
+    });
+
+    const result = await processCallEvent(payload, env);
+
+    console.log({
+      message: `[Test/coldcall] result: ${result.isColdCall ? `COLD CALL [${result.outcome}]` : result.reason}`,
+      source: 'test-coldcall',
+      callId: payload.call_id,
+      processed: result.processed,
+      isColdCall: result.isColdCall,
+      outcome: result.outcome,
+      reason: result.reason,
+    });
+
+    return new Response(JSON.stringify(result, null, 2), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+
+  } catch (error) {
+    console.error({ message: `[Test/coldcall] error: ${error.message}`, source: 'test-coldcall', stack: error.stack });
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 }

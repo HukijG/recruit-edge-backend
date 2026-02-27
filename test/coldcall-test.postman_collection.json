@@ -1,0 +1,103 @@
+{
+	"info": {
+		"name": "RF-Dialpad Cold Call Testing",
+		"description": "Test the /test/coldcall endpoint with real and mock payloads.\n\nSet the `token` variable to your RF_WEBHOOK_SECRET before running.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "https://rf-dialpad-sync-dev.example-account.workers.dev"
+		},
+		{
+			"key": "token",
+			"value": "YOUR_RF_WEBHOOK_SECRET_HERE"
+		}
+	],
+	"item": [
+		{
+			"name": "Sam Nguyen — Connected Call (real transcript)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{base_url}}/test/coldcall?token={{token}}",
+					"host": ["{{base_url}}"],
+					"path": ["test", "coldcall"],
+					"query": [
+						{
+							"key": "token",
+							"value": "{{token}}"
+						}
+					]
+				},
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"state\": \"call_transcription\",\n  \"call_id\": 5449043052994560,\n  \"direction\": \"outbound\",\n  \"target\": {\n    \"id\": 8000000000000001,\n    \"name\": \"Joel Haines\"\n  },\n  \"contact\": {\n    \"id\": \"shared_contact_pool_Company:0000000000000000_uid_RF48635\",\n    \"name\": \"Sam Nguyen\"\n  },\n  \"date_started\": 1772134509000,\n  \"event_timestamp\": 1772134509000\n}"
+				},
+				"description": "Real call_id from Sam Nguyen's cold call on Feb 26. State is call_transcription so the worker fetches the actual transcript from Dialpad API, then classifies it.\n\nWill create a real RF activity on candidate 48635 if classified as cold call."
+			}
+		},
+		{
+			"name": "Mock Voicemail — Klaus Berger (inline transcript)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{base_url}}/test/coldcall?token={{token}}",
+					"host": ["{{base_url}}"],
+					"path": ["test", "coldcall"],
+					"query": [
+						{
+							"key": "token",
+							"value": "{{token}}"
+						}
+					]
+				},
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"state\": \"transcription\",\n  \"call_id\": 9999999999999999,\n  \"direction\": \"outbound\",\n  \"target\": {\n    \"id\": 8000000000000001,\n    \"name\": \"Joel Haines\"\n  },\n  \"contact\": {\n    \"id\": \"shared_contact_pool_Company:0000000000000000_uid_RF48658\",\n    \"name\": \"Klaus Berger\"\n  },\n  \"date_started\": 1772202266000,\n  \"event_timestamp\": 1772202266000,\n  \"transcription_text\": \"Hi Dirk, this is Joel Haines calling from Acme Recruiting. I came across your profile on LinkedIn and wanted to reach out regarding a senior engineering opportunity I think could be a great fit for your background. If you have a few minutes to chat, please give me a call back at your convenience. My number is 650-555-0125. Thanks, Dirk. Talk soon.\"\n}"
+				},
+				"description": "Mock voicemail with inline transcription_text. State is 'transcription' so no Dialpad API call needed — transcript comes from the payload.\n\nUses a fake call_id to avoid dedup conflicts. Will create a real RF activity on candidate 48658 (Klaus Berger) if classified as cold call."
+			}
+		},
+		{
+			"name": "Dry Run — No RF Update (fake contact ID)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{base_url}}/test/coldcall?token={{token}}",
+					"host": ["{{base_url}}"],
+					"path": ["test", "coldcall"],
+					"query": [
+						{
+							"key": "token",
+							"value": "{{token}}"
+						}
+					]
+				},
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"state\": \"transcription\",\n  \"call_id\": 8888888888888888,\n  \"direction\": \"outbound\",\n  \"target\": {\n    \"id\": 8000000000000001,\n    \"name\": \"Joel Haines\"\n  },\n  \"contact\": {\n    \"id\": \"test_no_rf_id\",\n    \"name\": \"(555) 123-4567\"\n  },\n  \"date_started\": 1772202266000,\n  \"event_timestamp\": 1772202266000,\n  \"transcription_text\": \"Hi, this is Joel Haines calling from Acme Recruiting. I saw your profile and wanted to discuss a DevOps lead role. Please call me back when you get a chance.\"\n}"
+				},
+				"description": "Safe dry run — contact ID has no RF UID so it will hit the deferred path (store in KV by phone number). No RF candidate will be updated.\n\nUseful for testing the pipeline without side effects."
+			}
+		}
+	]
+}

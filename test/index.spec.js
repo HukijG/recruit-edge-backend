@@ -465,15 +465,15 @@ describe('classifyColdCall', () => {
 			AI: {
 				run: async (_model, opts) => {
 					capturedMessages = opts.messages;
-					return { response: '{"is_cold_call": false, "reasoning": "test"}' };
+					return { response: '{"is_cold_call": false, "outcome": null, "reasoning": "test"}' };
 				}
 			}
 		};
 		const longText = 'a'.repeat(10000);
-		await classifyColdCall(longText, mockEnv);
+		await classifyColdCall(longText, mockEnv, 'call_transcription');
 		const userMessage = capturedMessages.find(m => m.role === 'user');
-		// "Transcript:\n\n" prefix = 13 chars + 5000 truncated = 5013
-		expect(userMessage.content.length).toBeLessThanOrEqual(5013);
+		// "Call type: Connected call\n\nTranscript:\n\n" prefix = 40 chars + 5000 truncated = 5040
+		expect(userMessage.content.length).toBeLessThanOrEqual(5040);
 	});
 
 	it('parses JSON when LLM includes curly braces in reasoning text', async () => {
