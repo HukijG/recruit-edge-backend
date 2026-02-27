@@ -1,13 +1,17 @@
-import { createOrUpdateDialpadContact } from './dialpad-client.js';
+import { createOrUpdateDialpadContact, listDialpadCalls } from './dialpad-client.js';
 import { verifyJWT } from './auth.js';
 import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
-  searchRFCandidateByEmail, addRFCandidateNote
+  searchRFCandidateByEmail, addRFCandidateNote, createRFCustomActivity,
+  listRFCandidateActivities, hasExistingColdCallActivity
 } from './rf-client.js';
 import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
-import { processCallEvent, checkPendingColdCall } from './cold-call.js';
+import {
+  processCallEvent, checkPendingColdCall, fetchCallTranscript, classifyColdCall,
+  formatActivityTime, formatOutcomeLabel, isOutboundCall, BACKFILL_AI_MODEL
+} from './cold-call.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -54,6 +58,10 @@ export default {
 
       if (url.pathname === '/webhook/dialpad/calls' && request.method === 'POST') {
         return await handleDialpadCallWebhook(request, env);
+      }
+
+      if (url.pathname === '/test/coldcall/backfill' && request.method === 'POST') {
+        return await handleColdCallBackfill(request, env, url);
       }
 
       if (url.pathname === '/test/coldcall' && request.method === 'POST') {
@@ -759,6 +767,231 @@ async function handleTestColdCall(request, env, url) {
 
   } catch (error) {
     console.error({ message: `[Test/coldcall] error: ${error.message}`, source: 'test-coldcall', stack: error.stack });
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+const JOEL_DIALPAD_USER_ID = '8000000000000001';
+const COLD_CALL_ACTIVITY_TYPE_ID = 1002;
+const JOEL_RF_USER_ID = 900001;
+
+async function handleColdCallBackfill(request, env, url) {
+  try {
+    const webhookSecret = env.RF_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+    const token = url.searchParams.get('token');
+    if (!token || token !== webhookSecret) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+
+    const body = await request.json();
+    const { days_ago, cursor, limit = 10 } = body;
+
+    if (!days_ago || typeof days_ago !== 'number' || days_ago <= 0) {
+      return new Response(JSON.stringify({ error: 'days_ago is required (positive number)' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    const startedAfter = Date.now() - (days_ago * 86400000);
+
+    console.log({
+      message: `[Backfill] starting: days_ago=${days_ago} (started_after=${startedAfter}) limit=${limit}`,
+      source: 'backfill',
+      step: 'start',
+      days_ago,
+      started_after: startedAfter,
+      cursor,
+      limit,
+    });
+
+    // 1. Fetch calls from Dialpad
+    const dialpadResult = await listDialpadCalls({
+      target_id: JOEL_DIALPAD_USER_ID,
+      started_after: startedAfter,
+      cursor,
+    }, env);
+
+    const allCalls = dialpadResult.items || [];
+    const nextCursor = dialpadResult.cursor || null;
+
+    console.log({
+      message: `[Backfill] fetched ${allCalls.length} calls from Dialpad, cursor=${nextCursor ? 'yes' : 'none'}`,
+      source: 'backfill',
+      step: 'fetch',
+      totalCalls: allCalls.length,
+      hasCursor: !!nextCursor,
+    });
+
+    // 2. Filter: outbound only, RF-linked contacts only
+    const qualifyingCalls = allCalls.filter(call => {
+      if (!isOutboundCall(call.direction)) return false;
+      const rfId = extractRFIdFromDialpadContact(String(call.contact?.id || ''));
+      return !!rfId;
+    });
+
+    console.log({
+      message: `[Backfill] ${qualifyingCalls.length}/${allCalls.length} calls qualify (outbound + RF-linked)`,
+      source: 'backfill',
+      step: 'filter',
+      qualifying: qualifyingCalls.length,
+      total: allCalls.length,
+    });
+
+    // 3. Process up to limit
+    const summary = {
+      total_from_dialpad: allCalls.length,
+      filtered_outbound_rf: qualifyingCalls.length,
+      already_logged: 0,
+      no_transcript: 0,
+      classified: 0,
+      cold_calls_created: 0,
+      not_cold_call: 0,
+      errors: 0,
+    };
+    const callResults = [];
+    const toProcess = qualifyingCalls.slice(0, limit);
+
+    for (const call of toProcess) {
+      const callId = String(call.call_id || call.id);
+      const rfCandidateId = extractRFIdFromDialpadContact(String(call.contact?.id || ''));
+      const contactName = call.contact?.name || 'Unknown';
+
+      try {
+        // 3a. Check existing RF activities for dedup
+        const activitiesResponse = await listRFCandidateActivities(rfCandidateId, env);
+        const activities = Array.isArray(activitiesResponse)
+          ? activitiesResponse
+          : (activitiesResponse.activities || activitiesResponse.data || activitiesResponse.results || []);
+
+        const callTimestamp = call.date_started || call.started_at || Date.now();
+
+        if (hasExistingColdCallActivity(activities, callTimestamp)) {
+          summary.already_logged++;
+          callResults.push({ call_id: callId, contact_name: contactName, rf_candidate_id: rfCandidateId, status: 'already_logged' });
+          console.log({ message: `[Backfill] skip: already logged call_id=${callId} candidate=${rfCandidateId}`, source: 'backfill', step: 'dedup', callId, rfCandidateId });
+          continue;
+        }
+
+        // 3b. Fetch transcript
+        let transcriptText = '';
+        const callState = call.voicemail_link ? 'transcription' : 'call_transcription';
+
+        if (callState === 'transcription') {
+          transcriptText = call.transcription_text || '';
+        } else {
+          try {
+            const transcript = await fetchCallTranscript(callId, env);
+            transcriptText = typeof transcript === 'string'
+              ? transcript
+              : (transcript.text || transcript.transcription || JSON.stringify(transcript));
+          } catch (err) {
+            console.log({ message: `[Backfill] transcript fetch failed for call_id=${callId}: ${err.message}`, source: 'backfill', step: 'transcript', callId });
+          }
+        }
+
+        if (!transcriptText) {
+          summary.no_transcript++;
+          callResults.push({ call_id: callId, contact_name: contactName, rf_candidate_id: rfCandidateId, status: 'no_transcript' });
+          console.log({ message: `[Backfill] skip: no transcript call_id=${callId}`, source: 'backfill', step: 'transcript', callId });
+          continue;
+        }
+
+        // 3c. Classify with smaller model
+        const classification = await classifyColdCall(transcriptText, env, callState, BACKFILL_AI_MODEL);
+        summary.classified++;
+
+        console.log({
+          message: `[Backfill] classified call_id=${callId}: is_cold_call=${classification.is_cold_call} outcome=${classification.outcome}`,
+          source: 'backfill',
+          step: 'classify',
+          callId,
+          rfCandidateId,
+          contactName,
+          isColdCall: classification.is_cold_call,
+          outcome: classification.outcome,
+          reasoning: classification.reasoning,
+        });
+
+        if (!classification.is_cold_call) {
+          summary.not_cold_call++;
+          callResults.push({
+            call_id: callId, contact_name: contactName, rf_candidate_id: rfCandidateId,
+            status: 'not_cold_call', reasoning: classification.reasoning
+          });
+          continue;
+        }
+
+        // 3d. Create RF activity + update source
+        const activityTime = formatActivityTime(callTimestamp);
+        const outcomeLabel = formatOutcomeLabel(classification.outcome);
+        const activityText = outcomeLabel
+          ? `Cold call with ${contactName} — ${outcomeLabel}`
+          : `Cold call with ${contactName}`;
+
+        await createRFCustomActivity({
+          activity_text: activityText,
+          activity_time: activityTime,
+          activity_type_id: COLD_CALL_ACTIVITY_TYPE_ID,
+          activity_user_id: JOEL_RF_USER_ID,
+          associated_entities: { candidates: [parseInt(rfCandidateId, 10)] },
+          mentions: []
+        }, env);
+
+        await updateRFCandidate(rfCandidateId, { source: 'Cold Call' }, env);
+
+        summary.cold_calls_created++;
+        callResults.push({
+          call_id: callId, contact_name: contactName, rf_candidate_id: rfCandidateId,
+          status: 'created', outcome: classification.outcome, reasoning: classification.reasoning
+        });
+
+        console.log({
+          message: `[Backfill] created activity: "${activityText}" candidate=${rfCandidateId}`,
+          source: 'backfill',
+          step: 'rf_update',
+          callId,
+          rfCandidateId,
+          contactName,
+          activityText,
+          outcome: classification.outcome,
+        });
+
+      } catch (err) {
+        summary.errors++;
+        callResults.push({
+          call_id: callId, contact_name: contactName, rf_candidate_id: rfCandidateId,
+          status: 'error', error: err.message
+        });
+        console.error({ message: `[Backfill] error processing call_id=${callId}: ${err.message}`, source: 'backfill', step: 'error', callId, rfCandidateId });
+      }
+    }
+
+    console.log({
+      message: `[Backfill] done: ${summary.cold_calls_created} created, ${summary.already_logged} dupes, ${summary.not_cold_call} not cold, ${summary.no_transcript} no transcript, ${summary.errors} errors`,
+      source: 'backfill',
+      step: 'done',
+      summary,
+    });
+
+    return new Response(JSON.stringify({
+      summary,
+      calls: callResults,
+      next_cursor: nextCursor,
+      has_more: !!nextCursor,
+    }, null, 2), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+
+  } catch (error) {
+    console.error({ message: `[Backfill] unhandled error: ${error.message}`, source: 'backfill', stack: error.stack });
     return new Response(JSON.stringify({ error: error.message }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' }

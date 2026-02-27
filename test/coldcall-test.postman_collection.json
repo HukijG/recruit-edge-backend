@@ -98,6 +98,34 @@
 				},
 				"description": "Safe dry run — contact ID has no RF UID so it will hit the deferred path (store in KV by phone number). No RF candidate will be updated.\n\nUseful for testing the pipeline without side effects."
 			}
+		},
+		{
+			"name": "Backfill Cold Calls",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{base_url}}/test/coldcall/backfill?token={{token}}",
+					"host": ["{{base_url}}"],
+					"path": ["test", "coldcall", "backfill"],
+					"query": [
+						{
+							"key": "token",
+							"value": "{{token}}"
+						}
+					]
+				},
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"days_ago\": 3,\n  \"cursor\": null,\n  \"limit\": 10\n}"
+				},
+				"description": "Retroactively process cold calls from Dialpad call history.\n\nQueries Dialpad call list API for Joel's outbound calls in the given time range, classifies transcripts with a smaller AI model, and creates RF activities for detected cold calls.\n\nDeduplicates against existing RF activities to avoid duplicates. Use cursor + limit to paginate through large result sets.\n\nAdjust started_after/started_before to the epoch ms timestamps for your target date range."
+			}
 		}
 	]
 }

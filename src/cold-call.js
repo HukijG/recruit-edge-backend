@@ -15,6 +15,7 @@ const JOEL_RF_USER_ID = 900001;
 const COLD_CALL_ACTIVITY_TYPE_ID = 1002;
 const TRANSCRIPT_MAX_CHARS = 5000;
 const AI_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+export const BACKFILL_AI_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 const VALID_OUTCOMES = ['voicemail', 'connected_positive', 'connected_negative'];
 
 const COLD_CALL_SYSTEM_PROMPT = `You are a call transcript classifier for a recruiting firm. Analyze this transcript and determine:
@@ -116,7 +117,7 @@ export async function fetchCallTranscript(callId, env) {
   return await response.json();
 }
 
-export async function classifyColdCall(transcriptText, env, callState) {
+export async function classifyColdCall(transcriptText, env, callState, modelOverride) {
   const truncated = truncateTranscript(transcriptText);
 
   if (!truncated) {
@@ -126,7 +127,7 @@ export async function classifyColdCall(transcriptText, env, callState) {
   const callTypeHint = callState === 'transcription' ? 'Voicemail' : 'Connected call';
   const userMessage = `Call type: ${callTypeHint}\n\nTranscript:\n\n${truncated}`;
 
-  const response = await env.AI.run(AI_MODEL, {
+  const response = await env.AI.run(modelOverride || AI_MODEL, {
     messages: [
       { role: 'system', content: COLD_CALL_SYSTEM_PROMPT },
       { role: 'user', content: userMessage }
