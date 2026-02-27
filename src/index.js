@@ -830,11 +830,21 @@ async function handleColdCallBackfill(request, env, url) {
     });
 
     // 2. Filter: outbound only, RF-linked contacts only
-    const qualifyingCalls = allCalls.filter(call => {
-      if (!isOutboundCall(call.direction)) return false;
+    const qualifyingCalls = [];
+    const skippedCalls = [];
+    for (const call of allCalls) {
+      const callId = String(call.call_id || call.id);
+      if (!isOutboundCall(call.direction)) {
+        skippedCalls.push({ call_id: callId, contact_name: call.contact?.name, reason: 'inbound' });
+        continue;
+      }
       const rfId = extractRFIdFromDialpadContact(String(call.contact?.id || ''));
-      return !!rfId;
-    });
+      if (!rfId) {
+        skippedCalls.push({ call_id: callId, contact_name: call.contact?.name, reason: 'no RF link', contact_id: String(call.contact?.id || '') });
+        continue;
+      }
+      qualifyingCalls.push(call);
+    }
 
     console.log({
       message: `[Backfill] ${qualifyingCalls.length}/${allCalls.length} calls qualify (outbound + RF-linked)`,
@@ -842,6 +852,7 @@ async function handleColdCallBackfill(request, env, url) {
       step: 'filter',
       qualifying: qualifyingCalls.length,
       total: allCalls.length,
+      skipped: skippedCalls,
     });
 
     // 3. Process up to limit

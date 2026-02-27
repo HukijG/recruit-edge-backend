@@ -18,22 +18,22 @@ const AI_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 export const BACKFILL_AI_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 const VALID_OUTCOMES = ['voicemail', 'connected_positive', 'connected_negative'];
 
-const COLD_CALL_SYSTEM_PROMPT = `You are a call transcript classifier for a recruiting firm. Analyze this transcript and determine:
-1. Whether this is a COLD CALL (first-ever outbound contact with a candidate)
-2. If it is a cold call, what was the OUTCOME
+const COLD_CALL_SYSTEM_PROMPT = `You are a call transcript classifier for a recruiting firm. Determine if this is a COLD CALL and what the outcome was.
 
-COLD CALL definition:
-- First-ever contact with someone who doesn't know the caller
-- Caller introduces themselves and their role/reason for reaching out
-- Unfamiliar, formal tone — not a follow-up, scheduled call, or catch-up
-- May be a connected conversation OR a voicemail left for a stranger
-- The caller typically mentions reaching out via LinkedIn, a specific job role, or an opportunity
+A COLD CALL is the first-ever PHONE conversation with a candidate. It IS a cold call if:
+- Caller introduces themselves, their company, and why they're calling
+- Caller references a LinkedIn message, InMail, or email they sent previously — this is STILL a cold call because it's the first PHONE contact
+- Formal/unfamiliar tone — the two people have never spoken before
+- Caller mentions a specific job role, opportunity, or reason for reaching out
+- May be a live conversation OR a voicemail left for someone they've never spoken to
 
-NOT a cold call:
-- Conversation with someone already spoken to before
-- Scheduled call, follow-up, prep call, or update
-- Familiar tone — "Hey, how's it going?", "Thanks for booking time", etc.
-- Internal calls between colleagues
+It is NOT a cold call if:
+- They have spoken on the phone before (e.g., "great talking to you last week")
+- It's a scheduled call, booked meeting, or calendar invite follow-up
+- Familiar tone — "Hey, how's it going?", "Thanks for booking time"
+- Internal call between colleagues
+
+IMPORTANT: Saying "I sent you a message on LinkedIn" or "following up on my LinkedIn message" means this IS a cold call. The caller sent a written message first and is now calling for the first time. That is cold outreach by phone.
 
 OUTCOME (only when is_cold_call is true):
 - "voicemail": Caller left a voicemail, no live conversation occurred
