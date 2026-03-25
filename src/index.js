@@ -3,7 +3,7 @@ import { verifyJWT } from './auth.js';
 import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
-  searchRFCandidateByEmail, addRFCandidateNote
+  searchRFCandidateByEmail, addRFCandidateNote, moveToCallBooked
 } from './rf-client.js';
 import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
@@ -362,6 +362,7 @@ async function handleCalendarWebhook(request, env) {
       attendeeEmail: payload.attendee_email,
       attendeeName: payload.attendee_name,
       linkedin: payload.linkedin_answer,
+      phoneNumber: payload.phone_number,
     });
 
     await processCalendarEvent(payload, env);
@@ -378,7 +379,7 @@ async function handleCalendarWebhook(request, env) {
 }
 
 async function processCalendarEvent(payload, env) {
-  const { attendee_email, attendee_name, linkedin_answer } = payload;
+  const { attendee_email, attendee_name, linkedin_answer, phone_number } = payload;
 
   // Find the RF candidate via tiered lookup
   let candidateId = null;
@@ -431,6 +432,7 @@ async function processCalendarEvent(payload, env) {
   // GET current candidate data (RF update REPLACES arrays, doesn't append)
   const currentCandidate = await getRFCandidate(candidateId, env);
 
+  // === EMAIL MERGE ===
   const existingEmails = Array.isArray(currentCandidate.email)
     ? currentCandidate.email
     : [];
@@ -439,30 +441,83 @@ async function processCalendarEvent(payload, env) {
     e => e.email?.toLowerCase() === attendee_email.toLowerCase()
   );
 
-  if (emailAlreadyExists) {
-    console.log({ message: `[Calendar] → skipped: email already exists`, source: 'calendar', candidateId, attendeeEmail: attendee_email });
-    return;
+  let mergedEmails = existingEmails;
+  let emailAdded = false;
+
+  if (!emailAlreadyExists) {
+    const isPrimary = existingEmails.length === 0 ? 1 : 0;
+    mergedEmails = [...existingEmails, { email: attendee_email, is_primary: isPrimary }];
+    emailAdded = true;
   }
 
-  const isPrimary = existingEmails.length === 0 ? 1 : 0;
-  const mergedEmails = [...existingEmails, { email: attendee_email, is_primary: isPrimary }];
+  // === PHONE MERGE ===
+  const existingPhones = Array.isArray(currentCandidate.phone_number)
+    ? currentCandidate.phone_number
+    : [];
 
-  // Update RF candidate with merged emails
-  await updateRFCandidate(candidateId, { email: mergedEmails }, env);
+  let mergedPhones = existingPhones;
+  let phoneAdded = false;
 
-  // Set debounce flag to prevent RF→Dialpad webhook loop
-  const syncKey = `sync:RF${candidateId}`;
-  await env.SYNC_STATE.put(syncKey, 'true', { expirationTtl: 60 });
+  if (phone_number) {
+    // Normalize for comparison: strip non-digits
+    const normalizedNew = phone_number.replace(/\D/g, '');
+    const phoneAlreadyExists = existingPhones.some(
+      p => (p.phone_number || '').replace(/\D/g, '') === normalizedNew
+    );
 
-  // Upsert Dialpad contact directly (RF webhook takes 6-7 hours)
+    if (!phoneAlreadyExists) {
+      mergedPhones = [...existingPhones, { phone_number: phone_number, type: 1 }];
+      phoneAdded = true;
+    }
+  }
+
+  // === UPDATE RF CANDIDATE ===
+  // Intentional change from old behavior: we no longer early-return when email exists.
+  // Stage movement and Dialpad upsert should always run regardless of data changes.
+  if (emailAdded || phoneAdded) {
+    const updatePayload = {};
+    if (emailAdded) updatePayload.email = mergedEmails;
+    if (phoneAdded) updatePayload.phone_number = mergedPhones;
+
+    await updateRFCandidate(candidateId, updatePayload, env);
+
+    // Set debounce flag ONLY when we actually update RF (prevents RF→Dialpad loop)
+    const syncKey = `sync:RF${candidateId}`;
+    await env.SYNC_STATE.put(syncKey, 'true', { expirationTtl: 60 });
+  } else {
+    console.log({ message: `[Calendar] → skipped RF update: email/phone already exist`, source: 'calendar', candidateId, attendeeEmail: attendee_email });
+  }
+
+  // === STAGE MOVEMENT ===
+  let stageMoved = false;
+  try {
+    const stageResult = await moveToCallBooked(candidateId, currentCandidate, env);
+    stageMoved = stageResult.moved;
+    if (stageMoved) {
+      console.log({
+        message: `[Calendar] → moved to Call Booked in job=${stageResult.jobId}`,
+        source: 'calendar',
+        candidateId,
+        jobId: stageResult.jobId,
+      });
+    } else {
+      console.log({
+        message: `[Calendar] → stage not moved: ${stageResult.reason}`,
+        source: 'calendar',
+        candidateId,
+      });
+    }
+  } catch (error) {
+    console.error({ message: '[Calendar] stage movement failed (non-fatal)', source: 'calendar', candidateId, error: error.message });
+  }
+
+  // === DIALPAD UPSERT ===
   let dialpadOk = true;
   try {
     const primaryEmail = mergedEmails.find(e => e.is_primary === 1)?.email || attendee_email;
     let phoneStr = '';
-    if (Array.isArray(currentCandidate.phone_number) && currentCandidate.phone_number.length > 0) {
-      phoneStr = currentCandidate.phone_number[0]?.phone_number || '';
-    } else if (typeof currentCandidate.phone_number === 'string') {
-      phoneStr = currentCandidate.phone_number;
+    if (mergedPhones.length > 0) {
+      phoneStr = mergedPhones[0]?.phone_number || '';
     }
 
     const dialpadCandidate = {
@@ -483,16 +538,22 @@ async function processCalendarEvent(payload, env) {
     console.error({ message: '[Calendar] Dialpad upsert failed (non-fatal)', source: 'calendar', candidateId, error: error.message });
   }
 
-  await cacheCandidate({ ...currentCandidate, email: mergedEmails }, env);
+  // === CACHE UPDATE ===
+  await cacheCandidate({ ...currentCandidate, email: mergedEmails, phone_number: mergedPhones }, env);
 
   console.log({
-    message: `[Calendar] → RF email merge${dialpadOk ? ' + Dialpad upsert' : ''} + cached candidate=${candidateId}`,
+    message: `[Calendar] → ${emailAdded ? 'email merge' : 'no email change'}${phoneAdded ? ' + phone merge' : ''}${stageMoved ? ' + stage moved' : ''}${dialpadOk ? ' + Dialpad upsert' : ''} + cached candidate=${candidateId}`,
     source: 'calendar',
-    action: 'email_merge',
+    action: 'calendar_sync',
     candidateId,
     lookupMethod,
     attendeeEmail: attendee_email,
+    phoneNumber: phone_number,
+    emailAdded,
+    phoneAdded,
+    stageMoved,
     totalEmails: mergedEmails.length,
+    totalPhones: mergedPhones.length,
     dialpadOk,
   });
 }
