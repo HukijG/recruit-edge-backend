@@ -2,7 +2,7 @@ import { env, createExecutionContext, waitOnExecutionContext, SELF } from 'cloud
 import { describe, it, expect } from 'vitest';
 import worker from '../src';
 import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
-import { createRFCustomActivity, extractRFIdFromDialpadContact } from '../src/rf-client.js';
+import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob } from '../src/rf-client.js';
 import {
 	isJoelsCall, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall,
 	normalizePhone, looksLikePhoneNumber
@@ -604,4 +604,150 @@ describe('looksLikePhoneNumber', () => {
 	it('returns false for empty string', () => {
 		expect(looksLikePhoneNumber('')).toBe(false);
 	});
+});
+
+// ---------------------------------------------------------------------------
+// findEligibleJob tests (stage movement eligibility)
+// ---------------------------------------------------------------------------
+
+describe('findEligibleJob', () => {
+  // Helper: build a candidate GET response with jobs
+  function buildCandidate(jobs) {
+    return {
+      id: 49503,
+      first_name: 'Steve',
+      last_name: 'Xu',
+      jobs: jobs,
+    };
+  }
+
+  function buildJob(overrides = {}) {
+    return {
+      job_id: 977,
+      stage_name: 'Sourced',
+      stage_moved: '2026-03-24T17:10:16+0000',
+      added_to_job_by: { id: 900003, name: 'Bob Smith' },
+      stages: [
+        { id: 17934, name: 'Sourced', rank: 1 },
+        { id: 17935, name: 'Applied', rank: 2 },
+        { id: 17936, name: 'Replied', rank: 3 },
+        { id: 17937, name: 'Replied (Cold)', rank: 4 },
+        { id: 17938, name: 'Call Booked', rank: 5 },
+        { id: 17939, name: 'Shortlist', rank: 6 },
+      ],
+      ...overrides,
+    };
+  }
+
+  it('returns null when candidate has no jobs', () => {
+    const candidate = buildCandidate([]);
+    expect(findEligibleJob(candidate)).toBeNull();
+  });
+
+  it('returns null for null candidate', () => {
+    expect(findEligibleJob(null)).toBeNull();
+  });
+
+  it('returns null for candidate with undefined jobs', () => {
+    expect(findEligibleJob({ id: 1 })).toBeNull();
+  });
+
+  it('returns the job when candidate is in Sourced', () => {
+    const candidate = buildCandidate([buildJob({ stage_name: 'Sourced' })]);
+    const result = findEligibleJob(candidate);
+    expect(result).not.toBeNull();
+    expect(result.job_id).toBe(977);
+    expect(result.targetStage.name).toBe('Call Booked');
+  });
+
+  it('returns the job when candidate is in Replied', () => {
+    const candidate = buildCandidate([buildJob({ stage_name: 'Replied' })]);
+    const result = findEligibleJob(candidate);
+    expect(result).not.toBeNull();
+  });
+
+  it('returns the job when candidate is in Replied (Cold)', () => {
+    const candidate = buildCandidate([buildJob({ stage_name: 'Replied (Cold)' })]);
+    const result = findEligibleJob(candidate);
+    expect(result).not.toBeNull();
+  });
+
+  it('returns null when candidate is already in Call Booked', () => {
+    const candidate = buildCandidate([buildJob({ stage_name: 'Call Booked' })]);
+    expect(findEligibleJob(candidate)).toBeNull();
+  });
+
+  it('returns null when candidate is in Shortlist (past Call Booked)', () => {
+    const candidate = buildCandidate([buildJob({ stage_name: 'Shortlist' })]);
+    expect(findEligibleJob(candidate)).toBeNull();
+  });
+
+  it('returns null when candidate is in 1st Interview', () => {
+    const candidate = buildCandidate([buildJob({ stage_name: '1st Interview' })]);
+    expect(findEligibleJob(candidate)).toBeNull();
+  });
+
+  it('picks the job with the most recent stage_moved when multiple jobs exist', () => {
+    const oldJob = buildJob({
+      job_id: 100,
+      stage_name: 'Sourced',
+      stage_moved: '2026-03-20T10:00:00+0000',
+      stages: [
+        { id: 50001, name: 'Sourced', rank: 1 },
+        { id: 50002, name: 'Call Booked', rank: 5 },
+      ],
+    });
+    const recentJob = buildJob({
+      job_id: 200,
+      stage_name: 'Replied',
+      stage_moved: '2026-03-24T17:10:16+0000',
+      stages: [
+        { id: 60001, name: 'Replied', rank: 3 },
+        { id: 60002, name: 'Call Booked', rank: 5 },
+      ],
+    });
+    const candidate = buildCandidate([oldJob, recentJob]);
+    const result = findEligibleJob(candidate);
+    expect(result).not.toBeNull();
+    expect(result.job_id).toBe(200);
+    expect(result.targetStage.id).toBe(60002);
+  });
+
+  it('returns null when the most recent job is not in an eligible stage', () => {
+    const eligibleOldJob = buildJob({
+      job_id: 100,
+      stage_name: 'Sourced',
+      stage_moved: '2026-03-20T10:00:00+0000',
+    });
+    const ineligibleRecentJob = buildJob({
+      job_id: 200,
+      stage_name: 'Shortlist',
+      stage_moved: '2026-03-24T17:10:16+0000',
+    });
+    const candidate = buildCandidate([eligibleOldJob, ineligibleRecentJob]);
+    expect(findEligibleJob(candidate)).toBeNull();
+  });
+
+  it('returns null when job has no Call Booked stage in stages array', () => {
+    const job = buildJob({
+      stage_name: 'Sourced',
+      stages: [
+        { id: 17934, name: 'Sourced', rank: 1 },
+        { id: 17935, name: 'Applied', rank: 2 },
+      ],
+    });
+    const candidate = buildCandidate([job]);
+    expect(findEligibleJob(candidate)).toBeNull();
+  });
+
+  it('falls back to Joel user ID (900001) when added_to_job_by is missing', () => {
+    const job = buildJob({
+      stage_name: 'Sourced',
+      added_to_job_by: null,
+    });
+    const candidate = buildCandidate([job]);
+    const result = findEligibleJob(candidate);
+    expect(result).not.toBeNull();
+    expect(result.userId).toBe(900001);
+  });
 });

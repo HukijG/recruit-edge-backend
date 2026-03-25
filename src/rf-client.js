@@ -272,3 +272,95 @@ export async function createRFCustomActivity(activityData, env) {
 
   return await response.json();
 }
+
+/**
+ * Stage names eligible for automatic move to "Call Booked".
+ */
+const CALL_BOOKED_ELIGIBLE_STAGES = ['Sourced', 'Replied', 'Replied (Cold)'];
+const CALL_BOOKED_TARGET = 'Call Booked';
+const JOEL_RF_USER_ID = 900001;
+
+/**
+ * Find the most-recently-moved job on a candidate and check if it's
+ * eligible for stage movement to "Call Booked".
+ *
+ * @param {object} candidate - Full candidate object from GET /candidate/get (must include jobs array)
+ * @returns {{ job_id: number, targetStage: { id: number, name: string }, userId: number } | null}
+ */
+export function findEligibleJob(candidate) {
+  const jobs = candidate?.jobs;
+  if (!Array.isArray(jobs) || jobs.length === 0) return null;
+
+  // Sort by stage_moved descending — most recent first
+  const sorted = [...jobs].sort((a, b) =>
+    new Date(b.stage_moved).getTime() - new Date(a.stage_moved).getTime()
+  );
+
+  const mostRecent = sorted[0];
+
+  // Check if current stage is eligible
+  if (!CALL_BOOKED_ELIGIBLE_STAGES.includes(mostRecent.stage_name)) {
+    return null;
+  }
+
+  // Find "Call Booked" in this job's stages array
+  const targetStage = mostRecent.stages?.find(s => s.name === CALL_BOOKED_TARGET);
+  if (!targetStage) return null;
+
+  return {
+    job_id: mostRecent.job_id,
+    targetStage: { id: targetStage.id, name: targetStage.name },
+    userId: mostRecent.added_to_job_by?.id || JOEL_RF_USER_ID,
+  };
+}
+
+/**
+ * Move a candidate to "Call Booked" stage if eligible.
+ * Caller provides full candidate data (already fetched) to avoid a redundant GET.
+ *
+ * @param {string|number} candidateId - RF candidate ID
+ * @param {object} candidateData - Full candidate object from GET /candidate/get
+ * @param {object} env - Worker env
+ * @returns {{ moved: boolean, jobId?: number, reason?: string }}
+ */
+export async function moveToCallBooked(candidateId, candidateData, env) {
+  const eligible = findEligibleJob(candidateData);
+
+  if (!eligible) {
+    return { moved: false, reason: 'not eligible (no jobs, wrong stage, or no Call Booked stage)' };
+  }
+
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const payload = {
+    id: parseInt(candidateId, 10),
+    job_id: eligible.job_id,
+    stage: {
+      id: eligible.targetStage.id,
+      name: eligible.targetStage.name,
+    },
+    user_id: eligible.userId,
+  };
+
+  const response = await fetch(`${rfBaseUrl}/candidate/move-to-stage`, {
+    method: 'POST',
+    headers: {
+      'RF-Api-Key': rfApiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`RF move-to-stage error: ${response.status}`, errorText);
+    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+  }
+
+  return { moved: true, jobId: eligible.job_id };
+}
