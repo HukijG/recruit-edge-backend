@@ -114,12 +114,22 @@ Dialpad webhook (Updated only)
 
 **Trigger**: Google Apps Script detects a Reclaim booking event on Google Calendar (via EventUpdated trigger, runs every invocation scanning next 14 days).
 
+### Booking Types
+
+The worker now handles two booking types:
+
+1. **Dialpad meeting link** - event location contains `"meetings.dialpad.com/"`
+   - Merges attendee email into candidate's email array
+2. **Phone Call** - event location contains `"Phone Call"`
+   - Merges attendee phone number into candidate's phone array
+   - Merges attendee email into candidate's email array
+
 ### Apps Script Filtering (3-signal combo)
 
 All three must be present for an event to be processed:
 1. Description contains `"Looking forward to meeting!"` (custom Reclaim booking phrase)
 2. Description contains `"Question: LinkedIn Profile"` (pre-meeting question)
-3. Location contains `"meetings.dialpad.com/"` (Dialpad meeting link)
+3. Location contains either `"meetings.dialpad.com/"` (Dialpad meeting link) or `"Phone Call"`
 
 Plus: exactly 1 non-owner guest (the candidate).
 
@@ -137,13 +147,34 @@ Apps Script → POST /webhook/calendar
       Tier 4: Name cache lookup (unambiguous matches only)
 
   → GET /candidate/get?id=X (fetch current data — RF update REPLACES, not appends)
-  → Check if email already exists on candidate → skip if yes
-  → Merge new email into existing array (first email gets is_primary=1)
-  → POST /candidate/update with merged email array
+
+  → For Dialpad meeting link bookings:
+      - Check if email already exists on candidate → skip if yes
+      - Merge new email into existing array (first email gets is_primary=1)
+
+  → For Phone Call bookings:
+      - Extract phone number from event
+      - Check if phone already exists on candidate → skip if yes
+      - Merge new phone into existing array
+      - Merge new email into existing array
+
+  → POST /candidate/update with merged data
   → Set debounce: sync:RF{id} = "true" (60s TTL)
   → Upsert Dialpad contact directly (don't wait for RF webhook — 6-7 hour delay)
-  → Update candidate cache with new email data
+
+  → Check if candidate is eligible for stage movement:
+      - Current stage is Sourced, Replied, or Replied (Cold)
+      - Find most-recently-moved job on candidate
+      - If eligible job found → POST /api/external/candidate/move-to-stage (move to "Call Booked")
+
+  → Update candidate cache with new email/phone data
 ```
+
+**Stage Movement**: After successful email/phone merge and RF update, the worker calls `findEligibleJob()` (in `rf-client.js`) to check if the candidate can be moved to "Call Booked". The job must:
+- Have current stage in: Sourced, Replied, or Replied (Cold)
+- Be the most-recently-moved job on the candidate
+
+If eligible, `moveToCallBooked()` calls `POST /api/external/candidate/move-to-stage` with the stage ID.
 
 ---
 
