@@ -72,8 +72,8 @@ function processNewBookings() {
       continue;
     }
 
-    // Filter 3: Dialpad meeting location
-    if (location.indexOf('meetings.dialpad.com/') === -1) {
+    // Filter 3: Booking location — Dialpad meeting link OR Phone Call
+    if (location.indexOf('meetings.dialpad.com/') === -1 && location.indexOf('Phone Call') === -1) {
       continue;
     }
 
@@ -114,6 +114,14 @@ function processNewBookings() {
       linkedinAnswer = linkedinMatch[1].trim();
     }
 
+    // Phone number answer: extract from description (only present on Phone Call bookings)
+    // Exact Reclaim question text: "Please provide a number that would be best to reach you on"
+    var phoneAnswer = '';
+    var phoneMatch = description.match(/Question:\s*Please provide a number[^\n]*[\s\S]*?Answer:\s*(.+?)(?:\n|$)/i);
+    if (phoneMatch) {
+      phoneAnswer = phoneMatch[1].trim();
+    }
+
     // === BUILD + SEND PAYLOAD ===
 
     var payload = {
@@ -122,7 +130,8 @@ function processNewBookings() {
       event_start: event.getStartTime().toISOString(),
       attendee_email: attendeeEmail,
       attendee_name: attendeeName,
-      linkedin_answer: linkedinAnswer
+      linkedin_answer: linkedinAnswer,
+      phone_number: phoneAnswer || null
     };
 
     try {
