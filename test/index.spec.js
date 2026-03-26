@@ -7,7 +7,7 @@ import {
 	isJoelsCall, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall,
 	normalizePhone, looksLikePhoneNumber
 } from '../src/cold-call.js';
-import { enrichPerson, searchPeople } from '../src/apollo-client.js';
+import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, scoreSearchResults } from '../src/apollo-client.js';
 
 describe('RF-Dialpad Sync Worker', () => {
 	it('/health returns 200 with status message', async () => {
@@ -854,4 +854,253 @@ describe('searchPeople', () => {
     const result = await searchPeople({ q_keywords: 'test' }, mockEnv);
     expect(result).toEqual([]);
   });
+});
+
+// ---------------------------------------------------------------------------
+// normalizeOrgName tests
+// ---------------------------------------------------------------------------
+
+describe('normalizeOrgName', () => {
+	it('lowercases and trims', () => {
+		expect(normalizeOrgName('  Acme Corp  ')).toBe('acme');
+	});
+
+	it('strips Inc suffix', () => {
+		expect(normalizeOrgName('Acme Inc')).toBe('acme');
+	});
+
+	it('strips Inc. suffix with dot', () => {
+		expect(normalizeOrgName('Acme Inc.')).toBe('acme');
+	});
+
+	it('strips Ltd suffix', () => {
+		expect(normalizeOrgName('Acme Ltd')).toBe('acme');
+	});
+
+	it('strips LLC suffix', () => {
+		expect(normalizeOrgName('Acme LLC')).toBe('acme');
+	});
+
+	it('strips Corp suffix', () => {
+		expect(normalizeOrgName('Acme Corp')).toBe('acme');
+	});
+
+	it('strips Corp. suffix', () => {
+		expect(normalizeOrgName('Acme Corp.')).toBe('acme');
+	});
+
+	it('strips Co. suffix', () => {
+		expect(normalizeOrgName('Acme Co.')).toBe('acme');
+	});
+
+	it('strips suffix with comma before it', () => {
+		expect(normalizeOrgName('Acme, Inc.')).toBe('acme');
+	});
+
+	it('returns empty string for null', () => {
+		expect(normalizeOrgName(null)).toBe('');
+	});
+
+	it('returns empty string for undefined', () => {
+		expect(normalizeOrgName(undefined)).toBe('');
+	});
+
+	it('returns empty string for empty string', () => {
+		expect(normalizeOrgName('')).toBe('');
+	});
+
+	it('returns empty string when name is just a suffix', () => {
+		expect(normalizeOrgName('LLC')).toBe('');
+	});
+});
+
+// ---------------------------------------------------------------------------
+// verifyApolloMatch tests
+// ---------------------------------------------------------------------------
+
+describe('verifyApolloMatch', () => {
+	it('returns match when both name and org match', () => {
+		const apollo = { first_name: 'Jane', last_name: 'Doe', organization: { name: 'Acme Inc' } };
+		const rf = { first_name: 'Jane', last_name: 'Doe', current_organization: 'Acme' };
+		const result = verifyApolloMatch(apollo, rf);
+		expect(result.match).toBe(true);
+		expect(result.reasons).toEqual([]);
+	});
+
+	it('matches case-insensitively', () => {
+		const apollo = { first_name: 'JANE', last_name: 'DOE', organization: { name: 'ACME' } };
+		const rf = { first_name: 'jane', last_name: 'doe', current_organization: 'acme' };
+		const result = verifyApolloMatch(apollo, rf);
+		expect(result.match).toBe(true);
+	});
+
+	it('skips last name comparison when RF last name is single char', () => {
+		const apollo = { first_name: 'Andrew', last_name: 'Chen', organization: { name: 'Acme' } };
+		const rf = { first_name: 'Andrew', last_name: 'C', current_organization: 'Acme' };
+		const result = verifyApolloMatch(apollo, rf);
+		expect(result.match).toBe(true);
+	});
+
+	it('skips last name comparison when RF last name is single char with dot', () => {
+		const apollo = { first_name: 'Andrew', last_name: 'Chen', organization: { name: 'Acme' } };
+		const rf = { first_name: 'Andrew', last_name: 'C.', current_organization: 'Acme' };
+		const result = verifyApolloMatch(apollo, rf);
+		expect(result.match).toBe(true);
+	});
+
+	it('reports first name mismatch', () => {
+		const apollo = { first_name: 'John', last_name: 'Doe', organization: { name: 'Acme' } };
+		const rf = { first_name: 'Jane', last_name: 'Doe', current_organization: 'Acme' };
+		const result = verifyApolloMatch(apollo, rf);
+		expect(result.match).toBe(false);
+		expect(result.reasons.length).toBeGreaterThan(0);
+		expect(result.reasons[0]).toContain('First name mismatch');
+	});
+
+	it('reports org mismatch', () => {
+		const apollo = { first_name: 'Jane', last_name: 'Doe', organization: { name: 'BigCorp' } };
+		const rf = { first_name: 'Jane', last_name: 'Doe', current_organization: 'Acme' };
+		const result = verifyApolloMatch(apollo, rf);
+		expect(result.match).toBe(false);
+		expect(result.reasons.some(r => r.includes('Organization mismatch'))).toBe(true);
+	});
+
+	it('reports last name mismatch when not single char', () => {
+		const apollo = { first_name: 'Jane', last_name: 'Smith', organization: { name: 'Acme' } };
+		const rf = { first_name: 'Jane', last_name: 'Doe', current_organization: 'Acme' };
+		const result = verifyApolloMatch(apollo, rf);
+		expect(result.match).toBe(false);
+		expect(result.reasons.some(r => r.includes('Last name mismatch'))).toBe(true);
+	});
+
+	it('matches when org suffixes differ', () => {
+		const apollo = { first_name: 'Jane', last_name: 'Doe', organization: { name: 'Acme, Inc.' } };
+		const rf = { first_name: 'Jane', last_name: 'Doe', current_organization: 'Acme LLC' };
+		const result = verifyApolloMatch(apollo, rf);
+		expect(result.match).toBe(true);
+	});
+
+	it('handles null Apollo organization gracefully', () => {
+		const apollo = { first_name: 'Jane', last_name: 'Doe', organization: null };
+		const rf = { first_name: 'Jane', last_name: 'Doe', current_organization: 'Acme' };
+		const result = verifyApolloMatch(apollo, rf);
+		expect(result.match).toBe(false);
+		expect(result.reasons.some(r => r.includes('Organization mismatch'))).toBe(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// scoreSearchResults tests
+// ---------------------------------------------------------------------------
+
+describe('scoreSearchResults', () => {
+	const rfCandidate = {
+		first_name: 'Jane',
+		last_name: 'Doe',
+		current_title: 'Software Engineer',
+		current_organization: 'Acme Inc',
+	};
+
+	it('returns single match passing all checks', () => {
+		const results = [{
+			first_name: 'Jane',
+			last_name: 'Doe',
+			title: 'Software Engineer',
+			organization: { name: 'Acme' },
+			has_direct_phone: 'Yes',
+		}];
+		const best = scoreSearchResults(results, rfCandidate);
+		expect(best).not.toBeNull();
+		expect(best.first_name).toBe('Jane');
+	});
+
+	it('returns null when no first name match', () => {
+		const results = [{
+			first_name: 'John',
+			last_name: 'Doe',
+			title: 'Software Engineer',
+			organization: { name: 'Acme' },
+		}];
+		expect(scoreSearchResults(results, rfCandidate)).toBeNull();
+	});
+
+	it('picks the result passing all checks from multiple', () => {
+		const results = [
+			{
+				first_name: 'Jane',
+				last_name: 'Smith',
+				title: 'Designer',
+				organization: { name: 'OtherCo' },
+			},
+			{
+				first_name: 'Jane',
+				last_name: 'Doe',
+				title: 'Software Engineer',
+				organization: { name: 'Acme Inc.' },
+				has_direct_phone: 'Yes',
+			},
+		];
+		const best = scoreSearchResults(results, rfCandidate);
+		expect(best).not.toBeNull();
+		expect(best.last_name).toBe('Doe');
+	});
+
+	it('returns null when top two have same score (ambiguous)', () => {
+		const results = [
+			{
+				first_name: 'Jane',
+				last_name: 'Doe',
+				title: 'Software Engineer',
+				organization: { name: 'Different' },
+			},
+			{
+				first_name: 'Jane',
+				last_name: 'Smith',
+				title: 'Software Engineer',
+				organization: { name: 'OtherDifferent' },
+			},
+		];
+		expect(scoreSearchResults(results, rfCandidate)).toBeNull();
+	});
+
+	it('returns null for empty results', () => {
+		expect(scoreSearchResults([], rfCandidate)).toBeNull();
+	});
+
+	it('returns null for null results', () => {
+		expect(scoreSearchResults(null, rfCandidate)).toBeNull();
+	});
+
+	it('uses has_direct_phone as tiebreaker', () => {
+		const results = [
+			{
+				first_name: 'Jane',
+				last_name: 'Doe',
+				title: 'Software Engineer',
+				organization: { name: 'Acme' },
+				has_direct_phone: 'No',
+			},
+			{
+				first_name: 'Jane',
+				last_name: 'Smith',
+				title: 'Software Engineer',
+				organization: { name: 'Acme' },
+				has_direct_phone: 'Yes',
+			},
+		];
+		const best = scoreSearchResults(results, rfCandidate);
+		expect(best).not.toBeNull();
+		expect(best.last_name).toBe('Smith');
+	});
+
+	it('matches organizations with different suffixes', () => {
+		const results = [{
+			first_name: 'Jane',
+			last_name: 'Doe',
+			title: 'Software Engineer',
+			organization: { name: 'Acme, Inc.' },
+		}];
+		const best = scoreSearchResults(results, rfCandidate);
+		expect(best).not.toBeNull();
+	});
 });
