@@ -1,5 +1,5 @@
 import { env, createExecutionContext, waitOnExecutionContext, SELF } from 'cloudflare:test';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import worker from '../src';
 import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
 import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob } from '../src/rf-client.js';
@@ -7,6 +7,7 @@ import {
 	isJoelsCall, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall,
 	normalizePhone, looksLikePhoneNumber
 } from '../src/cold-call.js';
+import { enrichPerson, searchPeople } from '../src/apollo-client.js';
 
 describe('RF-Dialpad Sync Worker', () => {
 	it('/health returns 200 with status message', async () => {
@@ -749,5 +750,108 @@ describe('findEligibleJob', () => {
     const result = findEligibleJob(candidate);
     expect(result).not.toBeNull();
     expect(result.userId).toBe(900001);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Apollo API client tests
+// ---------------------------------------------------------------------------
+
+describe('enrichPerson', () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const mockEnv = { APOLLO_API_KEY: 'test-apollo-key' };
+
+  it('calls correct URL with correct headers and body', async () => {
+    const personData = { id: '123', first_name: 'Jane', last_name: 'Doe' };
+    globalThis.fetch = async (url, opts) => {
+      expect(url).toBe('https://api.apollo.io/api/v1/people/match');
+      expect(opts.method).toBe('POST');
+      expect(opts.headers['x-api-key']).toBe('test-apollo-key');
+      expect(opts.headers['Content-Type']).toBe('application/json');
+      const body = JSON.parse(opts.body);
+      expect(body.linkedin_url).toBe('https://linkedin.com/in/janedoe');
+      return new Response(JSON.stringify({ person: personData }), { status: 200 });
+    };
+
+    const result = await enrichPerson({ linkedin_url: 'https://linkedin.com/in/janedoe' }, {}, mockEnv);
+    expect(result).toEqual(personData);
+  });
+
+  it('returns person object on success', async () => {
+    const personData = { id: '456', first_name: 'John', last_name: 'Smith' };
+    globalThis.fetch = async () => new Response(JSON.stringify({ person: personData }), { status: 200 });
+
+    const result = await enrichPerson({ first_name: 'John', last_name: 'Smith' }, {}, mockEnv);
+    expect(result).toEqual(personData);
+  });
+
+  it('returns null when Apollo returns no person', async () => {
+    globalThis.fetch = async () => new Response(JSON.stringify({}), { status: 200 });
+
+    const result = await enrichPerson({ linkedin_url: 'https://linkedin.com/in/nobody' }, {}, mockEnv);
+    expect(result).toBeNull();
+  });
+
+  it('passes reveal_phone_number and webhook_url when provided', async () => {
+    globalThis.fetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      expect(body.reveal_phone_number).toBe(true);
+      expect(body.webhook_url).toBe('https://example.com/webhook');
+      expect(body.first_name).toBe('Jane');
+      return new Response(JSON.stringify({ person: { id: '789' } }), { status: 200 });
+    };
+
+    const result = await enrichPerson(
+      { first_name: 'Jane' },
+      { reveal_phone_number: true, webhook_url: 'https://example.com/webhook' },
+      mockEnv
+    );
+    expect(result).toEqual({ id: '789' });
+  });
+
+  it('returns null on non-200 response', async () => {
+    globalThis.fetch = async () => new Response('Unauthorized', { status: 401 });
+
+    const result = await enrichPerson({ linkedin_url: 'https://linkedin.com/in/test' }, {}, mockEnv);
+    expect(result).toBeNull();
+  });
+});
+
+describe('searchPeople', () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const mockEnv = { APOLLO_API_KEY: 'test-apollo-key' };
+
+  it('calls correct URL and returns people array', async () => {
+    const people = [{ id: '1', first_name: 'Alice' }, { id: '2', first_name: 'Bob' }];
+    globalThis.fetch = async (url, opts) => {
+      expect(url).toBe('https://api.apollo.io/api/v1/mixed_people/api_search');
+      expect(opts.method).toBe('POST');
+      expect(opts.headers['x-api-key']).toBe('test-apollo-key');
+      const body = JSON.parse(opts.body);
+      expect(body.page).toBe(1);
+      expect(body.per_page).toBe(25);
+      expect(body.q_keywords).toBe('engineer');
+      return new Response(JSON.stringify({ people }), { status: 200 });
+    };
+
+    const result = await searchPeople({ q_keywords: 'engineer' }, mockEnv);
+    expect(result).toEqual(people);
+  });
+
+  it('returns empty array on API failure', async () => {
+    globalThis.fetch = async () => new Response('Server Error', { status: 500 });
+
+    const result = await searchPeople({ q_keywords: 'test' }, mockEnv);
+    expect(result).toEqual([]);
   });
 });
