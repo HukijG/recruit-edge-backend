@@ -8,6 +8,7 @@ import {
 	normalizePhone, looksLikePhoneNumber
 } from '../src/cold-call.js';
 import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, scoreSearchResults } from '../src/apollo-client.js';
+import { isJoelCandidate, enrichCandidate } from '../src/enrichment.js';
 
 describe('RF-Dialpad Sync Worker', () => {
 	it('/health returns 200 with status message', async () => {
@@ -1102,5 +1103,111 @@ describe('scoreSearchResults', () => {
 		}];
 		const best = scoreSearchResults(results, rfCandidate);
 		expect(best).not.toBeNull();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// isJoelCandidate tests
+// ---------------------------------------------------------------------------
+
+describe('isJoelCandidate', () => {
+	it('returns true when a job has added_to_job_by.id === 900001', () => {
+		const candidate = {
+			id: 100,
+			jobs: [{ job_id: 1, added_to_job_by: { id: 900001, name: 'Joel Haines' } }],
+		};
+		expect(isJoelCandidate(candidate)).toBe(true);
+	});
+
+	it('returns false when jobs added by someone else', () => {
+		const candidate = {
+			id: 101,
+			jobs: [{ job_id: 1, added_to_job_by: { id: 900003, name: 'Bob Smith' } }],
+		};
+		expect(isJoelCandidate(candidate)).toBe(false);
+	});
+
+	it('returns true when ANY job (not just first) is Joel\'s', () => {
+		const candidate = {
+			id: 102,
+			jobs: [
+				{ job_id: 1, added_to_job_by: { id: 900003, name: 'Bob Smith' } },
+				{ job_id: 2, added_to_job_by: { id: 900001, name: 'Joel Haines' } },
+			],
+		};
+		expect(isJoelCandidate(candidate)).toBe(true);
+	});
+
+	it('returns false for empty jobs array', () => {
+		const candidate = { id: 103, jobs: [] };
+		expect(isJoelCandidate(candidate)).toBe(false);
+	});
+
+	it('returns false when jobs is undefined', () => {
+		const candidate = { id: 104 };
+		expect(isJoelCandidate(candidate)).toBe(false);
+	});
+
+	it('handles null added_to_job_by', () => {
+		const candidate = {
+			id: 105,
+			jobs: [{ job_id: 1, added_to_job_by: null }],
+		};
+		expect(isJoelCandidate(candidate)).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// enrichCandidate tests
+// ---------------------------------------------------------------------------
+
+describe('enrichCandidate', () => {
+	function mockEnv(overrides = {}) {
+		const kvStore = {};
+		return {
+			APOLLO_API_KEY: 'test-key',
+			APOLLO_WEBHOOK_SECRET: 'test-secret',
+			RF_API_KEY: 'test-rf-key',
+			RF_API_BASE_URL: 'https://api.recruiterflow.com/api/external',
+			SYNC_STATE: {
+				get: async (key) => kvStore[key] || null,
+				put: async (key, value, opts) => { kvStore[key] = value; },
+			},
+			WORKER_URL: 'https://rf-dialpad-sync-dev.example-account.workers.dev',
+			...overrides,
+		};
+	}
+
+	it('skips when phone already exists (string)', async () => {
+		const env = mockEnv();
+		const candidate = { id: 100, phone_number: '+61412345678', linkedin_profile: 'https://linkedin.com/in/test' };
+		const fullCandidate = { id: 100, phone_number: [] };
+		const result = await enrichCandidate(candidate, fullCandidate, env);
+		expect(result.enriched).toBe(false);
+		expect(result.reason).toBe('phone_exists');
+	});
+
+	it('skips when phone already exists (array on fullCandidate)', async () => {
+		const env = mockEnv();
+		const candidate = { id: 101, phone_number: '', linkedin_profile: 'https://linkedin.com/in/test' };
+		const fullCandidate = { id: 101, phone_number: [{ phone_number: '+61412345678', type: 1 }] };
+		const result = await enrichCandidate(candidate, fullCandidate, env);
+		expect(result.enriched).toBe(false);
+		expect(result.reason).toBe('phone_exists');
+	});
+
+	it('skips when apollo_enrich KV key already exists (dedup)', async () => {
+		const kvStore = { 'apollo_enrich:102': '{"apolloPersonId":"x"}' };
+		const env = mockEnv({
+			SYNC_STATE: {
+				get: async (key) => kvStore[key] || null,
+				put: async () => {},
+			},
+		});
+		const candidate = { id: 102, phone_number: '', linkedin_profile: 'https://linkedin.com/in/test' };
+		const fullCandidate = { id: 102, phone_number: [] };
+		const result = await enrichCandidate(candidate, fullCandidate, env);
+		expect(result.enriched).toBe(false);
+		expect(result.reason).toBe('already_attempted');
 	});
 });
