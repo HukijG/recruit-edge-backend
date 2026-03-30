@@ -101,6 +101,23 @@ export function normalizeOrgName(name) {
 }
 
 /**
+ * Strip a leading middle initial (e.g. "N. Romero" → "Romero", "N Romero" → "Romero")
+ * from a last name field. Only strips a single letter (with optional dot) followed by space.
+ */
+function stripMiddleInitial(lastName) {
+	return lastName.replace(/^[a-z]\.?\s+/i, '');
+}
+
+/**
+ * Case-insensitive last name comparison that tolerates middle initials
+ * embedded in the last name field (e.g. RF "N. Romero" vs Apollo "Romero").
+ */
+function lastNamesMatch(a, b) {
+	if (a === b) return true;
+	return stripMiddleInitial(a) === stripMiddleInitial(b);
+}
+
+/**
  * Verify an Apollo person matches an RF candidate.
  *
  * @param {Object} apolloPerson - Apollo person object with first_name, last_name, organization.name
@@ -117,13 +134,13 @@ export function verifyApolloMatch(apolloPerson, rfCandidate) {
 		reasons.push(`First name mismatch: Apollo "${apolloPerson.first_name}" vs RF "${rfCandidate.first_name}"`);
 	}
 
-	// Last name: case-insensitive exact match, skip if RF last name is single char (with optional dot)
+	// Last name: case-insensitive match (tolerates middle initials), skip if RF last name is single char (with optional dot)
 	const rfLast = (rfCandidate.last_name || '').trim();
 	const singleCharLastName = /^[a-zA-Z]\.?$/.test(rfLast);
 	if (!singleCharLastName) {
 		const aLast = (apolloPerson.last_name || '').trim().toLowerCase();
 		const rLast = rfLast.toLowerCase();
-		if (aLast !== rLast) {
+		if (!lastNamesMatch(aLast, rLast)) {
 			reasons.push(`Last name mismatch: Apollo "${apolloPerson.last_name}" vs RF "${rfCandidate.last_name}"`);
 		}
 	}
@@ -196,12 +213,12 @@ export function scoreEnrichedCandidate(apolloPerson, rfFullCandidate) {
 		gateFailures.push('organization');
 	}
 
-	// Gate: Last name exact match (required when not single-char)
+	// Gate: Last name match (tolerates middle initials, required when not single-char)
 	const rfLast = (rfFullCandidate.last_name || '').trim();
 	const isSingleCharLast = /^[a-zA-Z]\.?$/.test(rfLast);
 	if (!isSingleCharLast && rfLast) {
 		const aLast = (apolloPerson.last_name || '').trim().toLowerCase();
-		if (aLast !== rfLast.toLowerCase()) {
+		if (!lastNamesMatch(aLast, rfLast.toLowerCase())) {
 			gateFailures.push('last_name');
 		}
 	}

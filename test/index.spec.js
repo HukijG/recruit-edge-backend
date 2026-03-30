@@ -988,6 +988,27 @@ describe('verifyApolloMatch', () => {
 		expect(result.match).toBe(false);
 		expect(result.reasons.some(r => r.includes('Organization mismatch'))).toBe(true);
 	});
+
+	it('matches when RF last name has a middle initial prefix', () => {
+		const apollo = { first_name: 'Juan', last_name: 'Romero', organization: { name: 'Acme' } };
+		const rf = { first_name: 'Juan', last_name: 'N. Romero', current_organization: 'Acme' };
+		const result = verifyApolloMatch(apollo, rf);
+		expect(result.match).toBe(true);
+	});
+
+	it('matches when Apollo last name has a middle initial prefix', () => {
+		const apollo = { first_name: 'Juan', last_name: 'N. Romero', organization: { name: 'Acme' } };
+		const rf = { first_name: 'Juan', last_name: 'Romero', current_organization: 'Acme' };
+		const result = verifyApolloMatch(apollo, rf);
+		expect(result.match).toBe(true);
+	});
+
+	it('matches when RF last name has middle initial without dot', () => {
+		const apollo = { first_name: 'Juan', last_name: 'Romero', organization: { name: 'Acme' } };
+		const rf = { first_name: 'Juan', last_name: 'N Romero', current_organization: 'Acme' };
+		const result = verifyApolloMatch(apollo, rf);
+		expect(result.match).toBe(true);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -1172,6 +1193,14 @@ describe('scoreEnrichedCandidate', () => {
 		const rf = { ...baseRF, first_name: ' Jane', last_name: ' Doe' };
 		const result = scoreEnrichedCandidate(apollo, rf);
 		expect(result.passed).toBe(true);
+	});
+
+	it('passes last_name gate when RF has middle initial prefix', () => {
+		const apollo = { ...baseApollo, first_name: 'Juan', last_name: 'Romero' };
+		const rf = { ...baseRF, first_name: 'Juan', last_name: 'N. Romero' };
+		const result = scoreEnrichedCandidate(apollo, rf);
+		expect(result.passed).toBe(true);
+		expect(result.gateFailures).not.toContain('last_name');
 	});
 });
 
