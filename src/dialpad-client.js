@@ -29,8 +29,17 @@ export async function createOrUpdateDialpadContact(candidate, env) {
   };
 
   try {
+    console.log({
+      message: `[Dialpad] upserting contact uid=${uid}`,
+      source: 'dialpad',
+      contactId,
+      phones: contactData.phones,
+      urls: contactData.urls,
+    });
+
     // Try PATCH (update) first — avoids Dialpad firing "Created" events
-    const patchResponse = await fetch(`${dialpadBaseUrl}/contacts/${encodeURIComponent(contactId)}`, {
+    const patchUrl = `${dialpadBaseUrl}/contacts/${encodeURIComponent(contactId)}`;
+    const patchResponse = await fetch(patchUrl, {
       method: 'PATCH',
       headers,
       body: JSON.stringify(contactData)
@@ -38,11 +47,13 @@ export async function createOrUpdateDialpadContact(candidate, env) {
 
     if (patchResponse.ok) {
       const result = await patchResponse.json();
+      console.log({ message: `[Dialpad] PATCH success uid=${uid}`, source: 'dialpad', contactId });
       return { success: true, contactId, uid, method: 'update', dialpadResponse: result };
     }
 
     // Fall back to PUT (create) if contact doesn't exist yet
     if (patchResponse.status === 404) {
+      console.log({ message: `[Dialpad] PATCH 404 — falling back to PUT uid=${uid}`, source: 'dialpad', contactId });
       const putResponse = await fetch(`${dialpadBaseUrl}/contacts`, {
         method: 'PUT',
         headers,
@@ -55,6 +66,7 @@ export async function createOrUpdateDialpadContact(candidate, env) {
       }
 
       const result = await putResponse.json();
+      console.log({ message: `[Dialpad] PUT success (created) uid=${uid}`, source: 'dialpad', contactId });
       return { success: true, contactId, uid, method: 'create', dialpadResponse: result };
     }
 
