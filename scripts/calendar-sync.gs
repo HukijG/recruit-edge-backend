@@ -22,7 +22,6 @@ function processNewBookings() {
     ownerEmail: props.getProperty('OWNER_EMAIL')
   };
 
-  // Validate config
   if (!config.webhookUrl || !config.webhookSecret || !config.calendarId || !config.ownerEmail) {
     console.error('Missing configuration. Set WEBHOOK_URL, WEBHOOK_SECRET, CALENDAR_ID, OWNER_EMAIL in Script Properties.');
     return;
@@ -34,14 +33,12 @@ function processNewBookings() {
     return;
   }
 
-  // Look at events in the next 14 days
   var now = new Date();
   var endDate = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
   var events = calendar.getEvents(now, endDate);
 
   console.log('Scanning ' + events.length + ' events in next 14 days');
 
-  // Load processed event IDs (JSON array stored in a single property)
   var processedIds = loadProcessedIds(props);
   var newCount = 0;
 
@@ -49,35 +46,29 @@ function processNewBookings() {
     var event = events[i];
     var eventId = event.getId();
 
-    // Skip already processed
     if (processedIds.indexOf(eventId) !== -1) {
       continue;
     }
 
-    // Strip HTML from description for reliable text matching
     var rawDescription = event.getDescription() || '';
     var description = stripHtml(rawDescription);
+    var descLower = description.toLowerCase();
     var location = event.getLocation() || '';
     var title = event.getTitle() || '';
 
-    // === THREE-SIGNAL FILTER (all must pass) ===
+    // === BOOKING FILTER ===
 
-    // Filter 1: Custom booking description phrase
-    if (description.indexOf('Looking forward to meeting!') === -1) {
+    // Filter 1: LinkedIn pre-meeting question present (case-insensitive)
+    if (descLower.indexOf('question: linkedin profile') === -1) {
       continue;
     }
 
-    // Filter 2: LinkedIn pre-meeting question present
-    if (description.indexOf('Question: LinkedIn Profile') === -1) {
-      continue;
-    }
-
-    // Filter 3: Booking location — Dialpad meeting link OR Phone Call
+    // Filter 2: Booking location — Dialpad meeting link OR Phone Call
     if (location.indexOf('meetings.dialpad.com/') === -1 && location.indexOf('Phone Call') === -1) {
       continue;
     }
 
-    // Filter 4: Exactly 1 non-owner guest
+    // Filter 3: Exactly 1 non-owner guest
     var guests = event.getGuestList();
     var nonOwnerGuests = [];
     for (var g = 0; g < guests.length; g++) {
@@ -96,26 +87,21 @@ function processNewBookings() {
     var candidateGuest = nonOwnerGuests[0];
     var attendeeEmail = candidateGuest.getEmail();
 
-    // Candidate name: text before "//" in title, trimmed
     var attendeeName = '';
     var slashIndex = title.indexOf('//');
     if (slashIndex !== -1) {
       attendeeName = title.substring(0, slashIndex).trim();
     }
-    // Fall back to guest display name
     if (!attendeeName) {
       attendeeName = candidateGuest.getName() || '';
     }
 
-    // LinkedIn answer: extract from description (after "Question: LinkedIn Profile" line)
     var linkedinAnswer = '';
-    var linkedinMatch = description.match(/Question:\s*LinkedIn Profile[\s\S]*?Answer:\s*(.+?)(?:\n|$)/i);
+    var linkedinMatch = description.match(/Question:\s*Linkedin Profile[\s\S]*?Answer:\s*(.+?)(?:\n|$)/i);
     if (linkedinMatch) {
       linkedinAnswer = linkedinMatch[1].trim();
     }
 
-    // Phone number answer: extract from description (only present on Phone Call bookings)
-    // Exact Reclaim question text: "Please provide a number that would be best to reach you on"
     var phoneAnswer = '';
     var phoneMatch = description.match(/Question:\s*Please provide a number[^\n]*[\s\S]*?Answer:\s*(.+?)(?:\n|$)/i);
     if (phoneMatch) {
@@ -159,7 +145,6 @@ function processNewBookings() {
     }
   }
 
-  // Save processed IDs (cap at 100 — more than enough for a 14-day window)
   if (processedIds.length > 100) {
     processedIds = processedIds.slice(processedIds.length - 100);
   }
@@ -168,9 +153,6 @@ function processNewBookings() {
   console.log('Processed ' + newCount + ' new events. Total tracked: ' + processedIds.length);
 }
 
-/**
- * Load processed event IDs from Script Properties.
- */
 function loadProcessedIds(props) {
   var raw = props.getProperty('PROCESSED_EVENTS') || '[]';
   try {
@@ -180,10 +162,6 @@ function loadProcessedIds(props) {
   }
 }
 
-/**
- * Strip HTML tags and decode common entities for reliable text matching.
- * Google Calendar descriptions come back as HTML from getDescription().
- */
 function stripHtml(html) {
   if (!html) return '';
   return html
