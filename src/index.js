@@ -57,6 +57,10 @@ export default {
         return await handleDialpadCallWebhook(request, env);
       }
 
+      if (url.pathname === '/webhook/apollo' && request.method === 'POST') {
+        return await handleApolloWebhook(request, env, url);
+      }
+
       if (url.pathname === '/test/coldcall' && request.method === 'POST') {
         return await handleTestColdCall(request, env, url);
       }
@@ -808,6 +812,109 @@ async function handleDialpadCallWebhook(request, env) {
 
   } catch (error) {
     console.error({ message: `[Dialpad/calls] unhandled error: ${error.message}`, source: 'dialpad-calls', stack: error.stack });
+    return new Response('Internal Server Error', { status: 500 });
+  }
+}
+
+async function handleApolloWebhook(request, env, url) {
+  try {
+    const webhookSecret = env.APOLLO_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      console.error({ message: '[Apollo] secret not configured', source: 'apollo' });
+      return new Response('Unauthorized', { status: 401 });
+    }
+    const token = url.searchParams.get('token');
+    if (!token || token !== webhookSecret) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+
+    const rfId = url.searchParams.get('rfId');
+    if (!rfId) {
+      return new Response('Bad Request — missing rfId', { status: 400 });
+    }
+
+    const payload = await request.json();
+
+    console.log({
+      message: `[Apollo] webhook rfId=${rfId} personId=${payload.person?.id} phoneCount=${payload.phone_numbers?.length || 0}`,
+      source: 'apollo',
+      rfId,
+      personId: payload.person?.id,
+      phoneCount: payload.phone_numbers?.length || 0,
+    });
+
+    // Look up pending enrichment context from KV
+    const pendingRaw = await env.SYNC_STATE.get(`apollo_enrich:${rfId}`);
+    if (!pendingRaw) {
+      console.log({ message: `[Apollo] → no pending enrichment context for rfId=${rfId}, skipping`, source: 'apollo', rfId });
+      return new Response('OK', { status: 200 });
+    }
+    const pending = JSON.parse(pendingRaw);
+
+    // Extract phone numbers
+    const phoneNumbers = payload.phone_numbers;
+    if (!Array.isArray(phoneNumbers) || phoneNumbers.length === 0) {
+      console.log({ message: `[Apollo] → no phone numbers in payload, skipping`, source: 'apollo', rfId });
+      return new Response('OK', { status: 200 });
+    }
+
+    // Pick first valid phone
+    const validPhone = phoneNumbers.find(p => p.sanitized_number && p.status !== 'invalid');
+    if (!validPhone) {
+      console.log({ message: `[Apollo] → no valid phone numbers, skipping`, source: 'apollo', rfId });
+      return new Response('OK', { status: 200 });
+    }
+    const phoneStr = validPhone.sanitized_number;
+
+    // GET current candidate from RF
+    const currentCandidate = await getRFCandidate(rfId, env);
+
+    // Build primary email from current candidate
+    let primaryEmail = '';
+    if (Array.isArray(currentCandidate.email)) {
+      const primary = currentCandidate.email.find(e => e.is_primary === 1);
+      primaryEmail = primary ? primary.email : (currentCandidate.email[0]?.email || '');
+    } else if (typeof currentCandidate.email === 'string') {
+      primaryEmail = currentCandidate.email;
+    }
+
+    // Build Dialpad candidate object
+    const dialpadCandidate = {
+      id: parseInt(rfId, 10),
+      first_name: currentCandidate.first_name || pending.candidateFirstName || '',
+      last_name: currentCandidate.last_name || pending.candidateLastName || '',
+      name: currentCandidate.name || '',
+      email: primaryEmail,
+      phone_number: phoneStr,
+      current_organization: currentCandidate.current_organization || '',
+      current_title: currentCandidate.current_title || '',
+      linkedin_profile: pending.correctedLinkedIn || currentCandidate.linkedin_profile || '',
+    };
+
+    await createOrUpdateDialpadContact(dialpadCandidate, env);
+
+    // Update cache with new phone merged into existing phones
+    const existingPhones = Array.isArray(currentCandidate.phone_number) ? currentCandidate.phone_number : [];
+    const mergedPhones = [...existingPhones, { phone_number: phoneStr, type: 1 }];
+    await cacheCandidate({
+      ...currentCandidate,
+      phone_number: mergedPhones,
+      linkedin_profile: pending.correctedLinkedIn || currentCandidate.linkedin_profile || '',
+    }, env);
+
+    console.log({
+      message: `[Apollo] → Dialpad upsert + cached rfId=${rfId} phone=${phoneStr}`,
+      source: 'apollo',
+      action: 'apollo_phone_sync',
+      rfId,
+      phone: phoneStr,
+      correctedLinkedIn: pending.correctedLinkedIn || null,
+    });
+
+    return new Response('OK', { status: 200 });
+
+  } catch (error) {
+    console.error({ message: '[Apollo] error', source: 'apollo', error: error.message });
     return new Response('Internal Server Error', { status: 500 });
   }
 }

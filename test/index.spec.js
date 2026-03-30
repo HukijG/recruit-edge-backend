@@ -1211,3 +1211,48 @@ describe('enrichCandidate', () => {
 		expect(result.reason).toBe('already_attempted');
 	});
 });
+
+// ---------------------------------------------------------------------------
+// Apollo webhook handler auth tests
+// ---------------------------------------------------------------------------
+
+describe('Apollo webhook handler', () => {
+	it('returns 401 without token query param', async () => {
+		const request = new Request('http://example.com/webhook/apollo', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(401);
+	});
+
+	it('returns 401 with wrong token', async () => {
+		const request = new Request('http://example.com/webhook/apollo?token=wrong', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(401);
+	});
+
+	it('returns 400 when rfId is missing from query params', async () => {
+		const request = new Request(
+			`http://example.com/webhook/apollo?token=${env.APOLLO_WEBHOOK_SECRET}`,
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({}),
+			}
+		);
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(400);
+	});
+});
