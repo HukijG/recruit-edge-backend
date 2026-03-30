@@ -8,6 +8,7 @@ import {
 import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
 import { processCallEvent, checkPendingColdCall } from './cold-call.js';
+import { isJoelCandidate, enrichCandidate } from './enrichment.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -111,6 +112,30 @@ async function handleRecruiterflowWebhook(request, env) {
     });
 
     if (eventType === 'Created' || eventType === 'Updated') {
+      // Apollo enrichment on Created events only, for Joel's candidates
+      if (eventType === 'Created') {
+        try {
+          const fullCandidate = await getRFCandidate(candidate.id, env);
+          if (isJoelCandidate(fullCandidate)) {
+            const enrichResult = await enrichCandidate(candidate, fullCandidate, env);
+            if (enrichResult.correctedLinkedIn) {
+              candidate.linkedin_profile = enrichResult.correctedLinkedIn;
+            }
+            console.log({
+              message: `[RF] enrichment: ${enrichResult.enriched ? 'done' : `skipped (${enrichResult.reason})`}`,
+              source: 'rf',
+              candidateId: candidate.id,
+              enriched: enrichResult.enriched,
+              reason: enrichResult.reason,
+              correctedLinkedIn: enrichResult.correctedLinkedIn || null,
+              phoneRequested: enrichResult.phoneRequested || false,
+            });
+          }
+        } catch (error) {
+          console.error({ message: `[RF] enrichment failed (non-fatal)`, source: 'rf', candidateId: candidate.id, error: error.message });
+        }
+      }
+
       const synced = await syncCandidateToDialpad(candidate, env);
       await cacheCandidate(candidate, env);
       console.log({
@@ -166,6 +191,24 @@ async function handleManualRFWebhook(request, env, url) {
       linkedin: candidate.linkedin_profile,
       rfLink: candidate.rf_link,
     });
+
+    // Always enrich on manual send (ownership implicit)
+    try {
+      const fullCandidate = await getRFCandidate(candidate.id, env);
+      const enrichResult = await enrichCandidate(candidate, fullCandidate, env);
+      if (enrichResult.correctedLinkedIn) {
+        candidate.linkedin_profile = enrichResult.correctedLinkedIn;
+      }
+      console.log({
+        message: `[RF/manual] enrichment: ${enrichResult.enriched ? 'done' : `skipped (${enrichResult.reason})`}`,
+        source: 'rf-manual',
+        candidateId: candidate.id,
+        enriched: enrichResult.enriched,
+        reason: enrichResult.reason,
+      });
+    } catch (error) {
+      console.error({ message: `[RF/manual] enrichment failed (non-fatal)`, source: 'rf-manual', candidateId: candidate.id, error: error.message });
+    }
 
     const synced = await syncCandidateToDialpad(candidate, env);
     await cacheCandidate(candidate, env);
