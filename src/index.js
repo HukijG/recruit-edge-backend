@@ -482,9 +482,13 @@ async function processCalendarEvent(payload, env) {
   const currentCandidate = await getRFCandidate(candidateId, env);
 
   // === EMAIL MERGE ===
-  const existingEmails = Array.isArray(currentCandidate.email)
-    ? currentCandidate.email
-    : [];
+  // Normalize existing emails to { email, is_primary } — RF GET may return extra fields
+  // that the UPDATE endpoint rejects, or strings instead of objects.
+  const rawEmails = Array.isArray(currentCandidate.email) ? currentCandidate.email : [];
+  const existingEmails = rawEmails.map(e => {
+    if (typeof e === 'string') return { email: e, is_primary: 0 };
+    return { email: e.email, is_primary: e.is_primary ?? 0 };
+  }).filter(e => e.email);
 
   const emailAlreadyExists = existingEmails.some(
     e => e.email?.toLowerCase() === attendee_email.toLowerCase()
@@ -500,9 +504,12 @@ async function processCalendarEvent(payload, env) {
   }
 
   // === PHONE MERGE ===
-  const existingPhones = Array.isArray(currentCandidate.phone_number)
-    ? currentCandidate.phone_number
-    : [];
+  // Normalize existing phones to { phone_number, type } — same reason as emails.
+  const rawPhones = Array.isArray(currentCandidate.phone_number) ? currentCandidate.phone_number : [];
+  const existingPhones = rawPhones.map(p => {
+    if (typeof p === 'string') return { phone_number: p, type: 1 };
+    return { phone_number: p.phone_number, type: p.type ?? 1 };
+  }).filter(p => p.phone_number);
 
   let mergedPhones = existingPhones;
   let phoneAdded = false;
