@@ -2,7 +2,7 @@ import { env, createExecutionContext, waitOnExecutionContext, SELF } from 'cloud
 import { describe, it, expect, afterEach } from 'vitest';
 import worker from '../src';
 import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
-import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob } from '../src/rf-client.js';
+import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob, convertDialpadContactToRFUpdate } from '../src/rf-client.js';
 import {
 	isJoelsCall, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall,
 	normalizePhone, looksLikePhoneNumber
@@ -1254,5 +1254,43 @@ describe('Apollo webhook handler', () => {
 		const response = await worker.fetch(request, env, ctx);
 		await waitOnExecutionContext(ctx);
 		expect(response.status).toBe(400);
+	});
+});
+
+describe('convertDialpadContactToRFUpdate — removal sync', () => {
+	it('sends empty phone array when Dialpad phones is empty', () => {
+		const contact = { phones: [], emails: ['test@example.com'], primary_email: 'test@example.com', urls: [] };
+		const result = convertDialpadContactToRFUpdate(contact);
+		expect(result.phone_number).toEqual([]);
+	});
+
+	it('sends empty email array when Dialpad emails is empty', () => {
+		const contact = { phones: ['+14155551234'], emails: [], urls: [] };
+		const result = convertDialpadContactToRFUpdate(contact);
+		expect(result.email).toEqual([]);
+	});
+
+	it('clears linkedin when Dialpad urls is empty', () => {
+		const contact = { phones: [], emails: [], urls: [] };
+		const result = convertDialpadContactToRFUpdate(contact);
+		expect(result.linkedin_profile).toBe('');
+	});
+
+	it('still maps phone numbers correctly when present', () => {
+		const contact = { phones: ['+14155551234'], emails: [], urls: [] };
+		const result = convertDialpadContactToRFUpdate(contact);
+		expect(result.phone_number).toEqual([{ phone_number: '+14155551234', type: 1 }]);
+	});
+
+	it('still maps emails correctly when present', () => {
+		const contact = { phones: [], emails: ['test@example.com'], primary_email: 'test@example.com', urls: [] };
+		const result = convertDialpadContactToRFUpdate(contact);
+		expect(result.email).toEqual([{ email: 'test@example.com', is_primary: 1 }]);
+	});
+
+	it('does not include fields when property is undefined', () => {
+		const contact = {};
+		const result = convertDialpadContactToRFUpdate(contact);
+		expect(result).toEqual({});
 	});
 });

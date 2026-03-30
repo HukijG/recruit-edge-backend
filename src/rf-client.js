@@ -220,24 +220,32 @@ export async function addRFCandidateNote(candidateId, htmlContent, env) {
 export function convertDialpadContactToRFUpdate(dialpadContact) {
   const updateData = {};
 
-  if (dialpadContact.emails && dialpadContact.emails.length > 0) {
-    updateData.email = dialpadContact.emails.map((email) => ({
-      email: email,
-      is_primary: email === dialpadContact.primary_email ? 1 : 0
-    }));
+  if (dialpadContact.emails) {
+    updateData.email = dialpadContact.emails.length > 0
+      ? dialpadContact.emails.map((email) => ({
+          email: email,
+          is_primary: email === dialpadContact.primary_email ? 1 : 0
+        }))
+      : [];
   }
 
-  if (dialpadContact.phones && dialpadContact.phones.length > 0) {
-    updateData.phone_number = dialpadContact.phones.map((phone, index) => ({
-      phone_number: phone,
-      type: 1
-    }));
+  if (dialpadContact.phones) {
+    updateData.phone_number = dialpadContact.phones.length > 0
+      ? dialpadContact.phones.map((phone) => ({
+          phone_number: phone,
+          type: 1
+        }))
+      : [];
   }
 
-  if (dialpadContact.urls && dialpadContact.urls.length > 0) {
-    const linkedinUrl = dialpadContact.urls.find(url => url.includes('linkedin.com'));
-    if (linkedinUrl) {
-      updateData.linkedin_profile = linkedinUrl;
+  if (dialpadContact.urls) {
+    if (dialpadContact.urls.length > 0) {
+      const linkedinUrl = dialpadContact.urls.find(url => url.includes('linkedin.com'));
+      if (linkedinUrl) {
+        updateData.linkedin_profile = linkedinUrl;
+      }
+    } else {
+      updateData.linkedin_profile = '';
     }
   }
 
