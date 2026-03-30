@@ -5,7 +5,7 @@
  * (LinkedIn lookup → fallback search → phone reveal).
  */
 
-import { enrichPerson, searchPeople, verifyApolloMatch, scoreSearchResults } from './apollo-client.js';
+import { enrichPerson, searchPeople, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from './apollo-client.js';
 import { updateRFCandidate, addRFCandidateNote } from './rf-client.js';
 
 const JOEL_RF_USER_ID = 900001;
@@ -72,7 +72,7 @@ export async function enrichCandidate(candidate, fullCandidate, env) {
 		const verification = verifyApolloMatch(apolloPerson, candidate);
 		if (!verification.match) {
 			// Mismatch — go to fallback search (step 5)
-			apolloPerson = await fallbackSearch(candidate, env);
+			apolloPerson = await fallbackSearch(candidate, fullCandidate, env);
 			if (apolloPerson) {
 				if (apolloPerson.linkedin_url) {
 					correctedLinkedIn = apolloPerson.linkedin_url;
@@ -139,26 +139,60 @@ export async function enrichCandidate(candidate, fullCandidate, env) {
 
 /**
  * Fallback search when Apollo LinkedIn lookup returns a mismatched person.
- * Searches by name + org keywords, scores results, and enriches best match.
+ * Uses People Search (free) as a pre-filter, then enriches individual results (paid)
+ * and scores them against full RF candidate data.
  *
- * @param {Object} candidate - RF candidate
+ * @param {Object} candidate - RF candidate (webhook payload)
+ * @param {Object} fullCandidate - Full RF candidate from getRFCandidate() GET API
  * @param {Object} env
  * @returns {Promise<Object|null>} Apollo person or null
  */
-async function fallbackSearch(candidate, env) {
-	const keywords = `${candidate.first_name} ${candidate.current_organization}`;
+async function fallbackSearch(candidate, fullCandidate, env) {
+	const rfFirst = (candidate.first_name || '').trim();
+	const rfLast = (candidate.last_name || '').trim();
+	const isSingleCharLast = /^[a-zA-Z]\.?$/.test(rfLast);
+
+	// Build search keywords — include last name when not single-char
+	const namePart = isSingleCharLast ? rfFirst : `${rfFirst} ${rfLast}`;
+	const keywords = `${namePart} ${(candidate.current_organization || '').trim()}`;
+
 	const results = await searchPeople({
 		q_keywords: keywords,
-		person_titles: [candidate.current_title],
+		person_titles: [(candidate.current_title || '').trim()],
 		include_similar_titles: false,
 	}, env);
 
-	const best = scoreSearchResults(results, candidate);
-	if (!best) return null;
+	// Pre-filter: first name match, last_name_obfuscated letter check, cap at 5
+	const filtered = filterSearchResults(results, candidate);
+	if (filtered.length === 0) return null;
 
-	// Enrich the best match to get the full profile
-	const fullPerson = await enrichPerson({ id: best.id }, {}, env);
-	return fullPerson;
+	// Enrich each result and score against full RF candidate data
+	const scored = [];
+	for (const searchResult of filtered) {
+		const enriched = await enrichPerson({ id: searchResult.id }, {}, env);
+		if (!enriched) continue;
+
+		const result = scoreEnrichedCandidate(enriched, fullCandidate);
+		if (result.passed) {
+			scored.push({ person: enriched, ...result });
+		}
+	}
+
+	if (scored.length === 0) return null;
+
+	// Single gate-passing result — accept (gates are strong enough)
+	if (scored.length === 1) return scored[0].person;
+
+	// Multiple gate-passing results — pick best confidence, check for ambiguity
+	scored.sort((a, b) => b.confidence - a.confidence);
+
+	// Ambiguity: top 2 have same confidence → can't distinguish
+	if (scored[0].confidence === scored[1].confidence) return null;
+
+	// Require 60% confidence when disambiguating multiple results
+	if (scored[0].confidence < 60) return null;
+
+	return scored[0].person;
 }
 
 /**

@@ -7,7 +7,7 @@ import {
 	isJoelsCall, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall,
 	normalizePhone, looksLikePhoneNumber
 } from '../src/cold-call.js';
-import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, scoreSearchResults } from '../src/apollo-client.js';
+import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from '../src/apollo-client.js';
 import { isJoelCandidate, enrichCandidate } from '../src/enrichment.js';
 
 describe('RF-Dialpad Sync Worker', () => {
@@ -991,118 +991,187 @@ describe('verifyApolloMatch', () => {
 });
 
 // ---------------------------------------------------------------------------
-// scoreSearchResults tests
+// filterSearchResults tests
 // ---------------------------------------------------------------------------
 
-describe('scoreSearchResults', () => {
-	const rfCandidate = {
+describe('filterSearchResults', () => {
+	it('filters by first name match', () => {
+		const results = [
+			{ first_name: 'Jane', last_name_obfuscated: 'Do*' },
+			{ first_name: 'John', last_name_obfuscated: 'Do*' },
+			{ first_name: 'Jane', last_name_obfuscated: 'Sm***' },
+		];
+		const rfCandidate = { first_name: 'Jane', last_name: 'Doe' };
+		const filtered = filterSearchResults(results, rfCandidate);
+		expect(filtered).toHaveLength(2);
+		expect(filtered.every(r => r.first_name === 'Jane')).toBe(true);
+	});
+
+	it('filters by last_name_obfuscated first letter for single-char last name', () => {
+		const results = [
+			{ first_name: 'Max', last_name_obfuscated: 'Te***' },
+			{ first_name: 'Max', last_name_obfuscated: 'Sm***' },
+			{ first_name: 'Max', last_name_obfuscated: 'Th****' },
+		];
+		const rfCandidate = { first_name: 'Max', last_name: 'T' };
+		const filtered = filterSearchResults(results, rfCandidate);
+		expect(filtered).toHaveLength(2);
+		expect(filtered[0].last_name_obfuscated).toBe('Te***');
+		expect(filtered[1].last_name_obfuscated).toBe('Th****');
+	});
+
+	it('handles single-char last name with dot (e.g. "T.")', () => {
+		const results = [
+			{ first_name: 'Max', last_name_obfuscated: 'Te***' },
+			{ first_name: 'Max', last_name_obfuscated: 'Sm***' },
+		];
+		const rfCandidate = { first_name: 'Max', last_name: 'T.' };
+		const filtered = filterSearchResults(results, rfCandidate);
+		expect(filtered).toHaveLength(1);
+		expect(filtered[0].last_name_obfuscated).toBe('Te***');
+	});
+
+	it('does NOT filter by obfuscated last name for full last names', () => {
+		const results = [
+			{ first_name: 'Jane', last_name_obfuscated: 'Sm***' },
+			{ first_name: 'Jane', last_name_obfuscated: 'Do*' },
+		];
+		const rfCandidate = { first_name: 'Jane', last_name: 'Doe' };
+		const filtered = filterSearchResults(results, rfCandidate);
+		expect(filtered).toHaveLength(2);
+	});
+
+	it('caps results at 5', () => {
+		const results = Array.from({ length: 10 }, (_, i) => ({
+			first_name: 'Jane',
+			last_name_obfuscated: `Name${i}`,
+		}));
+		const rfCandidate = { first_name: 'Jane', last_name: 'Doe' };
+		const filtered = filterSearchResults(results, rfCandidate);
+		expect(filtered).toHaveLength(5);
+	});
+
+	it('returns empty array for null/empty input', () => {
+		expect(filterSearchResults(null, { first_name: 'Jane' })).toEqual([]);
+		expect(filterSearchResults([], { first_name: 'Jane' })).toEqual([]);
+	});
+
+	it('trims whitespace from names', () => {
+		const results = [{ first_name: '  Jane  ', last_name_obfuscated: 'Do*' }];
+		const rfCandidate = { first_name: ' Jane', last_name: 'Doe' };
+		const filtered = filterSearchResults(results, rfCandidate);
+		expect(filtered).toHaveLength(1);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// scoreEnrichedCandidate tests
+// ---------------------------------------------------------------------------
+
+describe('scoreEnrichedCandidate', () => {
+	const baseApollo = {
 		first_name: 'Jane',
 		last_name: 'Doe',
-		current_title: 'Software Engineer',
-		current_organization: 'Acme Inc',
+		title: 'Software Engineer',
+		organization: { name: 'Acme Inc' },
+		state: 'Massachusetts',
+		city: 'Boston',
+		country: 'United States',
+		employment_history: [],
 	};
 
-	it('returns single match passing all checks', () => {
-		const results = [{
-			first_name: 'Jane',
-			last_name: 'Doe',
-			title: 'Software Engineer',
-			organization: { name: 'Acme' },
-			has_direct_phone: 'Yes',
-		}];
-		const best = scoreSearchResults(results, rfCandidate);
-		expect(best).not.toBeNull();
-		expect(best.first_name).toBe('Jane');
+	const baseRF = {
+		first_name: 'Jane',
+		last_name: 'Doe',
+		current_designation: 'Software Engineer',
+		current_organization: 'Acme Inc',
+		location: { state: 'Massachusetts', city: 'Boston', country: 'United States' },
+		education: [{ school: 'MIT' }],
+	};
+
+	it('passes all gates and scores full confidence with matching data', () => {
+		const apollo = { ...baseApollo, employment_history: [{ degree: 'BS', organization_name: 'MIT' }] };
+		const result = scoreEnrichedCandidate(apollo, baseRF);
+		expect(result.passed).toBe(true);
+		expect(result.confidence).toBe(100);
+		expect(result.gateFailures).toEqual([]);
 	});
 
-	it('returns null when no first name match', () => {
-		const results = [{
-			first_name: 'John',
-			last_name: 'Doe',
-			title: 'Software Engineer',
-			organization: { name: 'Acme' },
-		}];
-		expect(scoreSearchResults(results, rfCandidate)).toBeNull();
+	it('fails first_name gate on mismatch', () => {
+		const apollo = { ...baseApollo, first_name: 'John' };
+		const result = scoreEnrichedCandidate(apollo, baseRF);
+		expect(result.passed).toBe(false);
+		expect(result.gateFailures).toContain('first_name');
 	});
 
-	it('picks the result passing all checks from multiple', () => {
-		const results = [
-			{
-				first_name: 'Jane',
-				last_name: 'Smith',
-				title: 'Designer',
-				organization: { name: 'OtherCo' },
-			},
-			{
-				first_name: 'Jane',
-				last_name: 'Doe',
-				title: 'Software Engineer',
-				organization: { name: 'Acme Inc.' },
-				has_direct_phone: 'Yes',
-			},
-		];
-		const best = scoreSearchResults(results, rfCandidate);
-		expect(best).not.toBeNull();
-		expect(best.last_name).toBe('Doe');
+	it('fails organization gate on mismatch', () => {
+		const apollo = { ...baseApollo, organization: { name: 'OtherCo' } };
+		const result = scoreEnrichedCandidate(apollo, baseRF);
+		expect(result.passed).toBe(false);
+		expect(result.gateFailures).toContain('organization');
 	});
 
-	it('returns null when top two have same score (ambiguous)', () => {
-		const results = [
-			{
-				first_name: 'Jane',
-				last_name: 'Doe',
-				title: 'Software Engineer',
-				organization: { name: 'Different' },
-			},
-			{
-				first_name: 'Jane',
-				last_name: 'Smith',
-				title: 'Software Engineer',
-				organization: { name: 'OtherDifferent' },
-			},
-		];
-		expect(scoreSearchResults(results, rfCandidate)).toBeNull();
+	it('fails last_name gate for full last names on mismatch', () => {
+		const apollo = { ...baseApollo, last_name: 'Smith' };
+		const result = scoreEnrichedCandidate(apollo, baseRF);
+		expect(result.passed).toBe(false);
+		expect(result.gateFailures).toContain('last_name');
 	});
 
-	it('returns null for empty results', () => {
-		expect(scoreSearchResults([], rfCandidate)).toBeNull();
+	it('skips last_name gate for single-char last names', () => {
+		const apollo = { ...baseApollo, last_name: 'Donovan' };
+		const rf = { ...baseRF, last_name: 'D' };
+		const result = scoreEnrichedCandidate(apollo, rf);
+		expect(result.passed).toBe(true);
+		expect(result.gateFailures).not.toContain('last_name');
 	});
 
-	it('returns null for null results', () => {
-		expect(scoreSearchResults(null, rfCandidate)).toBeNull();
+	it('normalizes org names with different suffixes', () => {
+		const apollo = { ...baseApollo, organization: { name: 'Acme, Inc.' } };
+		const result = scoreEnrichedCandidate(apollo, baseRF);
+		expect(result.passed).toBe(true);
 	});
 
-	it('uses has_direct_phone as tiebreaker', () => {
-		const results = [
-			{
-				first_name: 'Jane',
-				last_name: 'Doe',
-				title: 'Software Engineer',
-				organization: { name: 'Acme' },
-				has_direct_phone: 'No',
-			},
-			{
-				first_name: 'Jane',
-				last_name: 'Smith',
-				title: 'Software Engineer',
-				organization: { name: 'Acme' },
-				has_direct_phone: 'Yes',
-			},
-		];
-		const best = scoreSearchResults(results, rfCandidate);
-		expect(best).not.toBeNull();
-		expect(best.last_name).toBe('Smith');
+	it('scores title match (30 points)', () => {
+		const rf = { ...baseRF, location: null, education: [] };
+		const result = scoreEnrichedCandidate(baseApollo, rf);
+		expect(result.passed).toBe(true);
+		expect(result.matches).toContain('title');
+		expect(result.score).toBe(30);
 	});
 
-	it('matches organizations with different suffixes', () => {
-		const results = [{
-			first_name: 'Jane',
-			last_name: 'Doe',
-			title: 'Software Engineer',
-			organization: { name: 'Acme, Inc.' },
-		}];
-		const best = scoreSearchResults(results, rfCandidate);
-		expect(best).not.toBeNull();
+	it('scores location fields independently', () => {
+		const apollo = { ...baseApollo, title: 'Other Title', state: 'Massachusetts', city: 'Springfield', country: 'United States' };
+		const result = scoreEnrichedCandidate(apollo, baseRF);
+		expect(result.passed).toBe(true);
+		expect(result.matches).toContain('state');
+		expect(result.matches).toContain('country');
+		expect(result.mismatches).toContain('city');
+		expect(result.mismatches).toContain('title');
+	});
+
+	it('scores education match via employment_history', () => {
+		const apollo = { ...baseApollo, title: 'Other', employment_history: [{ degree: 'MS', organization_name: 'MIT' }] };
+		const result = scoreEnrichedCandidate(apollo, baseRF);
+		expect(result.passed).toBe(true);
+		expect(result.matches).toContain('education');
+	});
+
+	it('scores 0% confidence when titles mismatch and no other signals', () => {
+		const rf = { ...baseRF, current_designation: '', location: null, education: [] };
+		const apollo = { ...baseApollo, title: '' };
+		const result = scoreEnrichedCandidate(apollo, rf);
+		expect(result.passed).toBe(true);
+		expect(result.confidence).toBe(0);
+		expect(result.maxPossible).toBe(30);
+		expect(result.mismatches).toContain('title');
+	});
+
+	it('trims whitespace from all compared fields', () => {
+		const apollo = { ...baseApollo, first_name: '  Jane  ', last_name: ' Doe ', organization: { name: '  Acme Inc  ' } };
+		const rf = { ...baseRF, first_name: ' Jane', last_name: ' Doe' };
+		const result = scoreEnrichedCandidate(apollo, rf);
+		expect(result.passed).toBe(true);
 	});
 });
 

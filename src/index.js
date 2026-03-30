@@ -93,6 +93,7 @@ async function handleRecruiterflowWebhook(request, env) {
     }
 
     const eventType = request.headers.get('RF-Event-Type');
+    const clonedRequest = request.clone();
     const payload = await request.json();
     const candidate = payload?.candidate;
 
@@ -175,6 +176,7 @@ async function handleManualRFWebhook(request, env, url) {
       return new Response('Unauthorized', { status: 401 });
     }
 
+    const clonedRequest = request.clone();
     const candidate = await request.json();
 
     if (!candidate || !candidate.id) {
