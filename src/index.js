@@ -844,12 +844,15 @@ async function handleApolloWebhook(request, env, url) {
 
     const payload = await request.json();
 
+    // Apollo webhook sends { people: [{ id, phone_numbers, status }] }
+    const person = payload.people?.[0];
+
     console.log({
-      message: `[Apollo] webhook rfId=${rfId} personId=${payload.person?.id} phoneCount=${payload.phone_numbers?.length || 0}`,
+      message: `[Apollo] webhook rfId=${rfId} personId=${person?.id} phoneCount=${person?.phone_numbers?.length || 0}`,
       source: 'apollo',
       rfId,
-      personId: payload.person?.id,
-      phoneCount: payload.phone_numbers?.length || 0,
+      personId: person?.id,
+      phoneCount: person?.phone_numbers?.length || 0,
     });
 
     // Look up pending enrichment context from KV
@@ -860,15 +863,15 @@ async function handleApolloWebhook(request, env, url) {
     }
     const pending = JSON.parse(pendingRaw);
 
-    // Extract phone numbers
-    const phoneNumbers = payload.phone_numbers;
+    // Extract phone numbers from the person object
+    const phoneNumbers = person?.phone_numbers;
     if (!Array.isArray(phoneNumbers) || phoneNumbers.length === 0) {
       console.log({ message: `[Apollo] → no phone numbers in payload, skipping`, source: 'apollo', rfId });
       return new Response('OK', { status: 200 });
     }
 
-    // Pick first valid phone
-    const validPhone = phoneNumbers.find(p => p.sanitized_number && p.status !== 'invalid');
+    // Pick first valid phone — Apollo uses status_cd, not status
+    const validPhone = phoneNumbers.find(p => p.sanitized_number && p.status_cd !== 'invalid_number');
     if (!validPhone) {
       console.log({ message: `[Apollo] → no valid phone numbers, skipping`, source: 'apollo', rfId });
       return new Response('OK', { status: 200 });

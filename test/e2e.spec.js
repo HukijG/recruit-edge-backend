@@ -987,10 +987,13 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 		}), { expirationTtl: 900 });
 
 		const apolloWebhookPayload = {
-			person: { id: 'apollo-123' },
-			phone_numbers: [
-				{ sanitized_number: '+15555550100', status: 'valid_number', raw_number: '(978) 555-0146' },
-			],
+			people: [{
+				id: 'apollo-123',
+				status: 'success',
+				phone_numbers: [
+					{ sanitized_number: '+15555550100', status_cd: 'valid_number', raw_number: '(978) 555-0146' },
+				],
+			}],
 		};
 
 		const request = new Request(
@@ -1031,7 +1034,7 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 		// No enrichment context in KV (expired)
 
 		const apolloWebhookPayload = {
-			phone_numbers: [{ sanitized_number: '+15555550100', status: 'valid_number' }],
+			people: [{ id: 'apollo-456', status: 'success', phone_numbers: [{ sanitized_number: '+15555550100', status_cd: 'valid_number' }] }],
 		};
 
 		const request = new Request(
@@ -1061,7 +1064,7 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 		}), { expirationTtl: 900 });
 
 		const apolloWebhookPayload = {
-			phone_numbers: [{ sanitized_number: '+10000000000', status: 'invalid' }],
+			people: [{ id: 'apollo-123', status: 'success', phone_numbers: [{ sanitized_number: '+10000000000', status_cd: 'invalid_number' }] }],
 		};
 
 		const request = new Request(
