@@ -226,9 +226,9 @@ describe('E2E: RF → Dialpad (Created, not Joel candidate)', () => {
 
 		expect(response.status).toBe(200);
 
-		// Dialpad PUT should have been called
+		// Dialpad GET + PATCH should have been called
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
-		expect(dialpadCalls.length).toBe(1);
+		expect(dialpadCalls.length).toBe(2);
 
 		// Apollo should NOT have been called (not Joel's candidate)
 		const apolloCalls = findCalls(calls, 'apollo.io');
@@ -299,9 +299,9 @@ describe('E2E: RF → Dialpad (Created, Joel candidate, enrichment)', () => {
 		const apolloCalls = findCalls(calls, 'apollo.io');
 		expect(apolloCalls.length).toBeGreaterThanOrEqual(2);
 
-		// Dialpad should still be called
+		// Dialpad GET + PATCH should be called
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
-		expect(dialpadCalls.length).toBe(1);
+		expect(dialpadCalls.length).toBe(2);
 
 		// Enrichment dedup KV should be set
 		const enrichKey = await env.SYNC_STATE.get('apollo_enrich:12345');
@@ -371,9 +371,9 @@ describe('E2E: RF → Dialpad (Updated)', () => {
 
 		expect(response.status).toBe(200);
 
-		// Dialpad called
+		// Dialpad GET + PATCH called
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
-		expect(dialpadCalls.length).toBe(1);
+		expect(dialpadCalls.length).toBe(2);
 
 		// Apollo NOT called (Updated, not Created)
 		const apolloCalls = findCalls(calls, 'apollo.io');
@@ -484,9 +484,9 @@ describe('E2E: Manual RF webhook', () => {
 		const apolloCalls = findCalls(calls, 'apollo.io');
 		expect(apolloCalls.length).toBeGreaterThanOrEqual(1);
 
-		// Dialpad should also be called
+		// Dialpad GET + PATCH should be called
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
-		expect(dialpadCalls.length).toBe(1);
+		expect(dialpadCalls.length).toBe(2);
 	});
 });
 
@@ -720,9 +720,9 @@ describe('E2E: Calendar → RF + Dialpad', () => {
 		const moveCalls = findCalls(calls, '/candidate/move-to-stage');
 		expect(moveCalls.length).toBe(1);
 
-		// Dialpad upsert should be called
+		// Dialpad GET + PATCH should be called
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
-		expect(dialpadCalls.length).toBe(1);
+		expect(dialpadCalls.length).toBe(2);
 	});
 
 	it('skips when no candidate found via any lookup tier', async () => {
@@ -796,9 +796,9 @@ describe('E2E: Calendar → RF + Dialpad', () => {
 		const rfGetCalls = findCalls(calls, '/candidate/get');
 		expect(rfGetCalls.length).toBe(1);
 
-		// Dialpad upsert should run
+		// Dialpad GET + PATCH should run
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
-		expect(dialpadCalls.length).toBe(1);
+		expect(dialpadCalls.length).toBe(2);
 	});
 });
 
@@ -1015,10 +1015,10 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 		const rfGetCalls = findCalls(calls, '/candidate/get');
 		expect(rfGetCalls.length).toBe(1);
 
-		// Dialpad should be updated with the phone
+		// Dialpad GET + PATCH should be called, PATCH body has the phone
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
-		expect(dialpadCalls.length).toBe(1);
-		const dialpadBody = JSON.parse(dialpadCalls[0].opts.body);
+		expect(dialpadCalls.length).toBe(2);
+		const dialpadBody = JSON.parse(dialpadCalls[1].opts.body);
 		expect(dialpadBody.phones).toContain('+15555550100');
 
 		// Cache should be updated with phone
@@ -1474,8 +1474,8 @@ describe('E2E: Enrichment resilience', () => {
 		const apolloCalls = findCalls(calls, 'apollo.io');
 		expect(apolloCalls.length).toBeGreaterThanOrEqual(1);
 
-		// Dialpad should STILL be called (enrichment failure is non-fatal)
+		// Dialpad GET + PATCH should STILL be called (enrichment failure is non-fatal)
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
-		expect(dialpadCalls.length).toBe(1);
+		expect(dialpadCalls.length).toBe(2);
 	});
 });
