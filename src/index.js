@@ -65,6 +65,10 @@ export default {
         return await handleTestColdCall(request, env, url);
       }
 
+      if (url.pathname === '/candidates' && request.method === 'POST') {
+        return await handleCandidatesEndpoint(request, env, corsHeaders);
+      }
+
       return new Response('Not Found', {
         status: 404,
         headers: corsHeaders
@@ -982,6 +986,66 @@ async function handleTestColdCall(request, env, url) {
     return new Response(JSON.stringify({ error: error.message }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleCandidatesEndpoint(request, env, corsHeaders) {
+  const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  try {
+    const payload = await request.json();
+
+    if (!payload.candidates || !Array.isArray(payload.candidates)) {
+      return new Response(JSON.stringify({ error: 'Missing or invalid "candidates" array' }), {
+        status: 400,
+        headers: responseHeaders
+      });
+    }
+
+    console.log({
+      message: `[Candidates] Received batch of ${payload.candidates.length} candidates`,
+      source: 'candidates-endpoint',
+      count: payload.candidates.length,
+    });
+
+    for (const [i, candidate] of payload.candidates.entries()) {
+      const currentTitle = candidate.experience?.find(e => e.isCurrent)?.title || null;
+      const currentCompany = candidate.experience?.find(e => e.isCurrent)?.company || null;
+
+      console.log({
+        message: `[Candidates] [${i + 1}/${payload.candidates.length}] ${candidate.fullName}`,
+        source: 'candidates-endpoint',
+        index: i,
+        fullName: candidate.fullName,
+        linkedinUrl: candidate.linkedinUrl,
+        internalTalentUrl: candidate.internalTalentUrl,
+        headline: candidate.headline,
+        location: candidate.location,
+        industry: candidate.industry || '(none)',
+        photoUrl: candidate.photoUrl ? '(present)' : '(none)',
+        connectionDegree: candidate.connectionDegree,
+        pipelineStatus: candidate.pipelineStatus,
+        currentTitle,
+        currentCompany,
+        experienceCount: candidate.experience?.length || 0,
+        totalExperienceCount: candidate.totalExperienceCount,
+        educationCount: candidate.education?.length || 0,
+        experience: candidate.experience,
+        education: candidate.education,
+      });
+    }
+
+    return new Response(JSON.stringify({ received: payload.candidates.length }), {
+      status: 200,
+      headers: responseHeaders
+    });
+
+  } catch (error) {
+    console.error({ message: `[Candidates] Error: ${error.message}`, source: 'candidates-endpoint', stack: error.stack });
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: responseHeaders
     });
   }
 }
