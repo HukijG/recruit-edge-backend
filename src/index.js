@@ -1084,7 +1084,25 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
           dialpadSynced: synced,
         });
 
-        results.push({ fullName: ext.fullName, status: 'created', rfId, dialpadSynced: synced });
+        // Apollo enrichment — skip isJoelCandidate check since the extension is Joel's
+        let enriched = false;
+        try {
+          const enrichResult = await enrichCandidate(rfCandidate, rfCandidate, env);
+          enriched = enrichResult.enriched;
+          console.log({
+            message: `[Candidates] ${label} — enrichment: ${enrichResult.enriched ? 'done' : `skipped (${enrichResult.reason})`}`,
+            source: 'candidates-endpoint',
+            rfId,
+            enriched: enrichResult.enriched,
+            reason: enrichResult.reason,
+            correctedLinkedIn: enrichResult.correctedLinkedIn || null,
+            phoneRequested: enrichResult.phoneRequested || false,
+          });
+        } catch (error) {
+          console.error({ message: `[Candidates] ${label} — enrichment failed (non-fatal)`, source: 'candidates-endpoint', rfId, error: error.message });
+        }
+
+        results.push({ fullName: ext.fullName, status: 'created', rfId, dialpadSynced: synced, enriched });
 
       } catch (error) {
         console.error({
