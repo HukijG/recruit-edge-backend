@@ -467,8 +467,8 @@ export async function addCandidateToJob(candidateId, jobId, env) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      candidate_id: parseInt(candidateId, 10),
-      job_id: parseInt(jobId, 10),
+      "id": parseInt(candidateId, 10),
+      "job_id": parseInt(jobId, 10),
     }),
   });
 
