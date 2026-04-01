@@ -880,29 +880,17 @@ async function handleApolloWebhook(request, env, url) {
     }
     const phoneStr = validPhone.sanitized_number;
 
-    // GET current candidate from RF
+    // GET current candidate from RF to merge phone into existing data
     const currentCandidate = await getRFCandidate(rfId, env);
 
-    // Build primary email from current candidate
-    let primaryEmail = '';
-    if (Array.isArray(currentCandidate.email)) {
-      const primary = currentCandidate.email.find(e => e.is_primary === 1);
-      primaryEmail = primary ? primary.email : (currentCandidate.email[0]?.email || '');
-    } else if (typeof currentCandidate.email === 'string') {
-      primaryEmail = currentCandidate.email;
-    }
-
-    // Build Dialpad candidate object
+    // Only send the phone number to Dialpad — don't touch any other fields
+    // The contact already has correct name/title/linkedin from initial creation
     const dialpadCandidate = {
       id: parseInt(rfId, 10),
-      first_name: currentCandidate.first_name || pending.candidateFirstName || '',
-      last_name: currentCandidate.last_name || pending.candidateLastName || '',
+      first_name: currentCandidate.first_name || '',
+      last_name: currentCandidate.last_name || '',
       name: currentCandidate.name || '',
-      email: primaryEmail,
       phone_number: phoneStr,
-      current_organization: currentCandidate.current_organization || '',
-      current_title: currentCandidate.current_title || '',
-      linkedin_profile: pending.correctedLinkedIn || currentCandidate.linkedin_profile || '',
     };
 
     await createOrUpdateDialpadContact(dialpadCandidate, env);
@@ -913,16 +901,14 @@ async function handleApolloWebhook(request, env, url) {
     await cacheCandidate({
       ...currentCandidate,
       phone_number: mergedPhones,
-      linkedin_profile: pending.correctedLinkedIn || currentCandidate.linkedin_profile || '',
     }, env);
 
     console.log({
-      message: `[Apollo] → Dialpad upsert + cached rfId=${rfId} phone=${phoneStr}`,
+      message: `[Apollo] → Dialpad phone updated + cached rfId=${rfId} phone=${phoneStr}`,
       source: 'apollo',
       action: 'apollo_phone_sync',
       rfId,
       phone: phoneStr,
-      correctedLinkedIn: pending.correctedLinkedIn || null,
     });
 
     return new Response('OK', { status: 200 });
