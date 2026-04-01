@@ -1,0 +1,102 @@
+{
+    "name": "swagger candidate",
+    "email": [
+        {
+            "email": "swagger@mail.com",
+            "is_primary": 1
+        }
+    ],
+    "phone_number": [
+        {
+            "phone_number": "987689928",
+            "type": 1
+        }
+    ],
+    "linkedin_profile": "https://www.linkedin.com/in/jordan-blake/",
+    "twitter_profile": "https://twitter.com/989fabd17d7341a",
+    "facebook_profile": "https://www.facebook.com/bikash.shaw.56884",
+    "github_profile": "https://github.com/bikashkumarshaw",
+    "angellist_profile": "https://angel.co/u/bikash-shaw-1",
+    "tags": [
+        "swagger"
+    ],
+    "skills": [
+        "swagger"
+    ],
+    "title": "swagger pos",
+    "organization": "swagger company",
+    "source": "linkedin",
+    "lead_owner_id": 1,
+    "custom_fields": [
+        {
+            "id": 16,
+            "value": {
+                "currency": "USD",
+                "number": 600000
+            }
+        },
+        {
+            "id": 17,
+            "value": {
+                "currency": "USD",
+                "number1": 600000,
+                "number2": 800000
+            }
+        },
+        {
+            "id": 19,
+            "value": {
+                "number1": 600000,
+                "number2": 800000
+            }
+        },
+        {
+            "id": 20,
+            "value": [
+                "choice1",
+                "choice2"
+            ]
+        },
+        {
+            "id": 33,
+            "value": "Random"
+        }
+    ],
+    "location": {
+        "location": "New York Metropolitan Area",
+        "city": "New York city",
+        "state": "New York",
+        "country": "United States",
+        "postal_code": "3256"
+    },
+    "experience": [
+        {
+            "organization": "Facebook",
+            "designation": "SDE",
+            "from": [
+                "2",
+                "2021"
+            ],
+            "to": [
+                "2",
+                "2021"
+            ]
+        }
+    ],
+    "education": [
+        {
+            "school": "HPCA",
+            "degree": "10th",
+            "specialization": "MATHS",
+            "from": [
+                "5",
+                "2021"
+            ],
+            "to": [
+                "5",
+                "2022"
+            ]
+        }
+    ],
+    "added_time": "2021-01-12T10:16:16+0000"
+}
