@@ -8,7 +8,8 @@ import {
 import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
 import { processCallEvent, checkPendingColdCall } from './cold-call.js';
-import { isJoelCandidate, enrichCandidate } from './enrichment.js';
+import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enrichment.js';
+import { enrichPerson } from './apollo-client.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -1053,27 +1054,39 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
         }
 
         console.log({
-          message: `[Candidates] ${label} — created in RF (id=${rfId}), syncing to Dialpad`,
+          message: `[Candidates] ${label} — created in RF (id=${rfId}), fetching full candidate`,
           source: 'candidates-endpoint',
           rfId,
         });
 
-        // Build the RF-format candidate object for Dialpad sync + cache
-        const currentExp = ext.experience?.find(e => e.isCurrent);
-        const nameParts = ext.fullName.trim().split(/\s+/);
+        // Fetch the full RF candidate so we have proper field names + structure
+        const fullCandidate = await getRFCandidate(rfId, env);
+
+        // Build the webhook-format candidate for Dialpad sync + cache
+        // Use extension LinkedIn (correct) — RF may not return it immediately
+        let primaryEmail = '';
+        if (Array.isArray(fullCandidate.email) && fullCandidate.email.length > 0) {
+          const primary = fullCandidate.email.find(e => e.is_primary === 1);
+          primaryEmail = primary ? primary.email : (fullCandidate.email[0]?.email || '');
+        }
+        let phoneStr = '';
+        if (Array.isArray(fullCandidate.phone_number) && fullCandidate.phone_number.length > 0) {
+          phoneStr = fullCandidate.phone_number[0]?.phone_number || '';
+        }
+
         const rfCandidate = {
           id: rfId,
-          first_name: nameParts[0] || '',
-          last_name: nameParts.slice(1).join(' ') || '',
-          name: ext.fullName,
-          current_organization: currentExp?.company || '',
-          current_title: currentExp?.title || '',
-          linkedin_profile: ext.linkedinUrl || '',
-          email: '',
-          phone_number: '',
+          first_name: fullCandidate.first_name || '',
+          last_name: fullCandidate.last_name || '',
+          name: fullCandidate.name || ext.fullName,
+          current_organization: fullCandidate.current_organization || '',
+          current_title: fullCandidate.current_title || '',
+          linkedin_profile: ext.linkedinUrl || fullCandidate.linkedin_profile || '',
+          email: primaryEmail,
+          phone_number: phoneStr,
         };
 
-        // Sync to Dialpad (reuse existing flow — creates contact + sets debounce)
+        // Sync to Dialpad (creates contact with uid=RF{id} + sets debounce)
         const synced = await syncCandidateToDialpad(rfCandidate, env);
         await cacheCandidate(rfCandidate, env);
 
@@ -1084,25 +1097,40 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
           dialpadSynced: synced,
         });
 
-        // Apollo enrichment — skip isJoelCandidate check since the extension is Joel's
-        let enriched = false;
-        try {
-          const enrichResult = await enrichCandidate(rfCandidate, rfCandidate, env);
-          enriched = enrichResult.enriched;
-          console.log({
-            message: `[Candidates] ${label} — enrichment: ${enrichResult.enriched ? 'done' : `skipped (${enrichResult.reason})`}`,
-            source: 'candidates-endpoint',
-            rfId,
-            enriched: enrichResult.enriched,
-            reason: enrichResult.reason,
-            correctedLinkedIn: enrichResult.correctedLinkedIn || null,
-            phoneRequested: enrichResult.phoneRequested || false,
-          });
-        } catch (error) {
-          console.error({ message: `[Candidates] ${label} — enrichment failed (non-fatal)`, source: 'candidates-endpoint', rfId, error: error.message });
+        // Apollo phone reveal — LinkedIn URL is already correct from the extension,
+        // just look up the person and request phone. No verification/fallback/LinkedIn correction.
+        let phoneRequested = false;
+        if (rfCandidate.linkedin_profile && !phoneStr) {
+          try {
+            const apolloPerson = await enrichPerson({ linkedin_url: rfCandidate.linkedin_profile }, {}, env);
+            if (apolloPerson) {
+              const webhookUrl = buildApolloWebhookUrl(rfId, env);
+              await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, webhook_url: webhookUrl }, env);
+              // Store KV context so Apollo webhook can find this candidate
+              await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
+                apolloPersonId: apolloPerson.id,
+                timestamp: new Date().toISOString(),
+              }), { expirationTtl: 900 });
+              phoneRequested = true;
+              console.log({
+                message: `[Candidates] ${label} — phone reveal requested (apolloId=${apolloPerson.id})`,
+                source: 'candidates-endpoint',
+                rfId,
+                apolloPersonId: apolloPerson.id,
+              });
+            } else {
+              console.log({
+                message: `[Candidates] ${label} — Apollo lookup returned no person, skipping phone reveal`,
+                source: 'candidates-endpoint',
+                rfId,
+              });
+            }
+          } catch (error) {
+            console.error({ message: `[Candidates] ${label} — phone reveal failed (non-fatal): ${error.message}`, source: 'candidates-endpoint', rfId });
+          }
         }
 
-        results.push({ fullName: ext.fullName, status: 'created', rfId, dialpadSynced: synced, enriched });
+        results.push({ fullName: ext.fullName, status: 'created', rfId, dialpadSynced: synced, phoneRequested });
 
       } catch (error) {
         console.error({

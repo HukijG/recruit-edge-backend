@@ -38,7 +38,7 @@ export function isJoelCandidate(fullCandidate) {
  * @param {Object} env
  * @returns {string}
  */
-function buildApolloWebhookUrl(rfCandidateId, env) {
+export function buildApolloWebhookUrl(rfCandidateId, env) {
 	const base = env.WORKER_URL || 'https://rf-dialpad-sync-dev.example-account.workers.dev';
 	return `${base}/webhook/apollo?token=${encodeURIComponent(env.APOLLO_WEBHOOK_SECRET)}&rfId=${rfCandidateId}`;
 }
