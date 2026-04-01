@@ -885,17 +885,7 @@ async function handleApolloWebhook(request, env, url) {
     }
     const phoneStr = validPhone.sanitized_number;
 
-    // Patch Dialpad with ONLY the phone — contact already exists from initial sync
-    console.log({
-      message: `[Apollo] → patching Dialpad phone rfId=${rfId}`,
-      source: 'apollo',
-      rfId,
-      phone: phoneStr,
-    });
-
-    await patchDialpadContact(rfId, { phones: [phoneStr] }, env);
-
-    // Update RF directly — don't rely on Dialpad→RF roundtrip
+    // Update RF directly with the phone
     const currentCandidate = await getRFCandidate(rfId, env);
     const existingPhones = Array.isArray(currentCandidate.phone_number) ? currentCandidate.phone_number : [];
     const alreadyHasPhone = existingPhones.some(p => p.phone_number === phoneStr);
@@ -904,6 +894,9 @@ async function handleApolloWebhook(request, env, url) {
       await updateRFCandidate(rfId, { phone_number: mergedPhones }, env);
       console.log({ message: `[Apollo] → RF updated with phone rfId=${rfId}`, source: 'apollo', rfId, phone: phoneStr });
     }
+
+    // Patch Dialpad with ONLY the phone — contact exists from initial sync
+    await patchDialpadContact(rfId, { phones: [phoneStr] }, env);
 
     // Update cache with new phone
     const cached = await getCachedCandidate(rfId, env);
@@ -1064,8 +1057,11 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
         // Fetch the full RF candidate so we have proper field names + structure
         const fullCandidate = await getRFCandidate(rfId, env);
 
-        // Build the webhook-format candidate for Dialpad sync + cache
-        // Use extension LinkedIn (correct) — RF may not return it immediately
+        // Build the candidate for Dialpad sync + cache
+        // Use extension data directly — RF GET may not return org/title immediately after creation
+        const currentExp = ext.experience?.find(e => e.isCurrent);
+        const nameParts = ext.fullName.trim().split(/\s+/);
+
         let primaryEmail = '';
         if (Array.isArray(fullCandidate.email) && fullCandidate.email.length > 0) {
           const primary = fullCandidate.email.find(e => e.is_primary === 1);
@@ -1078,11 +1074,11 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
 
         const rfCandidate = {
           id: rfId,
-          first_name: fullCandidate.first_name || '',
-          last_name: fullCandidate.last_name || '',
-          name: fullCandidate.name || ext.fullName,
-          current_organization: fullCandidate.current_organization || '',
-          current_title: fullCandidate.current_title || '',
+          first_name: nameParts[0] || fullCandidate.first_name || '',
+          last_name: nameParts.slice(1).join(' ') || fullCandidate.last_name || '',
+          name: ext.fullName,
+          current_organization: currentExp?.company || fullCandidate.current_organization || '',
+          current_title: currentExp?.title || fullCandidate.current_title || '',
           linkedin_profile: ext.linkedinUrl || fullCandidate.linkedin_profile || '',
           email: primaryEmail,
           phone_number: phoneStr,
