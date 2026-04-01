@@ -93,23 +93,39 @@ function prepareContactData(candidate, uid) {
     uid: uid,
     first_name: firstName,
     last_name: lastName,
-    emails: [],
-    phones: [],
-    company_name: candidate.current_organization || '',
-    job_title: candidate.current_title || '',
-    urls: []
   };
 
+  // Only include fields that have values — Dialpad blanks fields that receive empty values
+  if (candidate.current_organization) {
+    contactData.company_name = candidate.current_organization;
+  }
+
+  if (candidate.current_title) {
+    contactData.job_title = candidate.current_title;
+  }
+
+  const emails = [];
   if (candidate.email && candidate.email.trim() !== '') {
-    contactData.emails.push(candidate.email.trim());
+    emails.push(candidate.email.trim());
+  }
+  if (emails.length > 0) {
+    contactData.emails = emails;
   }
 
+  const phones = [];
   if (candidate.phone_number && candidate.phone_number.trim() !== '') {
-    contactData.phones.push(candidate.phone_number.trim());
+    phones.push(candidate.phone_number.trim());
+  }
+  if (phones.length > 0) {
+    contactData.phones = phones;
   }
 
+  const urls = [];
   if (candidate.linkedin_profile && candidate.linkedin_profile.trim() !== '') {
-    contactData.urls.push(candidate.linkedin_profile.trim());
+    urls.push(candidate.linkedin_profile.trim());
+  }
+  if (urls.length > 0) {
+    contactData.urls = urls;
   }
 
   return contactData;
