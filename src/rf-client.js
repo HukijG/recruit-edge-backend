@@ -401,3 +401,82 @@ export async function moveToCallBooked(candidateId, candidateData, env) {
 
   return { moved: true, jobId: eligible.job_id };
 }
+
+/**
+ * Fetch all open jobs from RF, paginating through all pages.
+ * Returns slim objects: { id, name, company }
+ */
+export async function listOpenJobs(env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const allJobs = [];
+  let page = 1;
+  const perPage = 50;
+
+  while (true) {
+    const url = `${rfBaseUrl}/job/list?only_open=1&items_per_page=${perPage}&current_page=${page}`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { 'RF-Api-Key': rfApiKey },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`RF job/list error: ${response.status}`, errorText);
+      throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    }
+
+    const jobs = await response.json();
+    if (!Array.isArray(jobs) || jobs.length === 0) break;
+
+    for (const job of jobs) {
+      allJobs.push({
+        id: job.id,
+        name: job.name || job.title || '',
+        company: job.company?.name || '',
+      });
+    }
+
+    if (jobs.length < perPage) break;
+    page++;
+  }
+
+  return allJobs;
+}
+
+/**
+ * Add a candidate to a job in RF.
+ */
+export async function addCandidateToJob(candidateId, jobId, env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const response = await fetch(`${rfBaseUrl}/candidate/add-to-job`, {
+    method: 'POST',
+    headers: {
+      'RF-Api-Key': rfApiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      candidate_id: parseInt(candidateId, 10),
+      job_id: parseInt(jobId, 10),
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`RF add-to-job error: ${response.status}`, errorText);
+    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+  }
+
+  return await response.json();
+}

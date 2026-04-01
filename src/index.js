@@ -3,7 +3,8 @@ import { verifyJWT } from './auth.js';
 import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
-  searchRFCandidateByEmail, addRFCandidateNote, moveToCallBooked, addRFCandidate
+  searchRFCandidateByEmail, addRFCandidateNote, moveToCallBooked, addRFCandidate,
+  listOpenJobs, addCandidateToJob
 } from './rf-client.js';
 import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
@@ -68,6 +69,10 @@ export default {
 
       if (url.pathname === '/candidates' && request.method === 'POST') {
         return await handleCandidatesEndpoint(request, env, corsHeaders);
+      }
+
+      if (url.pathname === '/candidates/add-to-job' && request.method === 'POST') {
+        return await handleAddToJobEndpoint(request, env, corsHeaders);
       }
 
       return new Response('Not Found', {
@@ -1157,7 +1162,15 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
       errors,
     });
 
-    return new Response(JSON.stringify({ total, created, skipped, errors, results }), {
+    // Fetch open jobs for the extension's job selector dropdown
+    let jobs = [];
+    try {
+      jobs = await listOpenJobs(env);
+    } catch (error) {
+      console.error({ message: `[Candidates] Failed to fetch jobs: ${error.message}`, source: 'candidates-endpoint' });
+    }
+
+    return new Response(JSON.stringify({ total, created, skipped, errors, results, jobs }), {
       status: 200,
       headers: responseHeaders
     });
@@ -1212,4 +1225,64 @@ function mapExtensionToRFCandidate(ext) {
   }
 
   return rfCandidate;
+}
+
+async function handleAddToJobEndpoint(request, env, corsHeaders) {
+  const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  try {
+    const payload = await request.json();
+    const { rfIds, jobId } = payload;
+
+    if (!Array.isArray(rfIds) || rfIds.length === 0) {
+      return new Response(JSON.stringify({ error: 'Missing or empty "rfIds" array' }), {
+        status: 400, headers: responseHeaders
+      });
+    }
+    if (!jobId) {
+      return new Response(JSON.stringify({ error: 'Missing "jobId"' }), {
+        status: 400, headers: responseHeaders
+      });
+    }
+
+    console.log({
+      message: `[AddToJob] Adding ${rfIds.length} candidates to job ${jobId}`,
+      source: 'add-to-job',
+      rfIds,
+      jobId,
+    });
+
+    const results = [];
+    for (const rfId of rfIds) {
+      try {
+        await addCandidateToJob(rfId, jobId, env);
+        console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} ✓`, source: 'add-to-job' });
+        results.push({ rfId, status: 'added' });
+      } catch (error) {
+        console.error({ message: `[AddToJob] rfId=${rfId} → job ${jobId} failed: ${error.message}`, source: 'add-to-job' });
+        results.push({ rfId, status: 'error', reason: error.message });
+      }
+    }
+
+    const added = results.filter(r => r.status === 'added').length;
+    const errors = results.filter(r => r.status === 'error').length;
+
+    console.log({
+      message: `[AddToJob] Done: ${added} added, ${errors} errors`,
+      source: 'add-to-job',
+      jobId,
+      added,
+      errors,
+    });
+
+    return new Response(JSON.stringify({ jobId, added, errors, results }), {
+      status: 200, headers: responseHeaders
+    });
+
+  } catch (error) {
+    console.error({ message: `[AddToJob] Error: ${error.message}`, source: 'add-to-job', stack: error.stack });
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500, headers: responseHeaders
+    });
+  }
 }
