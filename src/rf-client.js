@@ -48,6 +48,35 @@ export async function updateRFCandidate(candidateId, updateData, env) {
 }
 
 /**
+ * Create a new candidate in RecruiterFlow
+ */
+export async function addRFCandidate(candidateData, env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const response = await fetch(`${rfBaseUrl}/candidate/add`, {
+    method: 'POST',
+    headers: {
+      'RF-Api-Key': rfApiKey,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(candidateData)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`RF add candidate error: ${response.status}`, errorText);
+    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+  }
+
+  return await response.json();
+}
+
+/**
  * Check if a LinkedIn answer is actually a valid LinkedIn URL
  */
 export function isValidLinkedInUrl(answer) {

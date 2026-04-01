@@ -3,7 +3,7 @@ import { verifyJWT } from './auth.js';
 import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
-  searchRFCandidateByEmail, addRFCandidateNote, moveToCallBooked
+  searchRFCandidateByEmail, addRFCandidateNote, moveToCallBooked, addRFCandidate
 } from './rf-client.js';
 import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
@@ -1003,40 +1003,112 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
       });
     }
 
+    const total = payload.candidates.length;
     console.log({
-      message: `[Candidates] Received batch of ${payload.candidates.length} candidates`,
+      message: `[Candidates] Received batch of ${total} candidates`,
       source: 'candidates-endpoint',
-      count: payload.candidates.length,
+      count: total,
     });
 
-    for (const [i, candidate] of payload.candidates.entries()) {
-      const currentTitle = candidate.experience?.find(e => e.isCurrent)?.title || null;
-      const currentCompany = candidate.experience?.find(e => e.isCurrent)?.company || null;
+    const results = [];
 
-      console.log({
-        message: `[Candidates] [${i + 1}/${payload.candidates.length}] ${candidate.fullName}`,
-        source: 'candidates-endpoint',
-        index: i,
-        fullName: candidate.fullName,
-        linkedinUrl: candidate.linkedinUrl,
-        internalTalentUrl: candidate.internalTalentUrl,
-        headline: candidate.headline,
-        location: candidate.location,
-        industry: candidate.industry || '(none)',
-        photoUrl: candidate.photoUrl ? '(present)' : '(none)',
-        connectionDegree: candidate.connectionDegree,
-        pipelineStatus: candidate.pipelineStatus,
-        currentTitle,
-        currentCompany,
-        experienceCount: candidate.experience?.length || 0,
-        totalExperienceCount: candidate.totalExperienceCount,
-        educationCount: candidate.education?.length || 0,
-        experience: candidate.experience,
-        education: candidate.education,
-      });
+    for (const [i, ext] of payload.candidates.entries()) {
+      const label = `[${i + 1}/${total}] ${ext.fullName}`;
+      try {
+        // Check if candidate already exists in RF by LinkedIn URL
+        const existing = ext.linkedinUrl
+          ? await searchRFCandidateByLinkedIn(ext.linkedinUrl, env)
+          : null;
+
+        if (existing) {
+          console.log({
+            message: `[Candidates] ${label} — already in RF (id=${existing.id}), skipping`,
+            source: 'candidates-endpoint',
+          });
+          results.push({ fullName: ext.fullName, status: 'skipped', reason: 'already_exists', rfId: existing.id });
+          continue;
+        }
+
+        // Map extension payload → RF candidate/add format
+        const rfPayload = mapExtensionToRFCandidate(ext);
+
+        console.log({
+          message: `[Candidates] ${label} — creating in RF`,
+          source: 'candidates-endpoint',
+          rfPayload,
+        });
+
+        // Create in RF
+        const rfResult = await addRFCandidate(rfPayload, env);
+        const rfId = rfResult?.data?.id;
+
+        if (!rfId) {
+          console.error({
+            message: `[Candidates] ${label} — RF add returned no ID`,
+            source: 'candidates-endpoint',
+            rfResult,
+          });
+          results.push({ fullName: ext.fullName, status: 'error', reason: 'no_rf_id', rfResult });
+          continue;
+        }
+
+        console.log({
+          message: `[Candidates] ${label} — created in RF (id=${rfId}), syncing to Dialpad`,
+          source: 'candidates-endpoint',
+          rfId,
+        });
+
+        // Build the RF-format candidate object for Dialpad sync + cache
+        const currentExp = ext.experience?.find(e => e.isCurrent);
+        const nameParts = ext.fullName.trim().split(/\s+/);
+        const rfCandidate = {
+          id: rfId,
+          first_name: nameParts[0] || '',
+          last_name: nameParts.slice(1).join(' ') || '',
+          name: ext.fullName,
+          current_organization: currentExp?.company || '',
+          current_title: currentExp?.title || '',
+          linkedin_profile: ext.linkedinUrl || '',
+          email: '',
+          phone_number: '',
+        };
+
+        // Sync to Dialpad (reuse existing flow — creates contact + sets debounce)
+        const synced = await syncCandidateToDialpad(rfCandidate, env);
+        await cacheCandidate(rfCandidate, env);
+
+        console.log({
+          message: `[Candidates] ${label} — ${synced ? 'Dialpad synced + cached' : 'Dialpad skipped (validation), cached'} rfId=${rfId}`,
+          source: 'candidates-endpoint',
+          rfId,
+          dialpadSynced: synced,
+        });
+
+        results.push({ fullName: ext.fullName, status: 'created', rfId, dialpadSynced: synced });
+
+      } catch (error) {
+        console.error({
+          message: `[Candidates] ${label} — error: ${error.message}`,
+          source: 'candidates-endpoint',
+          stack: error.stack,
+        });
+        results.push({ fullName: ext.fullName, status: 'error', reason: error.message });
+      }
     }
 
-    return new Response(JSON.stringify({ received: payload.candidates.length }), {
+    const created = results.filter(r => r.status === 'created').length;
+    const skipped = results.filter(r => r.status === 'skipped').length;
+    const errors = results.filter(r => r.status === 'error').length;
+
+    console.log({
+      message: `[Candidates] Batch complete: ${created} created, ${skipped} skipped, ${errors} errors`,
+      source: 'candidates-endpoint',
+      created,
+      skipped,
+      errors,
+    });
+
+    return new Response(JSON.stringify({ total, created, skipped, errors, results }), {
       status: 200,
       headers: responseHeaders
     });
@@ -1048,4 +1120,47 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
       headers: responseHeaders
     });
   }
+}
+
+/**
+ * Map the LinkedIn extension payload to RF's POST /candidate/add format.
+ */
+function mapExtensionToRFCandidate(ext) {
+  const nameParts = ext.fullName.trim().split(/\s+/);
+  const firstName = nameParts[0] || '';
+  const lastName = nameParts.slice(1).join(' ') || '';
+
+  const currentExp = ext.experience?.find(e => e.isCurrent);
+
+  const rfCandidate = {
+    name: ext.fullName,
+    linkedin_profile: ext.linkedinUrl || '',
+    title: currentExp?.title || '',
+    organization: currentExp?.company || '',
+    source: 'linkedin',
+    location: ext.location ? { location: ext.location } : undefined,
+  };
+
+  // Map experience entries
+  if (ext.experience?.length > 0) {
+    rfCandidate.experience = ext.experience.map(exp => ({
+      organization: exp.company || '',
+      designation: exp.title || '',
+      from: exp.startYear ? ['1', String(exp.startYear)] : [],
+      to: exp.isCurrent ? [] : (exp.endYear ? ['1', String(exp.endYear)] : []),
+    }));
+  }
+
+  // Map education entries
+  if (ext.education?.length > 0) {
+    rfCandidate.education = ext.education.map(edu => ({
+      school: edu.institution || '',
+      degree: edu.degree || '',
+      specialization: '',
+      from: edu.startYear ? ['1', String(edu.startYear)] : [],
+      to: edu.endYear ? ['1', String(edu.endYear)] : [],
+    }));
+  }
+
+  return rfCandidate;
 }
