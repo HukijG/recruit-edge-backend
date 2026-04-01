@@ -27,58 +27,34 @@ export async function createOrUpdateDialpadContact(candidate, env) {
     'Authorization': `Bearer ${dialpadApiKey}`
   };
 
+  // Build contact data — only include fields that have actual values
+  const contactData = buildContactData(candidate, uid);
+
   try {
+    console.log({
+      message: `[Dialpad] upserting contact uid=${uid}`,
+      source: 'dialpad',
+      contactId,
+      contactData,
+    });
+
     // Try PATCH (update) first — avoids Dialpad firing "Created" events
     const patchUrl = `${dialpadBaseUrl}/contacts/${encodeURIComponent(contactId)}`;
+    const patchResponse = await fetch(patchUrl, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify(contactData)
+    });
 
-    // GET the existing contact so we can merge — Dialpad PATCH replaces ALL fields,
-    // so omitting a field clears it
-    const getResponse = await fetch(patchUrl, { method: 'GET', headers });
-
-    if (getResponse.ok) {
-      const existing = await getResponse.json();
-      const contactData = mergeContactData(existing, candidate, uid);
-
-      console.log({
-        message: `[Dialpad] PATCHing contact uid=${uid}`,
-        source: 'dialpad',
-        contactId,
-        phones: contactData.phones,
-        urls: contactData.urls,
-        job_title: contactData.job_title,
-        company_name: contactData.company_name,
-      });
-
-      const patchResponse = await fetch(patchUrl, {
-        method: 'PATCH',
-        headers,
-        body: JSON.stringify(contactData)
-      });
-
-      if (patchResponse.ok) {
-        const result = await patchResponse.json();
-        console.log({ message: `[Dialpad] PATCH success uid=${uid}`, source: 'dialpad', contactId });
-        return { success: true, contactId, uid, method: 'update', dialpadResponse: result };
-      }
-
-      const errorText = await patchResponse.text();
-      throw new Error(`Dialpad PATCH error: ${patchResponse.status} - ${errorText}`);
+    if (patchResponse.ok) {
+      const result = await patchResponse.json();
+      console.log({ message: `[Dialpad] PATCH success uid=${uid}`, source: 'dialpad', contactId });
+      return { success: true, contactId, uid, method: 'update', dialpadResponse: result };
     }
 
-    // Contact doesn't exist yet — create with PUT
-    if (getResponse.status === 404) {
-      const contactData = prepareContactData(candidate, uid);
-
-      console.log({
-        message: `[Dialpad] creating contact uid=${uid}`,
-        source: 'dialpad',
-        contactId,
-        phones: contactData.phones,
-        urls: contactData.urls,
-        job_title: contactData.job_title,
-        company_name: contactData.company_name,
-      });
-
+    // Fall back to PUT (create) if contact doesn't exist yet
+    if (patchResponse.status === 404) {
+      console.log({ message: `[Dialpad] PATCH 404 — falling back to PUT uid=${uid}`, source: 'dialpad', contactId });
       const putResponse = await fetch(`${dialpadBaseUrl}/contacts`, {
         method: 'PUT',
         headers,
@@ -95,8 +71,9 @@ export async function createOrUpdateDialpadContact(candidate, env) {
       return { success: true, contactId, uid, method: 'create', dialpadResponse: result };
     }
 
-    const errorText = await getResponse.text();
-    throw new Error(`Dialpad GET error: ${getResponse.status} - ${errorText}`);
+    // Unexpected error from PATCH
+    const errorText = await patchResponse.text();
+    throw new Error(`Dialpad PATCH error: ${patchResponse.status} - ${errorText}`);
 
   } catch (error) {
     console.error('Dialpad API error:', error.message);
@@ -105,10 +82,11 @@ export async function createOrUpdateDialpadContact(candidate, env) {
 }
 
 /**
- * Merge new candidate data into existing Dialpad contact.
- * Only overwrites a field if the new value is non-empty — preserves existing data.
+ * Build contact payload. Only includes fields that have values —
+ * Dialpad PATCH clears any field present with an empty value.
+ * Omitting a field entirely leaves it untouched.
  */
-function mergeContactData(existing, candidate, uid) {
+function buildContactData(candidate, uid) {
   let firstName = candidate.first_name || '';
   let lastName = candidate.last_name || '';
   if (!firstName && !lastName && candidate.name) {
@@ -117,63 +95,15 @@ function mergeContactData(existing, candidate, uid) {
     lastName = parts.slice(1).join(' ') || '';
   }
 
-  return {
-    uid: uid,
-    first_name: firstName || existing.first_name || '',
-    last_name: lastName || existing.last_name || '',
-    company_name: candidate.current_organization || existing.company_name || '',
-    job_title: candidate.current_title || existing.job_title || '',
-    emails: buildMergedArray(existing.emails, candidate.email),
-    phones: buildMergedArray(existing.phones, candidate.phone_number),
-    urls: buildMergedArray(existing.urls, candidate.linkedin_profile),
-  };
-}
+  // uid + name always required
+  const data = { uid, first_name: firstName, last_name: lastName };
 
-/**
- * Merge a new value into an existing array, deduplicating.
- */
-function buildMergedArray(existing, newValue) {
-  const arr = Array.isArray(existing) ? [...existing] : [];
-  if (newValue && newValue.trim() !== '' && !arr.includes(newValue.trim())) {
-    arr.push(newValue.trim());
-  }
-  return arr;
-}
+  if (candidate.current_organization) data.company_name = candidate.current_organization;
+  if (candidate.current_title) data.job_title = candidate.current_title;
 
-/**
- * Build contact data for initial PUT (create) — no existing data to merge with.
- */
-function prepareContactData(candidate, uid) {
-  let firstName = candidate.first_name || '';
-  let lastName = candidate.last_name || '';
-  if (!firstName && !lastName && candidate.name) {
-    const parts = candidate.name.trim().split(/\s+/);
-    firstName = parts[0] || '';
-    lastName = parts.slice(1).join(' ') || '';
-  }
+  if (candidate.email && candidate.email.trim()) data.emails = [candidate.email.trim()];
+  if (candidate.phone_number && candidate.phone_number.trim()) data.phones = [candidate.phone_number.trim()];
+  if (candidate.linkedin_profile && candidate.linkedin_profile.trim()) data.urls = [candidate.linkedin_profile.trim()];
 
-  const contactData = {
-    uid: uid,
-    first_name: firstName,
-    last_name: lastName,
-    company_name: candidate.current_organization || '',
-    job_title: candidate.current_title || '',
-    emails: [],
-    phones: [],
-    urls: [],
-  };
-
-  if (candidate.email && candidate.email.trim() !== '') {
-    contactData.emails.push(candidate.email.trim());
-  }
-
-  if (candidate.phone_number && candidate.phone_number.trim() !== '') {
-    contactData.phones.push(candidate.phone_number.trim());
-  }
-
-  if (candidate.linkedin_profile && candidate.linkedin_profile.trim() !== '') {
-    contactData.urls.push(candidate.linkedin_profile.trim());
-  }
-
-  return contactData;
+  return data;
 }
