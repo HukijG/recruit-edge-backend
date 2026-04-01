@@ -1,4 +1,4 @@
-import { createOrUpdateDialpadContact } from './dialpad-client.js';
+import { createOrUpdateDialpadContact, patchDialpadContact } from './dialpad-client.js';
 import { verifyJWT } from './auth.js';
 import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
@@ -885,48 +885,42 @@ async function handleApolloWebhook(request, env, url) {
     }
     const phoneStr = validPhone.sanitized_number;
 
-    // Build FULL candidate object for Dialpad — merge phone into cached data
-    // KV cache is the source of truth (set during initial Dialpad sync with correct fields)
-    const cached = await getCachedCandidate(rfId, env);
-    const currentCandidate = await getRFCandidate(rfId, env);
+    // Patch Dialpad with ONLY the phone — contact already exists from initial sync
+    console.log({
+      message: `[Apollo] → patching Dialpad phone rfId=${rfId}`,
+      source: 'apollo',
+      rfId,
+      phone: phoneStr,
+    });
 
-    // Prefer cache for fields we know are correct (set during initial sync),
-    // fall back to RF GET
-    const dialpadCandidate = {
+    await patchDialpadContact(rfId, { phones: [phoneStr] }, env);
+
+    // Update RF directly — don't rely on Dialpad→RF roundtrip
+    const currentCandidate = await getRFCandidate(rfId, env);
+    const existingPhones = Array.isArray(currentCandidate.phone_number) ? currentCandidate.phone_number : [];
+    const alreadyHasPhone = existingPhones.some(p => p.phone_number === phoneStr);
+    if (!alreadyHasPhone) {
+      const mergedPhones = [...existingPhones, { phone_number: phoneStr, type: 1 }];
+      await updateRFCandidate(rfId, { phone_number: mergedPhones }, env);
+      console.log({ message: `[Apollo] → RF updated with phone rfId=${rfId}`, source: 'apollo', rfId, phone: phoneStr });
+    }
+
+    // Update cache with new phone
+    const cached = await getCachedCandidate(rfId, env);
+    await cacheCandidate({
+      ...(cached || {}),
       id: parseInt(rfId, 10),
       first_name: cached?.first_name || currentCandidate.first_name || '',
       last_name: cached?.last_name || currentCandidate.last_name || '',
-      name: currentCandidate.name || '',
       current_organization: cached?.current_organization || currentCandidate.current_organization || '',
       current_title: cached?.current_title || currentCandidate.current_title || '',
       linkedin_profile: cached?.linkedin_profile || currentCandidate.linkedin_profile || '',
       email: cached?.email || '',
       phone_number: phoneStr,
-    };
-
-    console.log({
-      message: `[Apollo] → updating Dialpad with phone rfId=${rfId}`,
-      source: 'apollo',
-      rfId,
-      phone: phoneStr,
-      hadCache: !!cached,
-      org: dialpadCandidate.current_organization,
-      title: dialpadCandidate.current_title,
-      linkedin: dialpadCandidate.linkedin_profile,
-    });
-
-    await createOrUpdateDialpadContact(dialpadCandidate, env);
-
-    // Update cache with new phone
-    const existingPhones = Array.isArray(currentCandidate.phone_number) ? currentCandidate.phone_number : [];
-    const mergedPhones = [...existingPhones, { phone_number: phoneStr, type: 1 }];
-    await cacheCandidate({
-      ...dialpadCandidate,
-      phone_number: mergedPhones,
     }, env);
 
     console.log({
-      message: `[Apollo] → Dialpad updated + cached rfId=${rfId} phone=${phoneStr}`,
+      message: `[Apollo] → done rfId=${rfId} phone=${phoneStr}`,
       source: 'apollo',
       action: 'apollo_phone_sync',
       rfId,

@@ -977,6 +977,7 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 		const calls = mockFetch([
 			rfGetCandidateRoute(fullCandidate),
 			dialpadContactRoute(),
+			rfUpdateCandidateRoute(),
 		]);
 
 		// Pre-seed the enrichment context (set during initial enrichment)
@@ -1015,11 +1016,18 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 		const rfGetCalls = findCalls(calls, '/candidate/get');
 		expect(rfGetCalls.length).toBe(1);
 
-		// Dialpad GET + PATCH should be called, PATCH body has the phone
+		// Dialpad PATCH should only contain the phone — nothing else
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
 		expect(dialpadCalls.length).toBe(1);
 		const dialpadBody = JSON.parse(dialpadCalls[0].opts.body);
-		expect(dialpadBody.phones).toContain('+15555550100');
+		expect(dialpadBody).toEqual({ phones: ['+15555550100'] });
+
+		// RF should be updated directly with the phone
+		const rfUpdateCalls = findCalls(calls, '/candidate/update');
+		expect(rfUpdateCalls.length).toBe(1);
+		const rfUpdateBody = JSON.parse(rfUpdateCalls[0].opts.body);
+		expect(rfUpdateBody.phone_number).toBeDefined();
+		expect(rfUpdateBody.phone_number.some(p => p.phone_number === '+15555550100')).toBe(true);
 
 		// Cache should be updated with phone
 		const cached = await env.SYNC_STATE.get('candidate:12345');

@@ -7,7 +7,7 @@
 
 import { enrichPerson, searchPeople, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from './apollo-client.js';
 import { updateRFCandidate, addRFCandidateNote } from './rf-client.js';
-import { createOrUpdateDialpadContact } from './dialpad-client.js';
+import { patchDialpadContact } from './dialpad-client.js';
 
 const JOEL_RF_USER_ID = 900001;
 
@@ -171,18 +171,12 @@ export async function enrichCandidate(candidate, fullCandidate, env) {
 			logError({ message: `[enrich] failed to update RF LinkedIn: ${err.message}`, rfId });
 		}
 
-		// Update Dialpad contact with corrected LinkedIn only — don't touch other fields
+		// Patch Dialpad contact with ONLY the corrected LinkedIn — nothing else
 		try {
-			await createOrUpdateDialpadContact({
-				id: parseInt(rfId, 10),
-				first_name: candidate.first_name || '',
-				last_name: candidate.last_name || '',
-				name: candidate.name || '',
-				linkedin_profile: correctedLinkedIn,
-			}, env);
-			log({ message: `[enrich] updated Dialpad LinkedIn to ${correctedLinkedIn}`, rfId });
+			await patchDialpadContact(rfId, { urls: [correctedLinkedIn] }, env);
+			log({ message: `[enrich] patched Dialpad LinkedIn to ${correctedLinkedIn}`, rfId });
 		} catch (err) {
-			logError({ message: `[enrich] failed to update Dialpad LinkedIn: ${err.message}`, rfId });
+			logError({ message: `[enrich] failed to patch Dialpad LinkedIn: ${err.message}`, rfId });
 		}
 	}
 

@@ -82,6 +82,53 @@ export async function createOrUpdateDialpadContact(candidate, env) {
 }
 
 /**
+ * PATCH an existing Dialpad contact with only the specified fields.
+ * Use this for enrichment/update paths where the contact already exists.
+ * Only sends the fields you pass — nothing else gets touched.
+ *
+ * @param {string|number} rfId - RF candidate ID (used to build the contact ID)
+ * @param {Object} fields - Dialpad API fields to set (e.g. { phones: ['+15551234567'], urls: ['https://...'] })
+ * @param {Object} env
+ */
+export async function patchDialpadContact(rfId, fields, env) {
+  const dialpadApiKey = env.DIALPAD_API_KEY;
+  const dialpadBaseUrl = env.DIALPAD_API_BASE_URL || 'https://dialpad.com/api/v2';
+
+  if (!dialpadApiKey) {
+    throw new Error('DIALPAD_API_KEY environment variable is required');
+  }
+
+  const contactId = buildDialpadContactId(rfId);
+  const patchUrl = `${dialpadBaseUrl}/contacts/${encodeURIComponent(contactId)}`;
+
+  console.log({
+    message: `[Dialpad] PATCH rfId=${rfId} fields=${Object.keys(fields).join(',')}`,
+    source: 'dialpad',
+    contactId,
+    fields,
+  });
+
+  const response = await fetch(patchUrl, {
+    method: 'PATCH',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${dialpadApiKey}`,
+    },
+    body: JSON.stringify(fields),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Dialpad PATCH error: ${response.status} - ${errorText}`);
+  }
+
+  const result = await response.json();
+  console.log({ message: `[Dialpad] PATCH success rfId=${rfId}`, source: 'dialpad', contactId });
+  return result;
+}
+
+/**
  * Build contact payload. Only includes fields that have values —
  * Dialpad PATCH clears any field present with an empty value.
  * Omitting a field entirely leaves it untouched.
