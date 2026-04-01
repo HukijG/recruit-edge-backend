@@ -6,7 +6,8 @@
  */
 
 import { enrichPerson, searchPeople, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from './apollo-client.js';
-import { updateRFCandidate, addRFCandidateNote } from './rf-client.js';
+import { updateRFCandidate, addRFCandidateNote, getRFCandidate } from './rf-client.js';
+import { createOrUpdateDialpadContact } from './dialpad-client.js';
 
 const JOEL_RF_USER_ID = 900001;
 
@@ -161,13 +162,46 @@ export async function enrichCandidate(candidate, fullCandidate, env) {
 		env
 	);
 
-	// Step 7: Update RF if LinkedIn was corrected
+	// Step 7: Update RF + Dialpad if LinkedIn was corrected
 	if (correctedLinkedIn) {
 		try {
 			await updateRFCandidate(rfId, { linkedin_profile: correctedLinkedIn }, env);
 			log({ message: `[enrich] updated RF LinkedIn to ${correctedLinkedIn}`, rfId });
 		} catch (err) {
 			logError({ message: `[enrich] failed to update RF LinkedIn: ${err.message}`, rfId });
+		}
+
+		// Update Dialpad contact with corrected LinkedIn — use full candidate data from RF
+		// to avoid clobbering existing fields (title, org, etc.)
+		try {
+			const freshCandidate = await getRFCandidate(rfId, env);
+			let primaryEmail = '';
+			if (Array.isArray(freshCandidate.email)) {
+				const primary = freshCandidate.email.find(e => e.is_primary === 1);
+				primaryEmail = primary ? primary.email : (freshCandidate.email[0]?.email || '');
+			} else if (typeof freshCandidate.email === 'string') {
+				primaryEmail = freshCandidate.email;
+			}
+			let phoneStr = '';
+			if (Array.isArray(freshCandidate.phone_number) && freshCandidate.phone_number.length > 0) {
+				phoneStr = freshCandidate.phone_number[0]?.phone_number || '';
+			} else if (typeof freshCandidate.phone_number === 'string') {
+				phoneStr = freshCandidate.phone_number;
+			}
+			await createOrUpdateDialpadContact({
+				id: parseInt(rfId, 10),
+				first_name: freshCandidate.first_name || '',
+				last_name: freshCandidate.last_name || '',
+				name: freshCandidate.name || '',
+				email: primaryEmail,
+				phone_number: phoneStr,
+				current_organization: freshCandidate.current_organization || '',
+				current_title: freshCandidate.current_title || '',
+				linkedin_profile: correctedLinkedIn,
+			}, env);
+			log({ message: `[enrich] updated Dialpad LinkedIn to ${correctedLinkedIn}`, rfId });
+		} catch (err) {
+			logError({ message: `[enrich] failed to update Dialpad LinkedIn: ${err.message}`, rfId });
 		}
 	}
 

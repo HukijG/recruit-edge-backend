@@ -117,15 +117,23 @@ async function handleRecruiterflowWebhook(request, env) {
     });
 
     if (eventType === 'Created' || eventType === 'Updated') {
+      // Sync to Dialpad FIRST with original RF data — don't let enrichment mutate the candidate object
+      const synced = await syncCandidateToDialpad(candidate, env);
+      await cacheCandidate(candidate, env);
+      console.log({
+        message: `[RF] → ${synced ? 'Dialpad upsert + cached' : 'skipped Dialpad (validation), cached'} candidate=${candidate.id}`,
+        source: 'rf',
+        action: synced ? 'dialpad_upsert' : 'skipped_validation',
+        candidateId: candidate.id,
+      });
+
       // Apollo enrichment on Created events only, for Joel's candidates
+      // Runs AFTER Dialpad sync — enrichment updates RF + Dialpad independently if it finds better data
       if (eventType === 'Created') {
         try {
           const fullCandidate = await getRFCandidate(candidate.id, env);
           if (isJoelCandidate(fullCandidate)) {
             const enrichResult = await enrichCandidate(candidate, fullCandidate, env);
-            if (enrichResult.correctedLinkedIn) {
-              candidate.linkedin_profile = enrichResult.correctedLinkedIn;
-            }
             console.log({
               message: `[RF] enrichment: ${enrichResult.enriched ? 'done' : `skipped (${enrichResult.reason})`}`,
               source: 'rf',
@@ -140,15 +148,6 @@ async function handleRecruiterflowWebhook(request, env) {
           console.error({ message: `[RF] enrichment failed (non-fatal)`, source: 'rf', candidateId: candidate.id, error: error.message });
         }
       }
-
-      const synced = await syncCandidateToDialpad(candidate, env);
-      await cacheCandidate(candidate, env);
-      console.log({
-        message: `[RF] → ${synced ? 'Dialpad upsert + cached' : 'skipped Dialpad (validation), cached'} candidate=${candidate.id}`,
-        source: 'rf',
-        action: synced ? 'dialpad_upsert' : 'skipped_validation',
-        candidateId: candidate.id,
-      });
     } else {
       console.log({ message: `[RF] → ignored event: ${eventType}`, source: 'rf', event: eventType });
     }
@@ -198,13 +197,21 @@ async function handleManualRFWebhook(request, env, url) {
       rfLink: candidate.rf_link,
     });
 
-    // Always enrich on manual send (ownership implicit)
+    // Sync to Dialpad FIRST with original RF data
+    const synced = await syncCandidateToDialpad(candidate, env);
+    await cacheCandidate(candidate, env);
+
+    console.log({
+      message: `[RF/manual] → ${synced ? 'Dialpad upsert + cached' : 'skipped Dialpad (validation), cached'} candidate=${candidate.id}`,
+      source: 'rf-manual',
+      action: synced ? 'dialpad_upsert' : 'skipped_validation',
+      candidateId: candidate.id,
+    });
+
+    // Enrichment runs AFTER Dialpad sync — updates RF + Dialpad independently if it finds better data
     try {
       const fullCandidate = await getRFCandidate(candidate.id, env);
       const enrichResult = await enrichCandidate(candidate, fullCandidate, env);
-      if (enrichResult.correctedLinkedIn) {
-        candidate.linkedin_profile = enrichResult.correctedLinkedIn;
-      }
       console.log({
         message: `[RF/manual] enrichment: ${enrichResult.enriched ? 'done' : `skipped (${enrichResult.reason})`}`,
         source: 'rf-manual',
@@ -215,16 +222,6 @@ async function handleManualRFWebhook(request, env, url) {
     } catch (error) {
       console.error({ message: `[RF/manual] enrichment failed (non-fatal)`, source: 'rf-manual', candidateId: candidate.id, error: error.message });
     }
-
-    const synced = await syncCandidateToDialpad(candidate, env);
-    await cacheCandidate(candidate, env);
-
-    console.log({
-      message: `[RF/manual] → ${synced ? 'Dialpad upsert + cached' : 'skipped Dialpad (validation), cached'} candidate=${candidate.id}`,
-      source: 'rf-manual',
-      action: synced ? 'dialpad_upsert' : 'skipped_validation',
-      candidateId: candidate.id,
-    });
 
     return new Response('Manual webhook processed successfully', {
       status: 200,
