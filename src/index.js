@@ -1157,7 +1157,7 @@ async function processOneCandidate(ext, i, total, env) {
         const apolloPerson = await enrichPerson({ linkedin_url: rfCandidate.linkedin_profile }, {}, env);
         if (apolloPerson) {
           const webhookUrl = buildApolloWebhookUrl(rfId, env);
-          await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, webhook_url: webhookUrl }, env);
+          await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, run_waterfall_phone: true, webhook_url: webhookUrl }, env);
           await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
             apolloPersonId: apolloPerson.id,
             timestamp: new Date().toISOString(),
