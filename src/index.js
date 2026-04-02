@@ -1322,7 +1322,7 @@ async function handleAddToJobEndpoint(request, env, corsHeaders) {
         console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} ✓`, source: 'add-to-job' });
         return { rfId, status: 'added' };
       } catch (error) {
-        if (error.message.toLowerCase().includes('already in pipeline')) {
+        if (error.message.toLowerCase().includes('already') && error.message.toLowerCase().includes('pipeline')) {
           console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} already in pipeline`, source: 'add-to-job' });
           return { rfId, status: 'already_in_job' };
         } else {
