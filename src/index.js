@@ -68,10 +68,18 @@ export default {
       }
 
       if (url.pathname === '/candidates' && request.method === 'POST') {
+        const extAuth = request.headers.get('X-Extension-Token');
+        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+        }
         return await handleCandidatesEndpoint(request, env, corsHeaders);
       }
 
       if (url.pathname === '/candidates/add-to-job' && request.method === 'POST') {
+        const extAuth = request.headers.get('X-Extension-Token');
+        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+        }
         return await handleAddToJobEndpoint(request, env, corsHeaders);
       }
 
