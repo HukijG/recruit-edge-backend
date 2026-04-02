@@ -82,6 +82,39 @@ export async function createOrUpdateDialpadContact(candidate, env) {
 }
 
 /**
+ * GET a Dialpad contact by RF candidate ID.
+ * Returns the contact object if found, or null if 404.
+ */
+export async function getDialpadContact(rfId, env) {
+  const dialpadApiKey = env.DIALPAD_API_KEY;
+  const dialpadBaseUrl = env.DIALPAD_API_BASE_URL || 'https://dialpad.com/api/v2';
+
+  if (!dialpadApiKey) {
+    throw new Error('DIALPAD_API_KEY environment variable is required');
+  }
+
+  const contactId = buildDialpadContactId(rfId);
+  const response = await fetch(`${dialpadBaseUrl}/contacts/${encodeURIComponent(contactId)}`, {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${dialpadApiKey}`,
+    },
+  });
+
+  if (response.status === 404) {
+    return null;
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Dialpad GET error: ${response.status} - ${errorText}`);
+  }
+
+  return response.json();
+}
+
+/**
  * PATCH an existing Dialpad contact with only the specified fields.
  * Use this for enrichment/update paths where the contact already exists.
  * Only sends the fields you pass — nothing else gets touched.

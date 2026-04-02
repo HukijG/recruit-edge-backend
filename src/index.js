@@ -1,4 +1,4 @@
-import { createOrUpdateDialpadContact, patchDialpadContact } from './dialpad-client.js';
+import { createOrUpdateDialpadContact, patchDialpadContact, getDialpadContact } from './dialpad-client.js';
 import { verifyJWT } from './auth.js';
 import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
@@ -1017,11 +1017,106 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
           : null;
 
         if (existing) {
+          const rfId = existing.id;
           console.log({
-            message: `[Candidates] ${label} — already in RF (id=${existing.id}), skipping`,
+            message: `[Candidates] ${label} — already in RF (id=${rfId}), checking Dialpad`,
             source: 'candidates-endpoint',
           });
-          results.push({ fullName: ext.fullName, status: 'skipped', reason: 'already_exists', rfId: existing.id });
+
+          const currentExp = ext.experience?.find(e => e.isCurrent);
+          const nameParts = ext.fullName.trim().split(/\s+/);
+
+          // Check if Dialpad contact exists
+          let dialpadContact = null;
+          try {
+            dialpadContact = await getDialpadContact(rfId, env);
+          } catch (error) {
+            console.error({ message: `[Candidates] ${label} — Dialpad GET failed: ${error.message}`, source: 'candidates-endpoint' });
+          }
+
+          let dialpadSynced = false;
+
+          if (!dialpadContact) {
+            // Not in Dialpad — full creation with all available fields
+            const fullCandidate = await getRFCandidate(rfId, env);
+
+            let primaryEmail = '';
+            if (Array.isArray(fullCandidate.email) && fullCandidate.email.length > 0) {
+              const primary = fullCandidate.email.find(e => e.is_primary === 1);
+              primaryEmail = primary ? primary.email : (fullCandidate.email[0]?.email || '');
+            }
+            let phoneStr = '';
+            if (Array.isArray(fullCandidate.phone_number) && fullCandidate.phone_number.length > 0) {
+              phoneStr = fullCandidate.phone_number[0]?.phone_number || '';
+            }
+
+            const rfCandidate = {
+              id: rfId,
+              first_name: nameParts[0] || fullCandidate.first_name || '',
+              last_name: nameParts.slice(1).join(' ') || fullCandidate.last_name || '',
+              name: ext.fullName,
+              current_organization: currentExp?.company || fullCandidate.current_organization || '',
+              current_title: currentExp?.title || fullCandidate.current_title || '',
+              linkedin_profile: ext.linkedinUrl || fullCandidate.linkedin_profile || '',
+              email: primaryEmail,
+              phone_number: phoneStr,
+            };
+
+            dialpadSynced = await syncCandidateToDialpad(rfCandidate, env);
+            await cacheCandidate(rfCandidate, env);
+            console.log({ message: `[Candidates] ${label} — created Dialpad contact rfId=${rfId}`, source: 'candidates-endpoint' });
+          } else {
+            // Already in Dialpad — only update company name and job title
+            const patchFields = {};
+            if (currentExp?.company) patchFields.company_name = currentExp.company;
+            if (currentExp?.title) patchFields.job_title = currentExp.title;
+
+            if (Object.keys(patchFields).length > 0) {
+              try {
+                await patchDialpadContact(rfId, patchFields, env);
+                dialpadSynced = true;
+                console.log({ message: `[Candidates] ${label} — patched Dialpad (company/title only) rfId=${rfId}`, source: 'candidates-endpoint' });
+              } catch (error) {
+                console.error({ message: `[Candidates] ${label} — Dialpad PATCH failed: ${error.message}`, source: 'candidates-endpoint' });
+              }
+            }
+          }
+
+          // Apollo phone enrichment — only if Dialpad contact has no phone and no prior attempt
+          let phoneRequested = false;
+          const hasDialpadPhone = dialpadContact?.phones?.length > 0;
+
+          if (!hasDialpadPhone && ext.linkedinUrl) {
+            const apolloFlag = await env.SYNC_STATE.get(`apollo_enrich:${rfId}`);
+            if (!apolloFlag) {
+              try {
+                const apolloPerson = await enrichPerson({ linkedin_url: ext.linkedinUrl }, {}, env);
+                if (apolloPerson) {
+                  const webhookUrl = buildApolloWebhookUrl(rfId, env);
+                  await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, webhook_url: webhookUrl }, env);
+                  await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
+                    apolloPersonId: apolloPerson.id,
+                    timestamp: new Date().toISOString(),
+                  }), { expirationTtl: 900 });
+                  phoneRequested = true;
+                  console.log({ message: `[Candidates] ${label} — phone reveal requested (apolloId=${apolloPerson.id})`, source: 'candidates-endpoint', rfId });
+                } else {
+                  // No Apollo match — set flag so we don't retry
+                  await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
+                    noMatch: true,
+                    timestamp: new Date().toISOString(),
+                  }), { expirationTtl: 900 });
+                  console.log({ message: `[Candidates] ${label} — Apollo returned no match, flagged to skip future attempts`, source: 'candidates-endpoint', rfId });
+                }
+              } catch (error) {
+                console.error({ message: `[Candidates] ${label} — phone reveal failed (non-fatal): ${error.message}`, source: 'candidates-endpoint', rfId });
+              }
+            } else {
+              console.log({ message: `[Candidates] ${label} — Apollo enrichment already attempted, skipping`, source: 'candidates-endpoint', rfId });
+            }
+          }
+
+          results.push({ fullName: ext.fullName, status: 'updated', rfId, dialpadSynced, phoneRequested });
           continue;
         }
 
@@ -1141,11 +1236,12 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
     }
 
     const created = results.filter(r => r.status === 'created').length;
+    const updated = results.filter(r => r.status === 'updated').length;
     const skipped = results.filter(r => r.status === 'skipped').length;
     const errors = results.filter(r => r.status === 'error').length;
 
     console.log({
-      message: `[Candidates] Batch complete: ${created} created, ${skipped} skipped, ${errors} errors`,
+      message: `[Candidates] Batch complete: ${created} created, ${updated} updated, ${skipped} skipped, ${errors} errors`,
       source: 'candidates-endpoint',
       created,
       skipped,
@@ -1160,7 +1256,7 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
       console.error({ message: `[Candidates] Failed to fetch jobs: ${error.message}`, source: 'candidates-endpoint' });
     }
 
-    return new Response(JSON.stringify({ total, created, skipped, errors, results, jobs }), {
+    return new Response(JSON.stringify({ total, created, updated, skipped, errors, results, jobs }), {
       status: 200,
       headers: responseHeaders
     });
