@@ -1006,9 +1006,7 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
       count: total,
     });
 
-    const results = [];
-
-    for (const [i, ext] of payload.candidates.entries()) {
+    const results = await Promise.all(payload.candidates.map(async (ext, i) => {
       const label = `[${i + 1}/${total}] ${ext.fullName}`;
       try {
         // Check if candidate already exists in RF by LinkedIn URL
@@ -1116,8 +1114,7 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
             }
           }
 
-          results.push({ fullName: ext.fullName, status: 'updated', rfId, dialpadSynced, phoneRequested });
-          continue;
+          return { fullName: ext.fullName, status: 'updated', rfId, dialpadSynced, phoneRequested };
         }
 
         // Map extension payload → RF candidate/add format
@@ -1139,8 +1136,7 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
             source: 'candidates-endpoint',
             rfResult,
           });
-          results.push({ fullName: ext.fullName, status: 'error', reason: 'no_rf_id', rfResult });
-          continue;
+          return { fullName: ext.fullName, status: 'error', reason: 'no_rf_id', rfResult };
         }
 
         console.log({
@@ -1223,7 +1219,7 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
           }
         }
 
-        results.push({ fullName: ext.fullName, status: 'created', rfId, dialpadSynced: synced, phoneRequested });
+        return { fullName: ext.fullName, status: 'created', rfId, dialpadSynced: synced, phoneRequested };
 
       } catch (error) {
         console.error({
@@ -1231,9 +1227,9 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
           source: 'candidates-endpoint',
           stack: error.stack,
         });
-        results.push({ fullName: ext.fullName, status: 'error', reason: error.message });
+        return { fullName: ext.fullName, status: 'error', reason: error.message };
       }
-    }
+    }));
 
     const created = results.filter(r => r.status === 'created').length;
     const updated = results.filter(r => r.status === 'updated').length;
@@ -1338,22 +1334,21 @@ async function handleAddToJobEndpoint(request, env, corsHeaders) {
       jobId,
     });
 
-    const results = [];
-    for (const rfId of rfIds) {
+    const results = await Promise.all(rfIds.map(async (rfId) => {
       try {
         await addCandidateToJob(rfId, jobId, env);
         console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} ✓`, source: 'add-to-job' });
-        results.push({ rfId, status: 'added' });
+        return { rfId, status: 'added' };
       } catch (error) {
         if (error.message.toLowerCase().includes('already in pipeline')) {
           console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} already in pipeline`, source: 'add-to-job' });
-          results.push({ rfId, status: 'already_in_job' });
+          return { rfId, status: 'already_in_job' };
         } else {
           console.error({ message: `[AddToJob] rfId=${rfId} → job ${jobId} failed: ${error.message}`, source: 'add-to-job' });
-          results.push({ rfId, status: 'error', reason: error.message });
+          return { rfId, status: 'error', reason: error.message };
         }
       }
-    }
+    }));
 
     const added = results.filter(r => r.status === 'added').length;
     const alreadyInJob = results.filter(r => r.status === 'already_in_job').length;
