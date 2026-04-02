@@ -1046,6 +1046,9 @@ async function processOneCandidate(ext, i, total, env) {
         if (Object.keys(patchFields).length > 0) {
           try {
             await patchDialpadContact(rfId, patchFields, env);
+            // Set debounce flag — prevents Dialpad's "Updated" webhook from syncing
+            // empty email/phone arrays back to RF and clearing existing data
+            await env.SYNC_STATE.put(`sync:RF${rfId}`, 'true', { expirationTtl: 60 });
             dialpadSynced = true;
             console.log({ message: `[Candidates] ${label} — patched Dialpad (company/title only) rfId=${rfId}`, source: 'candidates-endpoint' });
           } catch (error) {
