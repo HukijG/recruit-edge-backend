@@ -969,15 +969,8 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 	afterEach(() => { globalThis.fetch = originalFetch; });
 
 	it('delivers phone from Apollo to Dialpad and updates cache', async () => {
-		const fullCandidate = buildFullRFCandidate({
-			email: [{ email: 'tony@example.com', is_primary: 1 }],
-			phone_number: [],
-		});
-
 		const calls = mockFetch([
-			rfGetCandidateRoute(fullCandidate),
 			dialpadContactRoute(),
-			rfUpdateCandidateRoute(),
 		]);
 
 		// Pre-seed the enrichment context (set during initial enrichment)
@@ -986,6 +979,18 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 			correctedLinkedIn: null,
 			timestamp: new Date().toISOString(),
 		}), { expirationTtl: 900 });
+
+		// Pre-seed cache so the handler can update it
+		await env.SYNC_STATE.put('candidate:12345', JSON.stringify({
+			id: 12345,
+			first_name: 'Tony',
+			last_name: 'Doe',
+			current_organization: 'Datadog',
+			current_title: 'Premier Support Engineer 3',
+			linkedin_profile: 'https://www.linkedin.com/in/jane-doe-000000000',
+			email: 'tony@example.com',
+			phone_number: '',
+		}));
 
 		const apolloWebhookPayload = {
 			people: [{
@@ -1012,28 +1017,21 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 
 		expect(response.status).toBe(200);
 
-		// RF candidate should be fetched for current data
-		const rfGetCalls = findCalls(calls, '/candidate/get');
-		expect(rfGetCalls.length).toBe(1);
-
 		// Dialpad PATCH should only contain the phone — nothing else
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
 		expect(dialpadCalls.length).toBe(1);
 		const dialpadBody = JSON.parse(dialpadCalls[0].opts.body);
 		expect(dialpadBody).toEqual({ phones: ['+15555550100'] });
 
-		// RF should be updated directly with the phone
-		const rfUpdateCalls = findCalls(calls, '/candidate/update');
-		expect(rfUpdateCalls.length).toBe(1);
-		const rfUpdateBody = JSON.parse(rfUpdateCalls[0].opts.body);
-		expect(rfUpdateBody.phone_number).toBeDefined();
-		expect(rfUpdateBody.phone_number.some(p => p.phone_number === '+15555550100')).toBe(true);
+		// No RF calls — Dialpad→RF sync will carry the phone over
+		const rfCalls = findCalls(calls, 'recruiterflow.com');
+		expect(rfCalls.length).toBe(0);
 
 		// Cache should be updated with phone
 		const cached = await env.SYNC_STATE.get('candidate:12345');
 		expect(cached).not.toBeNull();
 		const cachedData = JSON.parse(cached);
-		expect(cachedData.phone_number).toBeDefined();
+		expect(cachedData.phone_number).toBe('+15555550100');
 	});
 
 	it('returns 200 silently when enrichment context expired', async () => {

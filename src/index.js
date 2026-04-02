@@ -885,32 +885,14 @@ async function handleApolloWebhook(request, env, url) {
     }
     const phoneStr = validPhone.sanitized_number;
 
-    // Update RF directly with the phone
-    const currentCandidate = await getRFCandidate(rfId, env);
-    const existingPhones = Array.isArray(currentCandidate.phone_number) ? currentCandidate.phone_number : [];
-    const alreadyHasPhone = existingPhones.some(p => p.phone_number === phoneStr);
-    if (!alreadyHasPhone) {
-      const mergedPhones = [...existingPhones, { phone_number: phoneStr, type: 1 }];
-      await updateRFCandidate(rfId, { phone_number: mergedPhones }, env);
-      console.log({ message: `[Apollo] → RF updated with phone rfId=${rfId}`, source: 'apollo', rfId, phone: phoneStr });
-    }
-
-    // Patch Dialpad with ONLY the phone — contact exists from initial sync
+    // Patch Dialpad with ONLY the phone — Dialpad→RF sync will carry it to RF
     await patchDialpadContact(rfId, { phones: [phoneStr] }, env);
 
     // Update cache with new phone
     const cached = await getCachedCandidate(rfId, env);
-    await cacheCandidate({
-      ...(cached || {}),
-      id: parseInt(rfId, 10),
-      first_name: cached?.first_name || currentCandidate.first_name || '',
-      last_name: cached?.last_name || currentCandidate.last_name || '',
-      current_organization: cached?.current_organization || currentCandidate.current_organization || '',
-      current_title: cached?.current_title || currentCandidate.current_title || '',
-      linkedin_profile: cached?.linkedin_profile || currentCandidate.linkedin_profile || '',
-      email: cached?.email || '',
-      phone_number: phoneStr,
-    }, env);
+    if (cached) {
+      await cacheCandidate({ ...cached, phone_number: phoneStr }, env);
+    }
 
     console.log({
       message: `[Apollo] → done rfId=${rfId} phone=${phoneStr}`,
