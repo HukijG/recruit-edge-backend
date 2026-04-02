@@ -1356,22 +1356,22 @@ describe('Apollo webhook handler', () => {
 });
 
 describe('convertDialpadContactToRFUpdate — removal sync', () => {
-	it('sends empty phone array when Dialpad phones is empty', () => {
+	it('omits phone_number when Dialpad phones is empty', () => {
 		const contact = { phones: [], emails: ['test@example.com'], primary_email: 'test@example.com', urls: [] };
 		const result = convertDialpadContactToRFUpdate(contact);
-		expect(result.phone_number).toEqual([]);
+		expect(result.phone_number).toBeUndefined();
 	});
 
-	it('sends empty email array when Dialpad emails is empty', () => {
+	it('omits email when Dialpad emails is empty', () => {
 		const contact = { phones: ['+14155551234'], emails: [], urls: [] };
 		const result = convertDialpadContactToRFUpdate(contact);
-		expect(result.email).toEqual([]);
+		expect(result.email).toBeUndefined();
 	});
 
-	it('clears linkedin when Dialpad urls is empty', () => {
+	it('omits linkedin when Dialpad urls is empty', () => {
 		const contact = { phones: [], emails: [], urls: [] };
 		const result = convertDialpadContactToRFUpdate(contact);
-		expect(result.linkedin_profile).toBe('');
+		expect(result.linkedin_profile).toBeUndefined();
 	});
 
 	it('still maps phone numbers correctly when present', () => {
