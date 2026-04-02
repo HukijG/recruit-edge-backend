@@ -996,7 +996,13 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
       count: total,
     });
 
-    const results = await Promise.all(payload.candidates.map(async (ext, i) => {
+    // Process in chunks of 5 to avoid overwhelming RF/Dialpad APIs
+    const CHUNK_SIZE = 5;
+    const results = [];
+    for (let c = 0; c < payload.candidates.length; c += CHUNK_SIZE) {
+      const chunk = payload.candidates.slice(c, c + CHUNK_SIZE);
+      const chunkResults = await Promise.all(chunk.map(async (ext, j) => {
+      const i = c + j;
       const label = `[${i + 1}/${total}] ${ext.fullName}`;
       try {
         // Check if candidate already exists in RF by LinkedIn URL
@@ -1130,39 +1136,26 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
         }
 
         console.log({
-          message: `[Candidates] ${label} — created in RF (id=${rfId}), fetching full candidate`,
+          message: `[Candidates] ${label} — created in RF (id=${rfId})`,
           source: 'candidates-endpoint',
           rfId,
         });
 
-        // Fetch the full RF candidate so we have proper field names + structure
-        const fullCandidate = await getRFCandidate(rfId, env);
-
-        // Build the candidate for Dialpad sync + cache
-        // Use extension data directly — RF GET may not return org/title immediately after creation
+        // Build candidate for Dialpad sync + cache from extension data directly
+        // No need to GET from RF — new candidates won't have email/phone yet
         const currentExp = ext.experience?.find(e => e.isCurrent);
         const nameParts = ext.fullName.trim().split(/\s+/);
 
-        let primaryEmail = '';
-        if (Array.isArray(fullCandidate.email) && fullCandidate.email.length > 0) {
-          const primary = fullCandidate.email.find(e => e.is_primary === 1);
-          primaryEmail = primary ? primary.email : (fullCandidate.email[0]?.email || '');
-        }
-        let phoneStr = '';
-        if (Array.isArray(fullCandidate.phone_number) && fullCandidate.phone_number.length > 0) {
-          phoneStr = fullCandidate.phone_number[0]?.phone_number || '';
-        }
-
         const rfCandidate = {
           id: rfId,
-          first_name: nameParts[0] || fullCandidate.first_name || '',
-          last_name: nameParts.slice(1).join(' ') || fullCandidate.last_name || '',
+          first_name: nameParts[0] || '',
+          last_name: nameParts.slice(1).join(' ') || '',
           name: ext.fullName,
-          current_organization: currentExp?.company || fullCandidate.current_organization || '',
-          current_title: currentExp?.title || fullCandidate.current_title || '',
-          linkedin_profile: ext.linkedinUrl || fullCandidate.linkedin_profile || '',
-          email: primaryEmail,
-          phone_number: phoneStr,
+          current_organization: currentExp?.company || '',
+          current_title: currentExp?.title || '',
+          linkedin_profile: ext.linkedinUrl || '',
+          email: '',
+          phone_number: '',
         };
 
         // Sync to Dialpad (creates contact with uid=RF{id} + sets debounce)
@@ -1220,6 +1213,8 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
         return { fullName: ext.fullName, status: 'error', reason: error.message };
       }
     }));
+      results.push(...chunkResults);
+    }
 
     const created = results.filter(r => r.status === 'created').length;
     const updated = results.filter(r => r.status === 'updated').length;
