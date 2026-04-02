@@ -1345,23 +1345,30 @@ async function handleAddToJobEndpoint(request, env, corsHeaders) {
         console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} ✓`, source: 'add-to-job' });
         results.push({ rfId, status: 'added' });
       } catch (error) {
-        console.error({ message: `[AddToJob] rfId=${rfId} → job ${jobId} failed: ${error.message}`, source: 'add-to-job' });
-        results.push({ rfId, status: 'error', reason: error.message });
+        if (error.message.toLowerCase().includes('already in pipeline')) {
+          console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} already in pipeline`, source: 'add-to-job' });
+          results.push({ rfId, status: 'already_in_job' });
+        } else {
+          console.error({ message: `[AddToJob] rfId=${rfId} → job ${jobId} failed: ${error.message}`, source: 'add-to-job' });
+          results.push({ rfId, status: 'error', reason: error.message });
+        }
       }
     }
 
     const added = results.filter(r => r.status === 'added').length;
+    const alreadyInJob = results.filter(r => r.status === 'already_in_job').length;
     const errors = results.filter(r => r.status === 'error').length;
 
     console.log({
-      message: `[AddToJob] Done: ${added} added, ${errors} errors`,
+      message: `[AddToJob] Done: ${added} added, ${alreadyInJob} already in job, ${errors} errors`,
       source: 'add-to-job',
       jobId,
       added,
+      alreadyInJob,
       errors,
     });
 
-    return new Response(JSON.stringify({ jobId, added, errors, results }), {
+    return new Response(JSON.stringify({ jobId, added, alreadyInJob, errors, results }), {
       status: 200, headers: responseHeaders
     });
 
