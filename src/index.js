@@ -976,6 +976,220 @@ async function handleTestColdCall(request, env, url) {
   }
 }
 
+/**
+ * Process a single candidate from the extension batch.
+ * Returns a result object — never throws (catches internally).
+ */
+async function processOneCandidate(ext, i, total, env) {
+  const label = `[${i + 1}/${total}] ${ext.fullName}`;
+  try {
+    // Check if candidate already exists in RF by LinkedIn URL
+    const existing = ext.linkedinUrl
+      ? await searchRFCandidateByLinkedIn(ext.linkedinUrl, env)
+      : null;
+
+    if (existing) {
+      const rfId = existing.id;
+      console.log({
+        message: `[Candidates] ${label} — already in RF (id=${rfId}), checking Dialpad`,
+        source: 'candidates-endpoint',
+      });
+
+      const currentExp = ext.experience?.find(e => e.isCurrent);
+      const nameParts = ext.fullName.trim().split(/\s+/);
+
+      // Check if Dialpad contact exists
+      let dialpadContact = null;
+      try {
+        dialpadContact = await getDialpadContact(rfId, env);
+      } catch (error) {
+        console.error({ message: `[Candidates] ${label} — Dialpad GET failed: ${error.message}`, source: 'candidates-endpoint' });
+      }
+
+      let dialpadSynced = false;
+
+      if (!dialpadContact) {
+        // Not in Dialpad — full creation with all available fields
+        const fullCandidate = await getRFCandidate(rfId, env);
+
+        let primaryEmail = '';
+        if (Array.isArray(fullCandidate.email) && fullCandidate.email.length > 0) {
+          const primary = fullCandidate.email.find(e => e.is_primary === 1);
+          primaryEmail = primary ? primary.email : (fullCandidate.email[0]?.email || '');
+        }
+        let phoneStr = '';
+        if (Array.isArray(fullCandidate.phone_number) && fullCandidate.phone_number.length > 0) {
+          phoneStr = fullCandidate.phone_number[0]?.phone_number || '';
+        }
+
+        const rfCandidate = {
+          id: rfId,
+          first_name: nameParts[0] || fullCandidate.first_name || '',
+          last_name: nameParts.slice(1).join(' ') || fullCandidate.last_name || '',
+          name: ext.fullName,
+          current_organization: currentExp?.company || fullCandidate.current_organization || '',
+          current_title: currentExp?.title || fullCandidate.current_title || '',
+          linkedin_profile: ext.linkedinUrl || fullCandidate.linkedin_profile || '',
+          email: primaryEmail,
+          phone_number: phoneStr,
+        };
+
+        dialpadSynced = await syncCandidateToDialpad(rfCandidate, env);
+        await cacheCandidate(rfCandidate, env);
+        console.log({ message: `[Candidates] ${label} — created Dialpad contact rfId=${rfId}`, source: 'candidates-endpoint' });
+      } else {
+        // Already in Dialpad — only update company name and job title
+        const patchFields = {};
+        if (currentExp?.company) patchFields.company_name = currentExp.company;
+        if (currentExp?.title) patchFields.job_title = currentExp.title;
+
+        if (Object.keys(patchFields).length > 0) {
+          try {
+            await patchDialpadContact(rfId, patchFields, env);
+            dialpadSynced = true;
+            console.log({ message: `[Candidates] ${label} — patched Dialpad (company/title only) rfId=${rfId}`, source: 'candidates-endpoint' });
+          } catch (error) {
+            console.error({ message: `[Candidates] ${label} — Dialpad PATCH failed: ${error.message}`, source: 'candidates-endpoint' });
+          }
+        }
+      }
+
+      // Apollo phone enrichment — only if Dialpad contact has no phone and no prior attempt
+      let phoneRequested = false;
+      const hasDialpadPhone = dialpadContact?.phones?.length > 0;
+
+      if (!hasDialpadPhone && ext.linkedinUrl) {
+        const apolloFlag = await env.SYNC_STATE.get(`apollo_enrich:${rfId}`);
+        if (!apolloFlag) {
+          try {
+            const apolloPerson = await enrichPerson({ linkedin_url: ext.linkedinUrl }, {}, env);
+            if (apolloPerson) {
+              const webhookUrl = buildApolloWebhookUrl(rfId, env);
+              await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, webhook_url: webhookUrl }, env);
+              await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
+                apolloPersonId: apolloPerson.id,
+                timestamp: new Date().toISOString(),
+              }), { expirationTtl: 900 });
+              phoneRequested = true;
+              console.log({ message: `[Candidates] ${label} — phone reveal requested (apolloId=${apolloPerson.id})`, source: 'candidates-endpoint', rfId });
+            } else {
+              await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
+                noMatch: true,
+                timestamp: new Date().toISOString(),
+              }), { expirationTtl: 900 });
+              console.log({ message: `[Candidates] ${label} — Apollo returned no match, flagged to skip future attempts`, source: 'candidates-endpoint', rfId });
+            }
+          } catch (error) {
+            console.error({ message: `[Candidates] ${label} — phone reveal failed (non-fatal): ${error.message}`, source: 'candidates-endpoint', rfId });
+          }
+        } else {
+          console.log({ message: `[Candidates] ${label} — Apollo enrichment already attempted, skipping`, source: 'candidates-endpoint', rfId });
+        }
+      }
+
+      return { fullName: ext.fullName, status: 'updated', rfId, dialpadSynced, phoneRequested };
+    }
+
+    // Map extension payload → RF candidate/add format
+    const rfPayload = mapExtensionToRFCandidate(ext);
+
+    console.log({
+      message: `[Candidates] ${label} — creating in RF`,
+      source: 'candidates-endpoint',
+      rfPayload,
+    });
+
+    // Create in RF
+    const rfResult = await addRFCandidate(rfPayload, env);
+    const rfId = rfResult?.data?.id;
+
+    if (!rfId) {
+      console.error({
+        message: `[Candidates] ${label} — RF add returned no ID`,
+        source: 'candidates-endpoint',
+        rfResult,
+      });
+      return { fullName: ext.fullName, status: 'error', reason: 'no_rf_id', rfResult };
+    }
+
+    console.log({
+      message: `[Candidates] ${label} — created in RF (id=${rfId})`,
+      source: 'candidates-endpoint',
+      rfId,
+    });
+
+    // Build candidate for Dialpad sync + cache from extension data directly
+    // No need to GET from RF — new candidates won't have email/phone yet
+    const currentExp = ext.experience?.find(e => e.isCurrent);
+    const nameParts = ext.fullName.trim().split(/\s+/);
+
+    const rfCandidate = {
+      id: rfId,
+      first_name: nameParts[0] || '',
+      last_name: nameParts.slice(1).join(' ') || '',
+      name: ext.fullName,
+      current_organization: currentExp?.company || '',
+      current_title: currentExp?.title || '',
+      linkedin_profile: ext.linkedinUrl || '',
+      email: '',
+      phone_number: '',
+    };
+
+    // Sync to Dialpad (creates contact with uid=RF{id} + sets debounce)
+    const synced = await syncCandidateToDialpad(rfCandidate, env);
+    await cacheCandidate(rfCandidate, env);
+
+    console.log({
+      message: `[Candidates] ${label} — ${synced ? 'Dialpad synced + cached' : 'Dialpad skipped (validation), cached'} rfId=${rfId}`,
+      source: 'candidates-endpoint',
+      rfId,
+      dialpadSynced: synced,
+    });
+
+    // Apollo phone reveal — LinkedIn URL is already correct from the extension,
+    // just look up the person and request phone. No verification/fallback/LinkedIn correction.
+    let phoneRequested = false;
+    if (rfCandidate.linkedin_profile && !rfCandidate.phone_number) {
+      try {
+        const apolloPerson = await enrichPerson({ linkedin_url: rfCandidate.linkedin_profile }, {}, env);
+        if (apolloPerson) {
+          const webhookUrl = buildApolloWebhookUrl(rfId, env);
+          await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, webhook_url: webhookUrl }, env);
+          await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
+            apolloPersonId: apolloPerson.id,
+            timestamp: new Date().toISOString(),
+          }), { expirationTtl: 900 });
+          phoneRequested = true;
+          console.log({
+            message: `[Candidates] ${label} — phone reveal requested (apolloId=${apolloPerson.id})`,
+            source: 'candidates-endpoint',
+            rfId,
+            apolloPersonId: apolloPerson.id,
+          });
+        } else {
+          console.log({
+            message: `[Candidates] ${label} — Apollo lookup returned no person, skipping phone reveal`,
+            source: 'candidates-endpoint',
+            rfId,
+          });
+        }
+      } catch (error) {
+        console.error({ message: `[Candidates] ${label} — phone reveal failed (non-fatal): ${error.message}`, source: 'candidates-endpoint', rfId });
+      }
+    }
+
+    return { fullName: ext.fullName, status: 'created', rfId, dialpadSynced: synced, phoneRequested };
+
+  } catch (error) {
+    console.error({
+      message: `[Candidates] ${label} — error: ${error.message}`,
+      source: 'candidates-endpoint',
+      stack: error.stack,
+    });
+    return { fullName: ext.fullName, status: 'error', reason: error.message };
+  }
+}
+
 async function handleCandidatesEndpoint(request, env, corsHeaders) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
@@ -996,220 +1210,15 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
       count: total,
     });
 
+    // Process in chunks of 5 for speed, but wait for all chunks before responding
+    const CHUNK_SIZE = 5;
     const results = [];
-
-    for (const [i, ext] of payload.candidates.entries()) {
-      const label = `[${i + 1}/${total}] ${ext.fullName}`;
-      try {
-        // Check if candidate already exists in RF by LinkedIn URL
-        const existing = ext.linkedinUrl
-          ? await searchRFCandidateByLinkedIn(ext.linkedinUrl, env)
-          : null;
-
-        if (existing) {
-          const rfId = existing.id;
-          console.log({
-            message: `[Candidates] ${label} — already in RF (id=${rfId}), checking Dialpad`,
-            source: 'candidates-endpoint',
-          });
-
-          const currentExp = ext.experience?.find(e => e.isCurrent);
-          const nameParts = ext.fullName.trim().split(/\s+/);
-
-          // Check if Dialpad contact exists
-          let dialpadContact = null;
-          try {
-            dialpadContact = await getDialpadContact(rfId, env);
-          } catch (error) {
-            console.error({ message: `[Candidates] ${label} — Dialpad GET failed: ${error.message}`, source: 'candidates-endpoint' });
-          }
-
-          let dialpadSynced = false;
-
-          if (!dialpadContact) {
-            // Not in Dialpad — full creation with all available fields
-            const fullCandidate = await getRFCandidate(rfId, env);
-
-            let primaryEmail = '';
-            if (Array.isArray(fullCandidate.email) && fullCandidate.email.length > 0) {
-              const primary = fullCandidate.email.find(e => e.is_primary === 1);
-              primaryEmail = primary ? primary.email : (fullCandidate.email[0]?.email || '');
-            }
-            let phoneStr = '';
-            if (Array.isArray(fullCandidate.phone_number) && fullCandidate.phone_number.length > 0) {
-              phoneStr = fullCandidate.phone_number[0]?.phone_number || '';
-            }
-
-            const rfCandidate = {
-              id: rfId,
-              first_name: nameParts[0] || fullCandidate.first_name || '',
-              last_name: nameParts.slice(1).join(' ') || fullCandidate.last_name || '',
-              name: ext.fullName,
-              current_organization: currentExp?.company || fullCandidate.current_organization || '',
-              current_title: currentExp?.title || fullCandidate.current_title || '',
-              linkedin_profile: ext.linkedinUrl || fullCandidate.linkedin_profile || '',
-              email: primaryEmail,
-              phone_number: phoneStr,
-            };
-
-            dialpadSynced = await syncCandidateToDialpad(rfCandidate, env);
-            await cacheCandidate(rfCandidate, env);
-            console.log({ message: `[Candidates] ${label} — created Dialpad contact rfId=${rfId}`, source: 'candidates-endpoint' });
-          } else {
-            // Already in Dialpad — only update company name and job title
-            const patchFields = {};
-            if (currentExp?.company) patchFields.company_name = currentExp.company;
-            if (currentExp?.title) patchFields.job_title = currentExp.title;
-
-            if (Object.keys(patchFields).length > 0) {
-              try {
-                await patchDialpadContact(rfId, patchFields, env);
-                dialpadSynced = true;
-                console.log({ message: `[Candidates] ${label} — patched Dialpad (company/title only) rfId=${rfId}`, source: 'candidates-endpoint' });
-              } catch (error) {
-                console.error({ message: `[Candidates] ${label} — Dialpad PATCH failed: ${error.message}`, source: 'candidates-endpoint' });
-              }
-            }
-          }
-
-          // Apollo phone enrichment — only if Dialpad contact has no phone and no prior attempt
-          let phoneRequested = false;
-          const hasDialpadPhone = dialpadContact?.phones?.length > 0;
-
-          if (!hasDialpadPhone && ext.linkedinUrl) {
-            const apolloFlag = await env.SYNC_STATE.get(`apollo_enrich:${rfId}`);
-            if (!apolloFlag) {
-              try {
-                const apolloPerson = await enrichPerson({ linkedin_url: ext.linkedinUrl }, {}, env);
-                if (apolloPerson) {
-                  const webhookUrl = buildApolloWebhookUrl(rfId, env);
-                  await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, webhook_url: webhookUrl }, env);
-                  await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
-                    apolloPersonId: apolloPerson.id,
-                    timestamp: new Date().toISOString(),
-                  }), { expirationTtl: 900 });
-                  phoneRequested = true;
-                  console.log({ message: `[Candidates] ${label} — phone reveal requested (apolloId=${apolloPerson.id})`, source: 'candidates-endpoint', rfId });
-                } else {
-                  // No Apollo match — set flag so we don't retry
-                  await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
-                    noMatch: true,
-                    timestamp: new Date().toISOString(),
-                  }), { expirationTtl: 900 });
-                  console.log({ message: `[Candidates] ${label} — Apollo returned no match, flagged to skip future attempts`, source: 'candidates-endpoint', rfId });
-                }
-              } catch (error) {
-                console.error({ message: `[Candidates] ${label} — phone reveal failed (non-fatal): ${error.message}`, source: 'candidates-endpoint', rfId });
-              }
-            } else {
-              console.log({ message: `[Candidates] ${label} — Apollo enrichment already attempted, skipping`, source: 'candidates-endpoint', rfId });
-            }
-          }
-
-          results.push({ fullName: ext.fullName, status: 'updated', rfId, dialpadSynced, phoneRequested });
-          continue;
-        }
-
-        // Map extension payload → RF candidate/add format
-        const rfPayload = mapExtensionToRFCandidate(ext);
-
-        console.log({
-          message: `[Candidates] ${label} — creating in RF`,
-          source: 'candidates-endpoint',
-          rfPayload,
-        });
-
-        // Create in RF
-        const rfResult = await addRFCandidate(rfPayload, env);
-        const rfId = rfResult?.data?.id;
-
-        if (!rfId) {
-          console.error({
-            message: `[Candidates] ${label} — RF add returned no ID`,
-            source: 'candidates-endpoint',
-            rfResult,
-          });
-          results.push({ fullName: ext.fullName, status: 'error', reason: 'no_rf_id', rfResult });
-          continue;
-        }
-
-        console.log({
-          message: `[Candidates] ${label} — created in RF (id=${rfId})`,
-          source: 'candidates-endpoint',
-          rfId,
-        });
-
-        // Build candidate for Dialpad sync + cache from extension data directly
-        // No need to GET from RF — new candidates won't have email/phone yet
-        const currentExp = ext.experience?.find(e => e.isCurrent);
-        const nameParts = ext.fullName.trim().split(/\s+/);
-
-        const rfCandidate = {
-          id: rfId,
-          first_name: nameParts[0] || '',
-          last_name: nameParts.slice(1).join(' ') || '',
-          name: ext.fullName,
-          current_organization: currentExp?.company || '',
-          current_title: currentExp?.title || '',
-          linkedin_profile: ext.linkedinUrl || '',
-          email: '',
-          phone_number: '',
-        };
-
-        // Sync to Dialpad (creates contact with uid=RF{id} + sets debounce)
-        const synced = await syncCandidateToDialpad(rfCandidate, env);
-        await cacheCandidate(rfCandidate, env);
-
-        console.log({
-          message: `[Candidates] ${label} — ${synced ? 'Dialpad synced + cached' : 'Dialpad skipped (validation), cached'} rfId=${rfId}`,
-          source: 'candidates-endpoint',
-          rfId,
-          dialpadSynced: synced,
-        });
-
-        // Apollo phone reveal — LinkedIn URL is already correct from the extension,
-        // just look up the person and request phone. No verification/fallback/LinkedIn correction.
-        let phoneRequested = false;
-        if (rfCandidate.linkedin_profile && !rfCandidate.phone_number) {
-          try {
-            const apolloPerson = await enrichPerson({ linkedin_url: rfCandidate.linkedin_profile }, {}, env);
-            if (apolloPerson) {
-              const webhookUrl = buildApolloWebhookUrl(rfId, env);
-              await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, webhook_url: webhookUrl }, env);
-              // Store KV context so Apollo webhook can find this candidate
-              await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
-                apolloPersonId: apolloPerson.id,
-                timestamp: new Date().toISOString(),
-              }), { expirationTtl: 900 });
-              phoneRequested = true;
-              console.log({
-                message: `[Candidates] ${label} — phone reveal requested (apolloId=${apolloPerson.id})`,
-                source: 'candidates-endpoint',
-                rfId,
-                apolloPersonId: apolloPerson.id,
-              });
-            } else {
-              console.log({
-                message: `[Candidates] ${label} — Apollo lookup returned no person, skipping phone reveal`,
-                source: 'candidates-endpoint',
-                rfId,
-              });
-            }
-          } catch (error) {
-            console.error({ message: `[Candidates] ${label} — phone reveal failed (non-fatal): ${error.message}`, source: 'candidates-endpoint', rfId });
-          }
-        }
-
-        results.push({ fullName: ext.fullName, status: 'created', rfId, dialpadSynced: synced, phoneRequested });
-
-      } catch (error) {
-        console.error({
-          message: `[Candidates] ${label} — error: ${error.message}`,
-          source: 'candidates-endpoint',
-          stack: error.stack,
-        });
-        results.push({ fullName: ext.fullName, status: 'error', reason: error.message });
-      }
+    for (let c = 0; c < payload.candidates.length; c += CHUNK_SIZE) {
+      const chunk = payload.candidates.slice(c, c + CHUNK_SIZE);
+      const chunkResults = await Promise.all(chunk.map((ext, j) =>
+        processOneCandidate(ext, c + j, total, env)
+      ));
+      results.push(...chunkResults);
     }
 
     const created = results.filter(r => r.status === 'created').length;
