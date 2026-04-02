@@ -996,13 +996,9 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
       count: total,
     });
 
-    // Process in chunks of 5 to avoid overwhelming RF/Dialpad APIs
-    const CHUNK_SIZE = 5;
     const results = [];
-    for (let c = 0; c < payload.candidates.length; c += CHUNK_SIZE) {
-      const chunk = payload.candidates.slice(c, c + CHUNK_SIZE);
-      const chunkResults = await Promise.all(chunk.map(async (ext, j) => {
-      const i = c + j;
+
+    for (const [i, ext] of payload.candidates.entries()) {
       const label = `[${i + 1}/${total}] ${ext.fullName}`;
       try {
         // Check if candidate already exists in RF by LinkedIn URL
@@ -1110,7 +1106,8 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
             }
           }
 
-          return { fullName: ext.fullName, status: 'updated', rfId, dialpadSynced, phoneRequested };
+          results.push({ fullName: ext.fullName, status: 'updated', rfId, dialpadSynced, phoneRequested });
+          continue;
         }
 
         // Map extension payload → RF candidate/add format
@@ -1132,7 +1129,8 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
             source: 'candidates-endpoint',
             rfResult,
           });
-          return { fullName: ext.fullName, status: 'error', reason: 'no_rf_id', rfResult };
+          results.push({ fullName: ext.fullName, status: 'error', reason: 'no_rf_id', rfResult });
+          continue;
         }
 
         console.log({
@@ -1172,7 +1170,7 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
         // Apollo phone reveal — LinkedIn URL is already correct from the extension,
         // just look up the person and request phone. No verification/fallback/LinkedIn correction.
         let phoneRequested = false;
-        if (rfCandidate.linkedin_profile && !phoneStr) {
+        if (rfCandidate.linkedin_profile && !rfCandidate.phone_number) {
           try {
             const apolloPerson = await enrichPerson({ linkedin_url: rfCandidate.linkedin_profile }, {}, env);
             if (apolloPerson) {
@@ -1202,7 +1200,7 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
           }
         }
 
-        return { fullName: ext.fullName, status: 'created', rfId, dialpadSynced: synced, phoneRequested };
+        results.push({ fullName: ext.fullName, status: 'created', rfId, dialpadSynced: synced, phoneRequested });
 
       } catch (error) {
         console.error({
@@ -1210,10 +1208,8 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
           source: 'candidates-endpoint',
           stack: error.stack,
         });
-        return { fullName: ext.fullName, status: 'error', reason: error.message };
+        results.push({ fullName: ext.fullName, status: 'error', reason: error.message });
       }
-    }));
-      results.push(...chunkResults);
     }
 
     const created = results.filter(r => r.status === 'created').length;
