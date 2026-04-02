@@ -1325,15 +1325,20 @@ async function handleAddToJobEndpoint(request, env, corsHeaders) {
     });
 
     const results = await Promise.all(rfIds.map(async (rfId) => {
-      try {
-        await addCandidateToJob(rfId, jobId, env);
-        console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} ✓`, source: 'add-to-job' });
-        return { rfId, status: 'added' };
-      } catch (error) {
-        if (error.message.toLowerCase().includes('already') && error.message.toLowerCase().includes('pipeline')) {
-          console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} already in pipeline`, source: 'add-to-job' });
-          return { rfId, status: 'already_in_job' };
-        } else {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await addCandidateToJob(rfId, jobId, env);
+          console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} ✓`, source: 'add-to-job' });
+          return { rfId, status: 'added' };
+        } catch (error) {
+          if (error.message.toLowerCase().includes('already') && error.message.toLowerCase().includes('pipeline')) {
+            console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} already in pipeline`, source: 'add-to-job' });
+            return { rfId, status: 'already_in_job' };
+          }
+          if (error.message.includes('502') && attempt < 3) {
+            console.log({ message: `[AddToJob] rfId=${rfId} → 502, retrying (${attempt}/2)`, source: 'add-to-job' });
+            continue;
+          }
           console.error({ message: `[AddToJob] rfId=${rfId} → job ${jobId} failed: ${error.message}`, source: 'add-to-job' });
           return { rfId, status: 'error', reason: error.message };
         }
