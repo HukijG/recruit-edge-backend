@@ -24,21 +24,26 @@ const ACTION_ITEMS_PROMPT = `Extract the key action items and next steps from th
 Respond with ONLY the bullet points, no preamble.`;
 
 const COLD_CALL_SYSTEM_PROMPT = `You are a call transcript classifier for a recruiting firm. Analyze this transcript and determine:
-1. Whether this is a COLD CALL (first-ever outbound contact with a candidate)
+1. Whether this is a COLD CALL (unsolicited outbound contact with a candidate)
 2. If it is a cold call, what was the OUTCOME
 
-COLD CALL definition:
+COLD CALL — DEFINITE indicators (any one of these = cold call, regardless of tone):
+- Caller says "headhunter" (e.g. "I'm Joel Haines, a headhunter")
+- Caller references following up on a LinkedIn message (e.g. "sent you a message about a role", "following up on my LinkedIn message", "reached out on LinkedIn about...")
+- Caller mentions sending a message about a specific role or opportunity
+
+These are ALWAYS cold calls even if the tone sounds casual or like a follow-up — the caller is following up on an unsolicited outreach, not a prior conversation.
+
+COLD CALL — other signals:
 - First-ever contact with someone who doesn't know the caller
 - Caller introduces themselves and their role/reason for reaching out
-- Unfamiliar, formal tone — not a follow-up, scheduled call, or catch-up
 - May be a connected conversation OR a voicemail left for a stranger
-- The caller typically mentions reaching out via LinkedIn, a specific job role, or an opportunity
 
 NOT a cold call:
-- Conversation with someone already spoken to before
-- Scheduled call, follow-up, prep call, or update
-- Familiar tone — "Hey, how's it going?", "Thanks for booking time", etc.
+- Candidate already knows the caller from a prior phone conversation
+- Scheduled call, prep call, interview debrief, or status update
 - Internal calls between colleagues
+- Candidate references a previous phone call ("good to talk again", "as we discussed last time")
 
 OUTCOME (only when is_cold_call is true):
 - "voicemail": Caller left a voicemail, no live conversation occurred
