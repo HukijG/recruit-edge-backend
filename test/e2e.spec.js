@@ -968,8 +968,10 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 describe('E2E: Apollo webhook (phone delivery)', () => {
 	afterEach(() => { globalThis.fetch = originalFetch; });
 
-	it('delivers phone from Apollo to Dialpad and updates cache', async () => {
+	it('delivers phone from Apollo to RF + Dialpad and updates cache', async () => {
 		const calls = mockFetch([
+			rfGetCandidateRoute(buildFullRFCandidate({ phone_number: [] })),
+			rfUpdateCandidateRoute(),
 			dialpadContactRoute(),
 		]);
 
@@ -1017,15 +1019,20 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 
 		expect(response.status).toBe(200);
 
+		// RF should be called: GET (to merge phones) + UPDATE (with merged phone array)
+		const rfCalls = findCalls(calls, 'recruiterflow.com');
+		const rfGetCalls = rfCalls.filter(c => c.url.includes('/candidate/get'));
+		const rfUpdateCalls = rfCalls.filter(c => c.url.includes('/candidate/update'));
+		expect(rfGetCalls.length).toBe(1);
+		expect(rfUpdateCalls.length).toBe(1);
+		const rfUpdateBody = JSON.parse(rfUpdateCalls[0].opts.body);
+		expect(rfUpdateBody.phone_number).toEqual([{ phone_number: '+15555550100', type: 1 }]);
+
 		// Dialpad PATCH should only contain the phone — nothing else
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
 		expect(dialpadCalls.length).toBe(1);
 		const dialpadBody = JSON.parse(dialpadCalls[0].opts.body);
 		expect(dialpadBody).toEqual({ phones: ['+15555550100'] });
-
-		// No RF calls — Dialpad→RF sync will carry the phone over
-		const rfCalls = findCalls(calls, 'recruiterflow.com');
-		expect(rfCalls.length).toBe(0);
 
 		// Cache should be updated with phone
 		const cached = await env.SYNC_STATE.get('candidate:12345');
@@ -1147,7 +1154,7 @@ describe('E2E: Dialpad Calls (cold call detection)', () => {
 		expect(dedup).toBe('true');
 	});
 
-	it('defers processing when contact is unassociated phone number', async () => {
+	it('skips call when contact has no RF ID', async () => {
 		const calls = mockFetch([]);
 
 		const callPayload = {
@@ -1155,7 +1162,7 @@ describe('E2E: Dialpad Calls (cold call detection)', () => {
 			target: { id: 8000000000000001 },
 			contact: {
 				id: 'some-random-contact-id',  // No RF ID
-				name: '(650) 521-2531',  // Phone number as name
+				name: '(650) 521-2531',
 			},
 			direction: 'outbound',
 			state: 'transcription',
@@ -1177,11 +1184,8 @@ describe('E2E: Dialpad Calls (cold call detection)', () => {
 
 		expect(response.status).toBe(200);
 
-		// Should have stored pending cold call in KV by phone
-		const pending = await env.SYNC_STATE.get('pending_coldcall:6505550125');
-		expect(pending).not.toBeNull();
-		const pendingData = JSON.parse(pending);
-		expect(pendingData.call_id).toBe('call-002');
+		// No external calls — just skipped
+		expect(calls.length).toBe(0);
 	});
 
 	it('skips non-Joel calls', async () => {

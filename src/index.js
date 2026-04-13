@@ -8,7 +8,7 @@ import {
 } from './rf-client.js';
 import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
-import { processCallEvent, checkPendingColdCall } from './cold-call.js';
+import { processCallEvent } from './cold-call.js';
 import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enrichment.js';
 import { enrichPerson } from './apollo-client.js';
 
@@ -316,31 +316,6 @@ async function processDialpadContactUpdate(contact, env) {
   if (!rfCandidateId) {
     console.log({ message: '[Dialpad] → skipped: no RF ID in contact', source: 'dialpad', contactId: contact.id });
     return;
-  }
-
-  // Check for deferred cold calls — runs regardless of sync debounce
-  if (contact.phones && contact.phones.length > 0) {
-    try {
-      const coldCallResult = await checkPendingColdCall(
-        contact.phones, rfCandidateId,
-        contact.display_name || `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
-        env
-      );
-      if (coldCallResult) {
-        const outcomeStr = coldCallResult.outcome ? ` [${coldCallResult.outcome}]` : '';
-        console.log({
-          message: `[Dialpad] → deferred cold call: ${coldCallResult.isColdCall ? `COLD CALL tracked${outcomeStr}` : coldCallResult.reason}`,
-          source: 'dialpad',
-          candidateId: rfCandidateId,
-          callId: coldCallResult.callId,
-          isColdCall: coldCallResult.isColdCall,
-          outcome: coldCallResult.outcome,
-          reason: coldCallResult.reason,
-        });
-      }
-    } catch (error) {
-      console.error({ message: `[Dialpad] deferred cold call check failed: ${error.message}`, source: 'dialpad', candidateId: rfCandidateId });
-    }
   }
 
   const syncKey = `sync:RF${rfCandidateId}`;
@@ -893,7 +868,29 @@ async function handleApolloWebhook(request, env, url) {
     }
     const phoneStr = validPhone.sanitized_number;
 
-    // Patch Dialpad with ONLY the phone — Dialpad→RF sync will carry it to RF
+    // Update RF directly — Dialpad Created events are intentionally ignored,
+    // so we can't rely on Dialpad→RF sync to carry the phone across.
+    const currentCandidate = await getRFCandidate(rfId, env);
+    const existingPhones = Array.isArray(currentCandidate.phone_number) ? currentCandidate.phone_number : [];
+    const normalizedNew = phoneStr.replace(/\D/g, '');
+    const phoneAlreadyExists = existingPhones.some(
+      p => (p.phone_number || '').replace(/\D/g, '') === normalizedNew
+    );
+
+    if (!phoneAlreadyExists) {
+      const mergedPhones = [
+        ...existingPhones.map(p => ({ phone_number: p.phone_number, type: p.type ?? 1 })),
+        { phone_number: phoneStr, type: 1 },
+      ];
+      await updateRFCandidate(rfId, { phone_number: mergedPhones }, env);
+      // Debounce prevents the eventual RF Updated webhook from re-syncing to Dialpad
+      await env.SYNC_STATE.put(`sync:RF${rfId}`, 'true', { expirationTtl: 60 });
+      console.log({ message: `[Apollo] → RF updated with phone`, source: 'apollo', rfId, phone: phoneStr });
+    } else {
+      console.log({ message: `[Apollo] → phone already in RF, skipped RF update`, source: 'apollo', rfId, phone: phoneStr });
+    }
+
+    // Patch Dialpad directly too — don't wait for RF webhook (hours of delay)
     await patchDialpadContact(rfId, { phones: [phoneStr] }, env);
 
     // Update cache with new phone

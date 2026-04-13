@@ -339,7 +339,7 @@ export function findEligibleJob(candidate) {
   return {
     job_id: mostRecent.job_id,
     targetStage: { id: targetStage.id, name: targetStage.name },
-    userId: mostRecent.added_to_job_by?.id || JOEL_RF_USER_ID,
+    userId: JOEL_RF_USER_ID,
   };
 }
 

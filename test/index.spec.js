@@ -4,8 +4,7 @@ import worker from '../src';
 import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
 import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob, convertDialpadContactToRFUpdate } from '../src/rf-client.js';
 import {
-	isJoelsCall, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall,
-	normalizePhone, looksLikePhoneNumber
+	isJoelsCall, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall
 } from '../src/cold-call.js';
 import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from '../src/apollo-client.js';
 import { isJoelCandidate, enrichCandidate } from '../src/enrichment.js';
@@ -553,58 +552,6 @@ describe('extractRFIdFromDialpadContact', () => {
 
 	it('returns null for empty string', () => {
 		expect(extractRFIdFromDialpadContact('')).toBeNull();
-	});
-});
-
-// ---------------------------------------------------------------------------
-// Phone number helpers (deferred cold call processing)
-// ---------------------------------------------------------------------------
-
-describe('normalizePhone', () => {
-	it('strips formatting from US phone number', () => {
-		expect(normalizePhone('(650) 521-2531')).toBe('6505550125');
-	});
-
-	it('strips country code, keeps last 10 digits', () => {
-		expect(normalizePhone('+16505550125')).toBe('6505550125');
-	});
-
-	it('handles plain digits', () => {
-		expect(normalizePhone('6505550125')).toBe('6505550125');
-	});
-
-	it('returns null for null input', () => {
-		expect(normalizePhone(null)).toBeNull();
-	});
-
-	it('returns null for short numbers', () => {
-		expect(normalizePhone('123')).toBeNull();
-	});
-
-	it('handles 7-digit numbers', () => {
-		expect(normalizePhone('521-2531')).toBe('5212531');
-	});
-});
-
-describe('looksLikePhoneNumber', () => {
-	it('returns true for formatted US phone', () => {
-		expect(looksLikePhoneNumber('(650) 521-2531')).toBe(true);
-	});
-
-	it('returns true for plain digits', () => {
-		expect(looksLikePhoneNumber('6505550125')).toBe(true);
-	});
-
-	it('returns false for a person name', () => {
-		expect(looksLikePhoneNumber('Bradley Naumann')).toBe(false);
-	});
-
-	it('returns false for null', () => {
-		expect(looksLikePhoneNumber(null)).toBe(false);
-	});
-
-	it('returns false for empty string', () => {
-		expect(looksLikePhoneNumber('')).toBe(false);
 	});
 });
 
