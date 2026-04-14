@@ -838,11 +838,10 @@ async function handleApolloWebhook(request, env, url) {
     const person = payload.people?.[0];
 
     console.log({
-      message: `[Apollo] webhook rfId=${rfId} personId=${person?.id} phoneCount=${person?.phone_numbers?.length || 0}`,
+      message: `[Apollo] raw webhook payload`,
       source: 'apollo',
       rfId,
-      personId: person?.id,
-      phoneCount: person?.phone_numbers?.length || 0,
+      rawPayload: JSON.stringify(payload),
     });
 
     // Look up pending enrichment context from KV

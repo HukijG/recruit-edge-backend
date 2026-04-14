@@ -29,22 +29,37 @@ export async function updateRFCandidate(candidateId, updateData, env) {
     ...updateData
   };
 
+  const bodyJson = JSON.stringify(payload);
+
+  console.log({
+    message: `RF update request`,
+    candidateId,
+    requestBody: bodyJson,
+  });
+
   const response = await fetch(`${rfBaseUrl}/candidate/update`, {
     method: 'POST',
     headers: {
       'RF-Api-Key': rfApiKey,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify(payload)
+    body: bodyJson
+  });
+
+  const responseText = await response.text();
+
+  console.log({
+    message: `RF update response`,
+    candidateId,
+    status: response.status,
+    responseBody: responseText,
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`RF update error: ${response.status}`, errorText);
-    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    throw new Error(`RF API error: ${response.status} - ${responseText}`);
   }
 
-  return await response.json();
+  return JSON.parse(responseText);
 }
 
 /**
