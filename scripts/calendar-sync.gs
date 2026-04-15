@@ -56,19 +56,16 @@ function processNewBookings() {
     var location = event.getLocation() || '';
     var title = event.getTitle() || '';
 
-    // === BOOKING FILTER ===
+    // === RECLAIM INTRO CALL DETECTION ===
+    // Reclaim booking-form events have a unique structure:
+    //   "Event name: ..." + "Pre-meeting questions:" + "Question: ..."
+    // No other calendar event will have this combination.
 
-    // Filter 1: LinkedIn pre-meeting question present (case-insensitive)
-    if (descLower.indexOf('question: linkedin profile') === -1) {
+    if (!description.match(/Event name:.*[\s\S]*?Pre-meeting questions:[\s\S]*?Question:/i)) {
       continue;
     }
 
-    // Filter 2: Booking location — Dialpad meeting link OR Phone Call
-    if (location.indexOf('meetings.dialpad.com/') === -1 && location.indexOf('Phone Call') === -1) {
-      continue;
-    }
-
-    // Filter 3: Exactly 1 non-owner guest
+    // Exactly 1 non-owner guest
     var guests = event.getGuestList();
     var nonOwnerGuests = [];
     for (var g = 0; g < guests.length; g++) {

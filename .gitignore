@@ -167,3 +167,4 @@ dist
 .wrangler/
 
 # Claude Code worktrees
+/.claude

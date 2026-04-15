@@ -890,7 +890,12 @@ async function handleApolloWebhook(request, env, url) {
     }
 
     // Patch Dialpad directly too — don't wait for RF webhook (hours of delay)
-    await patchDialpadContact(rfId, { phones: [phoneStr] }, env);
+    // Non-fatal: contact may not exist yet if extension creation failed or is still in progress
+    try {
+      await patchDialpadContact(rfId, { phones: [phoneStr] }, env);
+    } catch (dialpadErr) {
+      console.error({ message: `[Apollo] Dialpad patch failed (non-fatal)`, source: 'apollo', rfId, error: dialpadErr.message });
+    }
 
     // Update cache with new phone
     const cached = await getCachedCandidate(rfId, env);
