@@ -31,10 +31,11 @@ export async function updateRFCandidate(candidateId, updateData, env) {
 
   const bodyJson = JSON.stringify(payload);
 
+  // Inline request body in message so it surfaces in queryable CF Logs
+  // (structured `requestBody` field is stored but not indexed).
   console.log({
-    message: `RF update request`,
+    message: `RF update request candidate=${candidateId} body=${bodyJson}`,
     candidateId,
-    requestBody: bodyJson,
   });
 
   const response = await fetch(`${rfBaseUrl}/candidate/update`, {
@@ -48,11 +49,10 @@ export async function updateRFCandidate(candidateId, updateData, env) {
 
   const responseText = await response.text();
 
+  // Inline status + body so non-200s and validation errors are visible in CF Logs.
   console.log({
-    message: `RF update response`,
+    message: `RF update response candidate=${candidateId} status=${response.status} body=${responseText}`,
     candidateId,
-    status: response.status,
-    responseBody: responseText,
   });
 
   if (!response.ok) {

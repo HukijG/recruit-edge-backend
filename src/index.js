@@ -163,7 +163,7 @@ async function handleRecruiterflowWebhook(request, env) {
             });
           }
         } catch (error) {
-          console.error({ message: `[RF] enrichment failed (non-fatal)`, source: 'rf', candidateId: candidate.id, error: error.message });
+          console.error({ message: `[RF] enrichment failed (non-fatal) candidate=${candidate.id}: ${error.message}`, source: 'rf', candidateId: candidate.id });
         }
       }
     } else {
@@ -176,7 +176,7 @@ async function handleRecruiterflowWebhook(request, env) {
     });
 
   } catch (error) {
-    console.error({ message: '[RF] error', source: 'rf', error: error.message });
+    console.error({ message: `[RF] error: ${error.message}`, source: 'rf', stack: error.stack });
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -238,7 +238,7 @@ async function handleManualRFWebhook(request, env, url) {
         reason: enrichResult.reason,
       });
     } catch (error) {
-      console.error({ message: `[RF/manual] enrichment failed (non-fatal)`, source: 'rf-manual', candidateId: candidate.id, error: error.message });
+      console.error({ message: `[RF/manual] enrichment failed (non-fatal) candidate=${candidate.id}: ${error.message}`, source: 'rf-manual', candidateId: candidate.id });
     }
 
     return new Response('Manual webhook processed successfully', {
@@ -247,7 +247,7 @@ async function handleManualRFWebhook(request, env, url) {
     });
 
   } catch (error) {
-    console.error({ message: '[RF/manual] error', source: 'rf-manual', error: error.message });
+    console.error({ message: `[RF/manual] error: ${error.message}`, source: 'rf-manual', stack: error.stack });
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -305,7 +305,7 @@ async function handleDialpadWebhook(request, env) {
     });
 
   } catch (error) {
-    console.error({ message: '[Dialpad] error', source: 'dialpad', error: error.message });
+    console.error({ message: `[Dialpad] error: ${error.message}`, source: 'dialpad', stack: error.stack });
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -369,7 +369,7 @@ async function processDialpadContactUpdate(contact, env) {
     });
 
   } catch (error) {
-    console.error({ message: `[Dialpad] sync error`, source: 'dialpad', candidateId: rfCandidateId, error: error.message });
+    console.error({ message: `[Dialpad] sync error candidate=${rfCandidateId}: ${error.message}`, source: 'dialpad', candidateId: rfCandidateId });
     throw error;
   }
 }
@@ -412,7 +412,7 @@ async function handleCalendarWebhook(request, env) {
     });
 
   } catch (error) {
-    console.error({ message: '[Calendar] error', source: 'calendar', error: error.message });
+    console.error({ message: `[Calendar] error: ${error.message}`, source: 'calendar', stack: error.stack });
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -554,7 +554,7 @@ async function processCalendarEvent(payload, env) {
       });
     }
   } catch (error) {
-    console.error({ message: '[Calendar] stage movement failed (non-fatal)', source: 'calendar', candidateId, error: error.message });
+    console.error({ message: `[Calendar] stage movement failed (non-fatal) candidate=${candidateId}: ${error.message}`, source: 'calendar', candidateId });
   }
 
   // === DIALPAD UPSERT ===
@@ -581,7 +581,7 @@ async function processCalendarEvent(payload, env) {
     await createOrUpdateDialpadContact(dialpadCandidate, env);
   } catch (error) {
     dialpadOk = false;
-    console.error({ message: '[Calendar] Dialpad upsert failed (non-fatal)', source: 'calendar', candidateId, error: error.message });
+    console.error({ message: `[Calendar] Dialpad upsert failed (non-fatal) candidate=${candidateId}: ${error.message}`, source: 'calendar', candidateId });
   }
 
   // === CACHE UPDATE ===
@@ -693,7 +693,7 @@ async function handleKrispWebhook(request, env) {
     });
 
   } catch (error) {
-    console.error({ message: '[Krisp] error', source: 'krisp', error: error.message });
+    console.error({ message: `[Krisp] error: ${error.message}`, source: 'krisp', stack: error.stack });
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -914,7 +914,9 @@ async function handleApolloWebhook(request, env, url) {
     return new Response('OK', { status: 200 });
 
   } catch (error) {
-    console.error({ message: '[Apollo] error', source: 'apollo', error: error.message });
+    // Inline the actual error into the message so it surfaces in CF Logs metadata.
+    // Structured `error: error.message` field is not indexed and stays invisible.
+    console.error({ message: `[Apollo] error: ${error.message}`, source: 'apollo', stack: error.stack });
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -984,10 +986,35 @@ async function handleTestColdCall(request, env, url) {
 async function processOneCandidate(ext, i, total, env) {
   const label = `[${i + 1}/${total}] ${ext.fullName}`;
   try {
-    // Check if candidate already exists in RF by LinkedIn URL
+    // Search RF by LinkedIn URL — RF is authoritative, do not consult cache for matching.
+    // The cache can hold stale entries from silent corruption (e.g. a past enrichment
+    // overwriting a record's linkedin_profile). Trusting the cache for matching can
+    // route a new candidate to the wrong rfId; trusting RF avoids that.
     const existing = ext.linkedinUrl
       ? await searchRFCandidateByLinkedIn(ext.linkedinUrl, env)
       : null;
+
+    // Reconcile cache against the authoritative RF result. If the cache had this
+    // LinkedIn URL pointing at a different rfId, refreshing self-heals it for
+    // every downstream lookup (calendar, krisp, etc.) that does trust the cache.
+    if (ext.linkedinUrl) {
+      const cachedId = await lookupByLinkedIn(ext.linkedinUrl, env);
+      const rfIdStr = existing ? String(existing.id) : null;
+      if (cachedId && cachedId !== rfIdStr) {
+        console.warn({
+          message: `[Candidates] ${label} — cache stale for LinkedIn URL: cached rfId=${cachedId}, RF says ${rfIdStr || 'no match'}. Refreshing.`,
+          source: 'candidates-endpoint',
+          staleCachedId: cachedId,
+          actualRfId: rfIdStr,
+          linkedinUrl: ext.linkedinUrl,
+        });
+      }
+      if (existing) {
+        // Always re-cache the authoritative record so the LinkedIn → rfId index
+        // and the canonical record:{rfId} blob match what RF currently has.
+        await cacheCandidate(existing, env);
+      }
+    }
 
     if (existing) {
       const rfId = existing.id;
