@@ -980,6 +980,116 @@ async function handleTestColdCall(request, env, url) {
 }
 
 /**
+ * Handle a candidate that's already in RF: ensure Dialpad contact exists,
+ * patch company/title if it does, and request Apollo phone reveal if needed.
+ * Called both when search finds an existing record AND when /candidate/add
+ * returns 409 (LinkedIn already exists).
+ */
+async function processExistingRFCandidate(existing, ext, label, env) {
+  const rfId = existing.id;
+  console.log({
+    message: `[Candidates] ${label} — already in RF (id=${rfId}), checking Dialpad`,
+    source: 'candidates-endpoint',
+  });
+
+  const currentExp = ext.experience?.find(e => e.isCurrent);
+  const nameParts = ext.fullName.trim().split(/\s+/);
+
+  let dialpadContact = null;
+  try {
+    dialpadContact = await getDialpadContact(rfId, env);
+  } catch (error) {
+    console.error({ message: `[Candidates] ${label} — Dialpad GET failed: ${error.message}`, source: 'candidates-endpoint' });
+  }
+
+  let dialpadSynced = false;
+
+  if (!dialpadContact) {
+    // Not in Dialpad — full creation with all available fields
+    const fullCandidate = await getRFCandidate(rfId, env);
+
+    let primaryEmail = '';
+    if (Array.isArray(fullCandidate.email) && fullCandidate.email.length > 0) {
+      const primary = fullCandidate.email.find(e => e.is_primary === 1);
+      primaryEmail = primary ? primary.email : (fullCandidate.email[0]?.email || '');
+    }
+    let phoneStr = '';
+    if (Array.isArray(fullCandidate.phone_number) && fullCandidate.phone_number.length > 0) {
+      phoneStr = fullCandidate.phone_number[0]?.phone_number || '';
+    }
+
+    const rfCandidate = {
+      id: rfId,
+      first_name: nameParts[0] || fullCandidate.first_name || '',
+      last_name: nameParts.slice(1).join(' ') || fullCandidate.last_name || '',
+      name: ext.fullName,
+      current_organization: currentExp?.company || fullCandidate.current_organization || '',
+      current_title: currentExp?.title || fullCandidate.current_title || '',
+      linkedin_profile: ext.linkedinUrl || fullCandidate.linkedin_profile || '',
+      email: primaryEmail,
+      phone_number: phoneStr,
+    };
+
+    dialpadSynced = await syncCandidateToDialpad(rfCandidate, env);
+    await cacheCandidate(rfCandidate, env);
+    console.log({ message: `[Candidates] ${label} — created Dialpad contact rfId=${rfId}`, source: 'candidates-endpoint' });
+  } else {
+    // Already in Dialpad — only update company name and job title
+    const patchFields = {};
+    if (currentExp?.company) patchFields.company_name = currentExp.company;
+    if (currentExp?.title) patchFields.job_title = currentExp.title;
+
+    if (Object.keys(patchFields).length > 0) {
+      try {
+        await patchDialpadContact(rfId, patchFields, env);
+        // Set debounce flag — prevents Dialpad's "Updated" webhook from syncing
+        // empty email/phone arrays back to RF and clearing existing data
+        await env.SYNC_STATE.put(`sync:RF${rfId}`, 'true', { expirationTtl: 60 });
+        dialpadSynced = true;
+        console.log({ message: `[Candidates] ${label} — patched Dialpad (company/title only) rfId=${rfId}`, source: 'candidates-endpoint' });
+      } catch (error) {
+        console.error({ message: `[Candidates] ${label} — Dialpad PATCH failed: ${error.message}`, source: 'candidates-endpoint' });
+      }
+    }
+  }
+
+  // Apollo phone enrichment — only if Dialpad contact has no phone and no prior attempt
+  let phoneRequested = false;
+  const hasDialpadPhone = dialpadContact?.phones?.length > 0;
+
+  if (!hasDialpadPhone && ext.linkedinUrl) {
+    const apolloFlag = await env.SYNC_STATE.get(`apollo_enrich:${rfId}`);
+    if (!apolloFlag) {
+      try {
+        const apolloPerson = await enrichPerson({ linkedin_url: ext.linkedinUrl }, {}, env);
+        if (apolloPerson) {
+          const webhookUrl = buildApolloWebhookUrl(rfId, env);
+          await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, webhook_url: webhookUrl }, env);
+          await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
+            apolloPersonId: apolloPerson.id,
+            timestamp: new Date().toISOString(),
+          }), { expirationTtl: 900 });
+          phoneRequested = true;
+          console.log({ message: `[Candidates] ${label} — phone reveal requested (apolloId=${apolloPerson.id})`, source: 'candidates-endpoint', rfId });
+        } else {
+          await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
+            noMatch: true,
+            timestamp: new Date().toISOString(),
+          }), { expirationTtl: 900 });
+          console.log({ message: `[Candidates] ${label} — Apollo returned no match, flagged to skip future attempts`, source: 'candidates-endpoint', rfId });
+        }
+      } catch (error) {
+        console.error({ message: `[Candidates] ${label} — phone reveal failed (non-fatal): ${error.message}`, source: 'candidates-endpoint', rfId });
+      }
+    } else {
+      console.log({ message: `[Candidates] ${label} — Apollo enrichment already attempted, skipping`, source: 'candidates-endpoint', rfId });
+    }
+  }
+
+  return { fullName: ext.fullName, status: 'updated', rfId, dialpadSynced, phoneRequested };
+}
+
+/**
  * Process a single candidate from the extension batch.
  * Returns a result object — never throws (catches internally).
  */
@@ -987,34 +1097,11 @@ async function processOneCandidate(ext, i, total, env) {
   const label = `[${i + 1}/${total}] ${ext.fullName}`;
   try {
     // Search RF by LinkedIn URL — RF is authoritative, do not consult cache for matching.
-    // The cache can hold stale entries from silent corruption (e.g. a past enrichment
-    // overwriting a record's linkedin_profile). Trusting the cache for matching can
-    // route a new candidate to the wrong rfId; trusting RF avoids that.
-    let existing = ext.linkedinUrl
+    // (searchRFCandidateByLinkedIn filters out RF's substring-fuzzy matches and
+    // returns only true slug-matches.)
+    const existing = ext.linkedinUrl
       ? await searchRFCandidateByLinkedIn(ext.linkedinUrl, env)
       : null;
-
-    // Verify RF returned a candidate whose linkedin_profile actually matches what
-    // we searched for. RF's /candidate/search has been observed returning records
-    // whose linkedin_profile field does NOT equal the queried URL (e.g. searching
-    // for Eric's URL returned Avree's record id=37177 whose profile is Avree's own
-    // URL). Without this guard, the extension routes Eric's data into Avree's
-    // Dialpad contact. This is a non-negotiable safety check, not a matching
-    // algorithm — we still defer to RF for the actual match.
-    if (existing && ext.linkedinUrl) {
-      const wantNormalized = normalizeLinkedInUrl(ext.linkedinUrl);
-      const gotNormalized = normalizeLinkedInUrl(existing.linkedin_profile);
-      if (!gotNormalized || gotNormalized !== wantNormalized) {
-        console.error({
-          message: `[Candidates] ${label} — RF search returned wrong candidate. searched="${ext.linkedinUrl}" but rfId=${existing.id} has linkedin_profile="${existing.linkedin_profile}". Discarding match — will create new candidate.`,
-          source: 'candidates-endpoint',
-          searchedUrl: ext.linkedinUrl,
-          returnedRfId: existing.id,
-          returnedUrl: existing.linkedin_profile,
-        });
-        existing = null;
-      }
-    }
 
     // Reconcile cache against the authoritative RF result. If the cache had this
     // LinkedIn URL pointing at a different rfId, refreshing self-heals it for
@@ -1039,108 +1126,7 @@ async function processOneCandidate(ext, i, total, env) {
     }
 
     if (existing) {
-      const rfId = existing.id;
-      console.log({
-        message: `[Candidates] ${label} — already in RF (id=${rfId}), checking Dialpad`,
-        source: 'candidates-endpoint',
-      });
-
-      const currentExp = ext.experience?.find(e => e.isCurrent);
-      const nameParts = ext.fullName.trim().split(/\s+/);
-
-      // Check if Dialpad contact exists
-      let dialpadContact = null;
-      try {
-        dialpadContact = await getDialpadContact(rfId, env);
-      } catch (error) {
-        console.error({ message: `[Candidates] ${label} — Dialpad GET failed: ${error.message}`, source: 'candidates-endpoint' });
-      }
-
-      let dialpadSynced = false;
-
-      if (!dialpadContact) {
-        // Not in Dialpad — full creation with all available fields
-        const fullCandidate = await getRFCandidate(rfId, env);
-
-        let primaryEmail = '';
-        if (Array.isArray(fullCandidate.email) && fullCandidate.email.length > 0) {
-          const primary = fullCandidate.email.find(e => e.is_primary === 1);
-          primaryEmail = primary ? primary.email : (fullCandidate.email[0]?.email || '');
-        }
-        let phoneStr = '';
-        if (Array.isArray(fullCandidate.phone_number) && fullCandidate.phone_number.length > 0) {
-          phoneStr = fullCandidate.phone_number[0]?.phone_number || '';
-        }
-
-        const rfCandidate = {
-          id: rfId,
-          first_name: nameParts[0] || fullCandidate.first_name || '',
-          last_name: nameParts.slice(1).join(' ') || fullCandidate.last_name || '',
-          name: ext.fullName,
-          current_organization: currentExp?.company || fullCandidate.current_organization || '',
-          current_title: currentExp?.title || fullCandidate.current_title || '',
-          linkedin_profile: ext.linkedinUrl || fullCandidate.linkedin_profile || '',
-          email: primaryEmail,
-          phone_number: phoneStr,
-        };
-
-        dialpadSynced = await syncCandidateToDialpad(rfCandidate, env);
-        await cacheCandidate(rfCandidate, env);
-        console.log({ message: `[Candidates] ${label} — created Dialpad contact rfId=${rfId}`, source: 'candidates-endpoint' });
-      } else {
-        // Already in Dialpad — only update company name and job title
-        const patchFields = {};
-        if (currentExp?.company) patchFields.company_name = currentExp.company;
-        if (currentExp?.title) patchFields.job_title = currentExp.title;
-
-        if (Object.keys(patchFields).length > 0) {
-          try {
-            await patchDialpadContact(rfId, patchFields, env);
-            // Set debounce flag — prevents Dialpad's "Updated" webhook from syncing
-            // empty email/phone arrays back to RF and clearing existing data
-            await env.SYNC_STATE.put(`sync:RF${rfId}`, 'true', { expirationTtl: 60 });
-            dialpadSynced = true;
-            console.log({ message: `[Candidates] ${label} — patched Dialpad (company/title only) rfId=${rfId}`, source: 'candidates-endpoint' });
-          } catch (error) {
-            console.error({ message: `[Candidates] ${label} — Dialpad PATCH failed: ${error.message}`, source: 'candidates-endpoint' });
-          }
-        }
-      }
-
-      // Apollo phone enrichment — only if Dialpad contact has no phone and no prior attempt
-      let phoneRequested = false;
-      const hasDialpadPhone = dialpadContact?.phones?.length > 0;
-
-      if (!hasDialpadPhone && ext.linkedinUrl) {
-        const apolloFlag = await env.SYNC_STATE.get(`apollo_enrich:${rfId}`);
-        if (!apolloFlag) {
-          try {
-            const apolloPerson = await enrichPerson({ linkedin_url: ext.linkedinUrl }, {}, env);
-            if (apolloPerson) {
-              const webhookUrl = buildApolloWebhookUrl(rfId, env);
-              await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, webhook_url: webhookUrl }, env);
-              await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
-                apolloPersonId: apolloPerson.id,
-                timestamp: new Date().toISOString(),
-              }), { expirationTtl: 900 });
-              phoneRequested = true;
-              console.log({ message: `[Candidates] ${label} — phone reveal requested (apolloId=${apolloPerson.id})`, source: 'candidates-endpoint', rfId });
-            } else {
-              await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
-                noMatch: true,
-                timestamp: new Date().toISOString(),
-              }), { expirationTtl: 900 });
-              console.log({ message: `[Candidates] ${label} — Apollo returned no match, flagged to skip future attempts`, source: 'candidates-endpoint', rfId });
-            }
-          } catch (error) {
-            console.error({ message: `[Candidates] ${label} — phone reveal failed (non-fatal): ${error.message}`, source: 'candidates-endpoint', rfId });
-          }
-        } else {
-          console.log({ message: `[Candidates] ${label} — Apollo enrichment already attempted, skipping`, source: 'candidates-endpoint', rfId });
-        }
-      }
-
-      return { fullName: ext.fullName, status: 'updated', rfId, dialpadSynced, phoneRequested };
+      return await processExistingRFCandidate(existing, ext, label, env);
     }
 
     // Map extension payload → RF candidate/add format
@@ -1153,7 +1139,27 @@ async function processOneCandidate(ext, i, total, env) {
     });
 
     // Create in RF
-    const rfResult = await addRFCandidate(rfPayload, env);
+    let rfResult;
+    try {
+      rfResult = await addRFCandidate(rfPayload, env);
+    } catch (err) {
+      // RF returns 409 when a candidate with this LinkedIn URL already exists.
+      // The error body looks like: 409 - {"data":{"id":50615},"message":"..."}
+      // Recover by treating this as an existing candidate — fetch + run the
+      // already-in-RF path so Dialpad still gets updated.
+      const m = err.message?.match(/409.*"id":\s*(\d+)/);
+      if (m) {
+        const existingId = parseInt(m[1], 10);
+        console.warn({
+          message: `[Candidates] ${label} — RF /candidate/add returned 409 (already exists), recovering with rfId=${existingId}`,
+          source: 'candidates-endpoint',
+          rfId: existingId,
+        });
+        const fetched = await getRFCandidate(existingId, env);
+        return await processExistingRFCandidate(fetched, ext, label, env);
+      }
+      throw err;
+    }
     const rfId = rfResult?.data?.id;
 
     if (!rfId) {

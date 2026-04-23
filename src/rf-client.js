@@ -113,6 +113,29 @@ export function normalizeLinkedInUrl(url) {
 }
 
 /**
+ * Extract the unique LinkedIn profile slug from any of the formats RF/the
+ * extension might give us:
+ *   "https://www.linkedin.com/in/jamie-lin/"  → "jamie-lin"
+ *   "linkedin.com/in/jamie-lin"               → "jamie-lin"
+ *   "jamie-lin"                               → "jamie-lin"
+ *   "https://www.linkedin.com/pub/foo/1/2/3"  → "foo"
+ *
+ * Used for identity comparison when RF's search response gives a bare slug
+ * but the extension sent a full URL.
+ */
+export function extractLinkedInSlug(input) {
+  if (!input || typeof input !== 'string') return null;
+  const trimmed = input.trim().toLowerCase();
+  if (!trimmed) return null;
+  // If the string contains an /in/ or /pub/ segment, take the next path piece.
+  // Otherwise treat the whole string as the slug.
+  const pathMatch = trimmed.match(/(?:linkedin\.com\/)?(?:in|pub)\/([^\/?#\s]+)/);
+  if (pathMatch) return pathMatch[1].replace(/\/+$/, '') || null;
+  // Bare slug — strip any leading/trailing slashes and query/hash junk
+  return trimmed.replace(/[?#].*$/, '').replace(/^\/+|\/+$/g, '') || null;
+}
+
+/**
  * Fetch full candidate data from RF
  */
 export async function getRFCandidate(candidateId, env) {
@@ -176,15 +199,25 @@ export async function searchRFCandidateByLinkedIn(linkedinUrl, env) {
     const result = JSON.parse(responseText);
     const candidates = Array.isArray(result) ? result : (result.candidates || result.data || result.results || []);
 
-    // Diagnostic: log every search so we can verify RF's matching behavior.
-    // RF was returning candidates whose linkedin_profile didn't match the query
-    // (e.g. Eric's URL → Avree's record). We need visibility into what RF returns.
-    console.log({
-      message: `RF search by linkedin: searched="${linkedinUrl}" returnedCount=${candidates.length} returnedIds=[${candidates.map(c => c.id).join(',')}] returnedUrls=[${candidates.map(c => `"${c.linkedin_profile || ''}"`).join(',')}]`,
-      source: 'rf-search',
-    });
+    // RF's /candidate/search with linkedin_profile filter does substring matching,
+    // not exact match. Searching for "e-cobb" returns "averee-cobb" + "steve-cobb24"
+    // because both contain "e-cobb". Filter to only true matches by slug identity.
+    // RF returns linkedin_profile as a bare slug ("averee-cobb") even when we
+    // sent a full URL — extractLinkedInSlug normalizes both sides.
+    const wantSlug = extractLinkedInSlug(linkedinUrl);
+    const matches = wantSlug
+      ? candidates.filter(c => extractLinkedInSlug(c.linkedin_profile) === wantSlug)
+      : [];
 
-    return candidates.length > 0 ? candidates[0] : null;
+    if (candidates.length > 0 && matches.length !== candidates.length) {
+      // RF returned extras due to substring match — log so we can see how often this happens
+      console.log({
+        message: `RF search filtered fuzzy results: searched="${linkedinUrl}" rfReturned=${candidates.length} kept=${matches.length} discarded=${candidates.length - matches.length} (RF does substring match on linkedin_profile)`,
+        source: 'rf-search',
+      });
+    }
+
+    return matches.length > 0 ? matches[0] : null;
   } catch (error) {
     console.error({ message: `RF search failed: ${error.message} searchedUrl=${linkedinUrl}`, source: 'rf-search' });
     return null;
