@@ -870,7 +870,12 @@ async function handleApolloWebhook(request, env, url) {
     // Update RF directly — Dialpad Created events are intentionally ignored,
     // so we can't rely on Dialpad→RF sync to carry the phone across.
     const currentCandidate = await getRFCandidate(rfId, env);
-    const existingPhones = Array.isArray(currentCandidate.phone_number) ? currentCandidate.phone_number : [];
+    const rawPhones = Array.isArray(currentCandidate.phone_number) ? currentCandidate.phone_number : [];
+    // Drop legacy/malformed entries with no actual phone_number value before
+    // sending back to RF — RF rejects {type:1} entries as "invalid format".
+    const existingPhones = rawPhones
+      .map(p => (typeof p === 'string' ? { phone_number: p, type: 1 } : { phone_number: p.phone_number, type: p.type ?? 1 }))
+      .filter(p => p.phone_number);
     const normalizedNew = phoneStr.replace(/\D/g, '');
     const phoneAlreadyExists = existingPhones.some(
       p => (p.phone_number || '').replace(/\D/g, '') === normalizedNew
@@ -878,7 +883,7 @@ async function handleApolloWebhook(request, env, url) {
 
     if (!phoneAlreadyExists) {
       const mergedPhones = [
-        ...existingPhones.map(p => ({ phone_number: p.phone_number, type: p.type ?? 1 })),
+        ...existingPhones,
         { phone_number: phoneStr, type: 1 },
       ];
       await updateRFCandidate(rfId, { phone_number: mergedPhones }, env);
