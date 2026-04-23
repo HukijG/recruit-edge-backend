@@ -149,6 +149,13 @@ export async function searchRFCandidateByLinkedIn(linkedinUrl, env) {
     throw new Error('RF_API_KEY environment variable is required');
   }
 
+  const requestBody = {
+    filters: [{ conjunction: 'in', values: [linkedinUrl], key: 'linkedin_profile' }],
+    conjunction: 'match-all',
+    current_page: 1,
+    items_per_page: 5
+  };
+
   try {
     const response = await fetch(`${rfBaseUrl}/candidate/search`, {
       method: 'POST',
@@ -156,26 +163,30 @@ export async function searchRFCandidateByLinkedIn(linkedinUrl, env) {
         'RF-Api-Key': rfApiKey,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        filters: [{ conjunction: 'in', values: [linkedinUrl], key: 'linkedin_profile' }],
-        conjunction: 'match-all',
-        current_page: 1,
-        items_per_page: 5
-      })
+      body: JSON.stringify(requestBody)
     });
 
+    const responseText = await response.text();
+
     if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`RF search error: ${response.status}`, errorText);
+      console.error({ message: `RF search error status=${response.status} body=${responseText} searchedUrl=${linkedinUrl}`, source: 'rf-search' });
       return null;
     }
 
-    const result = await response.json();
+    const result = JSON.parse(responseText);
     const candidates = Array.isArray(result) ? result : (result.candidates || result.data || result.results || []);
+
+    // Diagnostic: log every search so we can verify RF's matching behavior.
+    // RF was returning candidates whose linkedin_profile didn't match the query
+    // (e.g. Eric's URL → Avree's record). We need visibility into what RF returns.
+    console.log({
+      message: `RF search by linkedin: searched="${linkedinUrl}" returnedCount=${candidates.length} returnedIds=[${candidates.map(c => c.id).join(',')}] returnedUrls=[${candidates.map(c => `"${c.linkedin_profile || ''}"`).join(',')}]`,
+      source: 'rf-search',
+    });
 
     return candidates.length > 0 ? candidates[0] : null;
   } catch (error) {
-    console.error('RF search failed:', error.message);
+    console.error({ message: `RF search failed: ${error.message} searchedUrl=${linkedinUrl}`, source: 'rf-search' });
     return null;
   }
 }

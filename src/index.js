@@ -990,9 +990,31 @@ async function processOneCandidate(ext, i, total, env) {
     // The cache can hold stale entries from silent corruption (e.g. a past enrichment
     // overwriting a record's linkedin_profile). Trusting the cache for matching can
     // route a new candidate to the wrong rfId; trusting RF avoids that.
-    const existing = ext.linkedinUrl
+    let existing = ext.linkedinUrl
       ? await searchRFCandidateByLinkedIn(ext.linkedinUrl, env)
       : null;
+
+    // Verify RF returned a candidate whose linkedin_profile actually matches what
+    // we searched for. RF's /candidate/search has been observed returning records
+    // whose linkedin_profile field does NOT equal the queried URL (e.g. searching
+    // for Eric's URL returned Avree's record id=37177 whose profile is Avree's own
+    // URL). Without this guard, the extension routes Eric's data into Avree's
+    // Dialpad contact. This is a non-negotiable safety check, not a matching
+    // algorithm — we still defer to RF for the actual match.
+    if (existing && ext.linkedinUrl) {
+      const wantNormalized = normalizeLinkedInUrl(ext.linkedinUrl);
+      const gotNormalized = normalizeLinkedInUrl(existing.linkedin_profile);
+      if (!gotNormalized || gotNormalized !== wantNormalized) {
+        console.error({
+          message: `[Candidates] ${label} — RF search returned wrong candidate. searched="${ext.linkedinUrl}" but rfId=${existing.id} has linkedin_profile="${existing.linkedin_profile}". Discarding match — will create new candidate.`,
+          source: 'candidates-endpoint',
+          searchedUrl: ext.linkedinUrl,
+          returnedRfId: existing.id,
+          returnedUrl: existing.linkedin_profile,
+        });
+        existing = null;
+      }
+    }
 
     // Reconcile cache against the authoritative RF result. If the cache had this
     // LinkedIn URL pointing at a different rfId, refreshing self-heals it for
