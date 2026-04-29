@@ -4,7 +4,7 @@ import worker from '../src';
 import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
 import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob, convertDialpadContactToRFUpdate } from '../src/rf-client.js';
 import {
-	isJoelsCall, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall
+	isMonitoredDialpadUser, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall, mergeColdCalledTag, getRFUserIdForDialpadUser
 } from '../src/cold-call.js';
 import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from '../src/apollo-client.js';
 import { isJoelCandidate, enrichCandidate } from '../src/enrichment.js';
@@ -307,21 +307,74 @@ describe('createRFCustomActivity', () => {
 // Cold call helper unit tests
 // ---------------------------------------------------------------------------
 
-describe('isJoelsCall', () => {
+describe('isMonitoredDialpadUser', () => {
 	it('returns true for Joel Dialpad user ID as string', () => {
-		expect(isJoelsCall('8000000000000001')).toBe(true);
+		expect(isMonitoredDialpadUser('8000000000000001')).toBe(true);
 	});
 
 	it('returns true for Joel Dialpad user ID as number', () => {
-		expect(isJoelsCall(8000000000000001)).toBe(true);
+		expect(isMonitoredDialpadUser(8000000000000001)).toBe(true);
+	});
+
+	it('returns true for Alice Dialpad user ID', () => {
+		expect(isMonitoredDialpadUser('8000000000000002')).toBe(true);
 	});
 
 	it('returns false for other user IDs', () => {
-		expect(isJoelsCall('9999999999999999')).toBe(false);
+		expect(isMonitoredDialpadUser('9999999999999999')).toBe(false);
 	});
 
 	it('returns false for undefined', () => {
-		expect(isJoelsCall(undefined)).toBe(false);
+		expect(isMonitoredDialpadUser(undefined)).toBe(false);
+	});
+});
+
+describe('getRFUserIdForDialpadUser', () => {
+	it('maps Joel Dialpad ID to Joel RF ID', () => {
+		expect(getRFUserIdForDialpadUser('8000000000000001')).toBe(900001);
+	});
+
+	it('maps Alice Dialpad ID to Alice RF ID', () => {
+		expect(getRFUserIdForDialpadUser('8000000000000002')).toBe(900002);
+	});
+
+	it('accepts numeric Dialpad IDs', () => {
+		expect(getRFUserIdForDialpadUser(8000000000000001)).toBe(900001);
+	});
+
+	it('returns null for unknown Dialpad user', () => {
+		expect(getRFUserIdForDialpadUser('9999999999999999')).toBeNull();
+	});
+
+	it('returns null for undefined', () => {
+		expect(getRFUserIdForDialpadUser(undefined)).toBeNull();
+	});
+});
+
+describe('mergeColdCalledTag', () => {
+	it('appends "Cold Called" to an existing tags array', () => {
+		expect(mergeColdCalledTag(['swagger', 'priority'])).toEqual(['swagger', 'priority', 'Cold Called']);
+	});
+
+	it('returns a single-tag array when input is empty', () => {
+		expect(mergeColdCalledTag([])).toEqual(['Cold Called']);
+	});
+
+	it('does not duplicate when "Cold Called" is already present', () => {
+		const tags = ['Cold Called', 'priority'];
+		expect(mergeColdCalledTag(tags)).toEqual(['Cold Called', 'priority']);
+	});
+
+	it('treats undefined as empty array', () => {
+		expect(mergeColdCalledTag(undefined)).toEqual(['Cold Called']);
+	});
+
+	it('treats null as empty array', () => {
+		expect(mergeColdCalledTag(null)).toEqual(['Cold Called']);
+	});
+
+	it('treats non-array input as empty array', () => {
+		expect(mergeColdCalledTag('not an array')).toEqual(['Cold Called']);
 	});
 });
 

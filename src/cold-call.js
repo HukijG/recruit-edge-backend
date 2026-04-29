@@ -6,13 +6,19 @@
  * and logs detected cold calls as RF custom activities.
  */
 
-import { extractRFIdFromDialpadContact, updateRFCandidate, createRFCustomActivity } from './rf-client.js';
+import { extractRFIdFromDialpadContact, updateRFCandidate, createRFCustomActivity, getRFCandidate } from './rf-client.js';
 
 // --- Constants ---
 
-const JOEL_DIALPAD_USER_ID = '8000000000000001';
-const JOEL_RF_USER_ID = 900001;
+// Dialpad user ID → RF user ID. Calls placed by these users are eligible for
+// cold-call classification, and the resulting RF activity is attributed to
+// the matching RF user.
+const DIALPAD_TO_RF_USER_ID = {
+  '8000000000000001': 900001,  // Joel
+  '8000000000000002': 900002,  // Alice
+};
 const COLD_CALL_ACTIVITY_TYPE_ID = 1002;
+const COLD_CALL_TAG = 'Cold Called';
 const TRANSCRIPT_MAX_CHARS = 5000;
 const AI_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 const VALID_OUTCOMES = ['voicemail', 'connected_positive', 'connected_negative'];
@@ -58,8 +64,22 @@ Respond with ONLY valid JSON, no other text:
 
 // --- Pure helpers ---
 
-export function isJoelsCall(targetId) {
-  return String(targetId) === JOEL_DIALPAD_USER_ID;
+export function isMonitoredDialpadUser(targetId) {
+  return String(targetId) in DIALPAD_TO_RF_USER_ID;
+}
+
+export function getRFUserIdForDialpadUser(targetId) {
+  return DIALPAD_TO_RF_USER_ID[String(targetId)] ?? null;
+}
+
+/**
+ * Append the "Cold Called" tag to an existing tags array (deduped).
+ * Defensive against missing/non-array input — RF /candidate/get is documented
+ * to return tags as an array of bare strings.
+ */
+export function mergeColdCalledTag(existingTags) {
+  const tags = Array.isArray(existingTags) ? existingTags : [];
+  return tags.includes(COLD_CALL_TAG) ? tags : [...tags, COLD_CALL_TAG];
 }
 
 export function isOutboundCall(direction) {
@@ -217,8 +237,8 @@ export async function processCallEvent(payload, env) {
 
   // --- Pre-LLM filters ---
 
-  if (!isJoelsCall(payload.target?.id)) {
-    console.log({ message: `[ColdCall] skipped: not Joel's call (target=${payload.target?.id})`, source: 'cold-call', step: 'filter', callId });
+  if (!isMonitoredDialpadUser(payload.target?.id)) {
+    console.log({ message: `[ColdCall] skipped: not a monitored target user (target=${payload.target?.id})`, source: 'cold-call', step: 'filter', callId });
     return { processed: false, isColdCall: false, outcome: null, reason: 'not target user' };
   }
 
@@ -295,7 +315,30 @@ export async function processCallEvent(payload, env) {
     return { processed: true, isColdCall: false, outcome: null, reason: classification.reasoning };
   }
 
-  // --- Cold call detected: update RF ---
+  // --- Cold call detected: fetch candidate, then write activity + tag/source update ---
+
+  // RF /candidate/update REPLACES arrays, so we must read existing tags first
+  // and send back the full merged set. Synchronous chain: any failure aborts —
+  // we'd rather lose an event than risk silently wiping tags or duplicating writes.
+  let candidate;
+  try {
+    candidate = await getRFCandidate(rfCandidateId, env);
+  } catch (error) {
+    console.error({ message: `[ColdCall] candidate fetch failed: ${error.message}`, source: 'cold-call', step: 'fetch_candidate', callId, rfCandidateId });
+    return { processed: true, isColdCall: true, outcome: classification.outcome, reason: `classified as cold call but candidate fetch failed: ${error.message}` };
+  }
+
+  const existingTags = candidate?.tags;
+  const mergedTags = mergeColdCalledTag(existingTags);
+  console.log({
+    message: `[ColdCall] tags read: existing=${JSON.stringify(existingTags)} merged=${JSON.stringify(mergedTags)}`,
+    source: 'cold-call',
+    step: 'tags_read',
+    callId,
+    rfCandidateId,
+    existingTags,
+    mergedTags,
+  });
 
   const callTimestamp = payload.date_started || payload.event_timestamp || Date.now();
   const activityTime = formatActivityTime(callTimestamp);
@@ -313,20 +356,22 @@ export async function processCallEvent(payload, env) {
     }
   }
 
+  const activityUserId = getRFUserIdForDialpadUser(payload.target?.id);
+
   try {
     await createRFCustomActivity({
       activity_text: activityText,
       activity_time: activityTime,
       activity_type_id: COLD_CALL_ACTIVITY_TYPE_ID,
-      activity_user_id: JOEL_RF_USER_ID,
+      activity_user_id: activityUserId,
       associated_entities: { candidates: [parseInt(rfCandidateId, 10)] },
       mentions: []
     }, env);
 
-    await updateRFCandidate(rfCandidateId, { source: 'Cold Call' }, env);
+    await updateRFCandidate(rfCandidateId, { source: 'Cold Call', tags: mergedTags }, env);
 
     console.log({
-      message: `[ColdCall] RF updated: activity="${activityText}" + source=Cold Call`,
+      message: `[ColdCall] RF updated: activity="${activityText}" + source=Cold Call + tags=${JSON.stringify(mergedTags)}`,
       source: 'cold-call',
       step: 'rf_update',
       callId,
@@ -334,6 +379,8 @@ export async function processCallEvent(payload, env) {
       contactName,
       activityText,
       outcome: classification.outcome,
+      tags: mergedTags,
+      activityUserId,
     });
   } catch (error) {
     console.error({ message: `[ColdCall] RF update failed: ${error.message}`, source: 'cold-call', step: 'rf_update', callId, rfCandidateId });
