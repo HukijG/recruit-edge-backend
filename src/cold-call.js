@@ -55,10 +55,16 @@ NOT a cold call:
 - Internal calls between colleagues
 - Candidate references a previous phone call ("good to talk again", "as we discussed last time")
 
-OUTCOME (only when is_cold_call is true):
-- "voicemail": Caller left a voicemail, no live conversation occurred
-- "connected_positive": Candidate engaged, showed interest, was open to hearing more, or agreed to follow up
-- "connected_negative": Candidate declined, wasn't interested, was dismissive, or call ended with no engagement
+OUTCOME (only when is_cold_call is true) — judge from transcript content. Be conservative: when in doubt, prefer "voicemail":
+
+- "voicemail": Caller leaves a message with no real candidate participation. This is the DEFAULT when the transcript is one-sided.
+  * The caller does ~all the substantive talking
+  * The "other side" of the transcript is silent, has only short greetings, has automated answering-machine prompts ("leave a message after the beep", "hinterlassen Sie eine Nachricht", etc.), OR contains garbled / mistranscribed text — Dialpad's transcription regularly produces nonsense words from non-English voicemail greetings (German, French, Spanish, etc.) that may look like brief candidate utterances. Treat all of these as voicemail prompts, NOT as candidate speech.
+  * If you cannot quote a SUBSTANTIVE candidate response (a real sentence, not a fragment or a single word), it's a voicemail.
+
+- "connected_positive": Two-way dialogue. The candidate speaks substantively — full sentences, asks questions, expresses interest, agrees to follow up. You must be able to point to actual candidate sentences in the transcript.
+
+- "connected_negative": Two-way dialogue. The candidate speaks substantively and declines, isn't interested, or disengages after engaging. You must be able to point to actual candidate sentences that EXPLICITLY decline, refuse, or show disinterest (e.g. "I'm not interested", "I just joined a new company", "please don't call me"). NEVER classify as connected_negative based on "tone", "the candidate didn't engage", or "no candidate response" — absence of candidate dialogue means VOICEMAIL, not connected_negative.
 
 Respond with ONLY valid JSON, no other text:
 {"is_cold_call": true, "outcome": "voicemail", "reasoning": "one sentence explanation"}
@@ -207,8 +213,15 @@ export async function classifyColdCall(transcriptText, env, callState) {
     return { is_cold_call: false, outcome: null, reasoning: 'No transcript text available' };
   }
 
-  const callTypeHint = callState === 'transcription' ? 'Voicemail' : 'Connected call';
-  const userMessage = `Call type: ${callTypeHint}\n\nTranscript:\n\n${truncated}`;
+  // Only pass a call-type hint when state='transcription' — that's Dialpad's
+  // dedicated voicemail webhook, so we know for sure. For 'call_transcription'
+  // Dialpad fires the same event for live calls AND for outbound calls that
+  // went to voicemail (especially with non-English answering machines), so
+  // pinning "Connected call" actively misleads the classifier. Let the LLM
+  // judge from content per the OUTCOME rules in the system prompt.
+  const userMessage = callState === 'transcription'
+    ? `Call type: Voicemail\n\nTranscript:\n\n${truncated}`
+    : `Transcript:\n\n${truncated}`;
 
   const response = await env.AI.run(AI_MODEL, {
     messages: [
