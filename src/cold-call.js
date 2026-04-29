@@ -29,6 +29,10 @@ const ACTION_ITEMS_PROMPT = `Extract the key action items and next steps from th
 
 Respond with ONLY the bullet points, no preamble.`;
 
+const NEGATIVE_NOTES_PROMPT = `Summarise the candidate's situation and the key points they raised from the end of this cold call transcript. Be very brief — 2-4 bullet points max. Capture anything notable about their current role, plans, timing, motivations, or perspective on the opportunity. If nothing notable was discussed, say "No specific notes from this call."
+
+Respond with ONLY the bullet points, no preamble. Put each bullet on its own line.`;
+
 const COLD_CALL_SYSTEM_PROMPT = `You are a call transcript classifier for a recruiting firm. Analyze this transcript and determine:
 1. Whether this is a COLD CALL (unsolicited outbound contact with a candidate)
 2. If it is a cold call, what was the OUTCOME
@@ -82,6 +86,16 @@ export function mergeColdCalledTag(existingTags) {
   return tags.includes(COLD_CALL_TAG) ? tags : [...tags, COLD_CALL_TAG];
 }
 
+/**
+ * Convert "\n" newlines to "<br>\n" so RF's activity_text renderer breaks lines.
+ * RF's activity field only honours <br>; other HTML tags are silently dropped,
+ * and bare \n collapses to a space at render time.
+ */
+export function addHtmlLineBreaks(text) {
+  if (!text) return text;
+  return text.replace(/\n/g, '<br>\n');
+}
+
 export function isOutboundCall(direction) {
   return direction === 'outbound';
 }
@@ -133,6 +147,29 @@ export async function extractActionItems(transcriptText, env) {
     return trimmed || null;
   } catch (error) {
     console.error({ message: `[ColdCall] Action items extraction failed: ${error.message}`, source: 'cold-call', step: 'action_items' });
+    return null;
+  }
+}
+
+/** For connected_negative calls, extract a short summary of what the candidate raised from the tail of the transcript using a lightweight model. */
+export async function extractNegativeCallNotes(transcriptText, env) {
+  const tail = extractTranscriptTail(transcriptText);
+  if (!tail) return null;
+
+  try {
+    const response = await env.AI.run(ACTION_ITEMS_MODEL, {
+      messages: [
+        { role: 'system', content: NEGATIVE_NOTES_PROMPT },
+        { role: 'user', content: tail }
+      ]
+    });
+
+    const raw = response.response;
+    const text = (typeof raw === 'object' && raw !== null) ? JSON.stringify(raw) : String(raw || '');
+    const trimmed = text.trim();
+    return trimmed || null;
+  } catch (error) {
+    console.error({ message: `[ColdCall] Negative-call notes extraction failed: ${error.message}`, source: 'cold-call', step: 'negative_notes' });
     return null;
   }
 }
@@ -347,20 +384,31 @@ export async function processCallEvent(payload, env) {
     ? `Cold call with ${contactName || 'Unknown'} — ${outcomeLabel}`
     : `Cold call with ${contactName || 'Unknown'}`;
 
-  // For positive calls, extract action items from the tail of the transcript
+  // For connected calls, extract a short bullet-point summary from the tail of
+  // the transcript using the cheap model. Positive calls get "Next steps",
+  // negative calls get "Notes" (general candidate context, not action items).
   if (classification.outcome === 'connected_positive') {
     const actionItems = await extractActionItems(transcriptText, env);
     if (actionItems) {
       activityText += `\n\nNext steps:\n${actionItems}`;
       console.log({ message: `[ColdCall] action items extracted`, source: 'cold-call', step: 'action_items', callId });
     }
+  } else if (classification.outcome === 'connected_negative') {
+    const notes = await extractNegativeCallNotes(transcriptText, env);
+    if (notes) {
+      activityText += `\n\nNotes:\n${notes}`;
+      console.log({ message: `[ColdCall] negative-call notes extracted`, source: 'cold-call', step: 'negative_notes', callId });
+    }
   }
 
   const activityUserId = getRFUserIdForDialpadUser(payload.target?.id);
+  // RF's activity_text only honours <br> for line breaks; bare \n collapses
+  // to a space at render time. Convert just before sending.
+  const formattedActivityText = addHtmlLineBreaks(activityText);
 
   try {
     await createRFCustomActivity({
-      activity_text: activityText,
+      activity_text: formattedActivityText,
       activity_time: activityTime,
       activity_type_id: COLD_CALL_ACTIVITY_TYPE_ID,
       activity_user_id: activityUserId,
@@ -371,13 +419,13 @@ export async function processCallEvent(payload, env) {
     await updateRFCandidate(rfCandidateId, { source: 'Cold Call', tags: mergedTags }, env);
 
     console.log({
-      message: `[ColdCall] RF updated: activity="${activityText}" + source=Cold Call + tags=${JSON.stringify(mergedTags)}`,
+      message: `[ColdCall] RF updated: activity="${formattedActivityText}" + source=Cold Call + tags=${JSON.stringify(mergedTags)}`,
       source: 'cold-call',
       step: 'rf_update',
       callId,
       rfCandidateId,
       contactName,
-      activityText,
+      activityText: formattedActivityText,
       outcome: classification.outcome,
       tags: mergedTags,
       activityUserId,

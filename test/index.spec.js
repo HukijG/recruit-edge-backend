@@ -4,7 +4,7 @@ import worker from '../src';
 import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
 import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob, convertDialpadContactToRFUpdate } from '../src/rf-client.js';
 import {
-	isMonitoredDialpadUser, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall, mergeColdCalledTag, getRFUserIdForDialpadUser
+	isMonitoredDialpadUser, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall, mergeColdCalledTag, getRFUserIdForDialpadUser, addHtmlLineBreaks
 } from '../src/cold-call.js';
 import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from '../src/apollo-client.js';
 import { isJoelCandidate, enrichCandidate } from '../src/enrichment.js';
@@ -348,6 +348,36 @@ describe('getRFUserIdForDialpadUser', () => {
 
 	it('returns null for undefined', () => {
 		expect(getRFUserIdForDialpadUser(undefined)).toBeNull();
+	});
+});
+
+describe('addHtmlLineBreaks', () => {
+	it('replaces every \\n with <br>\\n', () => {
+		expect(addHtmlLineBreaks('a\nb')).toBe('a<br>\nb');
+	});
+
+	it('produces double <br> for blank-line separators', () => {
+		expect(addHtmlLineBreaks('header\n\nbody')).toBe('header<br>\n<br>\nbody');
+	});
+
+	it('handles a multi-line activity text end-to-end', () => {
+		const input = 'Cold call with X — Connected (Positive)\n\nNext steps:\n- email follow-up\n- send JD';
+		const expected = 'Cold call with X — Connected (Positive)<br>\n<br>\nNext steps:<br>\n- email follow-up<br>\n- send JD';
+		expect(addHtmlLineBreaks(input)).toBe(expected);
+	});
+
+	it('does not append a trailing <br> when text has no trailing newline', () => {
+		expect(addHtmlLineBreaks('single line')).toBe('single line');
+	});
+
+	it('returns single-line text unchanged', () => {
+		expect(addHtmlLineBreaks('Cold call with X — Voicemail')).toBe('Cold call with X — Voicemail');
+	});
+
+	it('returns falsy input unchanged', () => {
+		expect(addHtmlLineBreaks('')).toBe('');
+		expect(addHtmlLineBreaks(null)).toBe(null);
+		expect(addHtmlLineBreaks(undefined)).toBe(undefined);
 	});
 });
 
