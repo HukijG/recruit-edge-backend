@@ -2,7 +2,7 @@ import { env, createExecutionContext, waitOnExecutionContext, SELF } from 'cloud
 import { describe, it, expect, afterEach } from 'vitest';
 import worker from '../src';
 import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
-import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob, convertDialpadContactToRFUpdate } from '../src/rf-client.js';
+import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob, convertDialpadContactToRFUpdate, findJobsForStageMove } from '../src/rf-client.js';
 import {
 	isMonitoredDialpadUser, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall, mergeColdCalledTag, getRFUserIdForDialpadUser, addHtmlLineBreaks
 } from '../src/cold-call.js';
@@ -781,6 +781,114 @@ describe('findEligibleJob', () => {
     const result = findEligibleJob(candidate);
     expect(result).not.toBeNull();
     expect(result.userId).toBe(900001);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findJobsForStageMove tests (generalised stage-move filter)
+// ---------------------------------------------------------------------------
+
+describe('findJobsForStageMove', () => {
+  function buildCandidate(jobs) {
+    return { id: 49503, first_name: 'Steve', last_name: 'Xu', jobs };
+  }
+
+  function buildJob(overrides = {}) {
+    return {
+      job_id: 977,
+      is_open: true,
+      stage_name: 'Sourced',
+      added_to_job_by: { id: 900001, name: 'Joel' },
+      stages: [
+        { id: 17934, name: 'Sourced', rank: 1 },
+        { id: 17935, name: 'Applied', rank: 2 },
+        { id: 17936, name: 'Replied', rank: 3 },
+      ],
+      ...overrides,
+    };
+  }
+
+  const COLD_CALL_FILTERS = {
+    currentStage: 'Sourced',
+    targetStage: 'Replied',
+    addedByUserId: 900001,
+  };
+
+  it('returns empty array when candidate has no jobs', () => {
+    expect(findJobsForStageMove(buildCandidate([]), COLD_CALL_FILTERS)).toEqual([]);
+  });
+
+  it('returns empty array for null candidate', () => {
+    expect(findJobsForStageMove(null, COLD_CALL_FILTERS)).toEqual([]);
+  });
+
+  it('returns empty array when filters are missing required fields', () => {
+    expect(findJobsForStageMove(buildCandidate([buildJob()]), {})).toEqual([]);
+    expect(findJobsForStageMove(buildCandidate([buildJob()]), { currentStage: 'Sourced' })).toEqual([]);
+  });
+
+  it('returns matching job with target stage info', () => {
+    const result = findJobsForStageMove(buildCandidate([buildJob()]), COLD_CALL_FILTERS);
+    expect(result).toEqual([{ job_id: 977, targetStage: { id: 17936, name: 'Replied' } }]);
+  });
+
+  it('excludes closed jobs by default', () => {
+    const result = findJobsForStageMove(buildCandidate([buildJob({ is_open: false })]), COLD_CALL_FILTERS);
+    expect(result).toEqual([]);
+  });
+
+  it('includes closed jobs when openOnly=false', () => {
+    const candidate = buildCandidate([buildJob({ is_open: false })]);
+    const result = findJobsForStageMove(candidate, { ...COLD_CALL_FILTERS, openOnly: false });
+    expect(result).toHaveLength(1);
+  });
+
+  it('excludes jobs not in the requested currentStage', () => {
+    const result = findJobsForStageMove(buildCandidate([buildJob({ stage_name: 'Replied' })]), COLD_CALL_FILTERS);
+    expect(result).toEqual([]);
+  });
+
+  it('excludes jobs added by other users when addedByUserId is set', () => {
+    const job = buildJob({ added_to_job_by: { id: 99999, name: 'Someone Else' } });
+    const result = findJobsForStageMove(buildCandidate([job]), COLD_CALL_FILTERS);
+    expect(result).toEqual([]);
+  });
+
+  it('does not filter by user when addedByUserId is omitted', () => {
+    const job = buildJob({ added_to_job_by: { id: 99999, name: 'Someone Else' } });
+    const result = findJobsForStageMove(buildCandidate([job]), {
+      currentStage: 'Sourced',
+      targetStage: 'Replied',
+    });
+    expect(result).toHaveLength(1);
+  });
+
+  it('excludes jobs that do not have the targetStage available', () => {
+    const job = buildJob({ stages: [{ id: 17934, name: 'Sourced', rank: 1 }] });
+    const result = findJobsForStageMove(buildCandidate([job]), COLD_CALL_FILTERS);
+    expect(result).toEqual([]);
+  });
+
+  it('returns multiple matching jobs', () => {
+    const candidate = buildCandidate([
+      buildJob({ job_id: 1 }),
+      buildJob({ job_id: 2 }),
+    ]);
+    const result = findJobsForStageMove(candidate, COLD_CALL_FILTERS);
+    expect(result).toHaveLength(2);
+    expect(result.map(j => j.job_id).sort()).toEqual([1, 2]);
+  });
+
+  it('mixes eligible and ineligible jobs correctly', () => {
+    const candidate = buildCandidate([
+      buildJob({ job_id: 1 }),                                                    // eligible
+      buildJob({ job_id: 2, is_open: false }),                                    // closed
+      buildJob({ job_id: 3, stage_name: 'Replied' }),                             // already past Sourced
+      buildJob({ job_id: 4, added_to_job_by: { id: 99999, name: 'Other' } }),     // wrong user
+    ]);
+    const result = findJobsForStageMove(candidate, COLD_CALL_FILTERS);
+    expect(result).toHaveLength(1);
+    expect(result[0].job_id).toBe(1);
   });
 });
 

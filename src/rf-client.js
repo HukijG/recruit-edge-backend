@@ -454,6 +454,106 @@ export async function moveToCallBooked(candidateId, candidateData, env) {
 }
 
 /**
+ * Generalised job filter for stage-move flows. Walks `candidate.jobs` and
+ * returns every entry that matches the supplied filters.
+ *
+ * Returns an array of { job_id, targetStage: { id, name } }.
+ *
+ * @param {object} candidate - Full candidate object from GET /candidate/get
+ * @param {object} filters
+ * @param {string} filters.currentStage   Required, e.g. 'Sourced'
+ * @param {string} filters.targetStage    Required, e.g. 'Replied'
+ * @param {number} [filters.addedByUserId] If set, only jobs whose
+ *                 `added_to_job_by.id` matches are returned
+ * @param {boolean} [filters.openOnly=true] Only consider jobs with is_open=true
+ */
+export function findJobsForStageMove(candidate, filters) {
+  const { currentStage, targetStage, addedByUserId, openOnly = true } = filters || {};
+  if (!currentStage || !targetStage) return [];
+
+  const jobs = candidate?.jobs;
+  if (!Array.isArray(jobs) || jobs.length === 0) return [];
+
+  const eligible = [];
+  for (const job of jobs) {
+    if (openOnly && !job?.is_open) continue;
+    if (job?.stage_name !== currentStage) continue;
+    if (addedByUserId !== undefined && job?.added_to_job_by?.id !== addedByUserId) continue;
+
+    const target = job?.stages?.find(s => s.name === targetStage);
+    if (!target) continue;
+
+    eligible.push({
+      job_id: job.job_id,
+      targetStage: { id: target.id, name: target.name },
+    });
+  }
+  return eligible;
+}
+
+/**
+ * Generalised stage-mover. Moves a candidate from `currentStage` to
+ * `targetStage` in every matching job (per findJobsForStageMove).
+ * Caller provides the full candidate object (already fetched) to avoid a
+ * redundant GET. Fail-fast: if any single move call errors, the loop
+ * aborts and the error is thrown.
+ *
+ * @param {string|number} candidateId
+ * @param {object} candidateData       Full candidate object from GET
+ * @param {object} options
+ * @param {string} options.currentStage
+ * @param {string} options.targetStage
+ * @param {number} options.userId      RF user_id to attribute the move to
+ * @param {number} [options.addedByUserId]
+ * @param {boolean} [options.openOnly=true]
+ * @param {object} env
+ * @returns {Promise<{ moved: number, jobIds: number[] }>}
+ */
+export async function moveJobsToStage(candidateId, candidateData, options, env) {
+  const { currentStage, targetStage, userId, addedByUserId, openOnly } = options;
+  const eligible = findJobsForStageMove(candidateData, { currentStage, targetStage, addedByUserId, openOnly });
+  if (eligible.length === 0) {
+    return { moved: 0, jobIds: [] };
+  }
+
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const movedJobIds = [];
+  for (const job of eligible) {
+    const payload = {
+      id: parseInt(candidateId, 10),
+      job_id: job.job_id,
+      stage: { id: job.targetStage.id, name: job.targetStage.name },
+      user_id: userId,
+    };
+
+    const response = await fetch(`${rfBaseUrl}/candidate/move-to-stage`, {
+      method: 'POST',
+      headers: {
+        'RF-Api-Key': rfApiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error({ message: `RF move-to-stage error candidate=${candidateId} job=${job.job_id} status=${response.status} body=${errorText}`, source: 'rf-move-stage' });
+      throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    }
+
+    movedJobIds.push(job.job_id);
+  }
+
+  return { moved: movedJobIds.length, jobIds: movedJobIds };
+}
+
+/**
  * Fetch all open jobs from RF, paginating through all pages.
  * Returns slim objects: { id, name, company }
  */

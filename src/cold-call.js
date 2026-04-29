@@ -6,7 +6,7 @@
  * and logs detected cold calls as RF custom activities.
  */
 
-import { extractRFIdFromDialpadContact, updateRFCandidate, createRFCustomActivity, getRFCandidate } from './rf-client.js';
+import { extractRFIdFromDialpadContact, updateRFCandidate, createRFCustomActivity, getRFCandidate, moveJobsToStage } from './rf-client.js';
 
 // --- Constants ---
 
@@ -433,6 +433,35 @@ export async function processCallEvent(payload, env) {
   } catch (error) {
     console.error({ message: `[ColdCall] RF update failed: ${error.message}`, source: 'cold-call', step: 'rf_update', callId, rfCandidateId });
     return { processed: true, isColdCall: true, outcome: classification.outcome, reason: `classified as cold call but RF update failed: ${error.message}` };
+  }
+
+  // For connected calls (positive or negative), progress the candidate from
+  // Sourced → Replied in any open job the recruiter sourced them to.
+  // Voicemails don't qualify — no actual reply happened. Filter is restrictive
+  // (open + Sourced + added_to_job_by === recruiter) so candidates already
+  // past Sourced, in closed jobs, or sourced by someone else are untouched.
+  if (classification.outcome === 'connected_positive' || classification.outcome === 'connected_negative') {
+    try {
+      const moveResult = await moveJobsToStage(rfCandidateId, candidate, {
+        currentStage: 'Sourced',
+        targetStage: 'Replied',
+        userId: activityUserId,
+        addedByUserId: activityUserId,
+      }, env);
+      console.log({
+        message: `[ColdCall] stage move: moved=${moveResult.moved} jobs=${JSON.stringify(moveResult.jobIds)}`,
+        source: 'cold-call',
+        step: 'stage_move',
+        callId,
+        rfCandidateId,
+        moved: moveResult.moved,
+        jobIds: moveResult.jobIds,
+        activityUserId,
+      });
+    } catch (error) {
+      console.error({ message: `[ColdCall] stage move failed: ${error.message}`, source: 'cold-call', step: 'stage_move', callId, rfCandidateId });
+      return { processed: true, isColdCall: true, outcome: classification.outcome, reason: `classified as cold call but stage move failed: ${error.message}` };
+    }
   }
 
   return { processed: true, isColdCall: true, outcome: classification.outcome, reason: classification.reasoning };
