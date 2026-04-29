@@ -436,17 +436,18 @@ export async function processCallEvent(payload, env) {
   }
 
   // For connected calls (positive or negative), progress the candidate from
-  // Sourced → Replied in any open job the recruiter sourced them to.
-  // Voicemails don't qualify — no actual reply happened. Filter is restrictive
-  // (open + Sourced + added_to_job_by === recruiter) so candidates already
-  // past Sourced, in closed jobs, or sourced by someone else are untouched.
+  // Sourced → Replied on jobs[0] (the most recently-touched job).
+  // Voicemails don't qualify — no actual reply happened. We deliberately do
+  // NOT scan later jobs: if jobs[0] is already past Sourced or closed, we
+  // skip rather than risk moving the wrong job. The added_to_job_by filter
+  // was dropped — the LinkedIn extension adds candidates via the API, not
+  // as a user, so that field doesn't carry the recruiter's RF user ID.
   if (classification.outcome === 'connected_positive' || classification.outcome === 'connected_negative') {
     try {
       const moveResult = await moveJobsToStage(rfCandidateId, candidate, {
         currentStage: 'Sourced',
         targetStage: 'Replied',
         userId: activityUserId,
-        addedByUserId: activityUserId,
       }, env);
       console.log({
         message: `[ColdCall] stage move: moved=${moveResult.moved} jobs=${JSON.stringify(moveResult.jobIds)}`,

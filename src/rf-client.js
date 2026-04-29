@@ -454,41 +454,39 @@ export async function moveToCallBooked(candidateId, candidateData, env) {
 }
 
 /**
- * Generalised job filter for stage-move flows. Walks `candidate.jobs` and
- * returns every entry that matches the supplied filters.
+ * Stage-move eligibility check that ONLY considers the first entry in
+ * `candidate.jobs`. RF returns jobs time-ordered, so jobs[0] is the most
+ * recently-touched job — i.e. the one the recruiter is currently working
+ * with. We deliberately do NOT scan later entries: if jobs[0] isn't
+ * eligible, we return [] and the move is skipped. Moving a *different*
+ * job than the one the recruiter is on is worse than doing nothing.
  *
- * Returns an array of { job_id, targetStage: { id, name } }.
+ * Returns [] or a single-element [{ job_id, targetStage: { id, name } }].
  *
  * @param {object} candidate - Full candidate object from GET /candidate/get
  * @param {object} filters
  * @param {string} filters.currentStage   Required, e.g. 'Sourced'
  * @param {string} filters.targetStage    Required, e.g. 'Replied'
- * @param {number} [filters.addedByUserId] If set, only jobs whose
- *                 `added_to_job_by.id` matches are returned
- * @param {boolean} [filters.openOnly=true] Only consider jobs with is_open=true
+ * @param {boolean} [filters.openOnly=true] Only act when jobs[0].is_open
  */
 export function findJobsForStageMove(candidate, filters) {
-  const { currentStage, targetStage, addedByUserId, openOnly = true } = filters || {};
+  const { currentStage, targetStage, openOnly = true } = filters || {};
   if (!currentStage || !targetStage) return [];
 
   const jobs = candidate?.jobs;
   if (!Array.isArray(jobs) || jobs.length === 0) return [];
 
-  const eligible = [];
-  for (const job of jobs) {
-    if (openOnly && !job?.is_open) continue;
-    if (job?.stage_name !== currentStage) continue;
-    if (addedByUserId !== undefined && job?.added_to_job_by?.id !== addedByUserId) continue;
+  const job = jobs[0];
+  if (openOnly && !job?.is_open) return [];
+  if (job?.stage_name !== currentStage) return [];
 
-    const target = job?.stages?.find(s => s.name === targetStage);
-    if (!target) continue;
+  const target = job?.stages?.find(s => s.name === targetStage);
+  if (!target) return [];
 
-    eligible.push({
-      job_id: job.job_id,
-      targetStage: { id: target.id, name: target.name },
-    });
-  }
-  return eligible;
+  return [{
+    job_id: job.job_id,
+    targetStage: { id: target.id, name: target.name },
+  }];
 }
 
 /**
@@ -504,14 +502,13 @@ export function findJobsForStageMove(candidate, filters) {
  * @param {string} options.currentStage
  * @param {string} options.targetStage
  * @param {number} options.userId      RF user_id to attribute the move to
- * @param {number} [options.addedByUserId]
  * @param {boolean} [options.openOnly=true]
  * @param {object} env
  * @returns {Promise<{ moved: number, jobIds: number[] }>}
  */
 export async function moveJobsToStage(candidateId, candidateData, options, env) {
-  const { currentStage, targetStage, userId, addedByUserId, openOnly } = options;
-  const eligible = findJobsForStageMove(candidateData, { currentStage, targetStage, addedByUserId, openOnly });
+  const { currentStage, targetStage, userId, openOnly } = options;
+  const eligible = findJobsForStageMove(candidateData, { currentStage, targetStage, openOnly });
   if (eligible.length === 0) {
     return { moved: 0, jobIds: [] };
   }

@@ -798,7 +798,6 @@ describe('findJobsForStageMove', () => {
       job_id: 977,
       is_open: true,
       stage_name: 'Sourced',
-      added_to_job_by: { id: 900001, name: 'Joel' },
       stages: [
         { id: 17934, name: 'Sourced', rank: 1 },
         { id: 17935, name: 'Applied', rank: 2 },
@@ -811,7 +810,6 @@ describe('findJobsForStageMove', () => {
   const COLD_CALL_FILTERS = {
     currentStage: 'Sourced',
     targetStage: 'Replied',
-    addedByUserId: 900001,
   };
 
   it('returns empty array when candidate has no jobs', () => {
@@ -848,47 +846,38 @@ describe('findJobsForStageMove', () => {
     expect(result).toEqual([]);
   });
 
-  it('excludes jobs added by other users when addedByUserId is set', () => {
-    const job = buildJob({ added_to_job_by: { id: 99999, name: 'Someone Else' } });
-    const result = findJobsForStageMove(buildCandidate([job]), COLD_CALL_FILTERS);
-    expect(result).toEqual([]);
-  });
-
-  it('does not filter by user when addedByUserId is omitted', () => {
-    const job = buildJob({ added_to_job_by: { id: 99999, name: 'Someone Else' } });
-    const result = findJobsForStageMove(buildCandidate([job]), {
-      currentStage: 'Sourced',
-      targetStage: 'Replied',
-    });
-    expect(result).toHaveLength(1);
-  });
-
   it('excludes jobs that do not have the targetStage available', () => {
     const job = buildJob({ stages: [{ id: 17934, name: 'Sourced', rank: 1 }] });
     const result = findJobsForStageMove(buildCandidate([job]), COLD_CALL_FILTERS);
     expect(result).toEqual([]);
   });
 
-  it('returns multiple matching jobs', () => {
+  it('only considers jobs[0] — returns it when eligible', () => {
     const candidate = buildCandidate([
       buildJob({ job_id: 1 }),
       buildJob({ job_id: 2 }),
     ]);
     const result = findJobsForStageMove(candidate, COLD_CALL_FILTERS);
-    expect(result).toHaveLength(2);
-    expect(result.map(j => j.job_id).sort()).toEqual([1, 2]);
-  });
-
-  it('mixes eligible and ineligible jobs correctly', () => {
-    const candidate = buildCandidate([
-      buildJob({ job_id: 1 }),                                                    // eligible
-      buildJob({ job_id: 2, is_open: false }),                                    // closed
-      buildJob({ job_id: 3, stage_name: 'Replied' }),                             // already past Sourced
-      buildJob({ job_id: 4, added_to_job_by: { id: 99999, name: 'Other' } }),     // wrong user
-    ]);
-    const result = findJobsForStageMove(candidate, COLD_CALL_FILTERS);
     expect(result).toHaveLength(1);
     expect(result[0].job_id).toBe(1);
+  });
+
+  it('only considers jobs[0] — does NOT fall through to a later eligible job when jobs[0] is wrong stage', () => {
+    const candidate = buildCandidate([
+      buildJob({ job_id: 1, stage_name: 'Replied' }), // ineligible (already past Sourced)
+      buildJob({ job_id: 2 }),                         // eligible but at index 1 — must NOT be picked
+    ]);
+    const result = findJobsForStageMove(candidate, COLD_CALL_FILTERS);
+    expect(result).toEqual([]);
+  });
+
+  it('only considers jobs[0] — does NOT fall through when jobs[0] is closed', () => {
+    const candidate = buildCandidate([
+      buildJob({ job_id: 1, is_open: false }),
+      buildJob({ job_id: 2 }),
+    ]);
+    const result = findJobsForStageMove(candidate, COLD_CALL_FILTERS);
+    expect(result).toEqual([]);
   });
 });
 
