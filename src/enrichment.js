@@ -8,8 +8,9 @@
 import { enrichPerson, searchPeople, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from './apollo-client.js';
 import { updateRFCandidate, addRFCandidateNote } from './rf-client.js';
 import { patchDialpadContact } from './dialpad-client.js';
+import { getUserByFirstName } from './users.js';
 
-const JOEL_RF_USER_ID = 900001;
+const JOEL_RF_USER_ID = getUserByFirstName('Joel').rfUserId;
 
 function log(data) {
 	console.log({ source: 'enrichment', ...data });

@@ -784,6 +784,22 @@ describe('findEligibleJob', () => {
     expect(result).not.toBeNull();
     expect(result.userId).toBe(900001);
   });
+
+  it('uses the Joel RF user ID sourced from users.js, not a duplicate literal', async () => {
+    const { getUserByFirstName } = await import('../src/users.js');
+    const joel = getUserByFirstName('Joel');
+    expect(joel.rfUserId).toBe(900001);
+    // findEligibleJob's userId field must equal Joel's rfUserId from the registry
+    const result = findEligibleJob({
+      jobs: [{
+        job_id: 1,
+        stage_name: 'Sourced',
+        stage_moved: '2026-03-30T15:08:04+0000',
+        stages: [{ id: 100, name: 'Call Booked' }],
+      }],
+    });
+    expect(result.userId).toBe(joel.rfUserId);
+  });
 });
 
 // ---------------------------------------------------------------------------

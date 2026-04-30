@@ -2,6 +2,8 @@
  * RecruiterFlow API Client
  */
 
+import { getUserByFirstName } from './users.js';
+
 /**
  * Extract RF candidate ID from Dialpad contact ID
  * @param {string} dialpadContactId - e.g. "shared_contact_pool_Company:xxx_uid_RFxxxxx"
@@ -278,7 +280,7 @@ export async function addRFCandidateNote(candidateId, htmlContent, env) {
   }
 
   const payload = {
-    created_by: 900001,
+    created_by: JOEL_RF_USER_ID,
     id: parseInt(candidateId, 10),
     mentions: [],
     value: htmlContent
@@ -366,7 +368,7 @@ export async function createRFCustomActivity(activityData, env) {
  */
 const CALL_BOOKED_ELIGIBLE_STAGES = ['Sourced', 'Replied', 'Replied (Cold)'];
 const CALL_BOOKED_TARGET = 'Call Booked';
-const JOEL_RF_USER_ID = 900001;
+const JOEL_RF_USER_ID = getUserByFirstName('Joel').rfUserId;
 
 /**
  * Find the most-recently-moved job on a candidate and check if it's
