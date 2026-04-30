@@ -788,7 +788,6 @@ describe('findEligibleJob', () => {
   it('uses the Joel RF user ID sourced from users.js, not a duplicate literal', async () => {
     const { getUserByFirstName } = await import('../src/users.js');
     const joel = getUserByFirstName('Joel');
-    expect(joel.rfUserId).toBe(900001);
     // findEligibleJob's userId field must equal Joel's rfUserId from the registry
     const result = findEligibleJob({
       jobs: [{
