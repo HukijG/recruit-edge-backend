@@ -1863,3 +1863,87 @@ describe('parseColdCallActivity', () => {
 		expect(parseColdCallActivity({ activity_id: 2, time: undefined, text: 'x' }).createdAt).toBeNull();
 	});
 });
+
+describe('pickConsultantJob', () => {
+	const originalFetch = globalThis.fetch;
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	it('returns null when candidate has no jobs', async () => {
+		const { pickConsultantJob } = await import('../src/rf-client.js');
+		expect(await pickConsultantJob({ jobs: [] }, 900001, env)).toBeNull();
+	});
+
+	it('returns null when candidate has only closed jobs', async () => {
+		const { pickConsultantJob } = await import('../src/rf-client.js');
+		const candidate = { jobs: [{ job_id: 1, is_open: false, stage_name: 'Sourced' }] };
+		expect(await pickConsultantJob(candidate, 900001, env)).toBeNull();
+	});
+
+	it('returns the job whose cached consultant_id matches', async () => {
+		const { cacheConsultantForJobLink } = await import('../src/cache.js');
+		const { pickConsultantJob } = await import('../src/rf-client.js');
+		await cacheConsultantForJobLink(70001, 100, null, env);     // none
+		await cacheConsultantForJobLink(70001, 200, 900001, env);   // Joel
+		await cacheConsultantForJobLink(70001, 300, 900002, env);   // Alice
+
+		const candidate = {
+			id: 70001,
+			jobs: [
+				{ job_id: 100, is_open: true, stage_name: 'Sourced', stages: [], stage_moved: '2026-04-29T00:00:00Z' },
+				{ job_id: 200, is_open: true, stage_name: 'Replied', stages: [], stage_moved: '2026-04-28T00:00:00Z' },
+				{ job_id: 300, is_open: true, stage_name: 'Sourced', stages: [], stage_moved: '2026-04-27T00:00:00Z' },
+			],
+		};
+		const result = await pickConsultantJob(candidate, 900001, env);
+		expect(result.job_id).toBe(200);
+	});
+
+	it('falls back to jobs[0] when no job matches the consultant', async () => {
+		const { cacheConsultantForJobLink } = await import('../src/cache.js');
+		const { pickConsultantJob } = await import('../src/rf-client.js');
+		await cacheConsultantForJobLink(70002, 100, 900002, env);   // Alice's job
+		await cacheConsultantForJobLink(70002, 200, null, env);     // none
+
+		const candidate = {
+			id: 70002,
+			jobs: [
+				{ job_id: 100, is_open: true, stage_name: 'Sourced', stage_moved: '2026-04-29T00:00:00Z' },
+				{ job_id: 200, is_open: true, stage_name: 'Replied', stage_moved: '2026-04-28T00:00:00Z' },
+			],
+		};
+		const result = await pickConsultantJob(candidate, 900001, env);
+		expect(result.job_id).toBe(100); // jobs[0] (open)
+	});
+
+	it('falls back to jobs[0] only if jobs[0] is open', async () => {
+		const { pickConsultantJob } = await import('../src/rf-client.js');
+		const candidate = {
+			id: 70003,
+			jobs: [
+				{ job_id: 100, is_open: false, stage_name: 'Sourced' },
+				{ job_id: 200, is_open: true, stage_name: 'Sourced' },
+			],
+		};
+		// jobs[0] is closed, no consultant match → null
+		expect(await pickConsultantJob(candidate, 900001, env)).toBeNull();
+	});
+
+	it('returns null when consultantRfUserId is null and jobs[0] is closed', async () => {
+		const { pickConsultantJob } = await import('../src/rf-client.js');
+		const candidate = {
+			id: 70004,
+			jobs: [{ job_id: 100, is_open: false, stage_name: 'Sourced' }],
+		};
+		expect(await pickConsultantJob(candidate, null, env)).toBeNull();
+	});
+
+	it('returns jobs[0] when consultantRfUserId is null and jobs[0] is open (legacy fallback)', async () => {
+		const { pickConsultantJob } = await import('../src/rf-client.js');
+		const candidate = {
+			id: 70005,
+			jobs: [{ job_id: 100, is_open: true, stage_name: 'Sourced' }],
+		};
+		const result = await pickConsultantJob(candidate, null, env);
+		expect(result.job_id).toBe(100);
+	});
+});

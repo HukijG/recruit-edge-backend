@@ -710,10 +710,16 @@ export async function resolveJobConsultantId(candidateId, jobId, env) {
   if (cached === 'none') return null;
   if (typeof cached === 'number') return cached;
 
-  // Cache miss — read from RF and write back
-  const fresh = await getJobCandidateConsultantId(candidateId, jobId, env);
-  await cacheConsultantForJobLink(candidateId, jobId, fresh, env);
-  return fresh;
+  // Cache miss — read from RF and write back. Treat RF errors as "unknown"
+  // (null) so callers can gracefully fall back rather than propagating a throw.
+  try {
+    const fresh = await getJobCandidateConsultantId(candidateId, jobId, env);
+    await cacheConsultantForJobLink(candidateId, jobId, fresh, env);
+    return fresh;
+  } catch (err) {
+    console.warn(`resolveJobConsultantId: RF lookup failed for candidate=${candidateId} job=${jobId}: ${err.message}`);
+    return null;
+  }
 }
 
 /**
@@ -742,6 +748,42 @@ export async function listCandidateActivities(candidateId, env) {
 
   const result = await response.json();
   return Array.isArray(result?.data) ? result.data : [];
+}
+
+/**
+ * Pick the best job to surface for a candidate in /candidate-details.
+ *
+ * Algorithm:
+ *   1. Filter to open jobs.
+ *   2. If consultantRfUserId is non-null, find the first job (in candidate.jobs
+ *      order) whose resolved consultant_id matches.
+ *   3. Otherwise (no match or no consultant), fall back to candidate.jobs[0]
+ *      if it's open.
+ *   4. Else null.
+ *
+ * Returns the raw job object (with all RF fields) or null.
+ */
+export async function pickConsultantJob(candidate, consultantRfUserId, env) {
+  const jobs = Array.isArray(candidate?.jobs) ? candidate.jobs : [];
+  if (jobs.length === 0) return null;
+
+  if (typeof consultantRfUserId === 'number') {
+    const openJobs = jobs.filter(j => j?.is_open);
+    // Resolve consultant_id in parallel
+    const resolved = await Promise.all(
+      openJobs.map(async j => ({
+        job: j,
+        consultantId: await resolveJobConsultantId(candidate.id, j.job_id, env),
+      }))
+    );
+    const match = resolved.find(r => r.consultantId === consultantRfUserId);
+    if (match) return match.job;
+  }
+
+  // Fallback: jobs[0] if open
+  const first = jobs[0];
+  if (first?.is_open) return first;
+  return null;
 }
 
 /**
