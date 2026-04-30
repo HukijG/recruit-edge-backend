@@ -1499,6 +1499,28 @@ describe('Apollo webhook handler', () => {
 	});
 });
 
+describe('cacheConsultantForJobLink / getCachedConsultantForJobLink', () => {
+	it('writes a numeric consultant ID and reads it back as a number', async () => {
+		const { cacheConsultantForJobLink, getCachedConsultantForJobLink } = await import('../src/cache.js');
+		await cacheConsultantForJobLink(50000, 999, 900001, env);
+		const result = await getCachedConsultantForJobLink(50000, 999, env);
+		expect(result).toBe(900001);
+	});
+
+	it('writes a "none" sentinel and reads it back as the string "none"', async () => {
+		const { cacheConsultantForJobLink, getCachedConsultantForJobLink } = await import('../src/cache.js');
+		await cacheConsultantForJobLink(50001, 999, null, env);
+		const result = await getCachedConsultantForJobLink(50001, 999, env);
+		expect(result).toBe('none');
+	});
+
+	it('returns null when no entry exists', async () => {
+		const { getCachedConsultantForJobLink } = await import('../src/cache.js');
+		const result = await getCachedConsultantForJobLink(99999, 99999, env);
+		expect(result).toBeNull();
+	});
+});
+
 describe('convertDialpadContactToRFUpdate — removal sync', () => {
 	it('omits phone_number when Dialpad phones is empty', () => {
 		const contact = { phones: [], emails: ['test@example.com'], primary_email: 'test@example.com', urls: [] };

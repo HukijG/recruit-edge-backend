@@ -10,6 +10,7 @@
 import { normalizeLinkedInUrl, isValidLinkedInUrl } from './rf-client.js';
 
 const CACHE_TTL = 60 * 24 * 60 * 60; // 60 days in seconds
+const CONSULTANT_CACHE_TTL = 30 * 24 * 60 * 60; // 30 days in seconds
 
 /**
  * Write canonical record + all index keys for a candidate.
@@ -132,4 +133,32 @@ export async function lookupByName(firstName, lastName, env) {
   const value = await env.SYNC_STATE.get(`name:${first}:${last}`);
   if (!value || value === 'AMBIGUOUS') return null;
   return value;
+}
+
+/**
+ * Cache the consultant_id for a (candidateId, jobId) link. Pass `null` to
+ * write the "none" sentinel (RF has no consultant_id on the link). 30-day TTL.
+ */
+export async function cacheConsultantForJobLink(candidateId, jobId, consultantRfUserId, env) {
+  const key = `consultant:job${jobId}:cand${candidateId}`;
+  const value = consultantRfUserId === null || consultantRfUserId === undefined
+    ? 'none'
+    : String(consultantRfUserId);
+  await env.SYNC_STATE.put(key, value, { expirationTtl: CONSULTANT_CACHE_TTL });
+}
+
+/**
+ * Read the cached consultant_id for a (candidateId, jobId) link.
+ * Returns:
+ *   - a number (the rfUserId) if cached as a numeric string
+ *   - the literal string "none" if RF has no consultant_id on the link
+ *   - null if the cache has no entry (caller should fall back to RF GET)
+ */
+export async function getCachedConsultantForJobLink(candidateId, jobId, env) {
+  const key = `consultant:job${jobId}:cand${candidateId}`;
+  const raw = await env.SYNC_STATE.get(key);
+  if (raw === null) return null;
+  if (raw === 'none') return 'none';
+  const num = parseInt(raw, 10);
+  return Number.isNaN(num) ? null : num;
 }
