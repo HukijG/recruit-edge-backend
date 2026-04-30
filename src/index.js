@@ -1482,18 +1482,33 @@ async function handleAddToJobEndpoint(request, env, corsHeaders) {
         addResult = { rfId, status: 'error', reason: 'retry loop exited without result' };
       }
 
-      // Step 2: write consultant_id only when add succeeded AND we have a consultant
-      if (addResult.status === 'added' && consultantRfUserId !== null) {
+      // Step 2: write consultant_id whenever the candidate is on the job and we have a
+      // consultant. Re-adds (already_in_job) reattribute to the current caller — by design,
+      // because the LinkedIn extension is the only path that hits this route and a recruiter
+      // would only re-add a candidate they're now driving themselves. This also gives us a
+      // simple cache-refresh mechanism: re-add a candidate to a job to populate the cache.
+      const shouldWriteConsultant =
+        (addResult.status === 'added' || addResult.status === 'already_in_job') &&
+        consultantRfUserId !== null;
+
+      if (shouldWriteConsultant) {
         try {
           await setJobCandidateConsultantId(rfId, jobId, consultantRfUserId, env);
           await cacheConsultantForJobLink(rfId, jobId, consultantRfUserId, env);
-          console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} consultant_id=${consultantRfUserId} ✓`, source: 'add-to-job' });
+          console.log({
+            message: `[AddToJob] rfId=${rfId} → job ${jobId} consultant_id=${consultantRfUserId} ✓ (status=${addResult.status})`,
+            source: 'add-to-job',
+            rfId,
+            jobId,
+            consultantRfUserId,
+            status: addResult.status,
+          });
         } catch (error) {
           addResult.consultantWriteFailed = true;
           console.error({ message: `[AddToJob] rfId=${rfId} → consultant_id write failed: ${error.message}`, source: 'add-to-job' });
         }
-      } else if (addResult.status === 'added') {
-        console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} ✓ (no consultant attribution)`, source: 'add-to-job' });
+      } else if (addResult.status === 'added' || addResult.status === 'already_in_job') {
+        console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} ${addResult.status} (no consultant attribution)`, source: 'add-to-job' });
       }
 
       return addResult;

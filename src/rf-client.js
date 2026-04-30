@@ -731,15 +731,46 @@ export async function addCandidateToJob(candidateId, jobId, env) {
  * Resolve the consultant_id for a job-candidate link, preferring KV cache.
  * On cache miss, GETs from RF and writes the result back to cache.
  * Returns the numeric value or null.
+ *
+ * Logs every lookup with cacheHit:true|false so we can verify the cache is
+ * doing its job in CF Logs.
  */
 export async function resolveJobConsultantId(candidateId, jobId, env) {
   const cached = await getCachedConsultantForJobLink(candidateId, jobId, env);
-  if (cached === 'none') return null;
-  if (typeof cached === 'number') return cached;
+  if (cached === 'none') {
+    console.log({
+      message: `[ConsultantCache] HIT (none) candidate=${candidateId} job=${jobId}`,
+      source: 'consultant-cache',
+      cacheHit: true,
+      candidateId,
+      jobId,
+      consultantId: null,
+    });
+    return null;
+  }
+  if (typeof cached === 'number') {
+    console.log({
+      message: `[ConsultantCache] HIT candidate=${candidateId} job=${jobId} consultantId=${cached}`,
+      source: 'consultant-cache',
+      cacheHit: true,
+      candidateId,
+      jobId,
+      consultantId: cached,
+    });
+    return cached;
+  }
 
   // Cache miss — read from RF and write back
   const fresh = await getJobCandidateConsultantId(candidateId, jobId, env);
   await cacheConsultantForJobLink(candidateId, jobId, fresh, env);
+  console.log({
+    message: `[ConsultantCache] MISS candidate=${candidateId} job=${jobId} resolvedFromRF=${fresh === null ? 'none' : fresh} (now cached)`,
+    source: 'consultant-cache',
+    cacheHit: false,
+    candidateId,
+    jobId,
+    consultantId: fresh,
+  });
   return fresh;
 }
 

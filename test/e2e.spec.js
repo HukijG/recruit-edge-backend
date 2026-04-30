@@ -1713,10 +1713,11 @@ describe('E2E: /candidates/add-to-job with consultantFirstName', () => {
 		expect(json.results[0].consultantWriteFailed).toBe(true);
 	});
 
-	it('does NOT write consultant_id when add returned already_in_job', async () => {
+	it('writes consultant_id even when add returned already_in_job (re-add reattributes + warms cache)', async () => {
 		const calls = mockFetch([
 			// RF returns 400 with the "already in pipeline" message → existing handler treats as already_in_job
 			{ match: '/candidate/add-to-job', response: { error: 'Candidate is already in this job pipeline' }, status: 400 },
+			{ match: '/job-candidate/custom-field/value/update', response: { success: true } },
 		]);
 
 		const request = new Request('http://example.com/candidates/add-to-job', {
@@ -1738,7 +1739,19 @@ describe('E2E: /candidates/add-to-job with consultantFirstName', () => {
 		expect(response.status).toBe(200);
 		const json = await response.json();
 		expect(json.results[0].status).toBe('already_in_job');
-		expect(findCalls(calls, '/job-candidate/custom-field/value/update')).toHaveLength(0);
+
+		// The consultant_id custom field should still be written, and the KV cache warmed.
+		const customFieldCalls = findCalls(calls, '/job-candidate/custom-field/value/update');
+		expect(customFieldCalls).toHaveLength(1);
+		const body = JSON.parse(customFieldCalls[0].opts.body);
+		expect(body).toEqual({
+			candidate_id: 50004,
+			job_id: 999,
+			custom_fields: [{ id: 16, value: 900001 }],
+		});
+
+		const { getCachedConsultantForJobLink } = await import('../src/cache.js');
+		expect(await getCachedConsultantForJobLink(50004, 999, env)).toBe(900001);
 	});
 });
 
