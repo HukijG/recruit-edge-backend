@@ -1721,3 +1721,50 @@ describe('listCandidateActivities', () => {
 		await expect(listCandidateActivities(50615, testEnv)).rejects.toThrow(/RF API error: 500/);
 	});
 });
+
+describe('normalizeToE164', () => {
+	it('passes through a valid E.164 string', async () => {
+		const { normalizeToE164 } = await import('../src/rf-client.js');
+		expect(normalizeToE164('+15551234567')).toBe('+15551234567');
+		expect(normalizeToE164('+447911123456')).toBe('+447911123456');
+	});
+
+	it('strips formatting around an E.164 number', async () => {
+		const { normalizeToE164 } = await import('../src/rf-client.js');
+		expect(normalizeToE164('+1 (555) 123-4567')).toBe('+15551234567');
+	});
+
+	it('prepends +1 to a 10-digit US number', async () => {
+		const { normalizeToE164 } = await import('../src/rf-client.js');
+		expect(normalizeToE164('5551234567')).toBe('+15551234567');
+		expect(normalizeToE164('(555) 123-4567')).toBe('+15551234567');
+	});
+
+	it('prepends + to an 11-digit number starting with 1', async () => {
+		const { normalizeToE164 } = await import('../src/rf-client.js');
+		expect(normalizeToE164('15551234567')).toBe('+15551234567');
+	});
+
+	it('returns null for too short', async () => {
+		const { normalizeToE164 } = await import('../src/rf-client.js');
+		expect(normalizeToE164('123')).toBeNull();
+	});
+
+	it('returns null for too long', async () => {
+		const { normalizeToE164 } = await import('../src/rf-client.js');
+		expect(normalizeToE164('+1234567890123456')).toBeNull();
+	});
+
+	it('returns null for empty / null / non-string', async () => {
+		const { normalizeToE164 } = await import('../src/rf-client.js');
+		expect(normalizeToE164('')).toBeNull();
+		expect(normalizeToE164(null)).toBeNull();
+		expect(normalizeToE164(undefined)).toBeNull();
+		expect(normalizeToE164(123)).toBeNull();
+	});
+
+	it('returns null for a string with no digits', async () => {
+		const { normalizeToE164 } = await import('../src/rf-client.js');
+		expect(normalizeToE164('not a number')).toBeNull();
+	});
+});

@@ -743,3 +743,32 @@ export async function listCandidateActivities(candidateId, env) {
   const result = await response.json();
   return Array.isArray(result?.data) ? result.data : [];
 }
+
+/**
+ * Normalize a raw phone string to E.164 (e.g. "+15551234567"). Returns null
+ * if the input can't be confidently parsed.
+ *
+ * Rules:
+ *   - Already-+ formatted: keep + and digits, sanity-check 7-15 digits total
+ *   - 10 digits, no +: assume US, prepend +1
+ *   - 11 digits starting with 1, no +: prepend +
+ *   - Otherwise: null (caller treats as "no usable phone")
+ */
+export function normalizeToE164(raw) {
+  if (typeof raw !== 'string' || !raw) return null;
+
+  const trimmed = raw.trim();
+  const hasPlus = trimmed.startsWith('+');
+  const digits = trimmed.replace(/\D/g, '');
+  if (!digits) return null;
+
+  if (hasPlus) {
+    if (digits.length < 7 || digits.length > 15) return null;
+    return `+${digits}`;
+  }
+
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+
+  return null;
+}
