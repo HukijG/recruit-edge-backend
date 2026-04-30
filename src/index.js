@@ -629,6 +629,28 @@ async function syncCandidateToDialpad(candidate, env) {
   const validation = validateCandidateForDialpad(candidate);
 
   if (!validation.isValidForSync) {
+    const missing = [];
+    if (!validation.hasName) missing.push('name');
+    if (!validation.hasOrganization) missing.push('current_organization');
+    if (!validation.hasTitle) missing.push('current_title');
+    console.warn({
+      message: `[Dialpad sync] skipped validation candidate=${candidate.id} missing=[${missing.join(', ')}]`,
+      source: 'dialpad-sync',
+      candidateId: candidate.id,
+      missing,
+      checks: {
+        hasName: validation.hasName,
+        hasOrganization: validation.hasOrganization,
+        hasTitle: validation.hasTitle,
+      },
+      values: {
+        first_name: candidate.first_name ?? null,
+        last_name: candidate.last_name ?? null,
+        name: candidate.name ?? null,
+        current_organization: candidate.current_organization ?? null,
+        current_title: candidate.current_title ?? null,
+      },
+    });
     return false;
   }
 
