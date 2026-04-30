@@ -628,6 +628,7 @@ export async function setJobCandidateConsultantId(candidateId, jobId, consultant
 
   if (!response.ok) {
     const errorText = await response.text();
+    console.error(`RF set-consultant-field error candidate=${candidateId} job=${jobId} status=${response.status}`, errorText);
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
