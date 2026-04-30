@@ -11,6 +11,7 @@ import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
 import { processCallEvent } from './cold-call.js';
 import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enrichment.js';
 import { enrichPerson } from './apollo-client.js';
+import { resolveRFUserId } from './users.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -1098,7 +1099,7 @@ async function processExistingRFCandidate(existing, ext, label, env) {
  * Process a single candidate from the extension batch.
  * Returns a result object — never throws (catches internally).
  */
-async function processOneCandidate(ext, i, total, env) {
+async function processOneCandidate(ext, i, total, env, consultantRfUserId) {
   const label = `[${i + 1}/${total}] ${ext.fullName}`;
   try {
     // Search RF by LinkedIn URL — RF is authoritative, do not consult cache for matching.
@@ -1135,7 +1136,7 @@ async function processOneCandidate(ext, i, total, env) {
     }
 
     // Map extension payload → RF candidate/add format
-    const rfPayload = mapExtensionToRFCandidate(ext);
+    const rfPayload = mapExtensionToRFCandidate(ext, consultantRfUserId);
 
     console.log({
       message: `[Candidates] ${label} — creating in RF`,
@@ -1267,11 +1268,22 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
       });
     }
 
+    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
+    const consultantRfUserId = resolveRFUserId(consultantFirstName);
+    if (consultantFirstName && consultantRfUserId === null) {
+      console.warn({
+        message: `[Candidates] unknown consultantFirstName="${consultantFirstName}", attribution will be skipped`,
+        source: 'candidates-endpoint',
+      });
+    }
+
     const total = payload.candidates.length;
     console.log({
-      message: `[Candidates] Received batch of ${total} candidates`,
+      message: `[Candidates] Received batch of ${total} candidates (consultant=${consultantFirstName || 'none'})`,
       source: 'candidates-endpoint',
       count: total,
+      consultantFirstName,
+      consultantRfUserId,
     });
 
     // Process in chunks of 5 for speed, but wait for all chunks before responding
@@ -1280,7 +1292,7 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
     for (let c = 0; c < payload.candidates.length; c += CHUNK_SIZE) {
       const chunk = payload.candidates.slice(c, c + CHUNK_SIZE);
       const chunkResults = await Promise.all(chunk.map((ext, j) =>
-        processOneCandidate(ext, c + j, total, env)
+        processOneCandidate(ext, c + j, total, env, consultantRfUserId)
       ));
       results.push(...chunkResults);
     }
@@ -1294,6 +1306,7 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
       message: `[Candidates] Batch complete: ${created} created, ${updated} updated, ${skipped} skipped, ${errors} errors`,
       source: 'candidates-endpoint',
       created,
+      updated,
       skipped,
       errors,
     });
@@ -1323,7 +1336,7 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
 /**
  * Map the LinkedIn extension payload to RF's POST /candidate/add format.
  */
-function mapExtensionToRFCandidate(ext) {
+function mapExtensionToRFCandidate(ext, consultantRfUserId) {
   const nameParts = ext.fullName.trim().split(/\s+/);
   const firstName = nameParts[0] || '';
   const lastName = nameParts.slice(1).join(' ') || '';
@@ -1338,6 +1351,10 @@ function mapExtensionToRFCandidate(ext) {
     source: 'linkedin',
     location: ext.location ? { location: ext.location } : undefined,
   };
+
+  if (typeof consultantRfUserId === 'number') {
+    rfCandidate.lead_owner_id = consultantRfUserId;
+  }
 
   // Map experience entries
   if (ext.experience?.length > 0) {

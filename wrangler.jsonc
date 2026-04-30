@@ -16,7 +16,10 @@
   },
   "vars": {
     "DIALPAD_API_BASE_URL": "https://dialpad.com/api/v2",
-    "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external"
+    "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external",
+    "LINKEDIN_EXTENSION_SECRET": "test-extension-secret",
+    "RF_API_KEY": "test-rf-api-key",
+    "DIALPAD_API_KEY": "test-dialpad-api-key"
   },
   "kv_namespaces": [
     {

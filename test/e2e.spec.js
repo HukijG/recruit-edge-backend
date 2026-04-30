@@ -1489,3 +1489,76 @@ describe('E2E: Enrichment resilience', () => {
 		expect(dialpadCalls.length).toBe(1);
 	});
 });
+
+describe('E2E: /candidates with consultantFirstName', () => {
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	it('sets lead_owner_id to the consultant rfUserId when adding a new candidate', async () => {
+		const calls = mockFetch([
+			{ match: '/candidate/search', response: [] }, // RF search returns no match → create
+			{ match: '/candidate/add', response: { data: { id: 99001 } } },
+			{ match: 'dialpad.com/api/v2/contacts', response: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF99001' } },
+			{ match: 'apollo.io/api/v1/people/match', response: { person: null } },
+			{ match: '/job/list', response: [] },
+		]);
+
+		const request = new Request('http://example.com/candidates', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				candidates: [{
+					linkedinUrl: 'https://www.linkedin.com/in/test-person-12345',
+					fullName: 'Test Person',
+					experience: [{ title: 'Engineer', company: 'Acme', startYear: 2020, isCurrent: true }],
+				}],
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		const addCalls = findCalls(calls, '/candidate/add');
+		expect(addCalls).toHaveLength(1);
+		const addBody = JSON.parse(addCalls[0].opts.body);
+		expect(addBody.lead_owner_id).toBe(900001);
+	});
+
+	it('omits lead_owner_id when consultantFirstName is unknown', async () => {
+		const calls = mockFetch([
+			{ match: '/candidate/search', response: [] },
+			{ match: '/candidate/add', response: { data: { id: 99002 } } },
+			{ match: 'dialpad.com/api/v2/contacts', response: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF99002' } },
+			{ match: 'apollo.io/api/v1/people/match', response: { person: null } },
+			{ match: '/job/list', response: [] },
+		]);
+
+		const request = new Request('http://example.com/candidates', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Nobody',
+				candidates: [{
+					linkedinUrl: 'https://www.linkedin.com/in/test-person-2',
+					fullName: 'Test Person Two',
+					experience: [{ title: 'Engineer', company: 'Acme', startYear: 2020, isCurrent: true }],
+				}],
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		const addCalls = findCalls(calls, '/candidate/add');
+		const addBody = JSON.parse(addCalls[0].opts.body);
+		expect(addBody).not.toHaveProperty('lead_owner_id');
+	});
+});
