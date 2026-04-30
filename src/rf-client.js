@@ -715,3 +715,31 @@ export async function resolveJobConsultantId(candidateId, jobId, env) {
   await cacheConsultantForJobLink(candidateId, jobId, fresh, env);
   return fresh;
 }
+
+/**
+ * GET /candidate/activity/list — full activity feed for a candidate.
+ * First page only (50 entries). Returns the data array (empty if none).
+ */
+export async function listCandidateActivities(candidateId, env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const url = `${rfBaseUrl}/candidate/activity/list?id=${candidateId}&items_per_page=50&current_page=1&include_count=true`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { 'RF-Api-Key': rfApiKey, 'Accept': 'application/json' },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`RF activity-list error candidate=${candidateId} status=${response.status}`, errorText);
+    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+  }
+
+  const result = await response.json();
+  return Array.isArray(result?.data) ? result.data : [];
+}

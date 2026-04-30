@@ -1680,3 +1680,44 @@ describe('resolveJobConsultantId', () => {
 		expect(await getCachedConsultantForJobLink(60004, 800, env)).toBe('none');
 	});
 });
+
+describe('listCandidateActivities', () => {
+	const originalFetch = globalThis.fetch;
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	it('GETs /candidate/activity/list with id query param and returns data array', async () => {
+		const { listCandidateActivities } = await import('../src/rf-client.js');
+		let captured;
+		globalThis.fetch = async (url) => {
+			captured = typeof url === 'string' ? url : url.toString();
+			return new Response(JSON.stringify({
+				data: [
+					{ activity_id: 1, type: { id: 1002, name: 'Cold Call' }, time: '2026-04-29T19:49:38+01:00', text: 'foo' },
+				],
+				total_items: 1,
+			}), { status: 200 });
+		};
+		const testEnv = { ...env, RF_API_KEY: 'test-rf-key' };
+		const result = await listCandidateActivities(50615, testEnv);
+		expect(captured).toContain('/candidate/activity/list');
+		expect(captured).toContain('id=50615');
+		expect(captured).toContain('items_per_page=50');
+		expect(captured).toContain('current_page=1');
+		expect(result).toHaveLength(1);
+		expect(result[0].activity_id).toBe(1);
+	});
+
+	it('returns [] when data is missing', async () => {
+		const { listCandidateActivities } = await import('../src/rf-client.js');
+		globalThis.fetch = async () => new Response(JSON.stringify({}), { status: 200 });
+		const testEnv = { ...env, RF_API_KEY: 'test-rf-key' };
+		expect(await listCandidateActivities(50615, testEnv)).toEqual([]);
+	});
+
+	it('throws on non-2xx', async () => {
+		const { listCandidateActivities } = await import('../src/rf-client.js');
+		globalThis.fetch = async () => new Response('nope', { status: 500 });
+		const testEnv = { ...env, RF_API_KEY: 'test-rf-key' };
+		await expect(listCandidateActivities(50615, testEnv)).rejects.toThrow(/RF API error: 500/);
+	});
+});
