@@ -1514,6 +1514,13 @@ describe('cacheConsultantForJobLink / getCachedConsultantForJobLink', () => {
 		expect(result).toBe('none');
 	});
 
+	it('treats undefined input as the "none" sentinel', async () => {
+		const { cacheConsultantForJobLink, getCachedConsultantForJobLink } = await import('../src/cache.js');
+		await cacheConsultantForJobLink(50002, 999, undefined, env);
+		const result = await getCachedConsultantForJobLink(50002, 999, env);
+		expect(result).toBe('none');
+	});
+
 	it('returns null when no entry exists', async () => {
 		const { getCachedConsultantForJobLink } = await import('../src/cache.js');
 		const result = await getCachedConsultantForJobLink(99999, 99999, env);

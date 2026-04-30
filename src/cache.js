@@ -3,8 +3,10 @@
  *
  * Canonical record:  candidate:{rfId} → JSON blob (60-day TTL)
  * Index keys:        linkedin:{normalized}, email:{lowercase}, name:{first}:{last} → rfId string (60-day TTL)
+ * Consultant index:  consultant:job{jobId}:cand{rfId} → rfUserId string or "none" sentinel (30-day TTL)
  *
  * Name index uses "AMBIGUOUS" sentinel when two different candidates share the same name.
+ * Consultant index uses "none" sentinel when RF has no consultant_id on the job-candidate link.
  */
 
 import { normalizeLinkedInUrl, isValidLinkedInUrl } from './rf-client.js';
