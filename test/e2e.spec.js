@@ -1742,6 +1742,86 @@ describe('E2E: /candidates/add-to-job with consultantFirstName', () => {
 	});
 });
 
+describe('E2E: /candidate-mark-invalid', () => {
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	it('returns 401 without X-Extension-Token', async () => {
+		const request = new Request('http://example.com/candidate-mark-invalid', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ rfId: 12345, consultantFirstName: 'Joel' }),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(401);
+	});
+
+	it('appends "Number Invalid" tag and POSTs /candidate/update', async () => {
+		const calls = mockFetch([
+			rfGetCandidateRoute(buildFullRFCandidate({ id: 12345, tags: ['Active'] })),
+			rfUpdateCandidateRoute(),
+		]);
+
+		const request = new Request('http://example.com/candidate-mark-invalid', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({ rfId: 12345, consultantFirstName: 'Joel' }),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ ok: true });
+
+		const updateCalls = findCalls(calls, '/candidate/update');
+		expect(updateCalls).toHaveLength(1);
+		const body = JSON.parse(updateCalls[0].opts.body);
+		expect(body).toEqual({ id: 12345, tags: ['Active', 'Number Invalid'] });
+	});
+
+	it('is idempotent: when tag already present, returns 200 with no /candidate/update call', async () => {
+		const calls = mockFetch([
+			rfGetCandidateRoute(buildFullRFCandidate({ id: 12345, tags: ['Active', 'Number Invalid'] })),
+		]);
+
+		const request = new Request('http://example.com/candidate-mark-invalid', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({ rfId: 12345, consultantFirstName: 'Joel' }),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ ok: true });
+		expect(findCalls(calls, '/candidate/update')).toHaveLength(0);
+	});
+
+	it('returns 400 when rfId is missing', async () => {
+		const request = new Request('http://example.com/candidate-mark-invalid', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({ consultantFirstName: 'Joel' }),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(400);
+	});
+});
+
 describe('E2E: /candidate-details', () => {
 	afterEach(() => { globalThis.fetch = originalFetch; });
 
@@ -1906,3 +1986,4 @@ describe('E2E: /candidate-details', () => {
 		expect(json.activities).toEqual([]);
 	});
 });
+

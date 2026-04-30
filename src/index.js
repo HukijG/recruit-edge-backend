@@ -9,7 +9,7 @@ import {
 } from './rf-client.js';
 import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName, cacheConsultantForJobLink } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
-import { processCallEvent, parseColdCallActivity } from './cold-call.js';
+import { processCallEvent, parseColdCallActivity, mergeTag } from './cold-call.js';
 import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enrichment.js';
 import { enrichPerson } from './apollo-client.js';
 import { resolveRFUserId } from './users.js';
@@ -22,7 +22,7 @@ export default {
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, X-RF-Webhook-Token, X-Calendar-Webhook-Token, X-Krisp-Webhook-Token, RF-Event-Type, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, X-RF-Webhook-Token, X-Calendar-Webhook-Token, X-Krisp-Webhook-Token, X-Extension-Token, RF-Event-Type, Authorization',
     };
 
     if (request.method === 'OPTIONS') {
@@ -83,6 +83,14 @@ export default {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
         }
         return await handleAddToJobEndpoint(request, env, corsHeaders);
+      }
+
+      if (url.pathname === '/candidate-mark-invalid' && request.method === 'POST') {
+        const extAuth = request.headers.get('X-Extension-Token');
+        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+        }
+        return await handleMarkInvalidEndpoint(request, env, corsHeaders);
       }
 
       if (url.pathname === '/candidate-details' && request.method === 'POST') {
@@ -1490,6 +1498,60 @@ async function handleAddToJobEndpoint(request, env, corsHeaders) {
     console.error({ message: `[AddToJob] Error: ${error.message}`, source: 'add-to-job', stack: error.stack });
     return new Response(JSON.stringify({ error: error.message }), {
       status: 500, headers: responseHeaders
+    });
+  }
+}
+
+async function handleMarkInvalidEndpoint(request, env, corsHeaders) {
+  const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  try {
+    const payload = await request.json();
+    const rfId = payload.rfId;
+    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
+
+    if (!rfId) {
+      return new Response(JSON.stringify({ error: 'Missing "rfId"' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    console.log({
+      message: `[MarkInvalid] rfId=${rfId} consultant=${consultantFirstName || 'none'}`,
+      source: 'mark-invalid',
+      rfId,
+      consultantFirstName,
+    });
+
+    const candidate = await getRFCandidate(rfId, env);
+    const existingTags = candidate?.tags;
+    const TAG = 'Number Invalid';
+
+    if (Array.isArray(existingTags) && existingTags.includes(TAG)) {
+      console.log({
+        message: `[MarkInvalid] rfId=${rfId} — tag already present, no-op`,
+        source: 'mark-invalid',
+        rfId,
+      });
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: responseHeaders });
+    }
+
+    const merged = mergeTag(existingTags, TAG);
+    await updateRFCandidate(rfId, { tags: merged }, env);
+
+    console.log({
+      message: `[MarkInvalid] rfId=${rfId} — tag added, total=${merged.length}`,
+      source: 'mark-invalid',
+      rfId,
+      tags: merged,
+    });
+
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: responseHeaders });
+
+  } catch (error) {
+    console.error({ message: `[MarkInvalid] error: ${error.message}`, source: 'mark-invalid', stack: error.stack });
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500, headers: responseHeaders,
     });
   }
 }
