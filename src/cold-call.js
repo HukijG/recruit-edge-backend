@@ -467,3 +467,41 @@ export async function processCallEvent(payload, env) {
   return { processed: true, isColdCall: true, outcome: classification.outcome, reason: classification.reasoning };
 }
 
+/**
+ * Map an RF activity object (from /candidate/activity/list) to the shape the
+ * extension's /candidate-details route expects. Only valid for cold-call
+ * activities (type.id === 1002).
+ *
+ * Description extraction: the activity text is built as
+ *   "Cold call with X — Outcome<br>\n<br>\n<body>"
+ * with addHtmlLineBreaks. We split on the first <br>\n<br>\n to peel the
+ * header and return the body as plain text (stripping remaining <br> tags).
+ */
+export function parseColdCallActivity(activity) {
+  const text = typeof activity?.text === 'string' ? activity.text : '';
+
+  // Outcome via regex on the header
+  let outcome = null;
+  const m = text.match(/—\s*(Voicemail|Connected)/);
+  if (m) {
+    outcome = m[1] === 'Voicemail' ? 'voicemail' : 'connected';
+  }
+
+  // Description = text after the first double-<br>; strip remaining <br>
+  let description = '';
+  const splitIndex = text.indexOf('<br>\n<br>\n');
+  if (splitIndex >= 0) {
+    description = text.slice(splitIndex + '<br>\n<br>\n'.length);
+    description = description.replace(/<br>\n?/g, '\n').trim();
+  }
+
+  return {
+    id: activity.activity_id,
+    type: 'cold_call',
+    name: 'Cold call',
+    description,
+    createdAt: new Date(activity.time).toISOString(),
+    outcome,
+  };
+}
+

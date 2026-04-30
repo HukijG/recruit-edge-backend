@@ -1793,3 +1793,67 @@ describe('addRFCandidate lead_owner_id', () => {
 		expect(captured.lead_owner_id).toBe(900001);
 	});
 });
+
+describe('parseColdCallActivity', () => {
+	it('extracts outcome=connected and the body for a connected_positive call', async () => {
+		const { parseColdCallActivity } = await import('../src/cold-call.js');
+		const activity = {
+			activity_id: 9912,
+			time: '2026-04-29T19:49:38+01:00',
+			text: 'Cold call with Lucas Ralph — Connected (Positive)<br>\n<br>\nNext steps:<br>\n• Joel will send information.<br>\n• Lucas can reach out.',
+		};
+		expect(parseColdCallActivity(activity)).toEqual({
+			id: 9912,
+			type: 'cold_call',
+			name: 'Cold call',
+			description: 'Next steps:\n• Joel will send information.\n• Lucas can reach out.',
+			createdAt: new Date('2026-04-29T19:49:38+01:00').toISOString(),
+			outcome: 'connected',
+		});
+	});
+
+	it('extracts outcome=connected and Notes body for a connected_negative call', async () => {
+		const { parseColdCallActivity } = await import('../src/cold-call.js');
+		const activity = {
+			activity_id: 9913,
+			time: '2026-04-29T19:49:38+01:00',
+			text: 'Cold call with Foo — Connected (Negative)<br>\n<br>\nNotes:<br>\n• Just joined a new role.',
+		};
+		const result = parseColdCallActivity(activity);
+		expect(result.outcome).toBe('connected');
+		expect(result.description).toBe('Notes:\n• Just joined a new role.');
+	});
+
+	it('extracts outcome=voicemail and empty description for a voicemail', async () => {
+		const { parseColdCallActivity } = await import('../src/cold-call.js');
+		const activity = {
+			activity_id: 9821,
+			time: '2026-04-22T14:33:00+00:00',
+			text: 'Cold call with Foo — Voicemail',
+		};
+		const result = parseColdCallActivity(activity);
+		expect(result.outcome).toBe('voicemail');
+		expect(result.description).toBe('');
+	});
+
+	it('returns outcome=null and empty description for a no-outcome legacy entry', async () => {
+		const { parseColdCallActivity } = await import('../src/cold-call.js');
+		const activity = {
+			activity_id: 9000,
+			time: '2026-01-01T00:00:00+00:00',
+			text: 'Cold call with Legacy User',
+		};
+		const result = parseColdCallActivity(activity);
+		expect(result.outcome).toBeNull();
+		expect(result.description).toBe('');
+	});
+
+	it('normalizes time to UTC ISO 8601', async () => {
+		const { parseColdCallActivity } = await import('../src/cold-call.js');
+		const result = parseColdCallActivity({
+			activity_id: 1, time: '2026-04-29T19:49:38+01:00', text: 'Cold call with X — Voicemail',
+		});
+		// 19:49:38 +01:00 = 18:49:38 UTC
+		expect(result.createdAt).toBe('2026-04-29T18:49:38.000Z');
+	});
+});
