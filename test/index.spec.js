@@ -4,8 +4,9 @@ import worker from '../src';
 import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
 import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob, convertDialpadContactToRFUpdate, findJobsForStageMove } from '../src/rf-client.js';
 import {
-	isMonitoredDialpadUser, isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall, mergeColdCalledTag, getRFUserIdForDialpadUser, addHtmlLineBreaks
+	isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall, mergeColdCalledTag, addHtmlLineBreaks
 } from '../src/cold-call.js';
+import { isMonitoredDialpadUser, getRFUserIdByDialpadId } from '../src/users.js';
 import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from '../src/apollo-client.js';
 import { isJoelCandidate, enrichCandidate } from '../src/enrichment.js';
 
@@ -329,25 +330,26 @@ describe('isMonitoredDialpadUser', () => {
 	});
 });
 
-describe('getRFUserIdForDialpadUser', () => {
-	it('maps Joel Dialpad ID to Joel RF ID', () => {
-		expect(getRFUserIdForDialpadUser('8000000000000001')).toBe(900001);
+describe('getRFUserIdByDialpadId', () => {
+	it('returns Joel RF user ID for Joel Dialpad ID', () => {
+		expect(getRFUserIdByDialpadId('8000000000000001')).toBe(900001);
 	});
 
-	it('maps Alice Dialpad ID to Alice RF ID', () => {
-		expect(getRFUserIdForDialpadUser('8000000000000002')).toBe(900002);
+	it('returns Alice RF user ID for Alice Dialpad ID', () => {
+		expect(getRFUserIdByDialpadId('8000000000000002')).toBe(900002);
 	});
 
-	it('accepts numeric Dialpad IDs', () => {
-		expect(getRFUserIdForDialpadUser(8000000000000001)).toBe(900001);
+	it('coerces numeric Dialpad IDs', () => {
+		expect(getRFUserIdByDialpadId(8000000000000001)).toBe(900001);
 	});
 
-	it('returns null for unknown Dialpad user', () => {
-		expect(getRFUserIdForDialpadUser('9999999999999999')).toBeNull();
+	it('returns null for unknown Dialpad ID', () => {
+		expect(getRFUserIdByDialpadId('1234567890')).toBeNull();
 	});
 
-	it('returns null for undefined', () => {
-		expect(getRFUserIdForDialpadUser(undefined)).toBeNull();
+	it('returns null for null/undefined', () => {
+		expect(getRFUserIdByDialpadId(null)).toBeNull();
+		expect(getRFUserIdByDialpadId(undefined)).toBeNull();
 	});
 });
 

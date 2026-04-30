@@ -7,16 +7,10 @@
  */
 
 import { extractRFIdFromDialpadContact, updateRFCandidate, createRFCustomActivity, getRFCandidate, moveJobsToStage } from './rf-client.js';
+import { isMonitoredDialpadUser, getRFUserIdByDialpadId } from './users.js';
 
 // --- Constants ---
 
-// Dialpad user ID → RF user ID. Calls placed by these users are eligible for
-// cold-call classification, and the resulting RF activity is attributed to
-// the matching RF user.
-const DIALPAD_TO_RF_USER_ID = {
-  '8000000000000001': 900001,  // Joel
-  '8000000000000002': 900002,  // Alice
-};
 const COLD_CALL_ACTIVITY_TYPE_ID = 1002;
 const COLD_CALL_TAG = 'Cold Called';
 const TRANSCRIPT_MAX_CHARS = 5000;
@@ -73,14 +67,6 @@ Respond with ONLY valid JSON, no other text:
 {"is_cold_call": false, "outcome": null, "reasoning": "one sentence explanation"}`;
 
 // --- Pure helpers ---
-
-export function isMonitoredDialpadUser(targetId) {
-  return String(targetId) in DIALPAD_TO_RF_USER_ID;
-}
-
-export function getRFUserIdForDialpadUser(targetId) {
-  return DIALPAD_TO_RF_USER_ID[String(targetId)] ?? null;
-}
 
 /**
  * Append the "Cold Called" tag to an existing tags array (deduped).
@@ -414,7 +400,7 @@ export async function processCallEvent(payload, env) {
     }
   }
 
-  const activityUserId = getRFUserIdForDialpadUser(payload.target?.id);
+  const activityUserId = getRFUserIdByDialpadId(payload.target?.id);
   // RF's activity_text only honours <br> for line breaks; bare \n collapses
   // to a space at render time. Convert just before sending.
   const formattedActivityText = addHtmlLineBreaks(activityText);
