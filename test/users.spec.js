@@ -42,6 +42,11 @@ describe('getUserByDialpadId', () => {
 	it('returns null for unknown id', () => {
 		expect(getUserByDialpadId('9999999999999999')).toBeNull();
 	});
+
+	it('returns null for null / undefined input', () => {
+		expect(getUserByDialpadId(null)).toBeNull();
+		expect(getUserByDialpadId(undefined)).toBeNull();
+	});
 });
 
 describe('getUserByRFUserId', () => {
@@ -51,6 +56,11 @@ describe('getUserByRFUserId', () => {
 
 	it('returns null for unknown id', () => {
 		expect(getUserByRFUserId(0)).toBeNull();
+	});
+
+	it('returns null for null / undefined input', () => {
+		expect(getUserByRFUserId(null)).toBeNull();
+		expect(getUserByRFUserId(undefined)).toBeNull();
 	});
 });
 
