@@ -1561,4 +1561,38 @@ describe('E2E: /candidates with consultantFirstName', () => {
 		const addBody = JSON.parse(addCalls[0].opts.body);
 		expect(addBody).not.toHaveProperty('lead_owner_id');
 	});
+
+	it('does NOT set lead_owner_id when the candidate already exists in RF', async () => {
+		const existingCandidate = buildFullRFCandidate({ id: 99003, linkedin_profile: 'https://www.linkedin.com/in/test-existing-person' });
+		const calls = mockFetch([
+			{ match: '/candidate/search', response: [existingCandidate] }, // RF search returns a match
+			{ match: '/candidate/get', response: { candidate: existingCandidate } },
+			{ match: 'dialpad.com/api/v2/contacts', response: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF99003' } },
+			{ match: 'apollo.io/api/v1/people/match', response: { person: null } },
+			{ match: '/job/list', response: [] },
+		]);
+
+		const request = new Request('http://example.com/candidates', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				candidates: [{
+					linkedinUrl: 'https://www.linkedin.com/in/test-existing-person',
+					fullName: 'Existing Person',
+					experience: [{ title: 'Engineer', company: 'Acme', startYear: 2020, isCurrent: true }],
+				}],
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		// /candidate/add should NOT be called (existing candidate path)
+		expect(findCalls(calls, '/candidate/add')).toHaveLength(0);
+	});
 });
