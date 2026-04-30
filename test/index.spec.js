@@ -1916,7 +1916,9 @@ describe('pickConsultantJob', () => {
 	});
 
 	it('falls back to jobs[0] only if jobs[0] is open', async () => {
+		const { cacheConsultantForJobLink } = await import('../src/cache.js');
 		const { pickConsultantJob } = await import('../src/rf-client.js');
+		await cacheConsultantForJobLink(70003, 200, 900002, env); // Alice's, doesn't match Joel
 		const candidate = {
 			id: 70003,
 			jobs: [
@@ -1924,7 +1926,7 @@ describe('pickConsultantJob', () => {
 				{ job_id: 200, is_open: true, stage_name: 'Sourced' },
 			],
 		};
-		// jobs[0] is closed, no consultant match → null
+		// jobs[0] is closed, no consultant match for Joel → null
 		expect(await pickConsultantJob(candidate, 900001, env)).toBeNull();
 	});
 

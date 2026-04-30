@@ -710,16 +710,10 @@ export async function resolveJobConsultantId(candidateId, jobId, env) {
   if (cached === 'none') return null;
   if (typeof cached === 'number') return cached;
 
-  // Cache miss — read from RF and write back. Treat RF errors as "unknown"
-  // (null) so callers can gracefully fall back rather than propagating a throw.
-  try {
-    const fresh = await getJobCandidateConsultantId(candidateId, jobId, env);
-    await cacheConsultantForJobLink(candidateId, jobId, fresh, env);
-    return fresh;
-  } catch (err) {
-    console.warn(`resolveJobConsultantId: RF lookup failed for candidate=${candidateId} job=${jobId}: ${err.message}`);
-    return null;
-  }
+  // Cache miss — read from RF and write back
+  const fresh = await getJobCandidateConsultantId(candidateId, jobId, env);
+  await cacheConsultantForJobLink(candidateId, jobId, fresh, env);
+  return fresh;
 }
 
 /**
@@ -769,12 +763,19 @@ export async function pickConsultantJob(candidate, consultantRfUserId, env) {
 
   if (typeof consultantRfUserId === 'number') {
     const openJobs = jobs.filter(j => j?.is_open);
-    // Resolve consultant_id in parallel
+    // Resolve consultant_id in parallel; treat per-job lookup failures as no-match
     const resolved = await Promise.all(
-      openJobs.map(async j => ({
-        job: j,
-        consultantId: await resolveJobConsultantId(candidate.id, j.job_id, env),
-      }))
+      openJobs.map(async j => {
+        try {
+          return { job: j, consultantId: await resolveJobConsultantId(candidate.id, j.job_id, env) };
+        } catch (error) {
+          console.warn({
+            message: `[pickConsultantJob] resolveJobConsultantId failed candidate=${candidate.id} job=${j.job_id}: ${error.message}`,
+            source: 'pick-consultant-job',
+          });
+          return { job: j, consultantId: null };
+        }
+      })
     );
     const match = resolved.find(r => r.consultantId === consultantRfUserId);
     if (match) return match.job;
