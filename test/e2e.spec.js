@@ -1596,3 +1596,120 @@ describe('E2E: /candidates with consultantFirstName', () => {
 		expect(findCalls(calls, '/candidate/add')).toHaveLength(0);
 	});
 });
+
+describe('E2E: /candidates/add-to-job with consultantFirstName', () => {
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	it('writes consultant_id custom field after successful add-to-job', async () => {
+		const calls = mockFetch([
+			{ match: '/candidate/add-to-job', response: { success: true } },
+			{ match: '/job-candidate/custom-field/value/update', response: { success: true } },
+		]);
+
+		const request = new Request('http://example.com/candidates/add-to-job', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				rfIds: [50000],
+				jobId: 999,
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		const customFieldCalls = findCalls(calls, '/job-candidate/custom-field/value/update');
+		expect(customFieldCalls).toHaveLength(1);
+		const body = JSON.parse(customFieldCalls[0].opts.body);
+		expect(body).toEqual({
+			candidate_id: 50000,
+			job_id: 999,
+			custom_fields: [{ id: 16, value: 900001 }],
+		});
+
+		const json = await response.json();
+		expect(json.results[0].status).toBe('added');
+	});
+
+	it('warms KV cache with the consultant value on success', async () => {
+		mockFetch([
+			{ match: '/candidate/add-to-job', response: { success: true } },
+			{ match: '/job-candidate/custom-field/value/update', response: { success: true } },
+		]);
+
+		const request = new Request('http://example.com/candidates/add-to-job', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				rfIds: [50001],
+				jobId: 1001,
+			}),
+		});
+		const ctx = createExecutionContext();
+		await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		const { getCachedConsultantForJobLink } = await import('../src/cache.js');
+		expect(await getCachedConsultantForJobLink(50001, 1001, env)).toBe(900001);
+	});
+
+	it('does NOT make the second call when consultantFirstName is missing', async () => {
+		const calls = mockFetch([
+			{ match: '/candidate/add-to-job', response: { success: true } },
+		]);
+
+		const request = new Request('http://example.com/candidates/add-to-job', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				rfIds: [50002],
+				jobId: 999,
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		expect(findCalls(calls, '/job-candidate/custom-field/value/update')).toHaveLength(0);
+	});
+
+	it('marks consultantWriteFailed=true when the second call fails, but still returns added', async () => {
+		mockFetch([
+			{ match: '/candidate/add-to-job', response: { success: true } },
+			{ match: '/job-candidate/custom-field/value/update', response: 'broken', status: 500 },
+		]);
+
+		const request = new Request('http://example.com/candidates/add-to-job', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				rfIds: [50003],
+				jobId: 999,
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		const json = await response.json();
+		expect(json.results[0].status).toBe('added');
+		expect(json.results[0].consultantWriteFailed).toBe(true);
+	});
+});

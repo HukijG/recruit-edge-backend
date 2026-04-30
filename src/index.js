@@ -4,9 +4,9 @@ import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
   searchRFCandidateByEmail, addRFCandidateNote, moveToCallBooked, addRFCandidate,
-  listOpenJobs, addCandidateToJob
+  listOpenJobs, addCandidateToJob, setJobCandidateConsultantId
 } from './rf-client.js';
-import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName } from './cache.js';
+import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName, cacheConsultantForJobLink } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
 import { processCallEvent } from './cold-call.js';
 import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enrichment.js';
@@ -1398,32 +1398,62 @@ async function handleAddToJobEndpoint(request, env, corsHeaders) {
       });
     }
 
+    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
+    const consultantRfUserId = resolveRFUserId(consultantFirstName);
+    if (consultantFirstName && consultantRfUserId === null) {
+      console.warn({
+        message: `[AddToJob] unknown consultantFirstName="${consultantFirstName}", consultant_id will not be written`,
+        source: 'add-to-job',
+      });
+    }
+
     console.log({
-      message: `[AddToJob] Adding ${rfIds.length} candidates to job ${jobId}`,
+      message: `[AddToJob] Adding ${rfIds.length} candidates to job ${jobId} (consultant=${consultantFirstName || 'none'})`,
       source: 'add-to-job',
       rfIds,
       jobId,
+      consultantFirstName,
+      consultantRfUserId,
     });
 
     const results = await Promise.all(rfIds.map(async (rfId) => {
+      // Step 1: existing add-to-job with retry on 502
+      let addResult = null;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
           await addCandidateToJob(rfId, jobId, env);
-          console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} ✓`, source: 'add-to-job' });
-          return { rfId, status: 'added' };
+          addResult = { rfId, status: 'added' };
+          break;
         } catch (error) {
           if (error.message.toLowerCase().includes('already') && error.message.toLowerCase().includes('pipeline')) {
-            console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} already in pipeline`, source: 'add-to-job' });
-            return { rfId, status: 'already_in_job' };
+            addResult = { rfId, status: 'already_in_job' };
+            break;
           }
           if (error.message.includes('502') && attempt < 3) {
             console.log({ message: `[AddToJob] rfId=${rfId} → 502, retrying (${attempt}/2)`, source: 'add-to-job' });
             continue;
           }
           console.error({ message: `[AddToJob] rfId=${rfId} → job ${jobId} failed: ${error.message}`, source: 'add-to-job' });
-          return { rfId, status: 'error', reason: error.message };
+          addResult = { rfId, status: 'error', reason: error.message };
+          break;
         }
       }
+
+      // Step 2: write consultant_id only when add succeeded AND we have a consultant
+      if (addResult.status === 'added' && consultantRfUserId !== null) {
+        try {
+          await setJobCandidateConsultantId(rfId, jobId, consultantRfUserId, env);
+          await cacheConsultantForJobLink(rfId, jobId, consultantRfUserId, env);
+          console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} consultant_id=${consultantRfUserId} ✓`, source: 'add-to-job' });
+        } catch (error) {
+          addResult.consultantWriteFailed = true;
+          console.error({ message: `[AddToJob] rfId=${rfId} → consultant_id write failed: ${error.message}`, source: 'add-to-job' });
+        }
+      } else if (addResult.status === 'added') {
+        console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} ✓ (no consultant attribution)`, source: 'add-to-job' });
+      }
+
+      return addResult;
     }));
 
     const added = results.filter(r => r.status === 'added').length;
