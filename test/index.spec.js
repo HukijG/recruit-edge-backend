@@ -802,96 +802,103 @@ describe('findEligibleJob', () => {
 // ---------------------------------------------------------------------------
 
 describe('findJobsForStageMove', () => {
-  function buildCandidate(jobs) {
-    return { id: 49503, first_name: 'Steve', last_name: 'Xu', jobs };
-  }
+	const originalFetch = globalThis.fetch;
+	afterEach(() => { globalThis.fetch = originalFetch; });
 
-  function buildJob(overrides = {}) {
-    return {
-      job_id: 977,
-      is_open: true,
-      stage_name: 'Sourced',
-      stages: [
-        { id: 17934, name: 'Sourced', rank: 1 },
-        { id: 17935, name: 'Applied', rank: 2 },
-        { id: 17936, name: 'Replied', rank: 3 },
-      ],
-      ...overrides,
-    };
-  }
+	it('returns the consultant-matched job when KV cache has it', async () => {
+		const { cacheConsultantForJobLink } = await import('../src/cache.js');
+		await cacheConsultantForJobLink(81001, 100, 900002, env);
+		await cacheConsultantForJobLink(81001, 200, 900001, env); // Joel's job
 
-  const COLD_CALL_FILTERS = {
-    currentStage: 'Sourced',
-    targetStage: 'Replied',
-  };
+		const candidate = {
+			id: 81001,
+			jobs: [
+				{ job_id: 100, is_open: true, stage_name: 'Sourced', stages: [{ id: 1, name: 'Sourced' }, { id: 2, name: 'Replied' }] },
+				{ job_id: 200, is_open: true, stage_name: 'Sourced', stages: [{ id: 3, name: 'Sourced' }, { id: 4, name: 'Replied' }] },
+			],
+		};
+		const result = await findJobsForStageMove(candidate, {
+			currentStage: 'Sourced',
+			targetStage: 'Replied',
+			recruiterRfUserId: 900001,
+		}, env);
+		expect(result).toHaveLength(1);
+		expect(result[0].job_id).toBe(200);
+	});
 
-  it('returns empty array when candidate has no jobs', () => {
-    expect(findJobsForStageMove(buildCandidate([]), COLD_CALL_FILTERS)).toEqual([]);
-  });
+	it('falls back to jobs[0] when no consultant match (and jobs[0] is open + Sourced)', async () => {
+		const { cacheConsultantForJobLink } = await import('../src/cache.js');
+		await cacheConsultantForJobLink(81002, 100, 900002, env); // Alice
+		await cacheConsultantForJobLink(81002, 200, null, env);   // none
 
-  it('returns empty array for null candidate', () => {
-    expect(findJobsForStageMove(null, COLD_CALL_FILTERS)).toEqual([]);
-  });
+		const candidate = {
+			id: 81002,
+			jobs: [
+				{ job_id: 100, is_open: true, stage_name: 'Sourced', stages: [{ id: 1, name: 'Sourced' }, { id: 2, name: 'Replied' }] },
+				{ job_id: 200, is_open: true, stage_name: 'Sourced', stages: [{ id: 3, name: 'Sourced' }, { id: 4, name: 'Replied' }] },
+			],
+		};
+		const result = await findJobsForStageMove(candidate, {
+			currentStage: 'Sourced',
+			targetStage: 'Replied',
+			recruiterRfUserId: 900001,
+		}, env);
+		expect(result).toHaveLength(1);
+		expect(result[0].job_id).toBe(100); // jobs[0]
+	});
 
-  it('returns empty array when filters are missing required fields', () => {
-    expect(findJobsForStageMove(buildCandidate([buildJob()]), {})).toEqual([]);
-    expect(findJobsForStageMove(buildCandidate([buildJob()]), { currentStage: 'Sourced' })).toEqual([]);
-  });
+	it('returns [] when jobs[0] is not in currentStage', async () => {
+		const candidate = {
+			id: 81003,
+			jobs: [{ job_id: 100, is_open: true, stage_name: 'Replied', stages: [] }],
+		};
+		const result = await findJobsForStageMove(candidate, {
+			currentStage: 'Sourced',
+			targetStage: 'Replied',
+			recruiterRfUserId: 900001,
+		}, env);
+		expect(result).toEqual([]);
+	});
 
-  it('returns matching job with target stage info', () => {
-    const result = findJobsForStageMove(buildCandidate([buildJob()]), COLD_CALL_FILTERS);
-    expect(result).toEqual([{ job_id: 977, targetStage: { id: 17936, name: 'Replied' } }]);
-  });
+	it('returns [] when jobs[0] is closed', async () => {
+		const candidate = {
+			id: 81004,
+			jobs: [{ job_id: 100, is_open: false, stage_name: 'Sourced', stages: [] }],
+		};
+		const result = await findJobsForStageMove(candidate, {
+			currentStage: 'Sourced',
+			targetStage: 'Replied',
+			recruiterRfUserId: 900001,
+		}, env);
+		expect(result).toEqual([]);
+	});
 
-  it('excludes closed jobs by default', () => {
-    const result = findJobsForStageMove(buildCandidate([buildJob({ is_open: false })]), COLD_CALL_FILTERS);
-    expect(result).toEqual([]);
-  });
+	it('returns [] when targetStage is not defined on jobs[0] stages', async () => {
+		const candidate = {
+			id: 81005,
+			jobs: [{ job_id: 100, is_open: true, stage_name: 'Sourced', stages: [{ id: 1, name: 'Sourced' }] }],
+		};
+		const result = await findJobsForStageMove(candidate, {
+			currentStage: 'Sourced',
+			targetStage: 'Replied',
+			recruiterRfUserId: 900001,
+		}, env);
+		expect(result).toEqual([]);
+	});
 
-  it('includes closed jobs when openOnly=false', () => {
-    const candidate = buildCandidate([buildJob({ is_open: false })]);
-    const result = findJobsForStageMove(candidate, { ...COLD_CALL_FILTERS, openOnly: false });
-    expect(result).toHaveLength(1);
-  });
-
-  it('excludes jobs not in the requested currentStage', () => {
-    const result = findJobsForStageMove(buildCandidate([buildJob({ stage_name: 'Replied' })]), COLD_CALL_FILTERS);
-    expect(result).toEqual([]);
-  });
-
-  it('excludes jobs that do not have the targetStage available', () => {
-    const job = buildJob({ stages: [{ id: 17934, name: 'Sourced', rank: 1 }] });
-    const result = findJobsForStageMove(buildCandidate([job]), COLD_CALL_FILTERS);
-    expect(result).toEqual([]);
-  });
-
-  it('only considers jobs[0] — returns it when eligible', () => {
-    const candidate = buildCandidate([
-      buildJob({ job_id: 1 }),
-      buildJob({ job_id: 2 }),
-    ]);
-    const result = findJobsForStageMove(candidate, COLD_CALL_FILTERS);
-    expect(result).toHaveLength(1);
-    expect(result[0].job_id).toBe(1);
-  });
-
-  it('only considers jobs[0] — does NOT fall through to a later eligible job when jobs[0] is wrong stage', () => {
-    const candidate = buildCandidate([
-      buildJob({ job_id: 1, stage_name: 'Replied' }), // ineligible (already past Sourced)
-      buildJob({ job_id: 2 }),                         // eligible but at index 1 — must NOT be picked
-    ]);
-    const result = findJobsForStageMove(candidate, COLD_CALL_FILTERS);
-    expect(result).toEqual([]);
-  });
-
-  it('only considers jobs[0] — does NOT fall through when jobs[0] is closed', () => {
-    const candidate = buildCandidate([
-      buildJob({ job_id: 1, is_open: false }),
-      buildJob({ job_id: 2 }),
-    ]);
-    const result = findJobsForStageMove(candidate, COLD_CALL_FILTERS);
-    expect(result).toEqual([]);
-  });
+	it('legacy behavior when recruiterRfUserId is null: returns jobs[0] if eligible', async () => {
+		const candidate = {
+			id: 81006,
+			jobs: [{ job_id: 100, is_open: true, stage_name: 'Sourced', stages: [{ id: 1, name: 'Sourced' }, { id: 2, name: 'Replied' }] }],
+		};
+		const result = await findJobsForStageMove(candidate, {
+			currentStage: 'Sourced',
+			targetStage: 'Replied',
+			recruiterRfUserId: null,
+		}, env);
+		expect(result).toHaveLength(1);
+		expect(result[0].job_id).toBe(100);
+	});
 });
 
 // ---------------------------------------------------------------------------

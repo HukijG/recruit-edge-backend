@@ -447,6 +447,7 @@ export async function processCallEvent(payload, env) {
         currentStage: 'Sourced',
         targetStage: 'Replied',
         userId: activityUserId,
+        recruiterRfUserId: activityUserId,
       }, env);
       console.log({
         message: `[ColdCall] stage move: moved=${moveResult.moved} jobs=${JSON.stringify(moveResult.jobIds)}`,
