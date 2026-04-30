@@ -1764,3 +1764,32 @@ describe('normalizeToE164', () => {
 		expect(normalizeToE164('not a number')).toBeNull();
 	});
 });
+
+describe('addRFCandidate lead_owner_id', () => {
+	const originalFetch = globalThis.fetch;
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	it('does NOT include lead_owner_id when caller does not provide one', async () => {
+		const { addRFCandidate } = await import('../src/rf-client.js');
+		let captured;
+		globalThis.fetch = async (url, opts) => {
+			captured = JSON.parse(opts.body);
+			return new Response(JSON.stringify({ data: { id: 1 } }), { status: 200 });
+		};
+		const testEnv = { ...env, RF_API_KEY: 'test-rf-key' };
+		await addRFCandidate({ name: 'Test', linkedin_profile: 'foo' }, testEnv);
+		expect(captured).not.toHaveProperty('lead_owner_id');
+	});
+
+	it('includes lead_owner_id verbatim when the caller passes one', async () => {
+		const { addRFCandidate } = await import('../src/rf-client.js');
+		let captured;
+		globalThis.fetch = async (url, opts) => {
+			captured = JSON.parse(opts.body);
+			return new Response(JSON.stringify({ data: { id: 1 } }), { status: 200 });
+		};
+		const testEnv = { ...env, RF_API_KEY: 'test-rf-key' };
+		await addRFCandidate({ name: 'Test', linkedin_profile: 'foo', lead_owner_id: 900001 }, testEnv);
+		expect(captured.lead_owner_id).toBe(900001);
+	});
+});
