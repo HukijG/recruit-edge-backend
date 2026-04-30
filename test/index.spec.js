@@ -1856,4 +1856,10 @@ describe('parseColdCallActivity', () => {
 		// 19:49:38 +01:00 = 18:49:38 UTC
 		expect(result.createdAt).toBe('2026-04-29T18:49:38.000Z');
 	});
+
+	it('returns createdAt=null for invalid or missing time', async () => {
+		const { parseColdCallActivity } = await import('../src/cold-call.js');
+		expect(parseColdCallActivity({ activity_id: 1, time: 'not a date', text: 'x' }).createdAt).toBeNull();
+		expect(parseColdCallActivity({ activity_id: 2, time: undefined, text: 'x' }).createdAt).toBeNull();
+	});
 });

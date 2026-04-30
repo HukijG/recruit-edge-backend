@@ -495,12 +495,21 @@ export function parseColdCallActivity(activity) {
     description = description.replace(/<br>\n?/g, '\n').trim();
   }
 
+  // Defensive: invalid timestamps would crash toISOString(); prefer null over crash.
+  let createdAt = null;
+  if (activity.time) {
+    const d = new Date(activity.time);
+    if (!Number.isNaN(d.getTime())) {
+      createdAt = d.toISOString();
+    }
+  }
+
   return {
     id: activity.activity_id,
     type: 'cold_call',
     name: 'Cold call',
     description,
-    createdAt: new Date(activity.time).toISOString(),
+    createdAt,
     outcome,
   };
 }
