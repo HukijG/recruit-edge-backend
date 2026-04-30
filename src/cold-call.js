@@ -69,13 +69,13 @@ Respond with ONLY valid JSON, no other text:
 // --- Pure helpers ---
 
 /**
- * Append the "Cold Called" tag to an existing tags array (deduped).
- * Defensive against missing/non-array input — RF /candidate/get is documented
- * to return tags as an array of bare strings.
+ * Append a tag to an existing tags array (deduped, set-like).
+ * Defensive against missing/non-array input — RF returns tags as an array
+ * of bare strings.
  */
-export function mergeColdCalledTag(existingTags) {
+export function mergeTag(existingTags, value) {
   const tags = Array.isArray(existingTags) ? existingTags : [];
-  return tags.includes(COLD_CALL_TAG) ? tags : [...tags, COLD_CALL_TAG];
+  return tags.includes(value) ? tags : [...tags, value];
 }
 
 /**
@@ -365,7 +365,7 @@ export async function processCallEvent(payload, env) {
   }
 
   const existingTags = candidate?.tags;
-  const mergedTags = mergeColdCalledTag(existingTags);
+  const mergedTags = mergeTag(existingTags, COLD_CALL_TAG);
   console.log({
     message: `[ColdCall] tags read: existing=${JSON.stringify(existingTags)} merged=${JSON.stringify(mergedTags)}`,
     source: 'cold-call',

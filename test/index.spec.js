@@ -4,7 +4,7 @@ import worker from '../src';
 import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
 import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob, convertDialpadContactToRFUpdate, findJobsForStageMove } from '../src/rf-client.js';
 import {
-	isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall, mergeColdCalledTag, addHtmlLineBreaks
+	isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall, mergeTag, addHtmlLineBreaks
 } from '../src/cold-call.js';
 import { isMonitoredDialpadUser, getRFUserIdByDialpadId } from '../src/users.js';
 import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from '../src/apollo-client.js';
@@ -383,30 +383,26 @@ describe('addHtmlLineBreaks', () => {
 	});
 });
 
-describe('mergeColdCalledTag', () => {
-	it('appends "Cold Called" to an existing tags array', () => {
-		expect(mergeColdCalledTag(['swagger', 'priority'])).toEqual(['swagger', 'priority', 'Cold Called']);
+describe('mergeTag', () => {
+	it('appends the tag when not present', () => {
+		expect(mergeTag(['Active'], 'Cold Called')).toEqual(['Active', 'Cold Called']);
 	});
 
-	it('returns a single-tag array when input is empty', () => {
-		expect(mergeColdCalledTag([])).toEqual(['Cold Called']);
+	it('returns existing array unchanged when tag already present', () => {
+		const existing = ['Active', 'Cold Called'];
+		expect(mergeTag(existing, 'Cold Called')).toBe(existing);
 	});
 
-	it('does not duplicate when "Cold Called" is already present', () => {
-		const tags = ['Cold Called', 'priority'];
-		expect(mergeColdCalledTag(tags)).toEqual(['Cold Called', 'priority']);
+	it('handles non-array input by treating it as empty', () => {
+		expect(mergeTag(null, 'Cold Called')).toEqual(['Cold Called']);
+		expect(mergeTag(undefined, 'Cold Called')).toEqual(['Cold Called']);
+		expect(mergeTag('not an array', 'Cold Called')).toEqual(['Cold Called']);
 	});
 
-	it('treats undefined as empty array', () => {
-		expect(mergeColdCalledTag(undefined)).toEqual(['Cold Called']);
-	});
-
-	it('treats null as empty array', () => {
-		expect(mergeColdCalledTag(null)).toEqual(['Cold Called']);
-	});
-
-	it('treats non-array input as empty array', () => {
-		expect(mergeColdCalledTag('not an array')).toEqual(['Cold Called']);
+	it('works for the Number Invalid tag', () => {
+		expect(mergeTag([], 'Number Invalid')).toEqual(['Number Invalid']);
+		const withTag = ['Number Invalid'];
+		expect(mergeTag(withTag, 'Number Invalid')).toBe(withTag);
 	});
 });
 
