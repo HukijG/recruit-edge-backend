@@ -3,6 +3,7 @@
  */
 
 import { getUserByFirstName } from './users.js';
+import { getCachedConsultantForJobLink, cacheConsultantForJobLink } from './cache.js';
 
 /**
  * Extract RF candidate ID from Dialpad contact ID
@@ -697,4 +698,20 @@ export async function addCandidateToJob(candidateId, jobId, env) {
   }
 
   return await response.json();
+}
+
+/**
+ * Resolve the consultant_id for a job-candidate link, preferring KV cache.
+ * On cache miss, GETs from RF and writes the result back to cache.
+ * Returns the numeric value or null.
+ */
+export async function resolveJobConsultantId(candidateId, jobId, env) {
+  const cached = await getCachedConsultantForJobLink(candidateId, jobId, env);
+  if (cached === 'none') return null;
+  if (typeof cached === 'number') return cached;
+
+  // Cache miss — read from RF and write back
+  const fresh = await getJobCandidateConsultantId(candidateId, jobId, env);
+  await cacheConsultantForJobLink(candidateId, jobId, fresh, env);
+  return fresh;
 }

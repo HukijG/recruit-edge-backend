@@ -1632,3 +1632,51 @@ describe('getJobCandidateConsultantId', () => {
 		await expect(getJobCandidateConsultantId(50000, 999, testEnv)).rejects.toThrow(/RF API error: 500/);
 	});
 });
+
+describe('resolveJobConsultantId', () => {
+	const originalFetch = globalThis.fetch;
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	it('returns the cached numeric value without hitting RF', async () => {
+		const { cacheConsultantForJobLink } = await import('../src/cache.js');
+		const { resolveJobConsultantId } = await import('../src/rf-client.js');
+		const testEnv = { ...env, RF_API_KEY: 'test-rf-key' };
+		await cacheConsultantForJobLink(60001, 800, 900001, env);
+		let fetchCount = 0;
+		globalThis.fetch = async () => { fetchCount++; return new Response('{}', { status: 200 }); };
+		expect(await resolveJobConsultantId(60001, 800, testEnv)).toBe(900001);
+		expect(fetchCount).toBe(0);
+	});
+
+	it('returns null when cache holds the "none" sentinel — no RF call', async () => {
+		const { cacheConsultantForJobLink } = await import('../src/cache.js');
+		const { resolveJobConsultantId } = await import('../src/rf-client.js');
+		const testEnv = { ...env, RF_API_KEY: 'test-rf-key' };
+		await cacheConsultantForJobLink(60002, 800, null, env);
+		let fetchCount = 0;
+		globalThis.fetch = async () => { fetchCount++; return new Response('{}', { status: 200 }); };
+		expect(await resolveJobConsultantId(60002, 800, testEnv)).toBeNull();
+		expect(fetchCount).toBe(0);
+	});
+
+	it('falls back to RF on cache miss, caches the result, and returns the value', async () => {
+		const { resolveJobConsultantId } = await import('../src/rf-client.js');
+		const { getCachedConsultantForJobLink } = await import('../src/cache.js');
+		const testEnv = { ...env, RF_API_KEY: 'test-rf-key' };
+		globalThis.fetch = async () => new Response(JSON.stringify({
+			data: [{ id: 16, name: 'consultant_id', value: 900002 }],
+		}), { status: 200 });
+		expect(await resolveJobConsultantId(60003, 800, testEnv)).toBe(900002);
+		// And the value got cached
+		expect(await getCachedConsultantForJobLink(60003, 800, env)).toBe(900002);
+	});
+
+	it('caches the "none" sentinel when RF returns no consultant_id', async () => {
+		const { resolveJobConsultantId } = await import('../src/rf-client.js');
+		const { getCachedConsultantForJobLink } = await import('../src/cache.js');
+		const testEnv = { ...env, RF_API_KEY: 'test-rf-key' };
+		globalThis.fetch = async () => new Response(JSON.stringify({ data: [] }), { status: 200 });
+		expect(await resolveJobConsultantId(60004, 800, testEnv)).toBeNull();
+		expect(await getCachedConsultantForJobLink(60004, 800, env)).toBe('none');
+	});
+});
