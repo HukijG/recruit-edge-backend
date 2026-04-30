@@ -2,33 +2,40 @@
 
 ## System Overview
 
-A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact records in sync across RecruiterFlow (RF), Dialpad, Google Calendar, and Krisp. RF is the source of truth for candidate records. A KV-backed cache provides fast lookups for integrations that don't have an RF candidate ID.
+A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact records in sync across RecruiterFlow (RF), Dialpad, Google Calendar, Krisp, and a custom LinkedIn Recruiter Chrome extension. RF is the source of truth for candidate records. A KV-backed cache provides fast lookups for integrations that don't have an RF candidate ID, and short-TTL snapshot caches make the extension's sidepanel responsive when recruiters walk through bulk-added candidate queues.
 
 ```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ RecruiterFlow │    │   Dialpad    │    │  Dialpad     │    │   Google     │    │    Krisp     │
-│  (RF)        │    │  (contacts)  │    │  (calls)     │    │  Calendar    │    │              │
-│              │    │              │    │              │    │  + Reclaim   │    │              │
-└──────┬───────┘    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
-       │ webhook           │ webhook           │ webhook           │ Apps Script        │ webhook
-       ▼                   ▼                   ▼                   ▼                   ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                          Cloudflare Worker (rf-dialpad-sync-dev)                                 │
-│                                                                                                  │
-│  /webhook/recruiterflow  /webhook/dialpad  /webhook/dialpad/calls  /webhook/calendar             │
-│  /webhook/krisp          /health                                                                 │
-│                                                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────────────────────────┐     │
-│  │                    KV: SYNC_STATE                                                        │     │
-│  │  candidate:{rfId}    → JSON canonical record       (60-day TTL)                          │     │
-│  │  linkedin:{url}      → rfId                        (60-day TTL)                          │     │
-│  │  email:{addr}        → rfId                        (60-day TTL)                          │     │
-│  │  name:{first}:{last} → rfId or AMBIGUOUS           (60-day TTL)                          │     │
-│  │  sync:RF{id}         → "true"                      (60-sec TTL)                          │     │
-│  │  krisp:note:{hash}   → "true"                      (24-hour TTL)                         │     │
-│  │  coldcall:{call_id}  → "true"                      (5-min TTL)                           │     │
-│  └─────────────────────────────────────────────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│ RecruiterFlow │  │   Dialpad    │  │  Dialpad     │  │   Google     │  │    Krisp     │  │   LinkedIn   │
+│   (RF)       │  │  (contacts)  │  │  (calls)     │  │  Calendar    │  │              │  │  Extension   │
+│              │  │              │  │              │  │  + Reclaim   │  │              │  │ (Chrome)     │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │ webhook         │ webhook         │ webhook         │ Apps Script      │ webhook         │ POST (X-Extension-Token)
+       ▼                 ▼                 ▼                 ▼                 ▼                 ▼
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                Cloudflare Worker (rf-dialpad-sync-dev)                                      │
+│                                                                                                              │
+│  /webhook/recruiterflow  /webhook/dialpad  /webhook/dialpad/calls  /webhook/calendar  /webhook/krisp        │
+│  /webhook/apollo  /candidates  /candidates/add-to-job  /candidate-details  /candidate-mark-invalid          │
+│  /health                                                                                                     │
+│                                                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐       │
+│  │                    KV: SYNC_STATE                                                                  │       │
+│  │  candidate:{rfId}                       → slim JSON record           (60-day TTL)                 │       │
+│  │  linkedin:{url}                         → rfId                       (60-day TTL)                 │       │
+│  │  email:{addr}                           → rfId                       (60-day TTL)                 │       │
+│  │  name:{first}:{last}                    → rfId or "AMBIGUOUS"        (60-day TTL)                 │       │
+│  │  sync:RF{id}                            → "true"                     (60-sec TTL)                 │       │
+│  │  krisp:note:{hash}                      → "true"                     (24-hour TTL)                │       │
+│  │  coldcall:{call_id}                     → "true"                     (5-min TTL)                  │       │
+│  │  apollo_enrich:{rfId}                   → JSON                       (15-min TTL)                 │       │
+│  │  consultant:job{jobId}:cand{rfId}       → rfUserId or "none"         (30-day TTL)                 │       │
+│  │  details:{rfId}                         → full RF candidate JSON     (20-min TTL)                 │       │
+│  │  activities:{rfId}                      → activity-list array        (20-min TTL)                 │       │
+│  │  batch:job{jobId}                       → ordered rfId array         (30-day TTL)                 │       │
+│  │  prewarm:rec{rfUserId}:job{jobId}       → { lastPrewarmIdx }         (1-hour TTL)                 │       │
+│  └──────────────────────────────────────────────────────────────────────────────────────────────────┘       │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -37,16 +44,20 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 
 | File | Purpose |
 |------|---------|
-| `src/index.js` | Worker entry point, request routing, all webhook handlers, sync orchestration |
-| `src/cache.js` | KV candidate cache: canonical records, index keys (linkedin, email, name), lookup functions |
-| `src/rf-client.js` | RF API client: candidate search/get/update, LinkedIn URL validation & normalization, Dialpad↔RF data conversion |
+| `src/index.js` | Worker entry point, request routing, all webhook handlers, extension routes, sync orchestration, neighbor-prewarm logic |
+| `src/users.js` | Team registry: hardcoded `USERS` array of `{ firstName, rfUserId, dialpadId }` records + accessors (`getUserByFirstName`, `getUserByDialpadId`, `getUserByRFUserId`, `resolveRFUserId`, `getRFUserIdByDialpadId`, `isMonitoredDialpadUser`). Single source of truth for cold-call attribution, calendar Joel-only logic, the extension's `consultantFirstName` resolution, and Apollo's Joel-only enrichment trigger |
+| `src/cache.js` | KV cache: canonical records, index keys (linkedin, email, name), consultant_id per job-link, details + activities snapshots, batch index, prewarm state, invalidation helper |
+| `src/rf-client.js` | RF API client: search/get/update, LinkedIn URL validation & normalization, Dialpad↔RF data conversion, custom-field consultant_id read/write/resolve, activity-list, phone normalization (`normalizeToE164`), job disambiguation (`pickConsultantJob`), stage-move filter, prewarm helper, single-retry-on-502 in `getRFCandidate` |
 | `src/dialpad-client.js` | Dialpad API client: contact PUT (create/update), data preparation from RF candidate format |
 | `src/krisp.js` | Krisp helpers: note formatting (HTML), candidate email extraction from meeting participants |
-| `src/cold-call.js` | Cold call detection: monitored-user filter (Joel + Alice), Dialpad transcript fetch, Workers AI classification (Llama 3.3 70B), per-outcome summary extraction (Llama 3.1 8B), RF custom activity + tag/source update + Sourced→Replied stage move, `<br>` line-break formatting for RF activity_text |
+| `src/cold-call.js` | Cold call detection: monitored-user filter (registry-driven), Dialpad transcript fetch, Workers AI classification (Llama 3.3 70B), per-outcome summary extraction (Llama 3.1 8B), RF custom activity + tag/source update + Sourced→Replied stage move, generic `mergeTag(tags, value)` helper, `parseColdCallActivity` for the extension shape |
+| `src/apollo-client.js` | Apollo API client: enrichment, search, verification, scoring |
+| `src/enrichment.js` | Enrichment orchestration: ownership check (sourced from `users.js`), LinkedIn verify, fallback search, phone reveal |
 | `src/auth.js` | JWT verification for Dialpad webhooks (HS256 via `jose`) |
 | `scripts/calendar-sync.gs` | Google Apps Script: detects Reclaim bookings on Google Calendar, extracts candidate data, posts to worker |
-| `wrangler.jsonc` | Worker config: KV binding, env vars, compatibility settings |
-| `test/index.spec.js` | Vitest tests using `@cloudflare/vitest-pool-workers` |
+| `wrangler.jsonc` | Worker config: KV binding, env vars, compatibility settings (no secrets — those are Cloudflare-managed) |
+| `vitest.config.js` | Vitest + miniflare config; test-only secret bindings live here, not in wrangler.jsonc |
+| `test/index.spec.js`, `test/e2e.spec.js`, `test/users.spec.js` | Vitest tests using `@cloudflare/vitest-pool-workers` |
 
 ---
 
@@ -61,6 +72,11 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `/webhook/calendar` | POST | `X-Calendar-Webhook-Token` header | Calendar booking events (from Apps Script) |
 | `/webhook/krisp` | POST | `X-Krisp-Webhook-Token` header | Krisp meeting note webhooks |
 | `/webhook/dialpad/calls` | POST | JWT Bearer (HS256) | Dialpad call transcription/voicemail webhooks |
+| `/webhook/apollo` | POST | `?token=` query param (`APOLLO_WEBHOOK_SECRET`) | Async phone reveal delivery from Apollo |
+| `/candidates` | POST | `X-Extension-Token` header | LinkedIn extension batch upsert (sets `lead_owner_id`) |
+| `/candidates/add-to-job` | POST | `X-Extension-Token` header | Add candidates to a job + write `consultant_id` custom field |
+| `/candidate-details` | POST | `X-Extension-Token` header | Sidepanel data: rfId, phone (E.164), picked job, cold-call activities |
+| `/candidate-mark-invalid` | POST | `X-Extension-Token` header | Tag candidate `"Number Invalid"` (idempotent) |
 
 ---
 
@@ -248,14 +264,17 @@ Dialpad call event (call_transcription or transcription state)
             currentStage: 'Sourced',
             targetStage: 'Replied',
             userId: activityUserId,
-            addedByUserId: activityUserId,    // only progress jobs the recruiter sourced
+            recruiterRfUserId: activityUserId,   // filter via cached consultant_id
          }, env)
-         → findJobsForStageMove walks candidate.jobs and picks every entry that is:
-           open + stage_name === 'Sourced' + added_to_job_by.id === recruiter
-           + has a 'Replied' stage available.
-         → For each match, POST /candidate/move-to-stage with user_id = recruiter.
-         → Multi-match is unlikely under that filter; if it occurs, every match is
-           moved (each represents a real sourcing effort).
+         → findJobsForStageMove walks candidate.jobs, builds the eligible set
+           (open + stage_name === 'Sourced' + has 'Replied' stage). For each
+           eligible job it resolves the consultant_id via resolveJobConsultantId
+           (KV `consultant:job{jobId}:cand{rfId}` first, RF GET on miss).
+         → Returns the FIRST job whose consultant_id matches the recruiter.
+         → Falls back to jobs[0] if eligible when no match — preserves legacy
+           behavior for older job-candidate links that lack the custom field.
+         → For the matched (or fallback) job, POST /candidate/move-to-stage with
+           user_id = recruiter.
 ```
 
 ### Key design decisions
@@ -277,6 +296,151 @@ Dialpad call event (call_transcription or transcription state)
 **Numeric IDs**: Dialpad sends `target.id` and `contact.id` as numbers in call webhooks. `isMonitoredDialpadUser()`, `getRFUserIdForDialpadUser()`, and `extractRFIdFromDialpadContact()` all use `String()` coercion.
 
 **Neuron budget**: ~35-40 neurons for classification + an additional ~5-10 for the cheap-model summary on connected calls. Dedup-before-AI ensures each call only hits AI once regardless of Dialpad retries.
+
+---
+
+## Data Flow: LinkedIn Extension → RF + Dialpad
+
+**Trigger**: A custom Chrome extension overlaying LinkedIn Recruiter. Recruiters bulk-add candidates from a pipeline view, then walk through them one-by-one in LinkedIn opening the sidepanel for each profile to cold-call via Dialpad. Authed via `X-Extension-Token` header.
+
+Every request body includes `consultantFirstName: string`, resolved through `src/users.js:resolveRFUserId` to an RF user ID for attribution.
+
+### `POST /candidates` — batch upsert
+
+```
+Extension → POST /candidates (consultantFirstName, candidates[])
+  → Verify X-Extension-Token (fail closed)
+  → resolveRFUserId(consultantFirstName) → consultantRfUserId | null
+
+  → For each candidate (chunks of 5, parallel):
+      → searchRFCandidateByLinkedIn(linkedinUrl) — slug-filtered for true matches
+      → Reconcile linkedin cache against RF (self-heals stale linkedin → rfId)
+
+      If existing → processExistingRFCandidate (no lead_owner_id touched):
+          → GET Dialpad contact
+          → If missing: full Dialpad creation; if present: PATCH company/title only
+          → Apollo phone reveal if no Dialpad phone + linkedin URL + no prior attempt
+
+      If new:
+          → mapExtensionToRFCandidate(ext, consultantRfUserId)
+              — sets lead_owner_id from registry when consultantRfUserId is a number
+          → POST /candidate/add (recover from 409 by re-routing to existing path)
+          → Build slim candidate record from extension data (no GET round-trip needed —
+            new candidates have no email/phone yet)
+          → syncCandidateToDialpad → cacheCandidate
+          → Apollo phone reveal (LinkedIn URL → enrichPerson, request reveal with
+            run_waterfall_phone, write apollo_enrich:{rfId} flag, 15-min TTL)
+
+  → listOpenJobs → response includes { total, created, updated, skipped, errors,
+                                       results, jobs }
+```
+
+### `POST /candidates/add-to-job` — add to job + write consultant_id
+
+```
+Extension → POST /candidates/add-to-job (consultantFirstName, rfIds[], jobId)
+  → Verify X-Extension-Token
+  → resolveRFUserId(consultantFirstName) → consultantRfUserId | null
+
+  → Per row (parallel):
+      Step 1: addCandidateToJob(rfId, jobId, env)
+          → 502 retry up to 3 attempts
+          → Recognizes "already in pipeline" error → status: 'already_in_job'
+          → Defensive null-guard: if loop exits without addResult, treat as error
+
+      Step 2: only when status ∈ {'added', 'already_in_job'} AND consultantRfUserId !== null
+          → setJobCandidateConsultantId(rfId, jobId, consultantRfUserId, env)
+              POST /job-candidate/custom-field/value/update
+              { candidate_id, job_id, custom_fields: [{ id: 16, value: rfUserId }] }
+          → cacheConsultantForJobLink(rfId, jobId, rfUserId, env)
+          → On failure: addResult.consultantWriteFailed = true (non-fatal)
+
+      Append: appendToJobBatchIndex(jobId, rfId, env) — idempotent dedupe
+
+  → Response: { jobId, added, alreadyInJob, errors, results }
+```
+
+Re-adds (status=`already_in_job`) DO write consultant_id and DO append to the batch index. This is intentional: the extension is the only path hitting this route, recruiters only re-add candidates they're now driving themselves, and re-adding is the user-facing way to refresh the cache + reattribute attribution for older job-candidate links.
+
+### `POST /candidate-details` — sidepanel data
+
+```
+Extension → POST /candidate-details (consultantFirstName, profileUrl)
+  → Verify X-Extension-Token
+  → Resolve rfId:
+      → lookupByLinkedIn (KV linkedin:{slug}) — fast path
+      → searchRFCandidateByLinkedIn fallback (caches the result on hit)
+      → 404 if neither yields a match
+
+  → Try cache first (parallel):
+      → getCachedCandidateDetails(rfId) (KV details:{rfId}, 20-min TTL)
+      → getCachedCandidateActivities(rfId) (KV activities:{rfId}, 20-min TTL)
+
+  → Cache MISS branches:
+      → Parallel-fetch only the missing pieces:
+          getRFCandidate(rfId) and/or listCandidateActivities(rfId)
+      → Cache the freshly-fetched pieces
+
+  → pickConsultantJob(candidate, consultantRfUserId, env):
+      → Filter to open jobs, sort by stage_moved desc
+      → For each, resolveJobConsultantId (KV → RF fallback, per-job try/catch)
+      → Return first match against consultantRfUserId, else jobs[0] if open
+
+  → normalizeToE164(first phone_number entry) → E.164 string or null
+
+  → activities.filter(type.id === 1002).map(parseColdCallActivity).sort(asc time)
+
+  → Fire-and-forget: ctx.waitUntil(handleNeighborPrewarm(rfId, jobId, recruiterRfId, env))
+
+  → Response: { rfId, fullName, phoneNumber, job, activities }
+```
+
+### `POST /candidate-mark-invalid` — tag-only invalidation
+
+```
+Extension → POST /candidate-mark-invalid (consultantFirstName, rfId)
+  → Verify X-Extension-Token
+  → 400 if rfId missing
+  → getRFCandidate(rfId) — read existing tags
+  → If tags already includes "Number Invalid" → { ok: true } (no RF write)
+  → Else: mergeTag(existingTags, "Number Invalid") → updateRFCandidate(rfId, { tags: merged })
+  → invalidateCandidateDetailsCache(rfId) — drops details:{rfId} + activities:{rfId}
+  → Response: { ok: true }
+```
+
+Phone is left in place. No custom activity is written. consultantFirstName is logged for traceability but doesn't drive any attribution write (RF tag updates don't carry per-action attribution).
+
+### Extension Caching Strategy
+
+The bulk-add → cold-call session pattern (50-200 candidates added at once, walked through one-by-one over 1-3 days) is the primary perf target. Two cooperating layers:
+
+**1. Snapshot caches** (`details:{rfId}`, `activities:{rfId}`, both 20-min TTL):
+- First `/candidate-details` for a candidate is a RF round-trip + KV write
+- Subsequent reads within 20 min are KV-only (~30-50ms total)
+- `/candidate-mark-invalid` invalidates so tag changes show up immediately
+
+**2. Neighbor prewarm via per-job batch index**:
+- `/candidates/add-to-job` appends successful rows (added OR already_in_job, deduped) to `batch:job{jobId}` — an ordered JSON array of rfIds in add-order, 30-day TTL
+- On `/candidate-details`, after picking the job, fire `ctx.waitUntil(handleNeighborPrewarm(rfId, jobId, recruiterRfUserId, env))`:
+  - Find the candidate's index in the batch list. Skip if not in any batch index.
+  - Read `prewarm:rec{rfUserId}:job{jobId}` for last prewarm position (1-hour TTL).
+  - **First call** (no state): prewarm 30 candidates either side (clipped to list bounds), set `lastPrewarmIdx = currentIdx`.
+  - **Subsequent calls**: if `|currentIdx - lastPrewarmIdx| >= 20`, prewarm the next 30 in the direction of motion. Update state.
+  - Otherwise: no-op.
+- Prewarm uses `prewarmCandidatesIfMissing(rfIds, env)` which only fetches RF for pieces not already cached.
+
+This pattern means:
+- Recruiter walks through profiles 1, 2, 3, ... in a job
+- Profile #1: ~600ms (RF GET + activity-list + cache writes + prewarms #2-30)
+- Profiles #2-30: ~30-50ms each (KV-only)
+- At profile #21: directional prewarm fetches #31-60 in background
+- Profile #31: still ~30-50ms (already prewarmed)
+
+`getRFCandidate` retries once on 502 — RF's edge produces transient 502s and a single retry is far cheaper than failing the whole sidepanel response.
+
+All four extension routes return `{ "error": "Internal Server Error" }` on 500 (server-side `console.error` still carries `error.message` + stack — full debug context stays in CF Logs, generic body keeps RF internals from leaking to clients).
+
+Cache hit/miss is logged at multiple layers — filter `source:prewarm`, `source:consultant-cache`, or look for `cacheHit:` fields to verify behavior in CF Observability.
 
 ---
 
@@ -304,13 +468,19 @@ A general-purpose cache that stores candidate records and provides O(1) lookups 
 
 | Key Pattern | Value | TTL |
 |-------------|-------|-----|
-| `candidate:{rfId}` | JSON: `{id, first_name, last_name, email, emails[], linkedin_profile, current_organization, current_title, phone_number, cached_at}` | 60 days |
+| `candidate:{rfId}` | Slim JSON: `{id, first_name, last_name, email, emails[], linkedin_profile, current_organization, current_title, phone_number, cached_at}` | 60 days |
 | `linkedin:{normalized_url}` | RF candidate ID string | 60 days |
 | `email:{lowercase_address}` | RF candidate ID string (one key per email in array) | 60 days |
 | `name:{first_lower}:{last_lower}` | RF candidate ID string, or `"AMBIGUOUS"` | 60 days |
-| `sync:RF{id}` | `"true"` | 60 seconds |
-| `krisp:note:{hash}` | `"true"` | 24 hours |
-| `coldcall:{call_id}` | `"true"` | 5 minutes |
+| `sync:RF{id}` | `"true"` (debounce flag) | 60 seconds |
+| `krisp:note:{hash}` | `"true"` (dedup flag) | 24 hours |
+| `coldcall:{call_id}` | `"true"` (dedup flag, set before AI classification) | 5 minutes |
+| `apollo_enrich:{rfId}` | JSON enrichment context (`apolloPersonId` or `noMatch:true`) | 15 minutes |
+| `consultant:job{jobId}:cand{rfId}` | RF user_id string or `"none"` sentinel | 30 days |
+| `details:{rfId}` | Full RF `/candidate/get` response (extension fast path) | 20 minutes |
+| `activities:{rfId}` | Full `/candidate/activity/list` data array | 20 minutes |
+| `batch:job{jobId}` | JSON array of rfId strings in extension-add order | 30 days |
+| `prewarm:rec{rfUserId}:job{jobId}` | `{ lastPrewarmIdx }` per-recruiter+job state | 1 hour |
 
 ### Cache Freshness
 
@@ -353,6 +523,13 @@ Example: `https://www.LinkedIn.com/in/John-Smith/?utm_source=share` → `linkedi
 | `RF_WEBHOOK_SECRET` | Shared secret verification for RF webhooks |
 | `CALENDAR_WEBHOOK_SECRET` | Shared secret verification for calendar webhooks |
 | `KRISP_WEBHOOK_SECRET` | Shared secret verification for Krisp webhooks |
+| `APOLLO_API_KEY` | Apollo API (Bearer auth) |
+| `APOLLO_WEBHOOK_SECRET` | Token query param verification for Apollo phone webhooks |
+| `LINKEDIN_EXTENSION_SECRET` | Shared secret for `X-Extension-Token` on extension routes |
+
+### Test bindings (in `vitest.config.js`, never deployed)
+
+`vitest.config.js`'s `poolOptions.workers.miniflare.bindings` provides non-secret stand-ins for `LINKEDIN_EXTENSION_SECRET`, `RF_API_KEY`, and `DIALPAD_API_KEY` so e2e tests can hit the worker without real credentials. `wrangler.jsonc` is intentionally clean of these values to avoid overwriting Cloudflare-managed production secrets on deploy.
 
 ### Vars (in `wrangler.jsonc`)
 
