@@ -789,7 +789,13 @@ export async function pickConsultantJob(candidate, consultantRfUserId, env) {
   if (jobs.length === 0) return null;
 
   if (typeof consultantRfUserId === 'number') {
-    const openJobs = jobs.filter(j => j?.is_open);
+    // Sort open jobs by stage_moved desc so when multiple jobs match the
+    // consultant, the most-recently-touched one wins (deterministic — not
+    // dependent on RF response ordering).
+    const openJobs = jobs
+      .filter(j => j?.is_open)
+      .slice()
+      .sort((a, b) => new Date(b?.stage_moved || 0).getTime() - new Date(a?.stage_moved || 0).getTime());
     // Resolve consultant_id in parallel; treat per-job lookup failures as no-match
     const resolved = await Promise.all(
       openJobs.map(async j => {

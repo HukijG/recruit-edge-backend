@@ -1343,7 +1343,7 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
 
   } catch (error) {
     console.error({ message: `[Candidates] Error: ${error.message}`, source: 'candidates-endpoint', stack: error.stack });
-    return new Response(JSON.stringify({ error: error.message }), {
+    return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
       status: 500,
       headers: responseHeaders
     });
@@ -1496,7 +1496,7 @@ async function handleAddToJobEndpoint(request, env, corsHeaders) {
 
   } catch (error) {
     console.error({ message: `[AddToJob] Error: ${error.message}`, source: 'add-to-job', stack: error.stack });
-    return new Response(JSON.stringify({ error: error.message }), {
+    return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
       status: 500, headers: responseHeaders
     });
   }
@@ -1550,7 +1550,7 @@ async function handleMarkInvalidEndpoint(request, env, corsHeaders) {
 
   } catch (error) {
     console.error({ message: `[MarkInvalid] error: ${error.message}`, source: 'mark-invalid', stack: error.stack });
-    return new Response(JSON.stringify({ error: error.message }), {
+    return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
       status: 500, headers: responseHeaders,
     });
   }
@@ -1651,7 +1651,7 @@ async function handleCandidateDetailsEndpoint(request, env, corsHeaders) {
 
   } catch (error) {
     console.error({ message: `[CandidateDetails] error: ${error.message}`, source: 'candidate-details', stack: error.stack });
-    return new Response(JSON.stringify({ error: error.message }), {
+    return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
       status: 500, headers: responseHeaders,
     });
   }
