@@ -1594,3 +1594,41 @@ describe('convertDialpadContactToRFUpdate — removal sync', () => {
 		expect(result).toEqual({});
 	});
 });
+
+describe('getJobCandidateConsultantId', () => {
+	const originalFetch = globalThis.fetch;
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	const testEnv = { RF_API_KEY: 'test-rf-key', RF_API_BASE_URL: 'https://api.recruiterflow.com/api/external' };
+
+	it('returns the numeric value when custom field id 16 is set', async () => {
+		const { getJobCandidateConsultantId } = await import('../src/rf-client.js');
+		globalThis.fetch = async () => new Response(JSON.stringify({
+			data: [
+				{ id: 102, name: 'Willing to relocate?', value: 'Yes' },
+				{ id: 16, name: 'consultant_id', value: 900001 },
+			],
+		}), { status: 200 });
+		expect(await getJobCandidateConsultantId(50000, 999, testEnv)).toBe(900001);
+	});
+
+	it('returns null when field id 16 is absent', async () => {
+		const { getJobCandidateConsultantId } = await import('../src/rf-client.js');
+		globalThis.fetch = async () => new Response(JSON.stringify({
+			data: [{ id: 102, name: 'Other', value: 'whatever' }],
+		}), { status: 200 });
+		expect(await getJobCandidateConsultantId(50000, 999, testEnv)).toBeNull();
+	});
+
+	it('returns null when data is empty', async () => {
+		const { getJobCandidateConsultantId } = await import('../src/rf-client.js');
+		globalThis.fetch = async () => new Response(JSON.stringify({ data: [] }), { status: 200 });
+		expect(await getJobCandidateConsultantId(50000, 999, testEnv)).toBeNull();
+	});
+
+	it('throws on non-2xx response', async () => {
+		const { getJobCandidateConsultantId } = await import('../src/rf-client.js');
+		globalThis.fetch = async () => new Response('boom', { status: 500 });
+		await expect(getJobCandidateConsultantId(50000, 999, testEnv)).rejects.toThrow(/RF API error: 500/);
+	});
+});

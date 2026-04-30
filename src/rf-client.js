@@ -636,6 +636,38 @@ export async function setJobCandidateConsultantId(candidateId, jobId, consultant
 }
 
 /**
+ * Read the consultant_id custom field for a job-candidate link.
+ * Returns the numeric value (an RF user_id) or null if the field is unset.
+ */
+export async function getJobCandidateConsultantId(candidateId, jobId, env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const url = `${rfBaseUrl}/job-candidate/custom-field/value/list?candidate_id=${candidateId}&job_id=${jobId}`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { 'RF-Api-Key': rfApiKey, 'Accept': 'application/json' },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`RF get-consultant-field error candidate=${candidateId} job=${jobId} status=${response.status}`, errorText);
+    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+  }
+
+  const result = await response.json();
+  const fields = Array.isArray(result?.data) ? result.data : [];
+  const entry = fields.find(f => f.id === JOB_CANDIDATE_CONSULTANT_FIELD_ID);
+  if (!entry || entry.value === null || entry.value === undefined) return null;
+  const num = typeof entry.value === 'number' ? entry.value : parseInt(entry.value, 10);
+  return Number.isNaN(num) ? null : num;
+}
+
+/**
  * Add a candidate to a job in RF.
  */
 export async function addCandidateToJob(candidateId, jobId, env) {
