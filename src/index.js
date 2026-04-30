@@ -4,11 +4,12 @@ import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
   searchRFCandidateByEmail, addRFCandidateNote, moveToCallBooked, addRFCandidate,
-  listOpenJobs, addCandidateToJob, setJobCandidateConsultantId
+  listOpenJobs, addCandidateToJob, setJobCandidateConsultantId,
+  listCandidateActivities, normalizeToE164, pickConsultantJob
 } from './rf-client.js';
 import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName, cacheConsultantForJobLink } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
-import { processCallEvent } from './cold-call.js';
+import { processCallEvent, parseColdCallActivity } from './cold-call.js';
 import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enrichment.js';
 import { enrichPerson } from './apollo-client.js';
 import { resolveRFUserId } from './users.js';
@@ -82,6 +83,14 @@ export default {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
         }
         return await handleAddToJobEndpoint(request, env, corsHeaders);
+      }
+
+      if (url.pathname === '/candidate-details' && request.method === 'POST') {
+        const extAuth = request.headers.get('X-Extension-Token');
+        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+        }
+        return await handleCandidateDetailsEndpoint(request, env, corsHeaders);
       }
 
       return new Response('Not Found', {
@@ -1481,6 +1490,107 @@ async function handleAddToJobEndpoint(request, env, corsHeaders) {
     console.error({ message: `[AddToJob] Error: ${error.message}`, source: 'add-to-job', stack: error.stack });
     return new Response(JSON.stringify({ error: error.message }), {
       status: 500, headers: responseHeaders
+    });
+  }
+}
+
+async function handleCandidateDetailsEndpoint(request, env, corsHeaders) {
+  const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  try {
+    const payload = await request.json();
+    const profileUrl = typeof payload.profileUrl === 'string' ? payload.profileUrl.trim() : '';
+    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
+
+    if (!profileUrl) {
+      return new Response(JSON.stringify({ error: 'Missing "profileUrl"' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    const consultantRfUserId = resolveRFUserId(consultantFirstName);
+
+    // Resolve rfId — KV first, RF search fallback
+    let rfId = await lookupByLinkedIn(profileUrl, env);
+    if (!rfId) {
+      const found = await searchRFCandidateByLinkedIn(profileUrl, env);
+      if (found) {
+        rfId = String(found.id);
+        await cacheCandidate(found, env);
+      }
+    }
+
+    if (!rfId) {
+      console.log({
+        message: `[CandidateDetails] no RF match for url=${profileUrl}`,
+        source: 'candidate-details',
+        profileUrl,
+      });
+      return new Response(JSON.stringify({ error: 'Candidate not found in RF' }), {
+        status: 404, headers: responseHeaders,
+      });
+    }
+
+    const rfIdNum = parseInt(rfId, 10);
+
+    // Parallel fetches: full candidate + activities
+    const [candidate, activities] = await Promise.all([
+      getRFCandidate(rfIdNum, env),
+      listCandidateActivities(rfIdNum, env),
+    ]);
+
+    // Pick best job
+    const pickedJob = await pickConsultantJob(candidate, consultantRfUserId, env);
+    const jobOut = pickedJob ? {
+      title: pickedJob.name || pickedJob.title || '',
+      company: pickedJob.company?.name || '',
+      stage: pickedJob.stage_name || '',
+    } : null;
+
+    // Normalize phone — first entry of phone_number array
+    let phoneNumber = null;
+    const rawPhones = Array.isArray(candidate.phone_number) ? candidate.phone_number : [];
+    if (rawPhones.length > 0) {
+      const first = rawPhones[0];
+      const raw = typeof first === 'string' ? first : first?.phone_number;
+      phoneNumber = normalizeToE164(raw);
+    }
+
+    // Filter + map + sort cold-call activities (ASC by time)
+    const coldCalls = activities
+      .filter(a => a?.type?.id === 1002)
+      .map(parseColdCallActivity)
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+
+    const fullName = candidate.name || `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim();
+
+    const responseBody = {
+      rfId: rfIdNum,
+      fullName,
+      phoneNumber,
+      job: jobOut,
+      activities: coldCalls,
+    };
+
+    console.log({
+      message: `[CandidateDetails] rfId=${rfIdNum} consultant=${consultantFirstName || 'none'} job=${jobOut ? jobOut.title : 'none'} activities=${coldCalls.length}`,
+      source: 'candidate-details',
+      rfId: rfIdNum,
+      consultantFirstName,
+      consultantRfUserId,
+      jobPicked: jobOut,
+      activityCount: coldCalls.length,
+      phonePresent: phoneNumber !== null,
+    });
+
+    return new Response(JSON.stringify(responseBody), {
+      status: 200, headers: responseHeaders,
+    });
+
+  } catch (error) {
+    console.error({ message: `[CandidateDetails] error: ${error.message}`, source: 'candidate-details', stack: error.stack });
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500, headers: responseHeaders,
     });
   }
 }

@@ -1741,3 +1741,168 @@ describe('E2E: /candidates/add-to-job with consultantFirstName', () => {
 		expect(findCalls(calls, '/job-candidate/custom-field/value/update')).toHaveLength(0);
 	});
 });
+
+describe('E2E: /candidate-details', () => {
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	it('returns 401 without X-Extension-Token', async () => {
+		const request = new Request('http://example.com/candidate-details', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ profileUrl: 'https://www.linkedin.com/in/foo' }),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(401);
+	});
+
+	it('returns 404 when no RF candidate matches the LinkedIn URL', async () => {
+		mockFetch([
+			{ match: '/candidate/search', response: [] },
+		]);
+
+		const request = new Request('http://example.com/candidate-details', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				profileUrl: 'https://www.linkedin.com/in/nonexistent-person',
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(404);
+		const json = await response.json();
+		expect(json.error).toMatch(/not found/i);
+	});
+
+	it('returns full details with picked job, normalized phone, and cold-call activities', async () => {
+		const fullCandidate = buildFullRFCandidate({
+			id: 80001,
+			linkedin_profile: 'https://www.linkedin.com/in/robert-fisher-123',
+			first_name: 'Joseph',
+			last_name: 'Knosp',
+			name: 'Robert Fisher',
+			phone_number: [{ phone_number: '5551234567', type: 1 }],
+			jobs: [{
+				job_id: 996,
+				is_open: true,
+				stage_name: 'Replied',
+				stage_moved: '2026-04-29T00:00:00Z',
+				name: 'Senior Data Engineer',
+				company: { name: 'Acme Inc' },
+				stages: [{ id: 1, name: 'Sourced' }, { id: 2, name: 'Replied' }],
+				added_to_job_by: { id: 900001, name: 'Joel Haines' },
+			}],
+		});
+
+		const { cacheConsultantForJobLink } = await import('../src/cache.js');
+		await cacheConsultantForJobLink(80001, 996, 900001, env);
+
+		mockFetch([
+			rfSearchRoute([fullCandidate]),
+			rfGetCandidateRoute(fullCandidate),
+			{ match: '/candidate/activity/list', response: {
+				data: [
+					// DESC by time as RF returns
+					{
+						activity_id: 9912,
+						type: { id: 1002, name: 'Cold Call' },
+						time: '2026-04-29T16:05:00+00:00',
+						text: 'Cold call with Robert Fisher — Connected (Positive)<br>\n<br>\nNext steps:<br>\n• Send follow-up.',
+						is_custom: true,
+					},
+					{
+						activity_id: 9821,
+						type: { id: 1002, name: 'Cold Call' },
+						time: '2026-04-22T14:33:00+00:00',
+						text: 'Cold call with Robert Fisher — Voicemail',
+						is_custom: true,
+					},
+					// Non-cold-call entry that should be filtered out
+					{
+						activity_id: 9999,
+						type: { id: 9, name: 'Added to job' },
+						time: '2026-04-21T00:00:00+00:00',
+						text: 'System added',
+						is_custom: false,
+					},
+				],
+				total_items: 3,
+			} },
+		]);
+
+		const request = new Request('http://example.com/candidate-details', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				profileUrl: 'https://www.linkedin.com/in/robert-fisher-123',
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		const json = await response.json();
+		expect(json.rfId).toBe(80001);
+		expect(json.fullName).toBe('Robert Fisher');
+		expect(json.phoneNumber).toBe('+15551234567');
+		expect(json.job).toEqual({
+			title: 'Senior Data Engineer',
+			company: 'Acme Inc',
+			stage: 'Replied',
+		});
+		expect(json.activities).toHaveLength(2); // ASC, only cold calls
+		expect(json.activities[0].id).toBe(9821); // older first
+		expect(json.activities[0].outcome).toBe('voicemail');
+		expect(json.activities[1].id).toBe(9912);
+		expect(json.activities[1].outcome).toBe('connected');
+		expect(json.activities[1].description).toBe('Next steps:\n• Send follow-up.');
+	});
+
+	it('returns null phoneNumber when phone_number array is empty', async () => {
+		const fullCandidate = buildFullRFCandidate({
+			id: 80002,
+			linkedin_profile: 'https://www.linkedin.com/in/no-phone',
+			phone_number: [],
+			jobs: [],
+		});
+
+		mockFetch([
+			rfSearchRoute([fullCandidate]),
+			rfGetCandidateRoute(fullCandidate),
+			{ match: '/candidate/activity/list', response: { data: [], total_items: 0 } },
+		]);
+
+		const request = new Request('http://example.com/candidate-details', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				profileUrl: 'https://www.linkedin.com/in/no-phone',
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		const json = await response.json();
+		expect(json.phoneNumber).toBeNull();
+		expect(json.job).toBeNull();
+		expect(json.activities).toEqual([]);
+	});
+});
