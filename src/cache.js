@@ -1,18 +1,24 @@
 /**
  * KV Candidate Cache Layer
  *
- * Canonical record:  candidate:{rfId} → JSON blob (60-day TTL)
+ * Canonical record:  candidate:{rfId} → JSON blob (60-day TTL, slim record)
  * Index keys:        linkedin:{normalized}, email:{lowercase}, name:{first}:{last} → rfId string (60-day TTL)
  * Consultant index:  consultant:job{jobId}:cand{rfId} → rfUserId string or "none" sentinel (30-day TTL)
+ * Details snapshot:  details:{rfId} → full RF /candidate/get response (5-min TTL)
+ * Activities snapshot: activities:{rfId} → full RF /candidate/activity/list data array (5-min TTL)
  *
  * Name index uses "AMBIGUOUS" sentinel when two different candidates share the same name.
  * Consultant index uses "none" sentinel when RF has no consultant_id on the job-candidate link.
+ * Details + activities snapshots back the /candidate-details fast path: subsequent reads within
+ * the 5-min TTL skip RF entirely. Invalidated by /candidate-mark-invalid so tag changes show up
+ * on the next read.
  */
 
 import { normalizeLinkedInUrl, isValidLinkedInUrl } from './rf-client.js';
 
 const CACHE_TTL = 60 * 24 * 60 * 60; // 60 days in seconds
 const CONSULTANT_CACHE_TTL = 30 * 24 * 60 * 60; // 30 days in seconds
+const DETAILS_CACHE_TTL = 5 * 60; // 5 minutes
 
 /**
  * Write canonical record + all index keys for a candidate.
@@ -163,4 +169,68 @@ export async function getCachedConsultantForJobLink(candidateId, jobId, env) {
   if (raw === 'none') return 'none';
   const num = parseInt(raw, 10);
   return Number.isNaN(num) ? null : num;
+}
+
+/**
+ * Cache the full RF /candidate/get response under details:{rfId}. 5-min TTL so
+ * the subsequent sidepanel open within that window skips the RF call entirely.
+ */
+export async function cacheCandidateDetails(rfId, candidate, env) {
+  if (!rfId || !candidate) return;
+  const key = `details:${rfId}`;
+  await env.SYNC_STATE.put(key, JSON.stringify(candidate), { expirationTtl: DETAILS_CACHE_TTL });
+}
+
+/**
+ * Read the cached full candidate. Returns the parsed object or null on miss.
+ */
+export async function getCachedCandidateDetails(rfId, env) {
+  if (!rfId) return null;
+  const key = `details:${rfId}`;
+  const raw = await env.SYNC_STATE.get(key);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cache the activity list under activities:{rfId}. 5-min TTL paired with the
+ * details cache for symmetric freshness.
+ */
+export async function cacheCandidateActivities(rfId, activities, env) {
+  if (!rfId || !Array.isArray(activities)) return;
+  const key = `activities:${rfId}`;
+  await env.SYNC_STATE.put(key, JSON.stringify(activities), { expirationTtl: DETAILS_CACHE_TTL });
+}
+
+/**
+ * Read the cached activities array. Returns array or null on miss.
+ */
+export async function getCachedCandidateActivities(rfId, env) {
+  if (!rfId) return null;
+  const key = `activities:${rfId}`;
+  const raw = await env.SYNC_STATE.get(key);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Invalidate both details and activities caches for an rfId. Called when a
+ * mutation changes the candidate's RF state (e.g. /candidate-mark-invalid)
+ * so the next /candidate-details read pulls fresh data.
+ */
+export async function invalidateCandidateDetailsCache(rfId, env) {
+  if (!rfId) return;
+  await Promise.all([
+    env.SYNC_STATE.delete(`details:${rfId}`),
+    env.SYNC_STATE.delete(`activities:${rfId}`),
+  ]);
 }

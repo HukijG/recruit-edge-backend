@@ -7,7 +7,13 @@ import {
   listOpenJobs, addCandidateToJob, setJobCandidateConsultantId,
   listCandidateActivities, normalizeToE164, pickConsultantJob
 } from './rf-client.js';
-import { cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName, cacheConsultantForJobLink } from './cache.js';
+import {
+  cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName,
+  cacheConsultantForJobLink,
+  cacheCandidateDetails, getCachedCandidateDetails,
+  cacheCandidateActivities, getCachedCandidateActivities,
+  invalidateCandidateDetailsCache,
+} from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
 import { processCallEvent, parseColdCallActivity, mergeTag } from './cold-call.js';
 import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enrichment.js';
@@ -1576,6 +1582,11 @@ async function handleMarkInvalidEndpoint(request, env, corsHeaders) {
     const merged = mergeTag(existingTags, TAG);
     await updateRFCandidate(rfId, { tags: merged }, env);
 
+    // Invalidate the details/activities snapshot caches so the next
+    // /candidate-details read picks up the new tag set immediately rather
+    // than waiting up to 5 minutes for the snapshot TTL to expire.
+    await invalidateCandidateDetailsCache(rfId, env);
+
     console.log({
       message: `[MarkInvalid] rfId=${rfId} — tag added, total=${merged.length}`,
       source: 'mark-invalid',
@@ -1609,12 +1620,14 @@ async function handleCandidateDetailsEndpoint(request, env, corsHeaders) {
 
     const consultantRfUserId = resolveRFUserId(consultantFirstName);
 
-    // Resolve rfId — KV first, RF search fallback
+    // Resolve rfId — KV linkedin index first, RF search fallback.
     let rfId = await lookupByLinkedIn(profileUrl, env);
+    let linkedinSource = rfId ? 'linkedin-cache' : null;
     if (!rfId) {
       const found = await searchRFCandidateByLinkedIn(profileUrl, env);
       if (found) {
         rfId = String(found.id);
+        linkedinSource = 'rf-search';
         await cacheCandidate(found, env);
       }
     }
@@ -1630,13 +1643,54 @@ async function handleCandidateDetailsEndpoint(request, env, corsHeaders) {
       });
     }
 
+    console.log({
+      message: `[CandidateDetails] linkedin → rfId=${rfId} via ${linkedinSource}`,
+      source: 'candidate-details',
+      cacheHit: linkedinSource === 'linkedin-cache',
+      linkedinSource,
+      rfId,
+    });
+
     const rfIdNum = parseInt(rfId, 10);
 
-    // Parallel fetches: full candidate + activities
-    const [candidate, activities] = await Promise.all([
-      getRFCandidate(rfIdNum, env),
-      listCandidateActivities(rfIdNum, env),
+    // Try details + activities cache first (5-min TTL). On hit, skip RF entirely.
+    const [cachedDetails, cachedActivities] = await Promise.all([
+      getCachedCandidateDetails(rfIdNum, env),
+      getCachedCandidateActivities(rfIdNum, env),
     ]);
+
+    let candidate = cachedDetails;
+    let activities = cachedActivities;
+
+    if (cachedDetails && cachedActivities) {
+      console.log({
+        message: `[CandidateDetails] details+activities cache HIT rfId=${rfIdNum}`,
+        source: 'candidate-details',
+        cacheHit: 'both',
+        rfId: rfIdNum,
+      });
+    } else {
+      // Fetch only what's missing — keep both fetches parallel
+      const [freshCandidate, freshActivities] = await Promise.all([
+        cachedDetails ? Promise.resolve(cachedDetails) : getRFCandidate(rfIdNum, env),
+        cachedActivities ? Promise.resolve(cachedActivities) : listCandidateActivities(rfIdNum, env),
+      ]);
+      candidate = freshCandidate;
+      activities = freshActivities;
+
+      // Write back the freshly-fetched pieces
+      const writes = [];
+      if (!cachedDetails) writes.push(cacheCandidateDetails(rfIdNum, candidate, env));
+      if (!cachedActivities) writes.push(cacheCandidateActivities(rfIdNum, activities, env));
+      if (writes.length) await Promise.all(writes);
+
+      console.log({
+        message: `[CandidateDetails] cache MISS rfId=${rfIdNum} detailsCached=${!!cachedDetails} activitiesCached=${!!cachedActivities}`,
+        source: 'candidate-details',
+        cacheHit: cachedDetails ? 'details-only' : (cachedActivities ? 'activities-only' : 'none'),
+        rfId: rfIdNum,
+      });
+    }
 
     // Pick best job
     const pickedJob = await pickConsultantJob(candidate, consultantRfUserId, env);

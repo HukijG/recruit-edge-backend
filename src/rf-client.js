@@ -139,7 +139,11 @@ export function extractLinkedInSlug(input) {
 }
 
 /**
- * Fetch full candidate data from RF
+ * Fetch full candidate data from RF.
+ *
+ * Retries once on 502 — RF's edge occasionally returns transient 502s and
+ * the cost of a single retry is far cheaper than failing the whole
+ * /candidate-details response and forcing the user to refresh.
  */
 export async function getRFCandidate(candidateId, env) {
   const rfApiKey = env.RF_API_KEY;
@@ -149,19 +153,36 @@ export async function getRFCandidate(candidateId, env) {
     throw new Error('RF_API_KEY environment variable is required');
   }
 
-  const response = await fetch(`${rfBaseUrl}/candidate/get?id=${candidateId}`, {
-    method: 'GET',
-    headers: { 'RF-Api-Key': rfApiKey }
-  });
+  const url = `${rfBaseUrl}/candidate/get?id=${candidateId}`;
 
-  if (!response.ok) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { 'RF-Api-Key': rfApiKey }
+    });
+
+    if (response.ok) {
+      const result = await response.json();
+      return result.candidate || result;
+    }
+
     const errorText = await response.text();
+
+    if (response.status === 502 && attempt === 1) {
+      console.warn({
+        message: `[RF get] 502 for candidate=${candidateId}, retrying once`,
+        source: 'rf-get',
+        candidateId,
+      });
+      continue;
+    }
+
     console.error(`RF get error: ${response.status}`, errorText);
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
-  const result = await response.json();
-  return result.candidate || result;
+  // Unreachable — the loop either returns or throws on every iteration
+  throw new Error('RF API error: unreachable');
 }
 
 /**
