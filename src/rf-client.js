@@ -600,6 +600,40 @@ export async function listOpenJobs(env) {
   return allJobs;
 }
 
+const JOB_CANDIDATE_CONSULTANT_FIELD_ID = 16;
+
+/**
+ * Write the consultant_id custom field on a job-candidate link.
+ * Field id 16 (number type) is provisioned in RF.
+ */
+export async function setJobCandidateConsultantId(candidateId, jobId, consultantRfUserId, env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const payload = {
+    candidate_id: parseInt(candidateId, 10),
+    job_id: parseInt(jobId, 10),
+    custom_fields: [{ id: JOB_CANDIDATE_CONSULTANT_FIELD_ID, value: consultantRfUserId }],
+  };
+
+  const response = await fetch(`${rfBaseUrl}/job-candidate/custom-field/value/update`, {
+    method: 'POST',
+    headers: { 'RF-Api-Key': rfApiKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+  }
+
+  return await response.json();
+}
+
 /**
  * Add a candidate to a job in RF.
  */

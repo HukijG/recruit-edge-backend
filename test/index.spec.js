@@ -1528,6 +1528,35 @@ describe('cacheConsultantForJobLink / getCachedConsultantForJobLink', () => {
 	});
 });
 
+describe('setJobCandidateConsultantId', () => {
+	const originalFetch = globalThis.fetch;
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	const testEnv = { RF_API_KEY: 'test-rf-key', RF_API_BASE_URL: 'https://api.recruiterflow.com/api/external' };
+
+	it('POSTs to /job-candidate/custom-field/value/update with custom field id 16', async () => {
+		const { setJobCandidateConsultantId } = await import('../src/rf-client.js');
+		let captured;
+		globalThis.fetch = async (url, opts) => {
+			captured = { url: typeof url === 'string' ? url : url.toString(), body: JSON.parse(opts.body) };
+			return new Response(JSON.stringify({ success: true }), { status: 200 });
+		};
+		await setJobCandidateConsultantId(50000, 999, 900001, testEnv);
+		expect(captured.url).toContain('/job-candidate/custom-field/value/update');
+		expect(captured.body).toEqual({
+			candidate_id: 50000,
+			job_id: 999,
+			custom_fields: [{ id: 16, value: 900001 }],
+		});
+	});
+
+	it('throws on non-2xx response', async () => {
+		const { setJobCandidateConsultantId } = await import('../src/rf-client.js');
+		globalThis.fetch = async () => new Response('boom', { status: 500 });
+		await expect(setJobCandidateConsultantId(50000, 999, 900001, testEnv)).rejects.toThrow(/RF API error: 500/);
+	});
+});
+
 describe('convertDialpadContactToRFUpdate — removal sync', () => {
 	it('omits phone_number when Dialpad phones is empty', () => {
 		const contact = { phones: [], emails: ['test@example.com'], primary_email: 'test@example.com', urls: [] };
