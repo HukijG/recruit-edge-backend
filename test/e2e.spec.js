@@ -1712,4 +1712,32 @@ describe('E2E: /candidates/add-to-job with consultantFirstName', () => {
 		expect(json.results[0].status).toBe('added');
 		expect(json.results[0].consultantWriteFailed).toBe(true);
 	});
+
+	it('does NOT write consultant_id when add returned already_in_job', async () => {
+		const calls = mockFetch([
+			// RF returns 400 with the "already in pipeline" message → existing handler treats as already_in_job
+			{ match: '/candidate/add-to-job', response: { error: 'Candidate is already in this job pipeline' }, status: 400 },
+		]);
+
+		const request = new Request('http://example.com/candidates/add-to-job', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				rfIds: [50004],
+				jobId: 999,
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		const json = await response.json();
+		expect(json.results[0].status).toBe('already_in_job');
+		expect(findCalls(calls, '/job-candidate/custom-field/value/update')).toHaveLength(0);
+	});
 });

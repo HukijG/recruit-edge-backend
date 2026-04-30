@@ -1439,6 +1439,10 @@ async function handleAddToJobEndpoint(request, env, corsHeaders) {
         }
       }
 
+      if (addResult === null) {
+        addResult = { rfId, status: 'error', reason: 'retry loop exited without result' };
+      }
+
       // Step 2: write consultant_id only when add succeeded AND we have a consultant
       if (addResult.status === 'added' && consultantRfUserId !== null) {
         try {
