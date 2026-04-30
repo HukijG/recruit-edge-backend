@@ -4,21 +4,29 @@
  * Canonical record:  candidate:{rfId} → JSON blob (60-day TTL, slim record)
  * Index keys:        linkedin:{normalized}, email:{lowercase}, name:{first}:{last} → rfId string (60-day TTL)
  * Consultant index:  consultant:job{jobId}:cand{rfId} → rfUserId string or "none" sentinel (30-day TTL)
- * Details snapshot:  details:{rfId} → full RF /candidate/get response (5-min TTL)
- * Activities snapshot: activities:{rfId} → full RF /candidate/activity/list data array (5-min TTL)
+ * Details snapshot:  details:{rfId} → full RF /candidate/get response (20-min TTL)
+ * Activities snapshot: activities:{rfId} → full RF /candidate/activity/list data array (20-min TTL)
+ * Job batch index:   batch:job{jobId} → JSON array of rfIds in extension-add order (30-day TTL)
+ * Prewarm state:     prewarm:rec{rfUserId}:job{jobId} → { lastPrewarmIdx } (1-hour TTL)
  *
  * Name index uses "AMBIGUOUS" sentinel when two different candidates share the same name.
  * Consultant index uses "none" sentinel when RF has no consultant_id on the job-candidate link.
  * Details + activities snapshots back the /candidate-details fast path: subsequent reads within
- * the 5-min TTL skip RF entirely. Invalidated by /candidate-mark-invalid so tag changes show up
+ * the 20-min TTL skip RF entirely. Invalidated by /candidate-mark-invalid so tag changes show up
  * on the next read.
+ * Batch index + prewarm state drive the neighbor-warming flow: when a recruiter opens a profile,
+ * we prewarm 30 candidates either side of its index in the batch list. Every 20 candidates of
+ * forward motion through the index, we prewarm the next 30 in that direction so the recruiter
+ * never hits a cold cache while walking through a queue.
  */
 
 import { normalizeLinkedInUrl, isValidLinkedInUrl } from './rf-client.js';
 
 const CACHE_TTL = 60 * 24 * 60 * 60; // 60 days in seconds
 const CONSULTANT_CACHE_TTL = 30 * 24 * 60 * 60; // 30 days in seconds
-const DETAILS_CACHE_TTL = 5 * 60; // 5 minutes
+const DETAILS_CACHE_TTL = 20 * 60; // 20 minutes
+const BATCH_INDEX_TTL = 30 * 24 * 60 * 60; // 30 days
+const PREWARM_STATE_TTL = 60 * 60; // 1 hour (per-session lifetime)
 
 /**
  * Write canonical record + all index keys for a candidate.
@@ -233,4 +241,76 @@ export async function invalidateCandidateDetailsCache(rfId, env) {
     env.SYNC_STATE.delete(`details:${rfId}`),
     env.SYNC_STATE.delete(`activities:${rfId}`),
   ]);
+}
+
+/**
+ * Append rfId to the per-job batch index (the order in which candidates were
+ * bulk-added to the job via the LinkedIn extension). Idempotent — skips if
+ * already present. Used by /candidate-details neighbor-prewarming so that
+ * opening one profile in a queue warms the surrounding candidates.
+ *
+ * Stored as a JSON array of rfId strings. 30-day TTL — long enough that a
+ * recruiter walking through a stale batch still finds the index intact.
+ */
+export async function appendToJobBatchIndex(jobId, rfId, env) {
+  if (!jobId || rfId === null || rfId === undefined) return;
+  const key = `batch:job${jobId}`;
+  const raw = await env.SYNC_STATE.get(key);
+  let list = [];
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) list = parsed;
+    } catch {
+      // fall through with empty list
+    }
+  }
+  const id = String(rfId);
+  if (list.includes(id)) return;
+  list.push(id);
+  await env.SYNC_STATE.put(key, JSON.stringify(list), { expirationTtl: BATCH_INDEX_TTL });
+}
+
+/**
+ * Read the per-job batch index. Returns array of rfId strings in append
+ * order, or [] if the key doesn't exist.
+ */
+export async function getJobBatchIndex(jobId, env) {
+  if (!jobId) return [];
+  const raw = await env.SYNC_STATE.get(`batch:job${jobId}`);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Read the per-recruiter+job prewarm state. Returns { lastPrewarmIdx } or
+ * null if no state is recorded yet (first call in a session).
+ */
+export async function getPrewarmState(rfUserId, jobId, env) {
+  if (!rfUserId || !jobId) return null;
+  const raw = await env.SYNC_STATE.get(`prewarm:rec${rfUserId}:job${jobId}`);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write the per-recruiter+job prewarm state. 1-hour TTL — long enough to
+ * cover a single calling session, short enough to forget stale state.
+ */
+export async function setPrewarmState(rfUserId, jobId, state, env) {
+  if (!rfUserId || !jobId || !state) return;
+  await env.SYNC_STATE.put(
+    `prewarm:rec${rfUserId}:job${jobId}`,
+    JSON.stringify(state),
+    { expirationTtl: PREWARM_STATE_TTL }
+  );
 }

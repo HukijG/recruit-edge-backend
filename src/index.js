@@ -5,7 +5,8 @@ import {
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
   searchRFCandidateByEmail, addRFCandidateNote, moveToCallBooked, addRFCandidate,
   listOpenJobs, addCandidateToJob, setJobCandidateConsultantId,
-  listCandidateActivities, normalizeToE164, pickConsultantJob
+  listCandidateActivities, normalizeToE164, pickConsultantJob,
+  prewarmCandidatesIfMissing,
 } from './rf-client.js';
 import {
   cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName,
@@ -13,6 +14,8 @@ import {
   cacheCandidateDetails, getCachedCandidateDetails,
   cacheCandidateActivities, getCachedCandidateActivities,
   invalidateCandidateDetailsCache,
+  appendToJobBatchIndex, getJobBatchIndex,
+  getPrewarmState, setPrewarmState,
 } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
 import { processCallEvent, parseColdCallActivity, mergeTag } from './cold-call.js';
@@ -88,7 +91,7 @@ export default {
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
         }
-        return await handleAddToJobEndpoint(request, env, corsHeaders);
+        return await handleAddToJobEndpoint(request, env, ctx, corsHeaders);
       }
 
       if (url.pathname === '/candidate-mark-invalid' && request.method === 'POST') {
@@ -104,7 +107,7 @@ export default {
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
         }
-        return await handleCandidateDetailsEndpoint(request, env, corsHeaders);
+        return await handleCandidateDetailsEndpoint(request, env, ctx, corsHeaders);
       }
 
       return new Response('Not Found', {
@@ -1425,7 +1428,7 @@ function mapExtensionToRFCandidate(ext, consultantRfUserId) {
   return rfCandidate;
 }
 
-async function handleAddToJobEndpoint(request, env, corsHeaders) {
+async function handleAddToJobEndpoint(request, env, ctx, corsHeaders) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
@@ -1517,6 +1520,19 @@ async function handleAddToJobEndpoint(request, env, corsHeaders) {
         console.log({ message: `[AddToJob] rfId=${rfId} → job ${jobId} ${addResult.status} (no consultant attribution)`, source: 'add-to-job' });
       }
 
+      // Append to the per-job batch index for both freshly-added rows AND
+      // re-adds (the dedup inside appendToJobBatchIndex makes re-adds a no-op
+      // for rfIds already in the list, but lets older candidates we never
+      // tracked enter the index when re-added). The index drives the
+      // /candidate-details neighbor-prewarming behavior.
+      if (addResult.status === 'added' || addResult.status === 'already_in_job') {
+        try {
+          await appendToJobBatchIndex(jobId, rfId, env);
+        } catch (error) {
+          console.warn({ message: `[AddToJob] batch index append failed rfId=${rfId} job=${jobId}: ${error.message}`, source: 'add-to-job' });
+        }
+      }
+
       return addResult;
     }));
 
@@ -1604,7 +1620,7 @@ async function handleMarkInvalidEndpoint(request, env, corsHeaders) {
   }
 }
 
-async function handleCandidateDetailsEndpoint(request, env, corsHeaders) {
+async function handleCandidateDetailsEndpoint(request, env, ctx, corsHeaders) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
@@ -1700,6 +1716,14 @@ async function handleCandidateDetailsEndpoint(request, env, corsHeaders) {
       stage: pickedJob.stage_name || '',
     } : null;
 
+    // Fire-and-forget neighbor prewarming. Reads the picked job's batch
+    // index, finds this candidate's position, and prewarms 30 either side
+    // on first hit OR the next 30 in the direction of motion when the
+    // recruiter has walked 20+ candidates since the last prewarm.
+    if (pickedJob && consultantRfUserId !== null && ctx?.waitUntil) {
+      ctx.waitUntil(handleNeighborPrewarm(rfIdNum, pickedJob.job_id, consultantRfUserId, env));
+    }
+
     // Normalize phone — first entry of phone_number array
     let phoneNumber = null;
     const rawPhones = Array.isArray(candidate.phone_number) ? candidate.phone_number : [];
@@ -1744,6 +1768,102 @@ async function handleCandidateDetailsEndpoint(request, env, corsHeaders) {
     console.error({ message: `[CandidateDetails] error: ${error.message}`, source: 'candidate-details', stack: error.stack });
     return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
       status: 500, headers: responseHeaders,
+    });
+  }
+}
+
+/**
+ * Neighbor-prewarm orchestration. Runs inside ctx.waitUntil so the response
+ * is never blocked. Reads the per-job batch index to find the current
+ * candidate's position, reads the per-recruiter+job prewarm state, and
+ * decides what (if anything) to prewarm:
+ *
+ *   - First call (no state): prewarm RING candidates either side. Sets state.
+ *   - Subsequent calls: if |currentIdx - lastPrewarmIdx| >= TRIGGER, prewarm
+ *     the next RING candidates in the direction of motion. Updates state.
+ *   - Otherwise: no-op (state untouched).
+ *
+ * Errors are caught and logged — never throw out of waitUntil.
+ */
+const PREWARM_RING = 30;
+const PREWARM_TRIGGER_DISTANCE = 20;
+
+async function handleNeighborPrewarm(rfId, jobId, recruiterRfUserId, env) {
+  try {
+    const batchList = await getJobBatchIndex(jobId, env);
+    const idx = batchList.indexOf(String(rfId));
+    if (idx < 0) {
+      console.log({
+        message: `[Prewarm] rfId=${rfId} not in batch index for job=${jobId}, skipping`,
+        source: 'prewarm',
+        rfId,
+        jobId,
+      });
+      return;
+    }
+
+    const state = await getPrewarmState(recruiterRfUserId, jobId, env);
+
+    if (!state || typeof state.lastPrewarmIdx !== 'number') {
+      // First call — prewarm both directions.
+      const start = Math.max(0, idx - PREWARM_RING);
+      const end = Math.min(batchList.length - 1, idx + PREWARM_RING);
+      const toWarm = batchList.slice(start, end + 1).filter(id => id !== String(rfId));
+      console.log({
+        message: `[Prewarm] initial both-directions rfId=${rfId} job=${jobId} idx=${idx} count=${toWarm.length}`,
+        source: 'prewarm',
+        rfId,
+        jobId,
+        idx,
+        count: toWarm.length,
+        phase: 'initial',
+      });
+      await prewarmCandidatesIfMissing(toWarm, env);
+      await setPrewarmState(recruiterRfUserId, jobId, { lastPrewarmIdx: idx }, env);
+      return;
+    }
+
+    const distance = idx - state.lastPrewarmIdx;
+    if (Math.abs(distance) < PREWARM_TRIGGER_DISTANCE) {
+      // Still within the prewarmed ring — nothing to do.
+      return;
+    }
+
+    let toWarm;
+    let direction;
+    if (distance > 0) {
+      // Ascending — prewarm the next RING ahead of the current index.
+      direction = 'asc';
+      const start = idx + 1;
+      const end = Math.min(batchList.length - 1, idx + PREWARM_RING);
+      toWarm = start <= end ? batchList.slice(start, end + 1) : [];
+    } else {
+      // Descending — prewarm the next RING behind the current index.
+      direction = 'desc';
+      const start = Math.max(0, idx - PREWARM_RING);
+      const end = idx - 1;
+      toWarm = start <= end ? batchList.slice(start, end + 1) : [];
+    }
+
+    console.log({
+      message: `[Prewarm] direction=${direction} rfId=${rfId} job=${jobId} idx=${idx} count=${toWarm.length}`,
+      source: 'prewarm',
+      rfId,
+      jobId,
+      idx,
+      direction,
+      count: toWarm.length,
+      phase: 'directional',
+    });
+    await prewarmCandidatesIfMissing(toWarm, env);
+    await setPrewarmState(recruiterRfUserId, jobId, { lastPrewarmIdx: idx }, env);
+  } catch (error) {
+    console.error({
+      message: `[Prewarm] handleNeighborPrewarm error: ${error.message}`,
+      source: 'prewarm',
+      rfId,
+      jobId,
+      stack: error.stack,
     });
   }
 }

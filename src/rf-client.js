@@ -3,7 +3,11 @@
  */
 
 import { getUserByFirstName } from './users.js';
-import { getCachedConsultantForJobLink, cacheConsultantForJobLink } from './cache.js';
+import {
+  getCachedConsultantForJobLink, cacheConsultantForJobLink,
+  cacheCandidateDetails, getCachedCandidateDetails,
+  cacheCandidateActivities, getCachedCandidateActivities,
+} from './cache.js';
 
 /**
  * Extract RF candidate ID from Dialpad contact ID
@@ -899,4 +903,51 @@ export function normalizeToE164(raw) {
   if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
 
   return null;
+}
+
+/**
+ * Background prewarm: for each rfId, fetch /candidate/get and
+ * /candidate/activity/list in parallel and write to the details +
+ * activities caches. Skips per-rfId pieces that are already cached. Failures
+ * are logged but never thrown — this runs inside ctx.waitUntil and a single
+ * bad candidate must not poison the rest of the batch.
+ */
+export async function prewarmCandidatesIfMissing(rfIds, env) {
+  if (!Array.isArray(rfIds) || rfIds.length === 0) return;
+
+  await Promise.all(rfIds.map(async (rfIdRaw) => {
+    const numId = typeof rfIdRaw === 'number' ? rfIdRaw : parseInt(rfIdRaw, 10);
+    if (Number.isNaN(numId)) return;
+
+    try {
+      const [cachedDetails, cachedActivities] = await Promise.all([
+        getCachedCandidateDetails(numId, env),
+        getCachedCandidateActivities(numId, env),
+      ]);
+
+      const tasks = [];
+      if (!cachedDetails) {
+        tasks.push((async () => {
+          const fresh = await getRFCandidate(numId, env);
+          await cacheCandidateDetails(numId, fresh, env);
+        })());
+      }
+      if (!cachedActivities) {
+        tasks.push((async () => {
+          const fresh = await listCandidateActivities(numId, env);
+          await cacheCandidateActivities(numId, fresh, env);
+        })());
+      }
+
+      if (tasks.length > 0) {
+        await Promise.all(tasks);
+      }
+    } catch (error) {
+      console.warn({
+        message: `[Prewarm] failed for rfId=${numId}: ${error.message}`,
+        source: 'prewarm',
+        rfId: numId,
+      });
+    }
+  }));
 }
