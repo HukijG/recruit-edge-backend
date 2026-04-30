@@ -280,7 +280,8 @@ export async function addRFCandidateNote(candidateId, htmlContent, env) {
   }
 
   const payload = {
-    created_by: JOEL_RF_USER_ID,
+    // TODO: route via users.js when Krisp template webhook support returns (currently dead code).
+    created_by: 900001,
     id: parseInt(candidateId, 10),
     mentions: [],
     value: htmlContent
