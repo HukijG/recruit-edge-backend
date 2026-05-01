@@ -22,8 +22,6 @@ import {
   invalidateCandidateDetailsCache,
   appendToJobBatchIndex, getJobBatchIndex,
   getPrewarmState, setPrewarmState,
-  setExtensionCallWatch, clearExtensionCallWatch,
-  getActiveExtensionCall, clearExtensionCallState,
 } from './cache.js';
 import { processExtensionCallEvent } from './extension-calls.js';
 
@@ -2161,11 +2159,21 @@ async function handleDialpadCallEndpoint(request, env, corsHeaders) {
     });
 
     // One-in-one-out: clear any prior watch/active state for this user before
-    // arming the new call. Then write the watch KV BEFORE asking Dialpad to
+    // arming the new call. Then write the watch BEFORE asking Dialpad to
     // dial — Dialpad's `calling` event can land within milliseconds and the
-    // webhook handler matches against this watch entry.
-    await clearExtensionCallState(user.dialpadId, env);
-    await setExtensionCallWatch(user.dialpadId, phoneNumber, env);
+    // webhook handler matches against this watch entry. State lives in the
+    // per-user Durable Object (strongly consistent across edge DCs); KV's
+    // eventual consistency would race here.
+    const callChannelStub = env.EXT_CALL_CHANNEL?.getByName(user.dialpadId);
+    if (callChannelStub) {
+      await callChannelStub.clearAll();
+      await callChannelStub.setWatch({ phone: phoneNumber, initiatedAt: Date.now() });
+    } else {
+      console.warn({
+        message: '[DialpadCall] EXT_CALL_CHANNEL binding missing — state tracking disabled',
+        source: 'dialpad-call',
+      });
+    }
 
     const result = await initiateCall({
       userId: user.dialpadId,
@@ -2175,8 +2183,10 @@ async function handleDialpadCallEndpoint(request, env, corsHeaders) {
 
     if (!result.ok) {
       // Dialpad rejected — no `calling` event will fire, so the watch we just
-      // wrote would otherwise sit until its 90s TTL. Clean it up.
-      await clearExtensionCallWatch(user.dialpadId, env);
+      // wrote would otherwise sit forever. Clean it up.
+      if (callChannelStub) {
+        await callChannelStub.clearWatch();
+      }
       const upstreamMsg = result.body?.error || result.body?.message || `HTTP ${result.status}`;
       console.error({
         message: `[DialpadCall] Dialpad rejected: ${upstreamMsg}`,
@@ -2359,7 +2369,18 @@ async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
       });
     }
 
-    const active = await getActiveExtensionCall(user.dialpadId, env);
+    const callChannelStub = env.EXT_CALL_CHANNEL?.getByName(user.dialpadId);
+    if (!callChannelStub) {
+      console.error({
+        message: '[DialpadHangup] EXT_CALL_CHANNEL binding missing',
+        source: 'dialpad-hangup',
+      });
+      return new Response(JSON.stringify({ ok: false, error: 'Hangup channel not configured' }), {
+        status: 500, headers: responseHeaders,
+      });
+    }
+
+    const active = await callChannelStub.getActive();
     if (!active || !active.callId) {
       console.warn({
         message: `[DialpadHangup] no active call consultant=${consultantFirstName}`,
@@ -2387,7 +2408,7 @@ async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
     // Per design: a hangup request always resets state, regardless of upstream
     // outcome. Dialpad rejection (already terminated, unknown id) shouldn't
     // leave a stuck "active" entry — the user explicitly asked us to clear.
-    await clearExtensionCallState(user.dialpadId, env);
+    await callChannelStub.clearAll();
 
     if (!result.ok) {
       const upstreamMsg = result.body?.error || result.body?.message || `HTTP ${result.status}`;
