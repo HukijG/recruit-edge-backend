@@ -24,5 +24,19 @@
       "id": "REDACTED_KV_NAMESPACE_ID",
       "preview_id": "REDACTED_KV_PREVIEW_NAMESPACE_ID"
     }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "EXT_CALL_CHANNEL",
+        "class_name": "ExtensionCallStateChannel"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ExtensionCallStateChannel"]
+    }
   ]
 }

@@ -1,6 +1,7 @@
 import {
   createOrUpdateDialpadContact, patchDialpadContact, getDialpadContact,
   getUserCallerId, initiateCall, buildCallerIdsFromDialpad, sendSMS,
+  hangupCall,
 } from './dialpad-client.js';
 import { verifyJWT } from './auth.js';
 import { signCallerIdAlias, verifyCallerIdAlias } from './dialpad-aliases.js';
@@ -21,7 +22,15 @@ import {
   invalidateCandidateDetailsCache,
   appendToJobBatchIndex, getJobBatchIndex,
   getPrewarmState, setPrewarmState,
+  setExtensionCallWatch, clearExtensionCallWatch,
+  getActiveExtensionCall, clearExtensionCallState,
 } from './cache.js';
+import { processExtensionCallEvent } from './extension-calls.js';
+
+// Durable Object class re-export — wrangler.jsonc references this name
+// (ExtensionCallStateChannel) in `durable_objects.bindings` and `migrations`,
+// and Cloudflare looks it up on the worker's main module.
+export { ExtensionCallStateChannel } from './extension-call-do.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
 import { processCallEvent, parseColdCallActivity, mergeTag } from './cold-call.js';
 import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enrichment.js';
@@ -73,6 +82,10 @@ export default {
 
       if (url.pathname === '/webhook/dialpad/calls' && request.method === 'POST') {
         return await handleDialpadCallWebhook(request, env);
+      }
+
+      if (url.pathname === '/webhook/dialpad/extension-calls' && request.method === 'POST') {
+        return await handleDialpadExtensionCallsWebhook(request, env, ctx);
       }
 
       if (url.pathname === '/webhook/apollo' && request.method === 'POST') {
@@ -137,6 +150,24 @@ export default {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
         }
         return await handleDialpadSmsEndpoint(request, env, corsHeaders);
+      }
+
+      if (url.pathname === '/dialpad-hangup' && request.method === 'POST') {
+        const extAuth = request.headers.get('X-Extension-Token');
+        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
+          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        }
+        return await handleDialpadHangupEndpoint(request, env, corsHeaders);
+      }
+
+      if (url.pathname === '/extension-call-stream' && request.method === 'GET') {
+        // Intentionally unauthenticated for now. The extension consumes this
+        // via `EventSource`, which can't send custom request headers — and
+        // putting the long-lived shared secret in the URL would just leak it
+        // to CF Logs. The existing X-Extension-Token isn't a real security
+        // boundary anyway (it's bundled into the extension). Will gate
+        // behind the OTP + session-token auth flow when that lands.
+        return await handleExtensionCallStream(request, env, corsHeaders);
       }
 
       return new Response('Not Found', {
@@ -889,6 +920,75 @@ async function handleDialpadCallWebhook(request, env) {
 
   } catch (error) {
     console.error({ message: `[Dialpad/calls] unhandled error: ${error.message}`, source: 'dialpad-calls', stack: error.stack });
+    return new Response('Internal Server Error', { status: 500 });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /webhook/dialpad/extension-calls — separate Dialpad subscription scoped to
+// call-state events (calling, hangup). Drives the extension's button-toggle
+// state via `processExtensionCallEvent`. Same JWT auth as
+// /webhook/dialpad/calls (DIALPAD_WEBHOOK_SECRET); separate path keeps the
+// state-machine logic out of the cold-call/transcription path.
+// ---------------------------------------------------------------------------
+
+async function handleDialpadExtensionCallsWebhook(request, env, ctx) {
+  try {
+    const authHeader = request.headers.get('Authorization');
+    const bodyText = await request.text();
+
+    let token;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.substring(7);
+    } else {
+      token = bodyText;
+    }
+
+    if (!token) {
+      return new Response('Unauthorized - No token', { status: 401 });
+    }
+
+    const payload = await verifyJWT(token, env.DIALPAD_WEBHOOK_SECRET);
+    if (!payload) {
+      return new Response('Unauthorized - Invalid token', { status: 401 });
+    }
+
+    console.log({
+      message: `[Dialpad/extension-calls] ${payload.state} call_id=${payload.call_id} target=${payload.target?.id} ext=${payload.external_number}`,
+      source: 'dialpad-extension-calls',
+      state: payload.state,
+      callId: payload.call_id,
+      direction: payload.direction,
+      targetId: payload.target?.id,
+      externalNumber: payload.external_number,
+      eventTimestamp: payload.event_timestamp,
+    });
+
+    const result = await processExtensionCallEvent(payload, env, ctx);
+
+    console.log({
+      message: result.processed
+        ? `[Dialpad/extension-calls] → ${result.transition} callId=${result.callId} user=${result.dialpadUserId}`
+        : `[Dialpad/extension-calls] → ignored: ${result.reason}`,
+      source: 'dialpad-extension-calls',
+      processed: result.processed,
+      transition: result.transition,
+      reason: result.reason,
+      callId: result.callId,
+      dialpadUserId: result.dialpadUserId,
+    });
+
+    return new Response('Extension-call webhook processed', {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+  } catch (error) {
+    console.error({
+      message: `[Dialpad/extension-calls] unhandled error: ${error.message}`,
+      source: 'dialpad-extension-calls',
+      stack: error.stack,
+    });
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -2060,6 +2160,13 @@ async function handleDialpadCallEndpoint(request, env, corsHeaders) {
       hasOutboundCallerId: true,
     });
 
+    // One-in-one-out: clear any prior watch/active state for this user before
+    // arming the new call. Then write the watch KV BEFORE asking Dialpad to
+    // dial — Dialpad's `calling` event can land within milliseconds and the
+    // webhook handler matches against this watch entry.
+    await clearExtensionCallState(user.dialpadId, env);
+    await setExtensionCallWatch(user.dialpadId, phoneNumber, env);
+
     const result = await initiateCall({
       userId: user.dialpadId,
       phoneNumber,
@@ -2067,6 +2174,9 @@ async function handleDialpadCallEndpoint(request, env, corsHeaders) {
     }, env);
 
     if (!result.ok) {
+      // Dialpad rejected — no `calling` event will fire, so the watch we just
+      // wrote would otherwise sit until its 90s TTL. Clean it up.
+      await clearExtensionCallWatch(user.dialpadId, env);
       const upstreamMsg = result.body?.error || result.body?.message || `HTTP ${result.status}`;
       console.error({
         message: `[DialpadCall] Dialpad rejected: ${upstreamMsg}`,
@@ -2082,11 +2192,11 @@ async function handleDialpadCallEndpoint(request, env, corsHeaders) {
       }), { status: 502, headers: responseHeaders });
     }
 
-    const responseBody = { ok: true };
-    const callId = result.body?.call_id || result.body?.id;
-    if (callId) responseBody.callId = callId;
-
-    return new Response(JSON.stringify(responseBody), {
+    // call_id is intentionally NOT returned to the extension — the worker
+    // owns it from here on (stored in extcall:active:{userId} once the
+    // calling webhook fires). The extension hangs up by sending consultant
+    // identity only; we look up the call_id server-side.
+    return new Response(JSON.stringify({ ok: true }), {
       status: 200, headers: responseHeaders,
     });
   } catch (error) {
@@ -2216,4 +2326,169 @@ async function handleDialpadSmsEndpoint(request, env, corsHeaders) {
       status: 500, headers: responseHeaders,
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// /dialpad-hangup — terminate the consultant's active call. The extension
+// only sends consultantFirstName; the worker holds the Dialpad call_id in
+// extcall:active:{dialpadUserId}, written when the matching `calling` event
+// landed. 409 if no active call. Clears the active KV regardless of Dialpad's
+// upstream response — per the design's one-in-one-out invariant, a hangup
+// request always returns the user to "no active call" state, even if Dialpad
+// rejects (e.g. call already terminated). The hangup webhook event is the
+// fallback for "hung up elsewhere" cases — see extension-calls.js.
+// ---------------------------------------------------------------------------
+
+async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
+  const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  try {
+    const payload = await request.json();
+    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName.trim() : '';
+
+    if (!consultantFirstName) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    const user = getUserByFirstName(consultantFirstName);
+    if (!user) {
+      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+        status: 403, headers: responseHeaders,
+      });
+    }
+
+    const active = await getActiveExtensionCall(user.dialpadId, env);
+    if (!active || !active.callId) {
+      console.warn({
+        message: `[DialpadHangup] no active call consultant=${consultantFirstName}`,
+        source: 'dialpad-hangup',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+      });
+      return new Response(JSON.stringify({ ok: false, error: 'No active call' }), {
+        status: 409, headers: responseHeaders,
+      });
+    }
+
+    const callId = String(active.callId);
+
+    console.log({
+      message: `[DialpadHangup] consultant=${consultantFirstName} callId=${callId}`,
+      source: 'dialpad-hangup',
+      consultantFirstName,
+      dialpadId: user.dialpadId,
+      callId,
+    });
+
+    const result = await hangupCall({ callId }, env);
+
+    // Per design: a hangup request always resets state, regardless of upstream
+    // outcome. Dialpad rejection (already terminated, unknown id) shouldn't
+    // leave a stuck "active" entry — the user explicitly asked us to clear.
+    await clearExtensionCallState(user.dialpadId, env);
+
+    if (!result.ok) {
+      const upstreamMsg = result.body?.error || result.body?.message || `HTTP ${result.status}`;
+      console.error({
+        message: `[DialpadHangup] Dialpad rejected: ${upstreamMsg}`,
+        source: 'dialpad-hangup',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        callId,
+        upstreamStatus: result.status,
+        upstreamBody: result.body,
+      });
+      return new Response(JSON.stringify({
+        ok: false,
+        error: `Dialpad rejected the hangup: ${upstreamMsg}`,
+      }), { status: 502, headers: responseHeaders });
+    }
+
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200, headers: responseHeaders,
+    });
+  } catch (error) {
+    console.error({
+      message: `[DialpadHangup] error: ${error.message}`,
+      source: 'dialpad-hangup',
+      stack: error.stack,
+    });
+    return new Response(JSON.stringify({ ok: false, error: 'Internal Server Error' }), {
+      status: 500, headers: responseHeaders,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /extension-call-stream — long-lived SSE stream the extension keeps open
+// while the consultant is using it. State changes (idle → calling → active
+// → ended) are pushed by the per-user Durable Object whenever the
+// /webhook/dialpad/extension-calls handler transitions the state machine.
+//
+// Auth: same X-Extension-Token as every other extension route. Identity
+// passed via ?consultantFirstName=Joel; resolved server-side to dialpadId.
+// The DO is named by dialpadId so every tab the consultant opens fans into
+// the same instance.
+//
+// Initial state is replayed on connect (the DO reads extcall:active /
+// extcall:watch from KV) — so a tab that opens mid-call gets the right
+// button immediately, not on the next transition.
+//
+// Heartbeats every 25s via DO alarm so proxies don't kill the connection.
+// ---------------------------------------------------------------------------
+
+async function handleExtensionCallStream(request, env, corsHeaders) {
+  const url = new URL(request.url);
+  const consultantFirstName = url.searchParams.get('consultantFirstName') || '';
+
+  if (!consultantFirstName) {
+    return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+      status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
+  const user = getUserByFirstName(consultantFirstName);
+  if (!user) {
+    return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+      status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
+  if (!env.EXT_CALL_CHANNEL) {
+    console.error({
+      message: '[ExtCallStream] EXT_CALL_CHANNEL binding missing',
+      source: 'extension-call-stream',
+    });
+    return new Response(JSON.stringify({ ok: false, error: 'Stream not configured' }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
+  console.log({
+    message: `[ExtCallStream] subscribe consultant=${consultantFirstName} dialpadId=${user.dialpadId}`,
+    source: 'extension-call-stream',
+    consultantFirstName,
+    dialpadId: user.dialpadId,
+  });
+
+  const stub = env.EXT_CALL_CHANNEL.getByName(user.dialpadId);
+  // Forward to the DO with userId in the URL so it can read initial state.
+  // The DO uses request.signal to detect client disconnect, so we just pass
+  // the same Request through.
+  const doUrl = new URL('https://do/subscribe');
+  doUrl.searchParams.set('userId', user.dialpadId);
+  const doRequest = new Request(doUrl.toString(), { method: 'GET', signal: request.signal });
+  const doResponse = await stub.fetch(doRequest);
+
+  // Merge worker CORS headers onto the SSE response so cross-origin extension
+  // contexts can consume it. Body is a ReadableStream — streamed verbatim.
+  const headers = new Headers(doResponse.headers);
+  for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
+
+  return new Response(doResponse.body, {
+    status: doResponse.status,
+    headers,
+  });
 }

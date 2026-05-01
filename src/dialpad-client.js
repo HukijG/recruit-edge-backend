@@ -229,6 +229,42 @@ export async function initiateCall({ userId, phoneNumber, outboundCallerId, cust
 }
 
 /**
+ * PUT Dialpad's hangup action for a specific call. Path is the singular
+ * `/call/{id}/actions/hangup` (not the plural `/calls/...` like most other
+ * routes), takes no request body, and returns 200 on success.
+ *
+ * The `callId` is the Dialpad call_id surfaced by `initiateCall` (we expose
+ * it on the `/dialpad-call` response as `callId` so the extension can echo
+ * it back here when the user clicks Hang up).
+ *
+ * Returns { ok, status, body } so callers can build a useful error envelope
+ * if Dialpad rejects (e.g. unknown call id, call already terminated).
+ */
+export async function hangupCall({ callId }, env) {
+  const dialpadApiKey = env?.DIALPAD_API_KEY;
+  const dialpadBaseUrl = env?.DIALPAD_API_BASE_URL || 'https://dialpad.com/api/v2';
+  if (!dialpadApiKey) {
+    throw new Error('DIALPAD_API_KEY environment variable is required');
+  }
+
+  const url = `${dialpadBaseUrl}/call/${encodeURIComponent(callId)}/actions/hangup`;
+  const response = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${dialpadApiKey}`,
+    },
+  });
+
+  let parsed = null;
+  const text = await response.text();
+  if (text) {
+    try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
+  }
+  return { ok: response.ok, status: response.status, body: parsed };
+}
+
+/**
  * Send an SMS via Dialpad's POST /api/v2/sms endpoint.
  *
  * Required: userId, toNumbers (array of up to 10 E.164 numbers — a single
