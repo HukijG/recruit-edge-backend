@@ -2155,6 +2155,17 @@ describe('E2E: /dialpad-call', () => {
 		return signCallerIdAlias(number, env);
 	}
 
+	function dialpadCall({ phoneNumber, callerAliasId, consultantFirstName = 'Joel' }) {
+		return new Request('http://example.com/dialpad-call', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({ consultantFirstName, phoneNumber, callerAliasId }),
+		});
+	}
+
 	it('returns 401 without X-Extension-Token', async () => {
 		const request = new Request('http://example.com/dialpad-call', {
 			method: 'POST',
@@ -2325,6 +2336,114 @@ describe('E2E: /dialpad-call', () => {
 		const json = await response.json();
 		expect(json.ok).toBe(false);
 		expect(json.error).toMatch(/Dialpad/i);
+	});
+
+	it('returns 429 with reason=rate_limit + Retry-After after 5 calls in the same window', async () => {
+		const alias = await makeAlias('+14155551212');
+		mockFetch([
+			{
+				match: '/users/8000000000000001/initiate_call',
+				response: { device: { id: 'native-1', type: 'native' } },
+			},
+		]);
+
+		// Use 5 distinct destinations for the first 5 calls so the dedup
+		// window doesn't fire — this isolates the rate-limit check.
+		for (let i = 0; i < 5; i++) {
+			const ctx = createExecutionContext();
+			const phoneNumber = `+1415555${(1000 + i).toString()}`;
+			const response = await worker.fetch(dialpadCall({ phoneNumber, callerAliasId: alias }), env, ctx);
+			await waitOnExecutionContext(ctx);
+			expect(response.status).toBe(200);
+		}
+
+		// 6th call (different number again, so it's not dedup) should be capped.
+		const ctx6 = createExecutionContext();
+		const blocked = await worker.fetch(
+			dialpadCall({ phoneNumber: '+14155556666', callerAliasId: alias }),
+			env, ctx6,
+		);
+		await waitOnExecutionContext(ctx6);
+		expect(blocked.status).toBe(429);
+		expect(blocked.headers.get('Retry-After')).toMatch(/^\d+$/);
+		const json = await blocked.json();
+		expect(json.ok).toBe(false);
+		expect(json.reason).toBe('rate_limit');
+		expect(json.retryAfterSec).toBeGreaterThan(0);
+		expect(json.error).toMatch(/rate limit/i);
+	});
+
+	it('returns 429 with reason=duplicate when the same number is dialled twice within 3s', async () => {
+		const alias = await makeAlias('+14155551212');
+		mockFetch([
+			{
+				match: '/users/8000000000000001/initiate_call',
+				response: { device: { id: 'native-1', type: 'native' } },
+			},
+		]);
+
+		// First call goes through.
+		const ctx1 = createExecutionContext();
+		const r1 = await worker.fetch(
+			dialpadCall({ phoneNumber: '+14155557777', callerAliasId: alias }),
+			env, ctx1,
+		);
+		await waitOnExecutionContext(ctx1);
+		expect(r1.status).toBe(200);
+
+		// Immediate retry to same number → blocked as duplicate.
+		const ctx2 = createExecutionContext();
+		const r2 = await worker.fetch(
+			dialpadCall({ phoneNumber: '+14155557777', callerAliasId: alias }),
+			env, ctx2,
+		);
+		await waitOnExecutionContext(ctx2);
+		expect(r2.status).toBe(429);
+		const json = await r2.json();
+		expect(json.ok).toBe(false);
+		expect(json.reason).toBe('duplicate');
+		expect(json.retryAfterSec).toBeGreaterThanOrEqual(1);
+		expect(json.retryAfterSec).toBeLessThanOrEqual(3);
+		expect(json.error).toMatch(/just dialled/i);
+	});
+
+	it('does NOT consume budget when the call is denied (state is unchanged on failure)', async () => {
+		const alias = await makeAlias('+14155551212');
+		mockFetch([
+			{
+				match: '/users/8000000000000001/initiate_call',
+				response: { device: { id: 'native-1', type: 'native' } },
+			},
+		]);
+
+		// Burn the budget with 5 distinct numbers.
+		for (let i = 0; i < 5; i++) {
+			const ctx = createExecutionContext();
+			await worker.fetch(
+				dialpadCall({ phoneNumber: `+1415555${(2000 + i).toString()}`, callerAliasId: alias }),
+				env, ctx,
+			);
+			await waitOnExecutionContext(ctx);
+		}
+
+		// 6th gets blocked.
+		const ctx6 = createExecutionContext();
+		const blocked = await worker.fetch(
+			dialpadCall({ phoneNumber: '+14155558888', callerAliasId: alias }),
+			env, ctx6,
+		);
+		await waitOnExecutionContext(ctx6);
+		expect(blocked.status).toBe(429);
+
+		// 7th attempt (also blocked, since state is unchanged) — confirms the
+		// 6th attempt did NOT push the oldest entry off and free up a slot.
+		const ctx7 = createExecutionContext();
+		const stillBlocked = await worker.fetch(
+			dialpadCall({ phoneNumber: '+14155559999', callerAliasId: alias }),
+			env, ctx7,
+		);
+		await waitOnExecutionContext(ctx7);
+		expect(stillBlocked.status).toBe(429);
 	});
 });
 

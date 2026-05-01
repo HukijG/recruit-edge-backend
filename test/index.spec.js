@@ -11,6 +11,7 @@ import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, filter
 import { isJoelCandidate, enrichCandidate } from '../src/enrichment.js';
 import { signCallerIdAlias, verifyCallerIdAlias } from '../src/dialpad-aliases.js';
 import { buildCallerIdsFromDialpad } from '../src/dialpad-client.js';
+import { decideCallRateLimit, checkAndRecordCall, CALL_RATE_WINDOW_MS, CALL_RATE_LIMIT, CALL_DEDUP_WINDOW_MS } from '../src/rate-limit.js';
 
 describe('RF-Dialpad Sync Worker', () => {
 	it('/health returns 200 with status message', async () => {
@@ -2123,5 +2124,153 @@ describe('buildCallerIdsFromDialpad', () => {
 		// shape doesn't include a plaintext-number field name.
 		expect(out[0]).not.toHaveProperty('phoneNumber');
 		expect(out[0]).not.toHaveProperty('number');
+	});
+});
+
+// ---------------------------------------------------------------------------
+// rate-limit: pure decideCallRateLimit + KV-backed checkAndRecordCall
+//
+// We want to keep the spam-protection on /dialpad-call entirely on our side
+// rather than rely on Dialpad's own 5/min limit — Dialpad rejecting a call
+// with no client-side feedback would just look like the call silently failed.
+// The pure decision function takes timestamps + now + phone and returns an
+// allow/deny decision; the KV wrapper layers SYNC_STATE persistence on top.
+// ---------------------------------------------------------------------------
+
+describe('rate-limit: decideCallRateLimit (pure)', () => {
+	const phone = '+14155551212';
+
+	it('allows first call when no prior history', () => {
+		const result = decideCallRateLimit({ timestamps: [], now: 1000, phoneNumber: phone });
+		expect(result.allowed).toBe(true);
+		expect(result.nextTimestamps).toEqual([{ t: 1000, phone }]);
+	});
+
+	it('exposes the configured window + limit constants', () => {
+		expect(CALL_RATE_LIMIT).toBe(5);
+		expect(CALL_RATE_WINDOW_MS).toBe(60_000);
+		expect(CALL_DEDUP_WINDOW_MS).toBe(3_000);
+	});
+
+	it('allows up to CALL_RATE_LIMIT calls within the window', () => {
+		const timestamps = [
+			{ t: 1000, phone: '+14155551111' },
+			{ t: 2000, phone: '+14155552222' },
+			{ t: 3000, phone: '+14155553333' },
+			{ t: 4000, phone: '+14155554444' },
+		];
+		const result = decideCallRateLimit({ timestamps, now: 5000, phoneNumber: phone });
+		expect(result.allowed).toBe(true);
+		expect(result.nextTimestamps).toHaveLength(5);
+	});
+
+	it('blocks the (limit+1)th call within the window with reason=rate_limit', () => {
+		const timestamps = [
+			{ t: 1000, phone: '+14155551111' },
+			{ t: 2000, phone: '+14155552222' },
+			{ t: 3000, phone: '+14155553333' },
+			{ t: 4000, phone: '+14155554444' },
+			{ t: 5000, phone: '+14155555555' },
+		];
+		const result = decideCallRateLimit({ timestamps, now: 6000, phoneNumber: phone });
+		expect(result.allowed).toBe(false);
+		expect(result.reason).toBe('rate_limit');
+		expect(result.retryAfterSec).toBeGreaterThan(0);
+		expect(result.retryAfterSec).toBeLessThanOrEqual(60);
+	});
+
+	it('allows a new call after the oldest timestamp slides past the window', () => {
+		const timestamps = [
+			{ t: 0, phone: '+14155551111' },        // 60.1s ago — out of window
+			{ t: 5_000, phone: '+14155552222' },
+			{ t: 10_000, phone: '+14155553333' },
+			{ t: 15_000, phone: '+14155554444' },
+			{ t: 20_000, phone: '+14155555555' },
+		];
+		const result = decideCallRateLimit({ timestamps, now: 60_100, phoneNumber: phone });
+		expect(result.allowed).toBe(true);
+		// Expired entry trimmed before persisting
+		expect(result.nextTimestamps.find(e => e.t === 0)).toBeUndefined();
+		expect(result.nextTimestamps).toHaveLength(5);
+	});
+
+	it('blocks duplicate call to same phone within dedup window with reason=duplicate', () => {
+		const timestamps = [{ t: 1000, phone }];
+		const result = decideCallRateLimit({ timestamps, now: 2000, phoneNumber: phone });
+		expect(result.allowed).toBe(false);
+		expect(result.reason).toBe('duplicate');
+		expect(result.retryAfterSec).toBeGreaterThanOrEqual(1);
+		expect(result.retryAfterSec).toBeLessThanOrEqual(3);
+	});
+
+	it('allows a repeat call to same phone after the dedup window expires', () => {
+		const timestamps = [{ t: 1000, phone }];
+		const result = decideCallRateLimit({ timestamps, now: 4500, phoneNumber: phone });
+		expect(result.allowed).toBe(true);
+	});
+
+	it('does not treat a different phone as a duplicate', () => {
+		const timestamps = [{ t: 1000, phone: '+14155559999' }];
+		const result = decideCallRateLimit({ timestamps, now: 2000, phoneNumber: phone });
+		expect(result.allowed).toBe(true);
+	});
+
+	it('returns dedup verdict in preference to rate_limit when both apply', () => {
+		// 5 entries, last one with the same phone within dedup window
+		const timestamps = [
+			{ t: 1_000, phone: '+14155551111' },
+			{ t: 2_000, phone: '+14155552222' },
+			{ t: 3_000, phone: '+14155553333' },
+			{ t: 4_000, phone: '+14155554444' },
+			{ t: 5_000, phone },                  // same phone as request, 1s ago
+		];
+		const result = decideCallRateLimit({ timestamps, now: 6_000, phoneNumber: phone });
+		expect(result.allowed).toBe(false);
+		expect(result.reason).toBe('duplicate');
+	});
+});
+
+describe('rate-limit: checkAndRecordCall (KV)', () => {
+	const k = (id) => `ratelimit:call:${id}`;
+
+	afterEach(async () => {
+		await env.SYNC_STATE.delete(k('test-rl-A'));
+		await env.SYNC_STATE.delete(k('test-rl-B'));
+	});
+
+	it('allows the first call and records the timestamp under ratelimit:call:{id}', async () => {
+		const result = await checkAndRecordCall({ dialpadUserId: 'test-rl-A', phoneNumber: '+14155551212' }, env);
+		expect(result.allowed).toBe(true);
+		const stored = JSON.parse(await env.SYNC_STATE.get(k('test-rl-A')));
+		expect(stored).toHaveLength(1);
+		expect(stored[0].phone).toBe('+14155551212');
+		expect(typeof stored[0].t).toBe('number');
+	});
+
+	it('does NOT record a denied call (state must not grow on denial)', async () => {
+		// Pre-seed 5 entries already in the window so the next call is rate-limited
+		const now = Date.now();
+		await env.SYNC_STATE.put(k('test-rl-A'), JSON.stringify(
+			[1, 2, 3, 4, 5].map(i => ({ t: now - 1000 * i, phone: `+1415555000${i}` })),
+		));
+		const result = await checkAndRecordCall({ dialpadUserId: 'test-rl-A', phoneNumber: '+14155559999' }, env);
+		expect(result.allowed).toBe(false);
+		const stored = JSON.parse(await env.SYNC_STATE.get(k('test-rl-A')));
+		expect(stored).toHaveLength(5);  // unchanged
+	});
+
+	it('keeps counters independent across different dialpad users', async () => {
+		// Hit user A 5 times to cap them
+		for (let i = 0; i < 5; i++) {
+			await checkAndRecordCall({
+				dialpadUserId: 'test-rl-A',
+				phoneNumber: `+1415555${(1000 + i).toString()}`,
+			}, env);
+		}
+		const a6 = await checkAndRecordCall({ dialpadUserId: 'test-rl-A', phoneNumber: '+14155559999' }, env);
+		expect(a6.allowed).toBe(false);
+
+		const b1 = await checkAndRecordCall({ dialpadUserId: 'test-rl-B', phoneNumber: '+14155551212' }, env);
+		expect(b1.allowed).toBe(true);
 	});
 });

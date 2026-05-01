@@ -4,6 +4,7 @@ import {
 } from './dialpad-client.js';
 import { verifyJWT } from './auth.js';
 import { signCallerIdAlias, verifyCallerIdAlias } from './dialpad-aliases.js';
+import { checkAndRecordCall } from './rate-limit.js';
 import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
@@ -2008,6 +2009,37 @@ async function handleDialpadCallEndpoint(request, env, corsHeaders) {
     if (!outboundCallerId) {
       return new Response(JSON.stringify({ ok: false, error: 'Invalid caller-ID selection — please refresh and try again' }), {
         status: 400, headers: responseHeaders,
+      });
+    }
+
+    // Rate limit + dedup at the request-processing step. Dialpad caps each
+    // user at 5 calls/min upstream; we mirror it locally so a button-mashing
+    // recruiter gets a clean 429 instead of an opaque Dialpad rejection.
+    // The 3s same-(user,phone) dedup window catches literal double-clicks.
+    const rateLimitDecision = await checkAndRecordCall({
+      dialpadUserId: user.dialpadId,
+      phoneNumber,
+    }, env);
+    if (!rateLimitDecision.allowed) {
+      const errorMsg = rateLimitDecision.reason === 'duplicate'
+        ? `You just dialled this number — wait ${rateLimitDecision.retryAfterSec}s before retrying`
+        : `Call rate limit hit (5/min) — try again in ${rateLimitDecision.retryAfterSec}s`;
+      console.warn({
+        message: `[DialpadCall] denied: ${rateLimitDecision.reason} consultant=${consultantFirstName}`,
+        source: 'dialpad-call',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        reason: rateLimitDecision.reason,
+        retryAfterSec: rateLimitDecision.retryAfterSec,
+      });
+      return new Response(JSON.stringify({
+        ok: false,
+        error: errorMsg,
+        reason: rateLimitDecision.reason,
+        retryAfterSec: rateLimitDecision.retryAfterSec,
+      }), {
+        status: 429,
+        headers: { ...responseHeaders, 'Retry-After': String(rateLimitDecision.retryAfterSec) },
       });
     }
 

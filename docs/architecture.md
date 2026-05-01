@@ -35,6 +35,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 │  │  activities:{rfId}                      → activity-list array        (20-min TTL)                 │       │
 │  │  batch:job{jobId}                       → ordered rfId array         (30-day TTL)                 │       │
 │  │  prewarm:rec{rfUserId}:job{jobId}       → { lastPrewarmIdx }         (1-hour TTL)                 │       │
+│  │  ratelimit:call:{dialpadUserId}         → JSON [{t,phone}]           (120-sec TTL)                │       │
 │  └──────────────────────────────────────────────────────────────────────────────────────────────────┘       │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -51,6 +52,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `src/rf-client.js` | RF API client: search/get/update, LinkedIn URL validation & normalization, Dialpad↔RF data conversion, custom-field consultant_id read/write/resolve, activity-list, phone normalization (`normalizeToE164`), job disambiguation (`pickConsultantJob`), stage-move filter, prewarm helper, single-retry-on-502 in `getRFCandidate` |
 | `src/dialpad-client.js` | Dialpad API client: contact PUT (create/update), data preparation from RF candidate format, `getUserCallerId` (fetch the consultant's caller-IDs) and `initiateCall` (POST `/users/{id}/initiate_call`) for the LinkedIn extension calling flow, plus the pure `buildCallerIdsFromDialpad` transform that turns Dialpad's flat `caller_id` shape into the extension-facing `callerIds[]` array with opaque aliases |
 | `src/dialpad-aliases.js` | Opaque caller-ID alias signing/verifying for the calling endpoints (HS256 JWT via `jose`, audience `dialpad-caller-id`, 7-day TTL). Keeps raw E.164 numbers off the wire to the extension |
+| `src/rate-limit.js` | Rolling-window rate-limit + cheap dedup gate for `/dialpad-call`. Pure `decideCallRateLimit({timestamps, now, phoneNumber})` returns `{allowed, reason?, retryAfterSec?, nextTimestamps?}`. KV-backed `checkAndRecordCall` reads SYNC_STATE, decides, persists on allow. 5 calls/60s rolling per Dialpad user_id, plus a 3s per-(user,phone) dedup window for double-clicks |
 | `src/krisp.js` | Krisp helpers: note formatting (HTML), candidate email extraction from meeting participants |
 | `src/cold-call.js` | Cold call detection: monitored-user filter (registry-driven), Dialpad transcript fetch, Workers AI classification (Llama 3.3 70B), per-outcome summary extraction (Llama 3.1 8B), RF custom activity + tag/source update + Sourced→Replied stage move, generic `mergeTag(tags, value)` helper, `parseColdCallActivity` for the extension shape |
 | `src/apollo-client.js` | Apollo API client: enrichment, search, verification, scoring |
@@ -449,11 +451,20 @@ Extension → POST /dialpad-call (consultantFirstName, phoneNumber, callerAliasI
   → 400 ok=false if callerAliasId missing
   → verifyCallerIdAlias(callerAliasId) → outboundCallerId (E.164)
   → 400 ok=false ("Invalid caller-ID selection — please refresh and try again") if alias is tampered/expired/unknown
+  → checkAndRecordCall({ dialpadUserId: user.dialpadId, phoneNumber }) — rolling-window gate
+       - Reads ratelimit:call:{dialpadUserId} (JSON [{t,phone}]) from SYNC_STATE
+       - Drops entries older than 60s
+       - If any entry within last 3s has same phoneNumber → 429 reason=duplicate
+       - Else if recent count >= 5 → 429 reason=rate_limit
+       - Else: append {t: now, phone}, write back (TTL 120s), allow
+  → 429 ok=false (reason: "rate_limit" | "duplicate", retryAfterSec, Retry-After header) if blocked
   → POST https://dialpad.com/api/v2/users/{user.dialpadId}/initiate_call
        body: { phone_number, outbound_caller_id }   (NO device_id — Dialpad auto-rings)
   → 502 ok=false ("Dialpad rejected the call: <upstream message>") if non-2xx
   → Response: { ok: true, callId? }
 ```
+
+The rate-limit + dedup is intentionally per-Dialpad-user (i.e. per recruiter), not per-candidate or per-call-id, because Dialpad's own 5/min cap is per outbound user. Mirroring it locally turns "Dialpad silently rejected this" into a clean 429 with a `retryAfterSec` the extension can render directly. Denied attempts deliberately don't consume budget — only allowed calls write back to KV. The read-decide-write isn't transactional; in the worst case two near-simultaneous edge requests both pass through, which Dialpad would reject anyway.
 
 Dialpad's `initiate_call` endpoint deliberately does not take a `device_id` — Dialpad auto-rings every eligible autocallable device the consultant has registered (Electron desktop app, web, CRM embeds), and the recruiter just picks up wherever rings. This is why `/dialpad-user-context` only returns caller IDs, not devices.
 
@@ -540,6 +551,7 @@ A general-purpose cache that stores candidate records and provides O(1) lookups 
 | `activities:{rfId}` | Full `/candidate/activity/list` data array | 20 minutes |
 | `batch:job{jobId}` | JSON array of rfId strings in extension-add order | 30 days |
 | `prewarm:rec{rfUserId}:job{jobId}` | `{ lastPrewarmIdx }` per-recruiter+job state | 1 hour |
+| `ratelimit:call:{dialpadUserId}` | JSON `[{t: ms-epoch, phone: E164}]` rolling-window state for `/dialpad-call` rate-limit + dedup | 120 sec |
 
 ### Cache Freshness
 
