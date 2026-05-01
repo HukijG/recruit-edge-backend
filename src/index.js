@@ -2405,6 +2405,34 @@ async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
 
     const result = await hangupCall({ callId }, env);
 
+    // Push state=ended to all SSE subscribers BEFORE clearing active. The
+    // hangup webhook from Dialpad will arrive a couple seconds later with
+    // the same call_id — by then active is gone, so processExtensionCallEvent
+    // will no-op and we avoid a double push. Net result: the extension gets
+    // exactly one state=ended event regardless of whether the user clicked
+    // the extension's Hangup button or hung up via the Dialpad app.
+    try {
+      const pushResult = await callChannelStub.pushState({
+        state: 'ended',
+        phoneNumber: active.phone,
+      });
+      console.log({
+        message: `[DialpadHangup] pushed state=ended delivered=${pushResult?.delivered ?? 0}`,
+        source: 'dialpad-hangup',
+        consultantFirstName,
+        callId,
+        delivered: pushResult?.delivered ?? 0,
+      });
+    } catch (err) {
+      console.error({
+        message: `[DialpadHangup] DO push failed: ${err?.message || 'unknown'}`,
+        source: 'dialpad-hangup',
+        consultantFirstName,
+        callId,
+        stack: err?.stack,
+      });
+    }
+
     // Per design: a hangup request always resets state, regardless of upstream
     // outcome. Dialpad rejection (already terminated, unknown id) shouldn't
     // leave a stuck "active" entry — the user explicitly asked us to clear.
