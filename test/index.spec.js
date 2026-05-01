@@ -10,7 +10,7 @@ import { isMonitoredDialpadUser, getRFUserIdByDialpadId } from '../src/users.js'
 import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from '../src/apollo-client.js';
 import { isJoelCandidate, enrichCandidate } from '../src/enrichment.js';
 import { signCallerIdAlias, verifyCallerIdAlias } from '../src/dialpad-aliases.js';
-import { buildCallerIdsFromDialpad } from '../src/dialpad-client.js';
+import { buildCallerIdsFromDialpad, sendSMS } from '../src/dialpad-client.js';
 import { decideCallRateLimit, checkAndRecordCall, CALL_RATE_WINDOW_MS, CALL_RATE_LIMIT, CALL_DEDUP_WINDOW_MS } from '../src/rate-limit.js';
 
 describe('RF-Dialpad Sync Worker', () => {
@@ -2272,5 +2272,145 @@ describe('rate-limit: checkAndRecordCall (KV)', () => {
 
 		const b1 = await checkAndRecordCall({ dialpadUserId: 'test-rl-B', phoneNumber: '+14155551212' }, env);
 		expect(b1.allowed).toBe(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// dialpad-client: sendSMS — POST /api/v2/sms with rolled / flexible params.
+// Endpoint shape on the worker side is still TBD; client method is just a
+// thin wrapper that lets callers ship whatever subset of the SMS API fields
+// they need (Dialpad rejects bad combinations server-side).
+// ---------------------------------------------------------------------------
+
+describe('dialpad-client: sendSMS', () => {
+	const originalFetch = globalThis.fetch;
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	function captureFetch(response = { id: '1', message_status: 'pending' }, status = 200) {
+		const captured = {};
+		globalThis.fetch = async (url, opts) => {
+			captured.url = typeof url === 'string' ? url : url.toString();
+			captured.opts = opts;
+			return new Response(JSON.stringify(response), {
+				status,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		};
+		return captured;
+	}
+
+	it('POSTs /api/v2/sms with required fields (user_id, to_numbers, text)', async () => {
+		const captured = captureFetch();
+		const result = await sendSMS({
+			userId: '8000000000000001',
+			toNumbers: ['+14155551212'],
+			text: 'Hello world',
+		}, env);
+
+		expect(result.ok).toBe(true);
+		expect(captured.url).toContain('/api/v2/sms');
+		expect(captured.opts.method).toBe('POST');
+		expect(captured.opts.headers.Authorization).toMatch(/^Bearer /);
+		expect(captured.opts.headers['Content-Type']).toBe('application/json');
+		const body = JSON.parse(captured.opts.body);
+		expect(body.user_id).toBe('8000000000000001');
+		expect(body.to_numbers).toEqual(['+14155551212']);
+		expect(body.text).toBe('Hello world');
+	});
+
+	it('wraps a single-string toNumbers into an array', async () => {
+		const captured = captureFetch();
+		await sendSMS({
+			userId: '8000000000000001',
+			toNumbers: '+14155551212',
+			text: 'Hi',
+		}, env);
+		const body = JSON.parse(captured.opts.body);
+		expect(body.to_numbers).toEqual(['+14155551212']);
+	});
+
+	it('passes fromNumber through as from_number', async () => {
+		const captured = captureFetch();
+		await sendSMS({
+			userId: '8000000000000001',
+			toNumbers: ['+14155551212'],
+			text: 'Hi',
+			fromNumber: '+447700900123',
+		}, env);
+		const body = JSON.parse(captured.opts.body);
+		expect(body.from_number).toBe('+447700900123');
+	});
+
+	it('passes through other optional fields (infer_country_code, media, sender_group_id, sender_group_type, channel_hashtag)', async () => {
+		const captured = captureFetch();
+		await sendSMS({
+			userId: '8000000000000001',
+			toNumbers: ['+14155551212'],
+			text: 'Hi',
+			inferCountryCode: true,
+			media: 'aGVsbG8=',
+			senderGroupId: 12345,
+			senderGroupType: 'office',
+			channelHashtag: 'general',
+		}, env);
+		const body = JSON.parse(captured.opts.body);
+		expect(body.infer_country_code).toBe(true);
+		expect(body.media).toBe('aGVsbG8=');
+		expect(body.sender_group_id).toBe(12345);
+		expect(body.sender_group_type).toBe('office');
+		expect(body.channel_hashtag).toBe('general');
+	});
+
+	it('omits optional fields when not provided', async () => {
+		const captured = captureFetch();
+		await sendSMS({
+			userId: '8000000000000001',
+			toNumbers: ['+14155551212'],
+			text: 'Hi',
+		}, env);
+		const body = JSON.parse(captured.opts.body);
+		expect(body).not.toHaveProperty('from_number');
+		expect(body).not.toHaveProperty('infer_country_code');
+		expect(body).not.toHaveProperty('media');
+		expect(body).not.toHaveProperty('sender_group_id');
+		expect(body).not.toHaveProperty('sender_group_type');
+		expect(body).not.toHaveProperty('channel_hashtag');
+	});
+
+	it('returns ok=false with parsed body when Dialpad responds non-2xx', async () => {
+		captureFetch({ error: 'Invalid number' }, 400);
+		const result = await sendSMS({
+			userId: '8000000000000001',
+			toNumbers: ['notanumber'],
+			text: 'Hi',
+		}, env);
+		expect(result.ok).toBe(false);
+		expect(result.status).toBe(400);
+		expect(result.body).toEqual({ error: 'Invalid number' });
+	});
+
+	it('returns the parsed Dialpad SMS record on success', async () => {
+		captureFetch({
+			id: '1004',
+			message_status: 'pending',
+			from_number: '+14155551001',
+			to_numbers: ['+14155557777'],
+		});
+		const result = await sendSMS({
+			userId: '2',
+			toNumbers: ['+14155557777'],
+			text: 'Test text',
+		}, env);
+		expect(result.ok).toBe(true);
+		expect(result.body.id).toBe('1004');
+		expect(result.body.message_status).toBe('pending');
+	});
+
+	it('throws when DIALPAD_API_KEY is missing', async () => {
+		captureFetch();
+		await expect(sendSMS(
+			{ userId: '1', toNumbers: ['+14155551212'], text: 'Hi' },
+			{ ...env, DIALPAD_API_KEY: '' },
+		)).rejects.toThrow(/DIALPAD_API_KEY/);
 	});
 });

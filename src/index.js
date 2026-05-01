@@ -1,6 +1,6 @@
 import {
   createOrUpdateDialpadContact, patchDialpadContact, getDialpadContact,
-  getUserCallerId, initiateCall, buildCallerIdsFromDialpad,
+  getUserCallerId, initiateCall, buildCallerIdsFromDialpad, sendSMS,
 } from './dialpad-client.js';
 import { verifyJWT } from './auth.js';
 import { signCallerIdAlias, verifyCallerIdAlias } from './dialpad-aliases.js';
@@ -129,6 +129,14 @@ export default {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
         }
         return await handleDialpadCallEndpoint(request, env, corsHeaders);
+      }
+
+      if (url.pathname === '/dialpad-sms' && request.method === 'POST') {
+        const extAuth = request.headers.get('X-Extension-Token');
+        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
+          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        }
+        return await handleDialpadSmsEndpoint(request, env, corsHeaders);
       }
 
       return new Response('Not Found', {
@@ -2085,6 +2093,123 @@ async function handleDialpadCallEndpoint(request, env, corsHeaders) {
     console.error({
       message: `[DialpadCall] error: ${error.message}`,
       source: 'dialpad-call',
+      stack: error.stack,
+    });
+    return new Response(JSON.stringify({ ok: false, error: 'Internal Server Error' }), {
+      status: 500, headers: responseHeaders,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /dialpad-sms — send a single SMS to a candidate via the consultant's
+// Dialpad number. Same auth + alias machinery as /dialpad-call; key
+// differences: callerAliasId is OPTIONAL (Dialpad falls back to the user's
+// default sender when from_number is omitted), text is sent verbatim
+// (preserve newlines/whitespace — recruiters typed it that way), and there's
+// no rate-limit gate for now (per the SMS handoff: ships test-only first,
+// revisit when production candidate-mode lights up).
+// ---------------------------------------------------------------------------
+
+async function handleDialpadSmsEndpoint(request, env, corsHeaders) {
+  const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  try {
+    const payload = await request.json();
+    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName.trim() : '';
+    const phoneNumber = typeof payload.phoneNumber === 'string' ? payload.phoneNumber.trim() : '';
+    // Do NOT trim text — recruiters typed it deliberately, including any
+    // leading/trailing whitespace. Only reject if it's empty after trim.
+    const text = typeof payload.text === 'string' ? payload.text : '';
+    // callerAliasId is optional — empty/missing means "use Dialpad default".
+    const callerAliasId = typeof payload.callerAliasId === 'string' ? payload.callerAliasId.trim() : '';
+
+    if (!consultantFirstName) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    const user = getUserByFirstName(consultantFirstName);
+    if (!user) {
+      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+        status: 403, headers: responseHeaders,
+      });
+    }
+
+    if (!phoneNumber) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing phone number' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+    if (!/^\+\d{6,}$/.test(phoneNumber)) {
+      return new Response(JSON.stringify({ ok: false, error: 'Invalid phone number' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    if (!text || !text.trim()) {
+      return new Response(JSON.stringify({ ok: false, error: 'Empty message' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    let outboundCallerId;
+    if (callerAliasId) {
+      outboundCallerId = await verifyCallerIdAlias(callerAliasId, env);
+      if (!outboundCallerId) {
+        return new Response(JSON.stringify({ ok: false, error: 'Invalid caller-ID selection — please refresh and try again' }), {
+          status: 400, headers: responseHeaders,
+        });
+      }
+    }
+
+    console.log({
+      message: `[DialpadSms] consultant=${consultantFirstName} → ${phoneNumber} chars=${text.length}`,
+      source: 'dialpad-sms',
+      consultantFirstName,
+      dialpadId: user.dialpadId,
+      hasFromNumber: !!outboundCallerId,
+      textLength: text.length,
+      // Don't log message body itself — handoff calls it candidate-PII
+      // once {{firstName}} is substituted.
+    });
+
+    const result = await sendSMS({
+      userId: user.dialpadId,
+      toNumbers: [phoneNumber],
+      text,
+      fromNumber: outboundCallerId,
+      inferCountryCode: false,
+    }, env);
+
+    if (!result.ok) {
+      const upstreamMsg = result.body?.error || result.body?.message || `HTTP ${result.status}`;
+      console.error({
+        message: `[DialpadSms] Dialpad rejected: ${upstreamMsg}`,
+        source: 'dialpad-sms',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        upstreamStatus: result.status,
+        upstreamBody: result.body,
+      });
+      return new Response(JSON.stringify({
+        ok: false,
+        error: `Dialpad rejected the message: ${upstreamMsg}`,
+      }), { status: 502, headers: responseHeaders });
+    }
+
+    const responseBody = { ok: true };
+    const messageId = result.body?.id || result.body?.message_id;
+    if (messageId) responseBody.messageId = messageId;
+
+    return new Response(JSON.stringify(responseBody), {
+      status: 200, headers: responseHeaders,
+    });
+  } catch (error) {
+    console.error({
+      message: `[DialpadSms] error: ${error.message}`,
+      source: 'dialpad-sms',
       stack: error.stack,
     });
     return new Response(JSON.stringify({ ok: false, error: 'Internal Server Error' }), {

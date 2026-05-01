@@ -229,6 +229,73 @@ export async function initiateCall({ userId, phoneNumber, outboundCallerId, cust
 }
 
 /**
+ * Send an SMS via Dialpad's POST /api/v2/sms endpoint.
+ *
+ * Required: userId, toNumbers (array of up to 10 E.164 numbers — a single
+ * string is also accepted and wrapped), text.
+ *
+ * Optional pass-throughs map 1:1 to the Dialpad SendSMSMessage schema and are
+ * only included in the request body when set, so callers can opt into more
+ * fields later without touching this method:
+ *   - fromNumber       → from_number          (overrides user_id / sender_group_id)
+ *   - inferCountryCode → infer_country_code
+ *   - media            → media                (base64; turns the message into MMS)
+ *   - senderGroupId    → sender_group_id
+ *   - senderGroupType  → sender_group_type    ("callcenter" | "department" | "office")
+ *   - channelHashtag   → channel_hashtag      (alternative to to_numbers)
+ *
+ * Returns { ok, status, body } so callers can build their own error envelope —
+ * Dialpad's body is parsed JSON when possible, otherwise { raw } when not.
+ */
+export async function sendSMS({
+  userId,
+  toNumbers,
+  text,
+  fromNumber,
+  inferCountryCode,
+  media,
+  senderGroupId,
+  senderGroupType,
+  channelHashtag,
+} = {}, env) {
+  const dialpadApiKey = env?.DIALPAD_API_KEY;
+  const dialpadBaseUrl = env?.DIALPAD_API_BASE_URL || 'https://dialpad.com/api/v2';
+  if (!dialpadApiKey) {
+    throw new Error('DIALPAD_API_KEY environment variable is required');
+  }
+
+  const url = `${dialpadBaseUrl}/sms`;
+  const body = {};
+  if (userId !== undefined && userId !== null) body.user_id = userId;
+  if (Array.isArray(toNumbers)) body.to_numbers = toNumbers;
+  else if (typeof toNumbers === 'string' && toNumbers) body.to_numbers = [toNumbers];
+  if (typeof text === 'string') body.text = text;
+  if (fromNumber) body.from_number = fromNumber;
+  if (typeof inferCountryCode === 'boolean') body.infer_country_code = inferCountryCode;
+  if (media) body.media = media;
+  if (senderGroupId !== undefined && senderGroupId !== null) body.sender_group_id = senderGroupId;
+  if (senderGroupType) body.sender_group_type = senderGroupType;
+  if (channelHashtag) body.channel_hashtag = channelHashtag;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${dialpadApiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  let parsed = null;
+  const respText = await response.text();
+  if (respText) {
+    try { parsed = JSON.parse(respText); } catch { parsed = { raw: respText }; }
+  }
+  return { ok: response.ok, status: response.status, body: parsed };
+}
+
+/**
  * Pure transform: takes the flat Dialpad caller_id response shape and a sign
  * function, returns the extension-facing callerIds[] array (with opaque aliases
  * in place of the underlying E.164 numbers).

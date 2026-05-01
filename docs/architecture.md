@@ -17,7 +17,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 │                                                                                                              │
 │  /webhook/recruiterflow  /webhook/dialpad  /webhook/dialpad/calls  /webhook/calendar  /webhook/krisp        │
 │  /webhook/apollo  /candidates  /candidates/add-to-job  /candidate-details  /candidate-mark-invalid          │
-│  /dialpad-user-context  /dialpad-call                                                                        │
+│  /dialpad-user-context  /dialpad-call  /dialpad-sms                                                          │
 │  /health                                                                                                     │
 │                                                                                                              │
 │  ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐       │
@@ -50,7 +50,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `src/users.js` | Team registry: hardcoded `USERS` array of `{ firstName, rfUserId, dialpadId }` records + accessors (`getUserByFirstName`, `getUserByDialpadId`, `getUserByRFUserId`, `resolveRFUserId`, `getRFUserIdByDialpadId`, `isMonitoredDialpadUser`). Single source of truth for cold-call attribution, calendar Joel-only logic, the extension's `consultantFirstName` resolution, and Apollo's Joel-only enrichment trigger |
 | `src/cache.js` | KV cache: canonical records, index keys (linkedin, email, name), consultant_id per job-link, details + activities snapshots, batch index, prewarm state, invalidation helper |
 | `src/rf-client.js` | RF API client: search/get/update, LinkedIn URL validation & normalization, Dialpad↔RF data conversion, custom-field consultant_id read/write/resolve, activity-list, phone normalization (`normalizeToE164`), job disambiguation (`pickConsultantJob`), stage-move filter, prewarm helper, single-retry-on-502 in `getRFCandidate` |
-| `src/dialpad-client.js` | Dialpad API client: contact PUT (create/update), data preparation from RF candidate format, `getUserCallerId` (fetch the consultant's caller-IDs) and `initiateCall` (POST `/users/{id}/initiate_call`) for the LinkedIn extension calling flow, plus the pure `buildCallerIdsFromDialpad` transform that turns Dialpad's flat `caller_id` shape into the extension-facing `callerIds[]` array with opaque aliases |
+| `src/dialpad-client.js` | Dialpad API client: contact PUT (create/update), data preparation from RF candidate format, `getUserCallerId` (fetch the consultant's caller-IDs) and `initiateCall` (POST `/users/{id}/initiate_call`) for the LinkedIn extension calling flow, plus the pure `buildCallerIdsFromDialpad` transform that turns Dialpad's flat `caller_id` shape into the extension-facing `callerIds[]` array with opaque aliases. Also `sendSMS` (POST `/sms`) — rolled-params wrapper backing `/dialpad-sms`; required: `userId`, `toNumbers`, `text`; optional pass-throughs for `fromNumber`, `inferCountryCode`, `media`, `senderGroupId`, `senderGroupType`, `channelHashtag` |
 | `src/dialpad-aliases.js` | Opaque caller-ID alias signing/verifying for the calling endpoints (HS256 JWT via `jose`, audience `dialpad-caller-id`, 7-day TTL). Keeps raw E.164 numbers off the wire to the extension |
 | `src/rate-limit.js` | Rolling-window rate-limit + cheap dedup gate for `/dialpad-call`. Pure `decideCallRateLimit({timestamps, now, phoneNumber})` returns `{allowed, reason?, retryAfterSec?, nextTimestamps?}`. KV-backed `checkAndRecordCall` reads SYNC_STATE, decides, persists on allow. 5 calls/60s rolling per Dialpad user_id, plus a 3s per-(user,phone) dedup window for double-clicks |
 | `src/krisp.js` | Krisp helpers: note formatting (HTML), candidate email extraction from meeting participants |
@@ -83,6 +83,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `/candidate-mark-invalid` | POST | `X-Extension-Token` header | Tag candidate `"Number Invalid"` (idempotent) |
 | `/dialpad-user-context` | POST | `X-Extension-Token` header | Caller-ID picker data: `{ callerIds: [{ aliasId, country, label?, isDefault? }] }` (opaque aliases, no raw E.164) |
 | `/dialpad-call` | POST | `X-Extension-Token` header | Initiate call via Dialpad `initiate_call`. Decodes `callerAliasId`; Dialpad auto-rings the consultant's eligible devices |
+| `/dialpad-sms` | POST | `X-Extension-Token` header | Send a single SMS via Dialpad `/sms`. Decodes `callerAliasId` (optional → Dialpad default sender); text is forwarded verbatim |
 
 ---
 
@@ -466,6 +467,31 @@ Extension → POST /dialpad-call (consultantFirstName, phoneNumber, callerAliasI
 
 The rate-limit + dedup is intentionally per-Dialpad-user (i.e. per recruiter), not per-candidate or per-call-id, because Dialpad's own 5/min cap is per outbound user. Mirroring it locally turns "Dialpad silently rejected this" into a clean 429 with a `retryAfterSec` the extension can render directly. Denied attempts deliberately don't consume budget — only allowed calls write back to KV. The read-decide-write isn't transactional; in the worst case two near-simultaneous edge requests both pass through, which Dialpad would reject anyway.
 
+### `POST /dialpad-sms` — send an SMS
+
+```
+Extension → POST /dialpad-sms (consultantFirstName, phoneNumber, callerAliasId?, text)
+  → Verify X-Extension-Token (401 ok=false on miss)
+  → 400 ok=false if consultantFirstName missing
+  → resolve consultantFirstName → user via getUserByFirstName(name)
+  → 403 ok=false if not in the registry
+  → 400 ok=false if phoneNumber missing or non-E.164
+  → 400 ok=false if text.trim() empty
+  → IF callerAliasId provided: verifyCallerIdAlias → from_number (E.164)
+       400 ok=false ("Invalid caller-ID selection — please refresh and try again") if invalid/expired
+       (callerAliasId omitted → Dialpad uses the user's default sender)
+  → POST https://dialpad.com/api/v2/sms
+       body: { user_id, to_numbers: [phoneNumber], from_number?, text, infer_country_code: false }
+  → 502 ok=false ("Dialpad rejected the message: <upstream message>") if non-2xx
+  → Response: { ok: true, messageId? }
+```
+
+Design notes:
+- **Text forwarded verbatim.** Recruiters write `{{firstName}}`-templated copy and the extension does the substitution client-side. Whitespace + newlines are typed deliberately for readability — the worker never trims, re-flows, or normalises. Empty messages (after trim) are still rejected so we don't ship a blank SMS.
+- **No rate-limit gate yet.** The SMS handoff explicitly says "ships test-call-only initially — one consultant, one number at a time. When production candidate-mode lights up, revisit." When that day comes, `src/rate-limit.js` is reusable: lift the pure decision function to take a configurable window/limit and add an `ratelimit:sms:{dialpadUserId}` key.
+- **No retries.** If Dialpad rejects, the extension's popover keeps the textarea contents and re-enables the Yes button so the recruiter retries manually. Auto-retry would risk double-sending — much harder to reason about than human-in-the-loop retry.
+- **PII-aware logging.** We log `textLength` but never the message body itself — once `{{firstName}}` is substituted client-side, the rendered text is candidate-identifying.
+
 Dialpad's `initiate_call` endpoint deliberately does not take a `device_id` — Dialpad auto-rings every eligible autocallable device the consultant has registered (Electron desktop app, web, CRM embeds), and the recruiter just picks up wherever rings. This is why `/dialpad-user-context` only returns caller IDs, not devices.
 
 ### Caller-ID alias signing
@@ -637,6 +663,7 @@ Example: `https://www.LinkedIn.com/in/John-Smith/?utm_source=share` → `linkedi
 - **Webhook auth**: JWT (HS256) in Authorization header or raw body
 - **User caller-IDs**: `GET /users/{userId}/caller_id` → flat shape `{ caller_id, phone_numbers, office_main_line, groups[], ... }` (NOT wrapped in `caller_id_proto` despite some old docs samples)
 - **Initiate call**: `POST /users/{userId}/initiate_call` with `{ phone_number, outbound_caller_id }`. We deliberately omit `device_id` — Dialpad auto-rings every eligible autocallable device the user has registered, which is exactly what we want
+- **Send SMS**: `POST /sms` with `{ user_id, to_numbers (array, ≤10), text, ... }`. Rate-limited 100/min (Tier 0) or 800/min (Tier 1). `from_number` overrides the user's default sending number when provided
 
 ---
 

@@ -2447,3 +2447,205 @@ describe('E2E: /dialpad-call', () => {
 	});
 });
 
+
+// ---------------------------------------------------------------------------
+// E2E: /dialpad-sms — send an SMS to a candidate via Dialpad.
+// ---------------------------------------------------------------------------
+
+describe('E2E: /dialpad-sms', () => {
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	async function makeAlias(number) {
+		const { signCallerIdAlias } = await import('../src/dialpad-aliases.js');
+		return signCallerIdAlias(number, env);
+	}
+
+	function dialpadSms(body) {
+		return new Request('http://example.com/dialpad-sms', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify(body),
+		});
+	}
+
+	it('returns 401 without X-Extension-Token', async () => {
+		const request = new Request('http://example.com/dialpad-sms', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(401);
+	});
+
+	it('returns 403 ok=false when consultantFirstName is unknown', async () => {
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(dialpadSms({
+			consultantFirstName: 'Nobody',
+			phoneNumber: '+14155551212',
+			text: 'Hello',
+		}), env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(403);
+		const json = await response.json();
+		expect(json.ok).toBe(false);
+		expect(json.error).toMatch(/consultant/i);
+	});
+
+	it('returns 400 ok=false when phoneNumber is missing', async () => {
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(dialpadSms({
+			consultantFirstName: 'Joel',
+			text: 'Hi',
+		}), env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(400);
+		const json = await response.json();
+		expect(json.error).toMatch(/phone/i);
+	});
+
+	it('returns 400 ok=false when phoneNumber is malformed', async () => {
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(dialpadSms({
+			consultantFirstName: 'Joel',
+			phoneNumber: 'not-a-number',
+			text: 'Hi',
+		}), env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(400);
+		const json = await response.json();
+		expect(json.error).toMatch(/invalid phone/i);
+	});
+
+	it('returns 400 ok=false when text is empty / whitespace-only', async () => {
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(dialpadSms({
+			consultantFirstName: 'Joel',
+			phoneNumber: '+14155551212',
+			text: '   \n  ',
+		}), env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(400);
+		const json = await response.json();
+		expect(json.error).toMatch(/empty message/i);
+	});
+
+	it('returns 400 ok=false when callerAliasId is invalid / forged', async () => {
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(dialpadSms({
+			consultantFirstName: 'Joel',
+			phoneNumber: '+14155551212',
+			text: 'Hi',
+			callerAliasId: 'forged-alias',
+		}), env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(400);
+		const json = await response.json();
+		expect(json.error).toMatch(/caller/i);
+	});
+
+	it('POSTs /api/v2/sms with verbatim text + decoded from_number, returns ok=true', async () => {
+		const alias = await makeAlias('+14155551212');
+		const calls = mockFetch([
+			{
+				match: '/api/v2/sms',
+				response: { id: 'sms-1004', message_status: 'pending' },
+			},
+		]);
+
+		const text = "Hi John,\n\nI'm reaching out because…\n\nLet me know!\n\nJoel";
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(dialpadSms({
+			consultantFirstName: 'Joel',
+			phoneNumber: '+447700900123',
+			callerAliasId: alias,
+			text,
+		}), env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		const json = await response.json();
+		expect(json.ok).toBe(true);
+		expect(json.messageId).toBe('sms-1004');
+
+		const smsCalls = findCalls(calls, '/api/v2/sms');
+		expect(smsCalls).toHaveLength(1);
+		const body = JSON.parse(smsCalls[0].opts.body);
+		expect(body.user_id).toBe('8000000000000001');
+		expect(body.to_numbers).toEqual(['+447700900123']);
+		expect(body.from_number).toBe('+14155551212');
+		// Critical: text is sent verbatim, no trim or normalisation.
+		expect(body.text).toBe(text);
+		expect(body.infer_country_code).toBe(false);
+
+		expect(smsCalls[0].opts.headers.Authorization).toMatch(/^Bearer /);
+	});
+
+	it('omits from_number when callerAliasId is not provided (Dialpad default)', async () => {
+		const calls = mockFetch([
+			{ match: '/api/v2/sms', response: { id: 'sms-2', message_status: 'pending' } },
+		]);
+
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(dialpadSms({
+			consultantFirstName: 'Joel',
+			phoneNumber: '+14155551212',
+			text: 'Hi',
+		}), env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		const body = JSON.parse(findCalls(calls, '/api/v2/sms')[0].opts.body);
+		expect(body).not.toHaveProperty('from_number');
+	});
+
+	it('returns 502 ok=false when Dialpad rejects the SMS (and surfaces upstream message)', async () => {
+		const alias = await makeAlias('+14155551212');
+		mockFetch([
+			{
+				match: '/api/v2/sms',
+				status: 400,
+				response: { error: 'Invalid destination' },
+			},
+		]);
+
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(dialpadSms({
+			consultantFirstName: 'Joel',
+			phoneNumber: '+14155551212',
+			callerAliasId: alias,
+			text: 'Hi',
+		}), env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(502);
+		const json = await response.json();
+		expect(json.ok).toBe(false);
+		expect(json.error).toMatch(/Dialpad rejected the message/i);
+		expect(json.error).toMatch(/Invalid destination/);
+	});
+
+	it('preserves leading and trailing whitespace in the message body', async () => {
+		const calls = mockFetch([
+			{ match: '/api/v2/sms', response: { id: 'sms-3' } },
+		]);
+
+		const text = '  hi there  '; // deliberately weird
+		const ctx = createExecutionContext();
+		await worker.fetch(dialpadSms({
+			consultantFirstName: 'Joel',
+			phoneNumber: '+14155551212',
+			text,
+		}), env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		const body = JSON.parse(findCalls(calls, '/api/v2/sms')[0].opts.body);
+		expect(body.text).toBe(text); // verbatim, not trimmed
+	});
+});
+
