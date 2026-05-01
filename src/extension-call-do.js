@@ -48,16 +48,28 @@ export class ExtensionCallStateChannel extends DurableObject {
 
     // Client disconnect cleanup. The DO request inherits the original
     // request's AbortSignal; aborting fires when the SSE stream closes.
+    // writer.close() returns a Promise — must .catch() it (the listener is
+    // sync; an unawaited rejected Promise would surface as an unhandled
+    // rejection and could take the DO RPC down on the next request.)
     request.signal.addEventListener('abort', () => {
       this.writers.delete(writer);
-      try { writer.close(); } catch {}
+      writer.close().catch(() => {});
     });
 
-    // Schedule a heartbeat alarm if one isn't already running. The alarm
-    // reschedules itself while writers remain. Fast op — fine to await.
-    const currentAlarm = await this.ctx.storage.getAlarm();
-    if (currentAlarm === null) {
-      await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT_MS);
+    // Schedule a heartbeat alarm if one isn't already running. Wrapped in
+    // try/catch so a transient storage hiccup doesn't fail the whole
+    // subscribe.
+    try {
+      const currentAlarm = await this.ctx.storage.getAlarm();
+      if (currentAlarm === null) {
+        await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT_MS);
+      }
+    } catch (err) {
+      console.error({
+        message: `[ExtCallChannel] alarm setup failed: ${err?.message || 'unknown'}`,
+        source: 'extension-call-do',
+        stack: err?.stack,
+      });
     }
 
     // Initial writes (hello + KV-replayed state) happen AFTER the response
@@ -79,8 +91,13 @@ export class ExtensionCallStateChannel extends DurableObject {
             `event: state\ndata: ${JSON.stringify(initial)}\n\n`
           ));
         }
-      } catch {
-        // Writer may have closed already (client disconnected mid-init); ignore.
+      } catch (err) {
+        // Writer may have closed already (client disconnected mid-init);
+        // log non-fatally for diagnosis.
+        console.warn({
+          message: `[ExtCallChannel] initial-write error: ${err?.message || 'unknown'}`,
+          source: 'extension-call-do',
+        });
       }
     })();
 
@@ -102,28 +119,60 @@ export class ExtensionCallStateChannel extends DurableObject {
    * The event shape pushed to the extension intentionally OMITS call_id —
    * per the design, the extension never sees that value; the worker holds it
    * in KV and uses it on /dialpad-hangup.
+   *
+   * Top-level try/catch keeps any internal error from surfacing as the
+   * opaque "internal error; reference = ..." that CF wraps unhandled DO
+   * RPC exceptions in. Real cause gets logged inside the DO instead.
    */
   async pushState(event) {
-    const sse = `event: state\ndata: ${JSON.stringify(event)}\n\n`;
-    return await this._broadcast(sse);
+    try {
+      const sse = `event: state\ndata: ${JSON.stringify(event)}\n\n`;
+      return await this._broadcast(sse);
+    } catch (err) {
+      console.error({
+        message: `[ExtCallChannel] pushState fatal: ${err?.message || 'unknown'}`,
+        source: 'extension-call-do',
+        stack: err?.stack,
+        writersSize: this.writers?.size ?? 'undef',
+        event,
+      });
+      return { delivered: 0, error: err?.message || 'unknown' };
+    }
   }
 
   async alarm() {
-    if (this.writers.size === 0) return;
-    await this._broadcast(': keepalive\n\n');
-    if (this.writers.size > 0) {
-      await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT_MS);
+    try {
+      if (!this.writers || this.writers.size === 0) return;
+      await this._broadcast(': keepalive\n\n');
+      if (this.writers && this.writers.size > 0) {
+        await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT_MS);
+      }
+    } catch (err) {
+      console.error({
+        message: `[ExtCallChannel] alarm fatal: ${err?.message || 'unknown'}`,
+        source: 'extension-call-do',
+        stack: err?.stack,
+      });
     }
   }
 
   async _broadcast(sseChunk) {
+    if (!this.writers || this.writers.size === 0) {
+      return { delivered: 0 };
+    }
     const bytes = new TextEncoder().encode(sseChunk);
     const dead = [];
     for (const writer of this.writers) {
       try {
         await writer.write(bytes);
-      } catch {
+      } catch (err) {
         dead.push(writer);
+        // Surface the actual write error so we can distinguish "writer was
+        // already closed" from anything more interesting.
+        console.warn({
+          message: `[ExtCallChannel] writer.write failed: ${err?.message || 'unknown'}`,
+          source: 'extension-call-do',
+        });
       }
     }
     for (const w of dead) {
