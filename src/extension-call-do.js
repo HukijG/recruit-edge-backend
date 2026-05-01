@@ -41,27 +41,9 @@ export class ExtensionCallStateChannel extends DurableObject {
 
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
-    const encoder = new TextEncoder();
 
-    // Greet immediately so the client knows the stream is live.
-    try {
-      await writer.write(encoder.encode(
-        `event: hello\ndata: ${JSON.stringify({ ok: true })}\n\n`
-      ));
-    } catch {}
-
-    // Replay current state from KV — ensures a tab opening mid-call gets the
-    // right initial button. Without this, the extension only learns of an
-    // active call when the next state transition happens.
-    if (dialpadUserId) {
-      try {
-        const initial = await this._readCurrentState(dialpadUserId);
-        await writer.write(encoder.encode(
-          `event: state\ndata: ${JSON.stringify(initial)}\n\n`
-        ));
-      } catch {}
-    }
-
+    // Register the writer up-front so any pushState that lands during the
+    // initial-events background task still hits this subscriber.
     this.writers.add(writer);
 
     // Client disconnect cleanup. The DO request inherits the original
@@ -72,11 +54,35 @@ export class ExtensionCallStateChannel extends DurableObject {
     });
 
     // Schedule a heartbeat alarm if one isn't already running. The alarm
-    // reschedules itself while writers remain.
+    // reschedules itself while writers remain. Fast op — fine to await.
     const currentAlarm = await this.ctx.storage.getAlarm();
     if (currentAlarm === null) {
       await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT_MS);
     }
+
+    // Initial writes (hello + KV-replayed state) happen AFTER the response
+    // returns. TransformStream's readable defaults to highWaterMark 0, so
+    // multiple awaited writes before returning the response would deadlock:
+    // the second write blocks until the first is consumed, but no consumer
+    // exists until the Response we're about to return reaches the client.
+    // Kick the writes off async — the DO stays alive while the streaming
+    // response is being consumed, so this background task runs to completion.
+    (async () => {
+      const encoder = new TextEncoder();
+      try {
+        await writer.write(encoder.encode(
+          `event: hello\ndata: ${JSON.stringify({ ok: true })}\n\n`
+        ));
+        if (dialpadUserId) {
+          const initial = await this._readCurrentState(dialpadUserId);
+          await writer.write(encoder.encode(
+            `event: state\ndata: ${JSON.stringify(initial)}\n\n`
+          ));
+        }
+      } catch {
+        // Writer may have closed already (client disconnected mid-init); ignore.
+      }
+    })();
 
     return new Response(readable, {
       headers: {
