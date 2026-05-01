@@ -162,6 +162,143 @@ export async function patchDialpadContact(rfId, fields, env) {
 }
 
 /**
+ * GET a Dialpad user's caller-ID record.
+ *
+ * Returns the flat shape Dialpad serves at GET /api/v2/users/{userId}/caller_id:
+ *   { caller_id, phone_numbers, office_main_line, groups, ... }
+ *
+ * Throws on non-2xx responses — callers translate that into the {ok:false} 502
+ * envelope the extension expects.
+ */
+export async function getUserCallerId(userId, env) {
+  const dialpadApiKey = env.DIALPAD_API_KEY;
+  const dialpadBaseUrl = env.DIALPAD_API_BASE_URL || 'https://dialpad.com/api/v2';
+  if (!dialpadApiKey) {
+    throw new Error('DIALPAD_API_KEY environment variable is required');
+  }
+  const url = `${dialpadBaseUrl}/users/${encodeURIComponent(userId)}/caller_id`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${dialpadApiKey}`,
+    },
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Dialpad caller_id GET ${response.status}: ${errorText}`);
+  }
+  return response.json();
+}
+
+/**
+ * POST Dialpad's initiate_call endpoint for a user. Dialpad auto-rings every
+ * eligible autocallable device the user has — we deliberately do NOT pass
+ * device_id, the recruiter just picks up on whichever app rings.
+ *
+ * Returns { ok, status, body } so callers can build a useful error message
+ * from Dialpad's own response if it rejects the call.
+ */
+export async function initiateCall({ userId, phoneNumber, outboundCallerId, customData }, env) {
+  const dialpadApiKey = env.DIALPAD_API_KEY;
+  const dialpadBaseUrl = env.DIALPAD_API_BASE_URL || 'https://dialpad.com/api/v2';
+  if (!dialpadApiKey) {
+    throw new Error('DIALPAD_API_KEY environment variable is required');
+  }
+  const url = `${dialpadBaseUrl}/users/${encodeURIComponent(userId)}/initiate_call`;
+  const body = { phone_number: phoneNumber };
+  if (outboundCallerId) body.outbound_caller_id = outboundCallerId;
+  if (customData) body.custom_data = customData;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${dialpadApiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  let parsed = null;
+  const text = await response.text();
+  if (text) {
+    try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
+  }
+  return { ok: response.ok, status: response.status, body: parsed };
+}
+
+/**
+ * Pure transform: takes the flat Dialpad caller_id response shape and a sign
+ * function, returns the extension-facing callerIds[] array (with opaque aliases
+ * in place of the underlying E.164 numbers).
+ *
+ * Walks phone_numbers (label "My number") → office_main_line ("Office main line")
+ * → groups[] (label = group's display_name). De-dupes on E.164 — first
+ * occurrence wins for label. Marks isDefault on the entry whose number matches
+ * the top-level caller_id field.
+ *
+ * @param {Object|null} dpCallerId — Dialpad's GET /users/{id}/caller_id response
+ * @param {(number: string) => Promise<string>} sign — alias-mint function
+ * @returns {Promise<Array<{aliasId: string, country: 'UK'|'US'|'OTHER', label?: string, isDefault?: boolean}>>}
+ */
+export async function buildCallerIdsFromDialpad(dpCallerId, sign) {
+  if (!dpCallerId) return [];
+
+  const seen = new Set(); // dedup by E.164 — first writer wins
+  /** @type {Array<{number: string, label: string}>} */
+  const ordered = [];
+
+  const push = (raw, label) => {
+    const normalized = normalizeE164(raw);
+    if (!normalized) return;
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    ordered.push({ number: normalized, label });
+  };
+
+  if (Array.isArray(dpCallerId.phone_numbers)) {
+    for (const n of dpCallerId.phone_numbers) push(n, 'My number');
+  }
+  push(dpCallerId.office_main_line, 'Office main line');
+  if (Array.isArray(dpCallerId.groups)) {
+    for (const g of dpCallerId.groups) {
+      if (!g) continue;
+      const label = (typeof g.display_name === 'string' && g.display_name.trim()) || 'Group';
+      push(g.caller_id, label);
+    }
+  }
+
+  const defaultNumber = normalizeE164(dpCallerId.caller_id);
+
+  const out = [];
+  for (const { number, label } of ordered) {
+    const entry = {
+      aliasId: await sign(number),
+      country: countryFromE164(number),
+      label,
+    };
+    if (defaultNumber && number === defaultNumber) entry.isDefault = true;
+    out.push(entry);
+  }
+  return out;
+}
+
+function normalizeE164(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (!/^\+\d{6,}$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+function countryFromE164(number) {
+  if (number.startsWith('+44')) return 'UK';
+  if (number.startsWith('+1')) return 'US';
+  return 'OTHER';
+}
+
+/**
  * Build contact payload. Only includes fields that have values —
  * Dialpad PATCH clears any field present with an empty value.
  * Omitting a field entirely leaves it untouched.

@@ -2000,3 +2000,327 @@ describe('E2E: /candidate-details', () => {
 	});
 });
 
+
+// ---------------------------------------------------------------------------
+// E2E: /dialpad-user-context — fetch caller-IDs for the consultant's picker
+// ---------------------------------------------------------------------------
+
+describe('E2E: /dialpad-user-context', () => {
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	it('returns 401 without X-Extension-Token', async () => {
+		const request = new Request('http://example.com/dialpad-user-context', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ consultantFirstName: 'Joel' }),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(401);
+	});
+
+	it('returns 403 ok=false when consultantFirstName is unknown', async () => {
+		const request = new Request('http://example.com/dialpad-user-context', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({ consultantFirstName: 'Nobody' }),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(403);
+		const json = await response.json();
+		expect(json.ok).toBe(false);
+		expect(typeof json.error).toBe('string');
+	});
+
+	it('returns 400 ok=false when consultantFirstName is missing entirely', async () => {
+		const request = new Request('http://example.com/dialpad-user-context', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(400);
+		const json = await response.json();
+		expect(json.ok).toBe(false);
+	});
+
+	it('returns callerIds with opaque round-trippable aliases and no plaintext numbers', async () => {
+		const calls = mockFetch([
+			{
+				match: '/users/8000000000000001/caller_id',
+				response: {
+					caller_id: '+14155551212',
+					phone_numbers: ['+14155551212', '+447700900123'],
+					office_main_line: '+14155551216',
+					groups: [{ caller_id: '+14155551215', display_name: 'Sales Team' }],
+				},
+			},
+		]);
+
+		const request = new Request('http://example.com/dialpad-user-context', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({ consultantFirstName: 'Joel' }),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		const json = await response.json();
+
+		expect(Array.isArray(json.callerIds)).toBe(true);
+		expect(json.callerIds).toHaveLength(4);
+
+		// Order: phone_numbers, office_main_line, groups
+		expect(json.callerIds[0]).toMatchObject({ country: 'US', label: 'My number', isDefault: true });
+		expect(json.callerIds[1]).toMatchObject({ country: 'UK', label: 'My number' });
+		expect(json.callerIds[1].isDefault).toBeUndefined();
+		expect(json.callerIds[2]).toMatchObject({ country: 'US', label: 'Office main line' });
+		expect(json.callerIds[3]).toMatchObject({ country: 'US', label: 'Sales Team' });
+
+		// At most one default
+		expect(json.callerIds.filter(c => c.isDefault).length).toBe(1);
+
+		// No plaintext phone numbers anywhere in the body
+		const responseStr = JSON.stringify(json);
+		expect(responseStr).not.toContain('+14155551212');
+		expect(responseStr).not.toContain('+447700900123');
+		expect(responseStr).not.toContain('+14155551216');
+		expect(responseStr).not.toContain('+14155551215');
+
+		// Aliases are server-decodable
+		const { verifyCallerIdAlias } = await import('../src/dialpad-aliases.js');
+		expect(await verifyCallerIdAlias(json.callerIds[0].aliasId, env)).toBe('+14155551212');
+		expect(await verifyCallerIdAlias(json.callerIds[1].aliasId, env)).toBe('+447700900123');
+		expect(await verifyCallerIdAlias(json.callerIds[2].aliasId, env)).toBe('+14155551216');
+		expect(await verifyCallerIdAlias(json.callerIds[3].aliasId, env)).toBe('+14155551215');
+
+		// Hit the right Dialpad URL exactly once with the consultant's Dialpad user ID
+		const dpCalls = findCalls(calls, '/users/8000000000000001/caller_id');
+		expect(dpCalls).toHaveLength(1);
+	});
+
+	it('returns 502 ok=false when Dialpad caller_id lookup fails', async () => {
+		mockFetch([
+			{ match: '/users/8000000000000001/caller_id', status: 500, response: 'oops' },
+		]);
+
+		const request = new Request('http://example.com/dialpad-user-context', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({ consultantFirstName: 'Joel' }),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(502);
+		const json = await response.json();
+		expect(json.ok).toBe(false);
+	});
+});
+
+
+// ---------------------------------------------------------------------------
+// E2E: /dialpad-call — initiate a call via Dialpad with the picked caller-ID
+// ---------------------------------------------------------------------------
+
+describe('E2E: /dialpad-call', () => {
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	async function makeAlias(number) {
+		const { signCallerIdAlias } = await import('../src/dialpad-aliases.js');
+		return signCallerIdAlias(number, env);
+	}
+
+	it('returns 401 without X-Extension-Token', async () => {
+		const request = new Request('http://example.com/dialpad-call', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(401);
+	});
+
+	it('returns 403 ok=false when consultantFirstName is unknown', async () => {
+		const alias = await makeAlias('+14155551212');
+		const request = new Request('http://example.com/dialpad-call', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Nobody',
+				phoneNumber: '+14155551212',
+				callerAliasId: alias,
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(403);
+		const json = await response.json();
+		expect(json.ok).toBe(false);
+	});
+
+	it('returns 400 ok=false when phoneNumber is missing', async () => {
+		const alias = await makeAlias('+14155551212');
+		const request = new Request('http://example.com/dialpad-call', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				callerAliasId: alias,
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(400);
+		const json = await response.json();
+		expect(json.ok).toBe(false);
+		expect(json.error).toMatch(/phone/i);
+	});
+
+	it('returns 400 ok=false when callerAliasId is missing', async () => {
+		const request = new Request('http://example.com/dialpad-call', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				phoneNumber: '+14155551212',
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(400);
+		const json = await response.json();
+		expect(json.ok).toBe(false);
+		expect(json.error).toMatch(/caller/i);
+	});
+
+	it('returns 400 ok=false when callerAliasId is invalid / forged', async () => {
+		const request = new Request('http://example.com/dialpad-call', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				phoneNumber: '+14155551212',
+				callerAliasId: 'totally-fake-alias',
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(400);
+		const json = await response.json();
+		expect(json.ok).toBe(false);
+		expect(json.error).toMatch(/caller/i);
+	});
+
+	it('POSTs initiate_call with phone_number + outbound_caller_id (no device_id) and returns ok=true', async () => {
+		const alias = await makeAlias('+14155551212');
+		const calls = mockFetch([
+			{
+				match: '/users/8000000000000001/initiate_call',
+				response: { device: { id: 'native-1', type: 'native' } },
+			},
+		]);
+
+		const request = new Request('http://example.com/dialpad-call', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				phoneNumber: '+447700900123',
+				callerAliasId: alias,
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		const json = await response.json();
+		expect(json.ok).toBe(true);
+
+		const callCalls = findCalls(calls, '/users/8000000000000001/initiate_call');
+		expect(callCalls).toHaveLength(1);
+		const body = JSON.parse(callCalls[0].opts.body);
+		expect(body.phone_number).toBe('+447700900123');
+		expect(body.outbound_caller_id).toBe('+14155551212');
+		// Per user clarification — Dialpad auto-rings eligible devices when no device_id is given.
+		expect(body.device_id).toBeUndefined();
+
+		// Bearer auth on the upstream call
+		expect(callCalls[0].opts.headers.Authorization).toMatch(/^Bearer /);
+	});
+
+	it('returns 502 ok=false when Dialpad rejects the call (and surfaces upstream message)', async () => {
+		const alias = await makeAlias('+14155551212');
+		mockFetch([
+			{
+				match: '/users/8000000000000001/initiate_call',
+				status: 400,
+				response: { error: 'No active autocallable device' },
+			},
+		]);
+
+		const request = new Request('http://example.com/dialpad-call', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Joel',
+				phoneNumber: '+447700900123',
+				callerAliasId: alias,
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(502);
+		const json = await response.json();
+		expect(json.ok).toBe(false);
+		expect(json.error).toMatch(/Dialpad/i);
+	});
+});
+

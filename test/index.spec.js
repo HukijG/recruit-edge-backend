@@ -9,6 +9,8 @@ import {
 import { isMonitoredDialpadUser, getRFUserIdByDialpadId } from '../src/users.js';
 import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from '../src/apollo-client.js';
 import { isJoelCandidate, enrichCandidate } from '../src/enrichment.js';
+import { signCallerIdAlias, verifyCallerIdAlias } from '../src/dialpad-aliases.js';
+import { buildCallerIdsFromDialpad } from '../src/dialpad-client.js';
 
 describe('RF-Dialpad Sync Worker', () => {
 	it('/health returns 200 with status message', async () => {
@@ -1954,5 +1956,175 @@ describe('pickConsultantJob', () => {
 		};
 		const result = await pickConsultantJob(candidate, null, env);
 		expect(result.job_id).toBe(100);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// dialpad-aliases: opaque caller-id alias signing/verifying
+// ---------------------------------------------------------------------------
+
+describe('signCallerIdAlias / verifyCallerIdAlias', () => {
+	it('round-trips an E.164 number through sign + verify', async () => {
+		const alias = await signCallerIdAlias('+14155551212', env);
+		expect(typeof alias).toBe('string');
+		expect(alias.length).toBeGreaterThan(0);
+		expect(await verifyCallerIdAlias(alias, env)).toBe('+14155551212');
+	});
+
+	it('produces different aliases for different numbers', async () => {
+		const a = await signCallerIdAlias('+14155551212', env);
+		const b = await signCallerIdAlias('+447700900123', env);
+		expect(a).not.toBe(b);
+		expect(await verifyCallerIdAlias(a, env)).toBe('+14155551212');
+		expect(await verifyCallerIdAlias(b, env)).toBe('+447700900123');
+	});
+
+	it('returns null for a tampered alias', async () => {
+		const alias = await signCallerIdAlias('+14155551212', env);
+		const tampered = alias.slice(0, -3) + 'AAA';
+		expect(await verifyCallerIdAlias(tampered, env)).toBeNull();
+	});
+
+	it('returns null for empty / non-string input', async () => {
+		expect(await verifyCallerIdAlias('', env)).toBeNull();
+		expect(await verifyCallerIdAlias(null, env)).toBeNull();
+		expect(await verifyCallerIdAlias(undefined, env)).toBeNull();
+		expect(await verifyCallerIdAlias('not-a-jwt', env)).toBeNull();
+	});
+
+	it('rejects a token signed for a different audience (domain separation)', async () => {
+		const { SignJWT } = await import('jose');
+		const secretBytes = new TextEncoder().encode(env.LINKEDIN_EXTENSION_SECRET);
+		const wrongAud = await new SignJWT({ n: '+14155551212' })
+			.setProtectedHeader({ alg: 'HS256' })
+			.setIssuedAt()
+			.setAudience('something-else')
+			.setExpirationTime('24h')
+			.sign(secretBytes);
+		expect(await verifyCallerIdAlias(wrongAud, env)).toBeNull();
+	});
+
+	it('rejects an expired token', async () => {
+		const { SignJWT } = await import('jose');
+		const secretBytes = new TextEncoder().encode(env.LINKEDIN_EXTENSION_SECRET);
+		const expired = await new SignJWT({ n: '+14155551212' })
+			.setProtectedHeader({ alg: 'HS256' })
+			.setIssuedAt(Math.floor(Date.now() / 1000) - 7200)
+			.setAudience('dialpad-caller-id')
+			.setExpirationTime(Math.floor(Date.now() / 1000) - 3600)
+			.sign(secretBytes);
+		expect(await verifyCallerIdAlias(expired, env)).toBeNull();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// dialpad-client: buildCallerIdsFromDialpad — pure transform from raw API
+// shape to the extension-facing callerIds[] payload (with aliases).
+// ---------------------------------------------------------------------------
+
+describe('buildCallerIdsFromDialpad', () => {
+	const fakeSign = async (n) => `alias:${n}`;
+
+	it('returns [] for an empty Dialpad caller_id response', async () => {
+		expect(await buildCallerIdsFromDialpad({}, fakeSign)).toEqual([]);
+		expect(await buildCallerIdsFromDialpad(null, fakeSign)).toEqual([]);
+	});
+
+	it('emits phone_numbers entries with label "My number"', async () => {
+		const out = await buildCallerIdsFromDialpad({
+			caller_id: '+14155551212',
+			phone_numbers: ['+14155551212'],
+		}, fakeSign);
+		expect(out).toEqual([{
+			aliasId: 'alias:+14155551212',
+			country: 'US',
+			label: 'My number',
+			isDefault: true,
+		}]);
+	});
+
+	it('emits office_main_line with label "Office main line" and no isDefault when caller_id is unset', async () => {
+		const out = await buildCallerIdsFromDialpad({
+			office_main_line: '+14155559999',
+		}, fakeSign);
+		expect(out).toHaveLength(1);
+		expect(out[0]).toMatchObject({ country: 'US', label: 'Office main line' });
+		expect(out[0].isDefault).toBeUndefined();
+	});
+
+	it('emits groups[] with display_name as label', async () => {
+		const out = await buildCallerIdsFromDialpad({
+			groups: [{ caller_id: '+14155557777', display_name: 'Sales Team' }],
+		}, fakeSign);
+		expect(out).toHaveLength(1);
+		expect(out[0]).toMatchObject({ country: 'US', label: 'Sales Team' });
+	});
+
+	it('de-dupes by E.164 — first occurrence wins for label', async () => {
+		const out = await buildCallerIdsFromDialpad({
+			phone_numbers: ['+14155551212'],
+			groups: [{ caller_id: '+14155551212', display_name: 'Should not override' }],
+		}, fakeSign);
+		expect(out).toHaveLength(1);
+		expect(out[0].label).toBe('My number');
+	});
+
+	it('derives country from prefix: +44→UK, +1→US, +33→OTHER', async () => {
+		const out = await buildCallerIdsFromDialpad({
+			phone_numbers: ['+447700900123', '+14155551212', '+33123456789'],
+		}, fakeSign);
+		expect(out.map(c => c.country)).toEqual(['UK', 'US', 'OTHER']);
+	});
+
+	it('marks isDefault on the entry whose number matches caller_id', async () => {
+		const out = await buildCallerIdsFromDialpad({
+			caller_id: '+14155551215',
+			phone_numbers: ['+14155551212', '+14155551213'],
+			groups: [{ caller_id: '+14155551215', display_name: 'Sales' }],
+		}, fakeSign);
+		const def = out.filter(c => c.isDefault);
+		expect(def).toHaveLength(1);
+		expect(def[0].label).toBe('Sales');
+	});
+
+	it('does not mark any default when caller_id matches no entry', async () => {
+		const out = await buildCallerIdsFromDialpad({
+			caller_id: '+19999999999',
+			phone_numbers: ['+14155551212'],
+		}, fakeSign);
+		expect(out[0].isDefault).toBeUndefined();
+	});
+
+	it('walks phone_numbers, then office_main_line, then groups', async () => {
+		const out = await buildCallerIdsFromDialpad({
+			phone_numbers: ['+14155551111'],
+			office_main_line: '+14155552222',
+			groups: [{ caller_id: '+14155553333', display_name: 'G1' }],
+		}, fakeSign);
+		expect(out.map(c => c.label)).toEqual(['My number', 'Office main line', 'G1']);
+	});
+
+	it('skips invalid / non-E.164 entries silently', async () => {
+		const out = await buildCallerIdsFromDialpad({
+			phone_numbers: ['', null, 'not-a-number', '+14155551212'],
+			office_main_line: '   ',
+			groups: [
+				{ caller_id: '', display_name: 'no-number' },
+				{ caller_id: '+447777777777', display_name: 'UK Group' },
+			],
+		}, fakeSign);
+		expect(out).toHaveLength(2);
+		expect(out.map(c => c.country)).toEqual(['US', 'UK']);
+	});
+
+	it('does NOT include a phoneNumber field on entries (only aliasId)', async () => {
+		const out = await buildCallerIdsFromDialpad({
+			phone_numbers: ['+14155551212'],
+		}, fakeSign);
+		// Opacity of aliasId itself is enforced by the real signCallerIdAlias —
+		// see the e2e test for /dialpad-user-context. Here we just verify the
+		// shape doesn't include a plaintext-number field name.
+		expect(out[0]).not.toHaveProperty('phoneNumber');
+		expect(out[0]).not.toHaveProperty('number');
 	});
 });

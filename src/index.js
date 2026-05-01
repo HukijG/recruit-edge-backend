@@ -1,5 +1,9 @@
-import { createOrUpdateDialpadContact, patchDialpadContact, getDialpadContact } from './dialpad-client.js';
+import {
+  createOrUpdateDialpadContact, patchDialpadContact, getDialpadContact,
+  getUserCallerId, initiateCall, buildCallerIdsFromDialpad,
+} from './dialpad-client.js';
 import { verifyJWT } from './auth.js';
+import { signCallerIdAlias, verifyCallerIdAlias } from './dialpad-aliases.js';
 import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
@@ -21,7 +25,7 @@ import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
 import { processCallEvent, parseColdCallActivity, mergeTag } from './cold-call.js';
 import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enrichment.js';
 import { enrichPerson } from './apollo-client.js';
-import { resolveRFUserId } from './users.js';
+import { resolveRFUserId, getUserByFirstName } from './users.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -108,6 +112,22 @@ export default {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
         }
         return await handleCandidateDetailsEndpoint(request, env, ctx, corsHeaders);
+      }
+
+      if (url.pathname === '/dialpad-user-context' && request.method === 'POST') {
+        const extAuth = request.headers.get('X-Extension-Token');
+        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
+          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        }
+        return await handleDialpadUserContextEndpoint(request, env, corsHeaders);
+      }
+
+      if (url.pathname === '/dialpad-call' && request.method === 'POST') {
+        const extAuth = request.headers.get('X-Extension-Token');
+        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
+          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        }
+        return await handleDialpadCallEndpoint(request, env, corsHeaders);
       }
 
       return new Response('Not Found', {
@@ -1864,6 +1884,179 @@ async function handleNeighborPrewarm(rfId, jobId, recruiterRfUserId, env) {
       rfId,
       jobId,
       stack: error.stack,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Dialpad calling endpoints — wired up to the LinkedIn Recruiter extension.
+// /dialpad-user-context returns the consultant's caller-IDs (with opaque
+// alias tokens) so the extension can render its picker without ever seeing
+// raw E.164 numbers. /dialpad-call decodes the picked alias and asks Dialpad
+// to ring the consultant's eligible devices via initiate_call.
+// ---------------------------------------------------------------------------
+
+async function handleDialpadUserContextEndpoint(request, env, corsHeaders) {
+  const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  try {
+    const payload = await request.json();
+    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName.trim() : '';
+
+    if (!consultantFirstName) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    const user = getUserByFirstName(consultantFirstName);
+    if (!user) {
+      console.warn({
+        message: `[DialpadUserContext] unknown consultantFirstName="${consultantFirstName}"`,
+        source: 'dialpad-user-context',
+        consultantFirstName,
+      });
+      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+        status: 403, headers: responseHeaders,
+      });
+    }
+
+    let dpCallerId;
+    try {
+      dpCallerId = await getUserCallerId(user.dialpadId, env);
+    } catch (error) {
+      console.error({
+        message: `[DialpadUserContext] Dialpad caller_id fetch failed: ${error.message}`,
+        source: 'dialpad-user-context',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        stack: error.stack,
+      });
+      return new Response(JSON.stringify({ ok: false, error: 'Dialpad caller_id lookup failed' }), {
+        status: 502, headers: responseHeaders,
+      });
+    }
+
+    const callerIds = await buildCallerIdsFromDialpad(
+      dpCallerId,
+      (number) => signCallerIdAlias(number, env),
+    );
+
+    console.log({
+      message: `[DialpadUserContext] consultant=${consultantFirstName} callerIds=${callerIds.length}`,
+      source: 'dialpad-user-context',
+      consultantFirstName,
+      dialpadId: user.dialpadId,
+      callerIdCount: callerIds.length,
+    });
+
+    return new Response(JSON.stringify({ callerIds }), {
+      status: 200, headers: responseHeaders,
+    });
+  } catch (error) {
+    console.error({
+      message: `[DialpadUserContext] error: ${error.message}`,
+      source: 'dialpad-user-context',
+      stack: error.stack,
+    });
+    return new Response(JSON.stringify({ ok: false, error: 'Internal Server Error' }), {
+      status: 500, headers: responseHeaders,
+    });
+  }
+}
+
+async function handleDialpadCallEndpoint(request, env, corsHeaders) {
+  const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  try {
+    const payload = await request.json();
+    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName.trim() : '';
+    const phoneNumber = typeof payload.phoneNumber === 'string' ? payload.phoneNumber.trim() : '';
+    const callerAliasId = typeof payload.callerAliasId === 'string' ? payload.callerAliasId.trim() : '';
+
+    if (!consultantFirstName) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    const user = getUserByFirstName(consultantFirstName);
+    if (!user) {
+      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+        status: 403, headers: responseHeaders,
+      });
+    }
+
+    if (!phoneNumber) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing phone number' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+    if (!/^\+\d{6,}$/.test(phoneNumber)) {
+      return new Response(JSON.stringify({ ok: false, error: 'Invalid phone number' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    if (!callerAliasId) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing caller-ID selection' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    const outboundCallerId = await verifyCallerIdAlias(callerAliasId, env);
+    if (!outboundCallerId) {
+      return new Response(JSON.stringify({ ok: false, error: 'Invalid caller-ID selection — please refresh and try again' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    console.log({
+      message: `[DialpadCall] consultant=${consultantFirstName} → ${phoneNumber}`,
+      source: 'dialpad-call',
+      consultantFirstName,
+      dialpadId: user.dialpadId,
+      // Don't log the actual outbound number; just whether one was picked.
+      hasOutboundCallerId: true,
+    });
+
+    const result = await initiateCall({
+      userId: user.dialpadId,
+      phoneNumber,
+      outboundCallerId,
+    }, env);
+
+    if (!result.ok) {
+      const upstreamMsg = result.body?.error || result.body?.message || `HTTP ${result.status}`;
+      console.error({
+        message: `[DialpadCall] Dialpad rejected: ${upstreamMsg}`,
+        source: 'dialpad-call',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        upstreamStatus: result.status,
+        upstreamBody: result.body,
+      });
+      return new Response(JSON.stringify({
+        ok: false,
+        error: `Dialpad rejected the call: ${upstreamMsg}`,
+      }), { status: 502, headers: responseHeaders });
+    }
+
+    const responseBody = { ok: true };
+    const callId = result.body?.call_id || result.body?.id;
+    if (callId) responseBody.callId = callId;
+
+    return new Response(JSON.stringify(responseBody), {
+      status: 200, headers: responseHeaders,
+    });
+  } catch (error) {
+    console.error({
+      message: `[DialpadCall] error: ${error.message}`,
+      source: 'dialpad-call',
+      stack: error.stack,
+    });
+    return new Response(JSON.stringify({ ok: false, error: 'Internal Server Error' }), {
+      status: 500, headers: responseHeaders,
     });
   }
 }

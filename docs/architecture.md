@@ -17,6 +17,7 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 │                                                                                                              │
 │  /webhook/recruiterflow  /webhook/dialpad  /webhook/dialpad/calls  /webhook/calendar  /webhook/krisp        │
 │  /webhook/apollo  /candidates  /candidates/add-to-job  /candidate-details  /candidate-mark-invalid          │
+│  /dialpad-user-context  /dialpad-call                                                                        │
 │  /health                                                                                                     │
 │                                                                                                              │
 │  ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐       │
@@ -48,7 +49,8 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `src/users.js` | Team registry: hardcoded `USERS` array of `{ firstName, rfUserId, dialpadId }` records + accessors (`getUserByFirstName`, `getUserByDialpadId`, `getUserByRFUserId`, `resolveRFUserId`, `getRFUserIdByDialpadId`, `isMonitoredDialpadUser`). Single source of truth for cold-call attribution, calendar Joel-only logic, the extension's `consultantFirstName` resolution, and Apollo's Joel-only enrichment trigger |
 | `src/cache.js` | KV cache: canonical records, index keys (linkedin, email, name), consultant_id per job-link, details + activities snapshots, batch index, prewarm state, invalidation helper |
 | `src/rf-client.js` | RF API client: search/get/update, LinkedIn URL validation & normalization, Dialpad↔RF data conversion, custom-field consultant_id read/write/resolve, activity-list, phone normalization (`normalizeToE164`), job disambiguation (`pickConsultantJob`), stage-move filter, prewarm helper, single-retry-on-502 in `getRFCandidate` |
-| `src/dialpad-client.js` | Dialpad API client: contact PUT (create/update), data preparation from RF candidate format |
+| `src/dialpad-client.js` | Dialpad API client: contact PUT (create/update), data preparation from RF candidate format, `getUserCallerId` (fetch the consultant's caller-IDs) and `initiateCall` (POST `/users/{id}/initiate_call`) for the LinkedIn extension calling flow, plus the pure `buildCallerIdsFromDialpad` transform that turns Dialpad's flat `caller_id` shape into the extension-facing `callerIds[]` array with opaque aliases |
+| `src/dialpad-aliases.js` | Opaque caller-ID alias signing/verifying for the calling endpoints (HS256 JWT via `jose`, audience `dialpad-caller-id`, 7-day TTL). Keeps raw E.164 numbers off the wire to the extension |
 | `src/krisp.js` | Krisp helpers: note formatting (HTML), candidate email extraction from meeting participants |
 | `src/cold-call.js` | Cold call detection: monitored-user filter (registry-driven), Dialpad transcript fetch, Workers AI classification (Llama 3.3 70B), per-outcome summary extraction (Llama 3.1 8B), RF custom activity + tag/source update + Sourced→Replied stage move, generic `mergeTag(tags, value)` helper, `parseColdCallActivity` for the extension shape |
 | `src/apollo-client.js` | Apollo API client: enrichment, search, verification, scoring |
@@ -77,6 +79,8 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `/candidates/add-to-job` | POST | `X-Extension-Token` header | Add candidates to a job + write `consultant_id` custom field |
 | `/candidate-details` | POST | `X-Extension-Token` header | Sidepanel data: rfId, phone (E.164), picked job, cold-call activities |
 | `/candidate-mark-invalid` | POST | `X-Extension-Token` header | Tag candidate `"Number Invalid"` (idempotent) |
+| `/dialpad-user-context` | POST | `X-Extension-Token` header | Caller-ID picker data: `{ callerIds: [{ aliasId, country, label?, isDefault? }] }` (opaque aliases, no raw E.164) |
+| `/dialpad-call` | POST | `X-Extension-Token` header | Initiate call via Dialpad `initiate_call`. Decodes `callerAliasId`; Dialpad auto-rings the consultant's eligible devices |
 
 ---
 
@@ -410,6 +414,60 @@ Extension → POST /candidate-mark-invalid (consultantFirstName, rfId)
 
 Phone is left in place. No custom activity is written. consultantFirstName is logged for traceability but doesn't drive any attribution write (RF tag updates don't carry per-action attribution).
 
+### `POST /dialpad-user-context` — caller-ID picker data
+
+```
+Extension → POST /dialpad-user-context (consultantFirstName)
+  → Verify X-Extension-Token (401 ok=false on miss)
+  → 400 ok=false if consultantFirstName missing
+  → resolve consultantFirstName → user via getUserByFirstName(name)
+  → 403 ok=false if not in the registry
+  → GET https://dialpad.com/api/v2/users/{user.dialpadId}/caller_id
+  → 502 ok=false if Dialpad fetch fails (upstream details in CF Logs only)
+  → buildCallerIdsFromDialpad(response, signCallerIdAlias):
+      - Walk: phone_numbers ("My number"), office_main_line ("Office main line"), groups[] (display_name)
+      - De-dupe by E.164 (first occurrence wins for label)
+      - Skip empty / non-E.164 entries silently
+      - Mark isDefault=true on the entry whose number === response.caller_id
+      - Country: +44 → UK, +1 → US, anything else → OTHER
+      - Replace each E.164 with an opaque alias via signCallerIdAlias()
+  → Response: { callerIds: [{ aliasId, country, label, isDefault? }] }
+```
+
+The response body never contains a raw phone number. The extension caches the response locally (TTL ~1h, keyed by consultant) and uses the aliases verbatim on `/dialpad-call`.
+
+### `POST /dialpad-call` — initiate a call
+
+```
+Extension → POST /dialpad-call (consultantFirstName, phoneNumber, callerAliasId)
+  → Verify X-Extension-Token (401 ok=false on miss)
+  → 400 ok=false if consultantFirstName missing
+  → resolve consultantFirstName → user via getUserByFirstName(name)
+  → 403 ok=false if not in the registry
+  → 400 ok=false if phoneNumber missing or non-E.164
+  → 400 ok=false if callerAliasId missing
+  → verifyCallerIdAlias(callerAliasId) → outboundCallerId (E.164)
+  → 400 ok=false ("Invalid caller-ID selection — please refresh and try again") if alias is tampered/expired/unknown
+  → POST https://dialpad.com/api/v2/users/{user.dialpadId}/initiate_call
+       body: { phone_number, outbound_caller_id }   (NO device_id — Dialpad auto-rings)
+  → 502 ok=false ("Dialpad rejected the call: <upstream message>") if non-2xx
+  → Response: { ok: true, callId? }
+```
+
+Dialpad's `initiate_call` endpoint deliberately does not take a `device_id` — Dialpad auto-rings every eligible autocallable device the consultant has registered (Electron desktop app, web, CRM embeds), and the recruiter just picks up wherever rings. This is why `/dialpad-user-context` only returns caller IDs, not devices.
+
+### Caller-ID alias signing
+
+`src/dialpad-aliases.js` mints HS256 JWTs to swap raw E.164 numbers for opaque tokens before they leave the worker:
+
+- **Signing key**: `LINKEDIN_EXTENSION_SECRET` (the same secret the extension already uses for `X-Extension-Token` auth — no new secret to provision).
+- **Audience**: `dialpad-caller-id`. Domain-separates these from anything else signed with the same secret. A token minted for caller-ID lookup can never be replayed against another JWT-using path.
+- **Expiry**: 7 days. Caller-ID lists rarely change in practice and the extension's local 1h cache typically expires long before the alias does — picking a longer TTL avoids any race where the cached alias outlives its server-side validity.
+- **Payload**: `{ n: "+1...", iat, exp, aud }`.
+- **Verification failures** (tampered, expired, wrong audience, malformed, missing) all return `null` — never throw. The route handler turns `null` into a 400 with a stable user-facing message.
+
+Tradeoff: the JWT format means a determined extension user could base64-decode the body to read the underlying number. That number is one of their own consultant's caller IDs, fetched seconds earlier from Dialpad — there's no real secret to leak. The crucial property is tamper-resistance: the extension can't forge an alias for an arbitrary number and trick the worker into dialling out from it. HMAC handles that.
+
 ### Extension Caching Strategy
 
 The bulk-add → cold-call session pattern (50-200 candidates added at once, walked through one-by-one over 1-3 days) is the primary perf target. Two cooperating layers:
@@ -525,7 +583,7 @@ Example: `https://www.LinkedIn.com/in/John-Smith/?utm_source=share` → `linkedi
 | `KRISP_WEBHOOK_SECRET` | Shared secret verification for Krisp webhooks |
 | `APOLLO_API_KEY` | Apollo API (Bearer auth) |
 | `APOLLO_WEBHOOK_SECRET` | Token query param verification for Apollo phone webhooks |
-| `LINKEDIN_EXTENSION_SECRET` | Shared secret for `X-Extension-Token` on extension routes |
+| `LINKEDIN_EXTENSION_SECRET` | Shared secret for `X-Extension-Token` on extension routes; also used as the HMAC key for opaque caller-ID aliases on `/dialpad-user-context` and `/dialpad-call` (domain-separated by JWT audience) |
 
 ### Test bindings (in `vitest.config.js`, never deployed)
 
@@ -564,6 +622,8 @@ Example: `https://www.LinkedIn.com/in/John-Smith/?utm_source=share` → `linkedi
 - **Upsert contact**: `PUT /contacts` with UID-based idempotency
 - **UID format**: `RF{candidateId}` → Dialpad generates full ID `shared_contact_pool_Company:{companyId}_uid_RF{candidateId}`
 - **Webhook auth**: JWT (HS256) in Authorization header or raw body
+- **User caller-IDs**: `GET /users/{userId}/caller_id` → flat shape `{ caller_id, phone_numbers, office_main_line, groups[], ... }` (NOT wrapped in `caller_id_proto` despite some old docs samples)
+- **Initiate call**: `POST /users/{userId}/initiate_call` with `{ phone_number, outbound_caller_id }`. We deliberately omit `device_id` — Dialpad auto-rings every eligible autocallable device the user has registered, which is exactly what we want
 
 ---
 
