@@ -425,7 +425,8 @@ Extension → POST /dialpad-user-context (consultantFirstName)
   → GET https://dialpad.com/api/v2/users/{user.dialpadId}/caller_id
   → 502 ok=false if Dialpad fetch fails (upstream details in CF Logs only)
   → buildCallerIdsFromDialpad(response, signCallerIdAlias):
-      - Walk: phone_numbers ("My number"), office_main_line ("Office main line"), groups[] (display_name)
+      - Walk: phone_numbers ("My number"), groups[] (display_name)
+      - office_main_line is intentionally skipped — never used in practice
       - De-dupe by E.164 (first occurrence wins for label)
       - Skip empty / non-E.164 entries silently
       - Mark isDefault=true on the entry whose number === response.caller_id

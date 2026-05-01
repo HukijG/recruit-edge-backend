@@ -2043,13 +2043,11 @@ describe('buildCallerIdsFromDialpad', () => {
 		}]);
 	});
 
-	it('emits office_main_line with label "Office main line" and no isDefault when caller_id is unset', async () => {
+	it('does NOT emit office_main_line — never used in practice', async () => {
 		const out = await buildCallerIdsFromDialpad({
 			office_main_line: '+14155559999',
 		}, fakeSign);
-		expect(out).toHaveLength(1);
-		expect(out[0]).toMatchObject({ country: 'US', label: 'Office main line' });
-		expect(out[0].isDefault).toBeUndefined();
+		expect(out).toEqual([]);
 	});
 
 	it('emits groups[] with display_name as label', async () => {
@@ -2095,19 +2093,18 @@ describe('buildCallerIdsFromDialpad', () => {
 		expect(out[0].isDefault).toBeUndefined();
 	});
 
-	it('walks phone_numbers, then office_main_line, then groups', async () => {
+	it('walks phone_numbers, then groups (office_main_line skipped)', async () => {
 		const out = await buildCallerIdsFromDialpad({
 			phone_numbers: ['+14155551111'],
 			office_main_line: '+14155552222',
 			groups: [{ caller_id: '+14155553333', display_name: 'G1' }],
 		}, fakeSign);
-		expect(out.map(c => c.label)).toEqual(['My number', 'Office main line', 'G1']);
+		expect(out.map(c => c.label)).toEqual(['My number', 'G1']);
 	});
 
 	it('skips invalid / non-E.164 entries silently', async () => {
 		const out = await buildCallerIdsFromDialpad({
 			phone_numbers: ['', null, 'not-a-number', '+14155551212'],
-			office_main_line: '   ',
 			groups: [
 				{ caller_id: '', display_name: 'no-number' },
 				{ caller_id: '+447777777777', display_name: 'UK Group' },

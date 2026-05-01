@@ -2084,19 +2084,24 @@ describe('E2E: /dialpad-user-context', () => {
 		const json = await response.json();
 
 		expect(Array.isArray(json.callerIds)).toBe(true);
-		expect(json.callerIds).toHaveLength(4);
+		// office_main_line is intentionally skipped, so the upstream's
+		// 4 candidate numbers collapse to 3 in the response.
+		expect(json.callerIds).toHaveLength(3);
 
-		// Order: phone_numbers, office_main_line, groups
+		// Order: phone_numbers, groups (office_main_line is dropped)
 		expect(json.callerIds[0]).toMatchObject({ country: 'US', label: 'My number', isDefault: true });
 		expect(json.callerIds[1]).toMatchObject({ country: 'UK', label: 'My number' });
 		expect(json.callerIds[1].isDefault).toBeUndefined();
-		expect(json.callerIds[2]).toMatchObject({ country: 'US', label: 'Office main line' });
-		expect(json.callerIds[3]).toMatchObject({ country: 'US', label: 'Sales Team' });
+		expect(json.callerIds[2]).toMatchObject({ country: 'US', label: 'Sales Team' });
+
+		// No "Office main line" entry leaked through
+		expect(json.callerIds.find(c => c.label === 'Office main line')).toBeUndefined();
 
 		// At most one default
 		expect(json.callerIds.filter(c => c.isDefault).length).toBe(1);
 
-		// No plaintext phone numbers anywhere in the body
+		// No plaintext phone numbers anywhere in the body — including the
+		// office_main_line number, which the worker now drops entirely.
 		const responseStr = JSON.stringify(json);
 		expect(responseStr).not.toContain('+14155551212');
 		expect(responseStr).not.toContain('+447700900123');
@@ -2107,8 +2112,7 @@ describe('E2E: /dialpad-user-context', () => {
 		const { verifyCallerIdAlias } = await import('../src/dialpad-aliases.js');
 		expect(await verifyCallerIdAlias(json.callerIds[0].aliasId, env)).toBe('+14155551212');
 		expect(await verifyCallerIdAlias(json.callerIds[1].aliasId, env)).toBe('+447700900123');
-		expect(await verifyCallerIdAlias(json.callerIds[2].aliasId, env)).toBe('+14155551216');
-		expect(await verifyCallerIdAlias(json.callerIds[3].aliasId, env)).toBe('+14155551215');
+		expect(await verifyCallerIdAlias(json.callerIds[2].aliasId, env)).toBe('+14155551215');
 
 		// Hit the right Dialpad URL exactly once with the consultant's Dialpad user ID
 		const dpCalls = findCalls(calls, '/users/8000000000000001/caller_id');

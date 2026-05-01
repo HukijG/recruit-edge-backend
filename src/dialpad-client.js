@@ -260,7 +260,7 @@ export async function buildCallerIdsFromDialpad(dpCallerId, sign) {
   if (Array.isArray(dpCallerId.phone_numbers)) {
     for (const n of dpCallerId.phone_numbers) push(n, 'My number');
   }
-  push(dpCallerId.office_main_line, 'Office main line');
+  // office_main_line is intentionally skipped — never used in practice.
   if (Array.isArray(dpCallerId.groups)) {
     for (const g of dpCallerId.groups) {
       if (!g) continue;
