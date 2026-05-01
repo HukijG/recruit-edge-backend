@@ -136,6 +136,62 @@ In rough order of effort vs payoff:
 
 User has flagged a deeper rearchitecture: queue-backed event processing with a message bus, ordered consumption, idempotent handlers. That's a different scale of project — months not days. The DO migration we just did is a stepping stone toward it (DOs are a reasonable home for the per-user actor model that a queue+bus design would converge to). Out of scope for this writeup.
 
+## Alternative architecture: per-user Dialpad WebSocket subscriptions
+
+The cleanest answer to the entire class of issues above is to **stop using webhooks for call-state and use Dialpad's WebSocket subscriptions instead**, scoped to the individual user and to the specific call we just placed.
+
+### The core insight
+
+Webhooks are a *broadcast firehose* — every state event for every user in the company hits one URL. We then have to:
+- Filter by `target.id` to figure out which user it's for
+- Filter by `direction` to ignore inbound calls
+- Match `external_number` against a watch entry to figure out which extension click triggered it
+- Dedupe retries and out-of-order deliveries
+
+All of that complexity exists because we're trying to recover the call-context that was discarded when Dialpad fanned the event out to a global webhook.
+
+WebSocket subscriptions can be **created and destroyed programmatically, scoped to a single user, scoped to specific call states**. So we never have to recover context — we just don't lose it in the first place.
+
+### How it would work
+
+Per-user setup (once, at hire time — automatable when adding to the team registry):
+- Worker creates a Dialpad WebSocket subscription scoped to that user_id, subscribed to no events initially.
+
+Per-call flow:
+1. User clicks Call. Extension hits `/dialpad-call` as today.
+2. Worker resolves the consultant's WebSocket connection (or opens it if not already alive — likely held in a per-user Durable Object similar to today).
+3. Worker **subscribes the socket to `calling` and `hangup` events** for this user.
+4. Worker pauses (microsecond-scale) and sends the Dialpad `initiate_call` API request.
+5. The very next event arriving on this socket *is* our call. No filtering needed — we know it's outbound (because we just initiated it), we know the user (the socket is theirs), and the timing window is so tight that any other event would be statistically improbable. Grab the `call_id` from this event.
+6. Stream `state: active` to the extension. Listen on the socket for the matching `hangup` event.
+7. On hangup: stream `state: ended`, unsubscribe the socket from `calling`/`hangup`, idle.
+
+### Why this is structurally better
+
+- **No multi-tenant routing.** The socket only carries one user's events.
+- **No webhook firehose to parse.** We're not filtering through hundreds of events to find ours; we're literally consuming one targeted stream.
+- **No phone-number-match heuristic.** We don't need to remember "the user just dialled +44...". The socket *is* the heuristic — anything appearing during our subscription window is ours.
+- **No dedup needed for the common case.** Sockets don't retry the way webhook delivery does. Out-of-order is also less likely (a single TCP-ordered stream).
+- **Lower latency.** Sockets are persistent, no per-event HTTPS handshake overhead. Events show up faster after Dialpad emits them.
+- **Cleanly composable.** Add a new state type (e.g., `connected`, `recording`) by subscribing to it. Drop one by unsubscribing. No deploy-time webhook config dance.
+
+### What it would cost / replace
+
+- The `/webhook/dialpad/extension-calls` HTTP endpoint goes away entirely.
+- The state-machine logic in `extension-calls.js` simplifies to "what came on the socket during my subscription window?" — way less code.
+- The per-user Durable Object becomes the natural home for the WebSocket connection (DOs already support hibernating WebSockets, so an idle socket costs ~0).
+- One-time programmatic setup of per-user Dialpad subscriptions; tear-down on user removal from registry.
+
+### Why we're not doing it now
+
+It's a meaningful rebuild of the entire call-state surface, not a patch. We've already got DO + KV + webhook plumbing in place that *mostly* works, and the user's primary use case (single-recruiter testing) tolerates the current flakiness. Worth circling back to once the team grows or the flakiness starts costing real recruiter time.
+
+### Trigger to revisit
+
+- Adding a third recruiter (Joel + Alice + N) — webhook-firehose filtering cost is per-recruiter and hits us O(team_size × call_volume).
+- A real production incident where the wrong call's state leaks to the wrong user's button (collision on phone-match heuristic).
+- Wanting `connected` / `recording` / other lifecycle states on the extension (would be near-trivial with sockets, additive but messy with webhooks).
+
 ## Files to remember
 
 - `src/extension-call-do.js` — DO class. Holds writers, watch+active in DO storage, RPC methods (`getWatch`, `setActive`, `clearAll`, `pushState`), heartbeat alarm.
