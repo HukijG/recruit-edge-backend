@@ -27,8 +27,6 @@ const CONSULTANT_CACHE_TTL = 30 * 24 * 60 * 60; // 30 days in seconds
 const DETAILS_CACHE_TTL = 20 * 60; // 20 minutes
 const BATCH_INDEX_TTL = 30 * 24 * 60 * 60; // 30 days
 const PREWARM_STATE_TTL = 60 * 60; // 1 hour (per-session lifetime)
-const EXT_CALL_WATCH_TTL = 90; // 90 seconds — just long enough to catch Dialpad's calling event
-const EXT_CALL_ACTIVE_TTL = 30 * 60; // 30 minutes — max plausible call length
 
 /**
  * Write canonical record + all index keys for a candidate.
@@ -317,68 +315,3 @@ export async function setPrewarmState(rfUserId, jobId, state, env) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Extension call-tracker state.
-//
-// Two keys per Dialpad user, written by /dialpad-call and the new
-// /webhook/dialpad/extension-calls handler:
-//   extcall:watch:{dialpadUserId}  → { phone, initiatedAt } (90s TTL)
-//   extcall:active:{dialpadUserId} → { callId, phone, startedAt } (30min TTL)
-//
-// Lifecycle:
-//   /dialpad-call → clears both, then writes watch with destination phone
-//   Dialpad 'calling' event matches watch.phone → promotes to active, clears watch
-//   Dialpad 'hangup' event matches active.callId → clears active
-//   /dialpad-hangup → reads active.callId, calls Dialpad hangup, clears active
-// One-in-one-out: every fresh /dialpad-call clears whatever state was there.
-// ---------------------------------------------------------------------------
-
-export async function setExtensionCallWatch(dialpadUserId, phone, env) {
-  if (!dialpadUserId || !phone) return;
-  const key = `extcall:watch:${dialpadUserId}`;
-  const value = JSON.stringify({ phone, initiatedAt: Date.now() });
-  await env.SYNC_STATE.put(key, value, { expirationTtl: EXT_CALL_WATCH_TTL });
-}
-
-export async function getExtensionCallWatch(dialpadUserId, env) {
-  if (!dialpadUserId) return null;
-  const raw = await env.SYNC_STATE.get(`extcall:watch:${dialpadUserId}`);
-  if (!raw) return null;
-  try { return JSON.parse(raw); } catch { return null; }
-}
-
-export async function clearExtensionCallWatch(dialpadUserId, env) {
-  if (!dialpadUserId) return;
-  await env.SYNC_STATE.delete(`extcall:watch:${dialpadUserId}`);
-}
-
-export async function setActiveExtensionCall(dialpadUserId, callId, phone, env) {
-  if (!dialpadUserId || !callId) return;
-  const key = `extcall:active:${dialpadUserId}`;
-  const value = JSON.stringify({ callId: String(callId), phone, startedAt: Date.now() });
-  await env.SYNC_STATE.put(key, value, { expirationTtl: EXT_CALL_ACTIVE_TTL });
-}
-
-export async function getActiveExtensionCall(dialpadUserId, env) {
-  if (!dialpadUserId) return null;
-  const raw = await env.SYNC_STATE.get(`extcall:active:${dialpadUserId}`);
-  if (!raw) return null;
-  try { return JSON.parse(raw); } catch { return null; }
-}
-
-export async function clearActiveExtensionCall(dialpadUserId, env) {
-  if (!dialpadUserId) return;
-  await env.SYNC_STATE.delete(`extcall:active:${dialpadUserId}`);
-}
-
-/**
- * Clear both watch and active keys for a user — used on every fresh
- * /dialpad-call to enforce the one-in-one-out invariant the design relies on.
- */
-export async function clearExtensionCallState(dialpadUserId, env) {
-  if (!dialpadUserId) return;
-  await Promise.all([
-    env.SYNC_STATE.delete(`extcall:watch:${dialpadUserId}`),
-    env.SYNC_STATE.delete(`extcall:active:${dialpadUserId}`),
-  ]);
-}

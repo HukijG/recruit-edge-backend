@@ -1,5 +1,7 @@
 # Architecture & Data Flow
 
+> **Status note (2026-05-03):** Call-state-related sections in this document (anything mentioning `extcall:watch`, `extcall:active`, `EXT_CALL_CHANNEL`, `ExtensionCallStateChannel`, `/webhook/dialpad/extension-calls`, `/extension-call-stream`, or SSE-over-DO fan-out) are obsolete. Cleanup landed first; full polling-based replacement is pending. See `CLAUDE.md` for the current state and `docs/archive/specs/2026-05-03-call-state-polling-design.md` for the target design. The system-overview diagram, file table, and endpoints table below have been trimmed; the detailed code-flow sections still reference the old design and will be rewritten with the implementation.
+
 ## System Overview
 
 A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact records in sync across RecruiterFlow (RF), Dialpad, Google Calendar, Krisp, and a custom LinkedIn Recruiter Chrome extension. RF is the source of truth for candidate records. A KV-backed cache provides fast lookups for integrations that don't have an RF candidate ID, and short-TTL snapshot caches make the extension's sidepanel responsive when recruiters walk through bulk-added candidate queues.
@@ -15,10 +17,10 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                                Cloudflare Worker (rf-dialpad-sync-dev)                                      │
 │                                                                                                              │
-│  /webhook/recruiterflow  /webhook/dialpad  /webhook/dialpad/calls  /webhook/dialpad/extension-calls         │
+│  /webhook/recruiterflow  /webhook/dialpad  /webhook/dialpad/calls                                          │
 │  /webhook/calendar  /webhook/krisp  /webhook/apollo                                                         │
 │  /candidates  /candidates/add-to-job  /candidate-details  /candidate-mark-invalid                           │
-│  /dialpad-user-context  /dialpad-call  /dialpad-sms  /dialpad-hangup  /extension-call-stream (SSE)          │
+│  /dialpad-user-context  /dialpad-call  /dialpad-sms  /dialpad-hangup  /extension-call-status               │
 │  /health                                                                                                     │
 │                                                                                                              │
 │  ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐       │
@@ -37,17 +39,10 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 │  │  batch:job{jobId}                       → ordered rfId array         (30-day TTL)                 │       │
 │  │  prewarm:rec{rfUserId}:job{jobId}       → { lastPrewarmIdx }         (1-hour TTL)                 │       │
 │  │  ratelimit:call:{dialpadUserId}         → JSON [{t,phone}]           (120-sec TTL)                │       │
-│  │  extcall:watch:{dialpadUserId}          → { phone, initiatedAt }     (90-sec TTL)                 │       │
-│  │  extcall:active:{dialpadUserId}         → { callId, phone, ... }     (30-min TTL)                 │       │
+│  │  extcall:callid:{dialpadUserId}         → Dialpad call_id string     (20-min TTL)                 │       │
 │  └──────────────────────────────────────────────────────────────────────────────────────────────────┘       │
 │                                                                                                              │
-│  ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐       │
-│  │                    Durable Object: EXT_CALL_CHANNEL                                                │       │
-│  │  ExtensionCallStateChannel — one instance per Dialpad user (getByName(dialpadUserId)).             │       │
-│  │  In-memory Set<WriterStream> of subscribed SSE writers; no persistent storage.                     │       │
-│  │  fetch() → SSE stream + KV-replayed initial state. pushState() RPC fans out.                       │       │
-│  │  alarm() → 25s heartbeat while writers exist.                                                      │       │
-│  └──────────────────────────────────────────────────────────────────────────────────────────────────┘       │
+│  No active Durable Objects. Migration v2 declares `ExtensionCallStateChannel` deletion.                     │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -62,8 +57,6 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `src/cache.js` | KV cache: canonical records, index keys (linkedin, email, name), consultant_id per job-link, details + activities snapshots, batch index, prewarm state, invalidation helper |
 | `src/rf-client.js` | RF API client: search/get/update, LinkedIn URL validation & normalization, Dialpad↔RF data conversion, custom-field consultant_id read/write/resolve, activity-list, phone normalization (`normalizeToE164`), job disambiguation (`pickConsultantJob`), stage-move filter, prewarm helper, single-retry-on-502 in `getRFCandidate` |
 | `src/dialpad-client.js` | Dialpad API client: contact PUT (create/update), data preparation from RF candidate format, `getUserCallerId` (fetch the consultant's caller-IDs) and `initiateCall` (POST `/users/{id}/initiate_call`) for the LinkedIn extension calling flow, plus the pure `buildCallerIdsFromDialpad` transform that turns Dialpad's flat `caller_id` shape into the extension-facing `callerIds[]` array with opaque aliases. Also `sendSMS` (POST `/sms`) — rolled-params wrapper backing `/dialpad-sms`; required: `userId`, `toNumbers`, `text`; optional pass-throughs for `fromNumber`, `inferCountryCode`, `media`, `senderGroupId`, `senderGroupType`, `channelHashtag`. And `hangupCall({ callId })` (PUT `/call/{id}/actions/hangup`) — no body, returns `{ ok, status, body }` |
-| `src/extension-calls.js` | Extension call-state machine + push wrapper. `processExtensionCallEvent(payload, env, ctx)` filters Dialpad calling/hangup webhook events (outbound-only on `calling`, registry-user-only via `getUserByDialpadId`, phone-match on watch, call_id-match on hangup), transitions `extcall:watch` → `extcall:active` and back, and calls `notifyExtensionCallState`. `notifyExtensionCallState` resolves the per-user DO via `EXT_CALL_CHANNEL.getByName(dialpadUserId)` and broadcasts via `pushState({ state, phoneNumber })` RPC (the call_id is intentionally never on the wire to the extension) |
-| `src/extension-call-do.js` | `ExtensionCallStateChannel` Durable Object — per-Dialpad-user SSE fan-in. `fetch()` returns an SSE Response, replays current state from KV (active or watch) on connect, registers a writer, schedules a heartbeat alarm if not already scheduled. `pushState(event)` RPC iterates writers, dropping dead ones. `alarm()` sends `: keepalive\n\n` every 25s while writers exist; reschedules itself. No persistent storage used — subscribers are in-memory only; on DO eviction the streams die and the extension reconnects with replay |
 | `src/dialpad-aliases.js` | Opaque caller-ID alias signing/verifying for the calling endpoints (HS256 JWT via `jose`, audience `dialpad-caller-id`, 7-day TTL). Keeps raw E.164 numbers off the wire to the extension |
 | `src/rate-limit.js` | Rolling-window rate-limit + cheap dedup gate for `/dialpad-call`. Pure `decideCallRateLimit({timestamps, now, phoneNumber})` returns `{allowed, reason?, retryAfterSec?, nextTimestamps?}`. KV-backed `checkAndRecordCall` reads SYNC_STATE, decides, persists on allow. 5 calls/60s rolling per Dialpad user_id, plus a 3s per-(user,phone) dedup window for double-clicks |
 | `src/krisp.js` | Krisp helpers: note formatting (HTML), candidate email extraction from meeting participants |
@@ -89,17 +82,16 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `/webhook/calendar` | POST | `X-Calendar-Webhook-Token` header | Calendar booking events (from Apps Script) |
 | `/webhook/krisp` | POST | `X-Krisp-Webhook-Token` header | Krisp meeting note webhooks |
 | `/webhook/dialpad/calls` | POST | JWT Bearer (HS256) | Dialpad call transcription/voicemail webhooks |
-| `/webhook/dialpad/extension-calls` | POST | JWT Bearer (HS256, same `DIALPAD_WEBHOOK_SECRET`) | Dialpad call-state webhooks (calling/hangup) — drives extension button toggle |
 | `/webhook/apollo` | POST | `?token=` query param (`APOLLO_WEBHOOK_SECRET`) | Async phone reveal delivery from Apollo |
 | `/candidates` | POST | `X-Extension-Token` header | LinkedIn extension batch upsert (sets `lead_owner_id`) |
 | `/candidates/add-to-job` | POST | `X-Extension-Token` header | Add candidates to a job + write `consultant_id` custom field |
 | `/candidate-details` | POST | `X-Extension-Token` header | Sidepanel data: rfId, phone (E.164), picked job, cold-call activities |
 | `/candidate-mark-invalid` | POST | `X-Extension-Token` header | Tag candidate `"Number Invalid"` (idempotent) |
 | `/dialpad-user-context` | POST | `X-Extension-Token` header | Caller-ID picker data: `{ callerIds: [{ aliasId, country, label?, isDefault? }] }` (opaque aliases, no raw E.164) |
-| `/dialpad-call` | POST | `X-Extension-Token` header | Initiate call via Dialpad `initiate_call`. Decodes `callerAliasId`; Dialpad auto-rings the consultant's eligible devices. Writes `extcall:watch` before invoking Dialpad. Response is `{ ok: true }` only (no `callId` — worker holds it server-side) |
+| `/dialpad-call` | POST | `X-Extension-Token` header | Initiate call via Dialpad `initiate_call`. Decodes `callerAliasId`; Dialpad auto-rings eligible devices. Clears any cached `extcall:callid` after Dialpad accepts. Response is `{ ok: true }` only (no `callId` — extension never sees it) |
 | `/dialpad-sms` | POST | `X-Extension-Token` header | Send a single SMS via Dialpad `/sms`. Decodes `callerAliasId` (optional → Dialpad default sender); text is forwarded verbatim |
-| `/dialpad-hangup` | POST | `X-Extension-Token` header | Terminate the consultant's active call. Body is just `{ consultantFirstName }`; worker reads `call_id` from `extcall:active`. 409 if no active call |
-| `/extension-call-stream` | GET | **None (intentionally — see Auth section below)** | SSE stream consumed via `EventSource`. State events (`idle | calling | active | ended`) pushed per-Dialpad-user via the `EXT_CALL_CHANNEL` Durable Object |
+| `/dialpad-hangup` | POST | `X-Extension-Token` header | Terminate the consultant's active call. Body is just `{ consultantFirstName }`; worker reads `call_id` from `extcall:callid` KV. 409 if no call_id cached |
+| `/extension-call-status` | POST | `X-Extension-Token` header | Polled ~every 500ms by extension after a `/dialpad-call`. Returns `{ state: "in_progress" \| "ended" }`. First poll discovers the Dialpad `call_id` via call-list and caches it; subsequent polls read call info |
 
 ---
 
