@@ -1,0 +1,29 @@
+{
+  "_note": "Sanitized example of the Krisp `note_generated` webhook (current as of 2026-06-04). Replaces the retired `summary_generated` shape: `data.content[]` is gone; the meeting notes now arrive as a single markdown string in `data.raw_content`, with an additional structured `data.sections` object (often null) and a short `data.raw_meeting` header line. Candidate details below are fabricated.",
+  "id": "019e93d8244970c0aa4bb0a21171ff78",
+  "event": "note_generated",
+  "data": {
+    "meeting": {
+      "id": "019e93af3ee275cb846af38d3ebe4418",
+      "title": "Jane Candidate // Alex Recruiter Intro Call",
+      "duration": 1283,
+      "owner": { "id": 8906372, "email": "owner@example.com" },
+      "calendar_event_id": "<opaque-calendar-id>",
+      "participants": [
+        { "last_name": "Recruiter", "id": "fe4a42f5f2a8584cb93d3a78201a6324", "first_name": "Alex", "email": "owner@example.com" },
+        { "last_name": null, "id": "c0c9946f-e1d4-49da-946b-d069571ff8ef", "first_name": null, "email": "jane.candidate@example.com" }
+      ],
+      "speakers": [
+        { "index": 1, "last_name": "Recruiter", "id": "fe4a42f5f2a8584cb93d3a78201a6324", "first_name": "Alex", "email": "owner@example.com" },
+        { "index": 2, "last_name": "", "id": "8543bad495eb532ca05155c3bf04b2ab", "first_name": "Jane", "email": "jane.candidate@example.com" }
+      ],
+      "start_date": "2026-06-04T17:29:24.372Z",
+      "end_date": "2026-06-04T17:50:47.372Z",
+      "url": "https://app.krisp.ai/n/019e93af3ee275cb846af38d3ebe4418"
+    },
+    "template": { "id": "019d67d788b677a99c78db9adb769abd", "name": "Candidate Screening Call Notes" },
+    "sections": { "action_items": null, "key_points": null, "outline": null },
+    "raw_meeting": "**Jane Candidate // Alex Recruiter Intro Call**\n🕞 Started at 05:29 PM on 04 Jun, lasted 21m",
+    "raw_content": "## **Jane Candidate // Alex Recruiter Intro Call**\n\n📅 Date: 04 Jun, 2026\n\n👤 Candidate Name: Jane Candidate\n\n💼 Role: Field/Customer Success Engineer\n\n---\n\n## **Background & Experience**\n\n### Current Role: Principal Customer Success Engineer\n\n- Owns end-to-end onboarding and deployment support\n\n- Manages a portfolio of enterprise accounts\n\n---\n\n## **Screening Checklist**\n\n### **Motivations**\n\n- Actively looking; wants fully remote with no travel\n\n### **Salary & Compensation**\n\n- Current: $170,000 base\n\n- Expected: $180,000–$200,000 base\n\n### **Notice Period**\n\n- Two weeks"
+  }
+}
