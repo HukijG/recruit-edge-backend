@@ -1,29 +1,29 @@
 /**
  * Extension call-state webhook handler.
  *
- * Single responsibility: maintain `extcall:callid:{userId}` in KV based on
- * Dialpad call-state webhook events. The polling endpoint reads that key to
- * tell the extension whether to show Hangup or Call.
+ * Dispatches Dialpad call-state events to the per-user `ExtCallState`
+ * Durable Object (strong consistency — see src/extension-call-do.js).
+ * The polling endpoint and request-driven endpoints don't write here;
+ * only this handler does.
  *
- * State transitions are webhook-driven, NOT request-driven:
- *   - `calling` event for a monitored user → KV[user.dialpadId] = call_id
- *     (overwrite-on-write, intentionally — a new call replaces any prior).
- *   - `hangup` event whose call_id matches what's stored → KV.delete
- *     (no-op if call_id doesn't match; protects against stale-event races).
- *   - Anything else (`connected`, `voicemail`, inbound direction, etc.) → drop.
- *
- * No phone-number / external_number matching, no eventual-consistency hooks
- * from /dialpad-call or /dialpad-hangup. Only the webhook touches KV. This
- * makes the system robust against missed events at the cost of "the extension
- * UI lags reality by the webhook delivery delay" — accepted as a nice-to-have
- * UX feature, not a correctness requirement.
+ *   - `calling` event for a monitored outbound call → DO.setCallId(call_id)
+ *     (overwrite-on-write — a new call replaces any prior record).
+ *   - `hangup` event whose call_id matches what's stored → DO.clearCallIdIfMatch(call_id).
+ *     Mismatched call_id is dropped silently (protects against stale-event
+ *     races where an old hangup arrives after a new call's calling event).
+ *   - Anything else (`connected`, `voicemail`, inbound, unmonitored target)
+ *     → drop silently with a structured-log explanation.
  */
 
 import { getUserByDialpadId } from './users.js';
 
 const ACTIVE_TRIGGER_STATES = new Set(['calling']);
 const TERMINAL_STATES = new Set(['hangup']);
-const EXTCALL_TTL_SEC = 20 * 60;
+
+function getDOStub(env, dialpadUserId) {
+  const id = env.EXT_CALL_STATE.idFromName(dialpadUserId);
+  return env.EXT_CALL_STATE.get(id);
+}
 
 export async function processExtensionCallEvent(payload, env) {
   const direction = payload?.direction;
@@ -45,10 +45,10 @@ export async function processExtensionCallEvent(payload, env) {
     return { processed: false, reason: 'unmonitored-target', targetId, eventState, eventCallId };
   }
 
-  const kvKey = `extcall:callid:${user.dialpadId}`;
+  const stub = getDOStub(env, user.dialpadId);
 
   if (ACTIVE_TRIGGER_STATES.has(eventState)) {
-    await env.SYNC_STATE.put(kvKey, eventCallId, { expirationTtl: EXTCALL_TTL_SEC });
+    await stub.setCallId(eventCallId);
     return {
       processed: true,
       reason: 'set-active',
@@ -60,20 +60,22 @@ export async function processExtensionCallEvent(payload, env) {
   }
 
   if (TERMINAL_STATES.has(eventState)) {
-    const stored = await env.SYNC_STATE.get(kvKey);
-    if (!stored) {
-      return { processed: false, reason: 'no-active-record', targetId, eventCallId };
+    const result = await stub.clearCallIdIfMatch(eventCallId);
+    if (result.cleared) {
+      return {
+        processed: true,
+        reason: 'cleared-on-hangup',
+        targetId,
+        dialpadUserId: user.dialpadId,
+        callId: eventCallId,
+      };
     }
-    if (stored !== eventCallId) {
-      return { processed: false, reason: 'callid-mismatch', targetId, eventCallId, recordCallId: stored };
-    }
-    await env.SYNC_STATE.delete(kvKey);
     return {
-      processed: true,
-      reason: 'cleared-on-hangup',
+      processed: false,
+      reason: result.reason === 'mismatch' ? 'callid-mismatch' : 'no-active-record',
       targetId,
-      dialpadUserId: user.dialpadId,
-      callId: eventCallId,
+      eventCallId,
+      recordCallId: result.stored ?? null,
     };
   }
 

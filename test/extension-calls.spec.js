@@ -1,22 +1,21 @@
 /**
- * Tests for the extension Call/Hangup polling flow (webhook-driven design).
+ * Tests for the extension Call/Hangup polling flow.
  *
- * The single source of truth for `extcall:callid:{userId}` is the Dialpad
- * webhook handler:
- *   - `calling` events SET the key to the event's call_id (overwrite prior).
- *   - `hangup` events DELETE the key iff their call_id matches what's stored.
- *
- * /dialpad-call doesn't touch KV. /dialpad-hangup reads the call_id from KV
- * to call Dialpad, but doesn't touch KV — the resulting hangup webhook is
- * what clears it. /extension-call-status is a pure KV read.
+ * Storage moved from KV to a per-user Durable Object (ExtCallState) for
+ * strong consistency. Same external behaviour:
+ *   - `calling` webhook → DO.setCallId (overwrite-on-write)
+ *   - `hangup` webhook with matching call_id → DO.clearCallIdIfMatch
+ *   - /extension-call-status reads DO, returns in_progress / ended
+ *   - /dialpad-hangup reads DO, calls Dialpad, doesn't clear (webhook does)
  */
 
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { SignJWT } from 'jose';
 import worker from '../src';
 
 const originalFetch = globalThis.fetch;
+const JOEL_DIALPAD_ID = '8000000000000001';
 
 function mockFetch(routes) {
   const calls = [];
@@ -53,19 +52,37 @@ async function createDialpadJWT(payload) {
     .sign(secret);
 }
 
-const KV_KEY = 'extcall:callid:8000000000000001';
+// Test helpers — talk directly to the DO so tests can seed/clear state.
+function getDOStub() {
+  return env.EXT_CALL_STATE.get(env.EXT_CALL_STATE.idFromName(JOEL_DIALPAD_ID));
+}
+
+async function clearDO() {
+  const stub = getDOStub();
+  const stored = await stub.getCallId();
+  if (stored) await stub.clearCallIdIfMatch(stored);
+}
+
+async function seedDO(callId) {
+  await getDOStub().setCallId(callId);
+}
+
+async function readDO() {
+  return await getDOStub().getCallId();
+}
 
 // ---------------------------------------------------------------------------
-// /dialpad-call no longer writes KV (the calling webhook does that)
+// /dialpad-call no longer writes call-state (the calling webhook does)
 // ---------------------------------------------------------------------------
 
-describe('/dialpad-call does not write extcall:callid', () => {
+describe('/dialpad-call does not write call-state directly', () => {
+  beforeEach(async () => { await clearDO(); });
   afterEach(async () => {
     globalThis.fetch = originalFetch;
-    await env.SYNC_STATE.delete(KV_KEY);
+    await clearDO();
   });
 
-  it('does not touch KV on Dialpad accept', async () => {
+  it('does not touch the DO on Dialpad accept', async () => {
     const alias = await makeAlias('+14155551212');
     mockFetch([
       { match: '/users/8000000000000001/initiate_call', response: { device: { id: 'native-1' } } },
@@ -80,38 +97,19 @@ describe('/dialpad-call does not write extcall:callid', () => {
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(200);
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBeNull();
-  });
-
-  it('does not clear a prior call_id (only the hangup webhook can clear)', async () => {
-    await env.SYNC_STATE.put(KV_KEY, 'prior-call-id-12345');
-    const alias = await makeAlias('+14155551212');
-    mockFetch([
-      { match: '/users/8000000000000001/initiate_call', response: { device: { id: 'native-1' } } },
-    ]);
-
-    const ctx = createExecutionContext();
-    await worker.fetch(new Request('http://example.com/dialpad-call', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET },
-      body: JSON.stringify({ consultantFirstName: 'Joel', phoneNumber: '+447700900123', callerAliasId: alias }),
-    }), env, ctx);
-    await waitOnExecutionContext(ctx);
-
-    // Prior call_id remains until either the new calling webhook overwrites
-    // or the matching hangup webhook clears.
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('prior-call-id-12345');
+    expect(await readDO()).toBeNull();
   });
 });
 
 // ---------------------------------------------------------------------------
-// /extension-call-status (pure KV read)
+// /extension-call-status (pure DO read, strongly consistent)
 // ---------------------------------------------------------------------------
 
 describe('/extension-call-status', () => {
+  beforeEach(async () => { await clearDO(); });
   afterEach(async () => {
     globalThis.fetch = originalFetch;
-    await env.SYNC_STATE.delete(KV_KEY);
+    await clearDO();
   });
 
   function statusReq(consultantFirstName = 'Joel') {
@@ -149,7 +147,7 @@ describe('/extension-call-status', () => {
     expect(response.status).toBe(403);
   });
 
-  it('returns ended when KV is empty', async () => {
+  it('returns ended when DO has no call_id', async () => {
     const ctx = createExecutionContext();
     const response = await worker.fetch(statusReq(), env, ctx);
     await waitOnExecutionContext(ctx);
@@ -157,8 +155,8 @@ describe('/extension-call-status', () => {
     expect(await response.json()).toEqual({ state: 'ended' });
   });
 
-  it('returns in_progress when KV has a call_id', async () => {
-    await env.SYNC_STATE.put(KV_KEY, '99999');
+  it('returns in_progress when DO has a call_id', async () => {
+    await seedDO('99999');
     const ctx = createExecutionContext();
     const response = await worker.fetch(statusReq(), env, ctx);
     await waitOnExecutionContext(ctx);
@@ -166,32 +164,30 @@ describe('/extension-call-status', () => {
     expect(await response.json()).toEqual({ state: 'in_progress' });
   });
 
-  it('does not call Dialpad regardless of KV state', async () => {
+  it('does not call Dialpad regardless of DO state', async () => {
     const calls = mockFetch([]);
+    const ctx1 = createExecutionContext();
+    await worker.fetch(statusReq(), env, ctx1);
+    await waitOnExecutionContext(ctx1);
 
-    // empty case
-    let ctx = createExecutionContext();
-    await worker.fetch(statusReq(), env, ctx);
-    await waitOnExecutionContext(ctx);
-
-    // populated case
-    await env.SYNC_STATE.put(KV_KEY, '99999');
-    ctx = createExecutionContext();
-    await worker.fetch(statusReq(), env, ctx);
-    await waitOnExecutionContext(ctx);
+    await seedDO('99999');
+    const ctx2 = createExecutionContext();
+    await worker.fetch(statusReq(), env, ctx2);
+    await waitOnExecutionContext(ctx2);
 
     expect(findCalls(calls, 'dialpad.com')).toHaveLength(0);
   });
 });
 
 // ---------------------------------------------------------------------------
-// /webhook/dialpad/extension-calls (webhook is the only path that writes KV)
+// /webhook/dialpad/extension-calls (the only writer)
 // ---------------------------------------------------------------------------
 
 describe('/webhook/dialpad/extension-calls', () => {
+  beforeEach(async () => { await clearDO(); });
   afterEach(async () => {
     globalThis.fetch = originalFetch;
-    await env.SYNC_STATE.delete(KV_KEY);
+    await clearDO();
   });
 
   function webhookReq(jwt) {
@@ -211,78 +207,78 @@ describe('/webhook/dialpad/extension-calls', () => {
     expect(response.status).toBe(401);
   });
 
-  it('calling event sets KV[user] = call_id', async () => {
+  it('calling event sets DO call_id', async () => {
     const jwt = await createDialpadJWT({
-      state: 'calling', direction: 'outbound', call_id: 99999, target: { id: '8000000000000001' },
+      state: 'calling', direction: 'outbound', call_id: 99999, target: { id: JOEL_DIALPAD_ID },
     });
     const ctx = createExecutionContext();
     const response = await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(200);
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
+    expect(await readDO()).toBe('99999');
   });
 
   it('calling event overwrites a prior call_id', async () => {
-    await env.SYNC_STATE.put(KV_KEY, 'prior-12345');
+    await seedDO('prior-12345');
     const jwt = await createDialpadJWT({
-      state: 'calling', direction: 'outbound', call_id: 99999, target: { id: '8000000000000001' },
+      state: 'calling', direction: 'outbound', call_id: 99999, target: { id: JOEL_DIALPAD_ID },
     });
     const ctx = createExecutionContext();
     await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
+    expect(await readDO()).toBe('99999');
   });
 
-  it('hangup event clears KV when call_id matches', async () => {
-    await env.SYNC_STATE.put(KV_KEY, '99999');
+  it('hangup event clears DO when call_id matches', async () => {
+    await seedDO('99999');
     const jwt = await createDialpadJWT({
-      state: 'hangup', direction: 'outbound', call_id: 99999, target: { id: '8000000000000001' },
+      state: 'hangup', direction: 'outbound', call_id: 99999, target: { id: JOEL_DIALPAD_ID },
     });
     const ctx = createExecutionContext();
     const response = await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(200);
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBeNull();
+    expect(await readDO()).toBeNull();
   });
 
   it('hangup event drops when call_id does not match (stale event)', async () => {
-    await env.SYNC_STATE.put(KV_KEY, '99999');
+    await seedDO('99999');
     const jwt = await createDialpadJWT({
-      state: 'hangup', direction: 'outbound', call_id: 88888, target: { id: '8000000000000001' },
+      state: 'hangup', direction: 'outbound', call_id: 88888, target: { id: JOEL_DIALPAD_ID },
     });
     const ctx = createExecutionContext();
     const response = await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(200);
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
+    expect(await readDO()).toBe('99999');
   });
 
-  it('hangup event drops when KV is empty', async () => {
+  it('hangup event drops when DO is empty', async () => {
     const jwt = await createDialpadJWT({
-      state: 'hangup', direction: 'outbound', call_id: 99999, target: { id: '8000000000000001' },
+      state: 'hangup', direction: 'outbound', call_id: 99999, target: { id: JOEL_DIALPAD_ID },
     });
     const ctx = createExecutionContext();
     const response = await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(200);
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBeNull();
+    expect(await readDO()).toBeNull();
   });
 
   it('drops inbound events defensively', async () => {
-    await env.SYNC_STATE.put(KV_KEY, '99999');
+    await seedDO('99999');
     const jwt = await createDialpadJWT({
-      state: 'calling', direction: 'inbound', call_id: 99999, target: { id: '8000000000000001' },
+      state: 'calling', direction: 'inbound', call_id: 99999, target: { id: JOEL_DIALPAD_ID },
     });
     const ctx = createExecutionContext();
     await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
+    expect(await readDO()).toBe('99999');
   });
 
   it('drops events for unmonitored target.id', async () => {
@@ -293,31 +289,31 @@ describe('/webhook/dialpad/extension-calls', () => {
     await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBeNull();
+    expect(await readDO()).toBeNull();
   });
 
-  it('drops unsupported states (e.g. connected, voicemail)', async () => {
-    await env.SYNC_STATE.put(KV_KEY, '99999');
+  it('drops unsupported states (e.g. voicemail)', async () => {
+    await seedDO('99999');
     const jwt = await createDialpadJWT({
-      state: 'voicemail', direction: 'outbound', call_id: 99999, target: { id: '8000000000000001' },
+      state: 'voicemail', direction: 'outbound', call_id: 99999, target: { id: JOEL_DIALPAD_ID },
     });
     const ctx = createExecutionContext();
     await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
 
-    // KV unchanged
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
+    expect(await readDO()).toBe('99999');
   });
 });
 
 // ---------------------------------------------------------------------------
-// /dialpad-hangup (reads call_id from KV; doesn't clear it)
+// /dialpad-hangup (reads call_id from DO; doesn't clear it)
 // ---------------------------------------------------------------------------
 
 describe('/dialpad-hangup', () => {
+  beforeEach(async () => { await clearDO(); });
   afterEach(async () => {
     globalThis.fetch = originalFetch;
-    await env.SYNC_STATE.delete(KV_KEY);
+    await clearDO();
   });
 
   function hangupReq(consultantFirstName = 'Joel') {
@@ -328,7 +324,7 @@ describe('/dialpad-hangup', () => {
     });
   }
 
-  it('returns 409 when KV has no call_id', async () => {
+  it('returns 409 when DO has no call_id', async () => {
     const ctx = createExecutionContext();
     const response = await worker.fetch(hangupReq(), env, ctx);
     await waitOnExecutionContext(ctx);
@@ -336,7 +332,7 @@ describe('/dialpad-hangup', () => {
   });
 
   it('calls Dialpad hangup with the stored call_id and returns 200', async () => {
-    await env.SYNC_STATE.put(KV_KEY, '99999');
+    await seedDO('99999');
     const calls = mockFetch([
       { match: '/call/99999/actions/hangup', response: {} },
     ]);
@@ -349,8 +345,8 @@ describe('/dialpad-hangup', () => {
     expect(findCalls(calls, '/call/99999/actions/hangup')).toHaveLength(1);
   });
 
-  it('does NOT clear KV on success — only the hangup webhook does', async () => {
-    await env.SYNC_STATE.put(KV_KEY, '99999');
+  it('does NOT clear the DO on success — only the hangup webhook does', async () => {
+    await seedDO('99999');
     mockFetch([
       { match: '/call/99999/actions/hangup', response: {} },
     ]);
@@ -359,11 +355,11 @@ describe('/dialpad-hangup', () => {
     await worker.fetch(hangupReq(), env, ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
+    expect(await readDO()).toBe('99999');
   });
 
-  it('returns 502 when Dialpad rejects, KV unchanged', async () => {
-    await env.SYNC_STATE.put(KV_KEY, '99999');
+  it('returns 502 when Dialpad rejects, DO unchanged', async () => {
+    await seedDO('99999');
     mockFetch([
       { match: '/call/99999/actions/hangup', status: 404, response: { error: 'Call not found' } },
     ]);
@@ -373,6 +369,6 @@ describe('/dialpad-hangup', () => {
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(502);
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
+    expect(await readDO()).toBe('99999');
   });
 });

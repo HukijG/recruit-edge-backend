@@ -25,6 +25,11 @@
       "preview_id": "REDACTED_KV_PREVIEW_NAMESPACE_ID"
     }
   ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "EXT_CALL_STATE", "class_name": "ExtCallState" }
+    ]
+  },
   "migrations": [
     {
       "tag": "v1",
@@ -33,6 +38,10 @@
     {
       "tag": "v2",
       "deleted_classes": ["ExtensionCallStateChannel"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["ExtCallState"]
     }
   ]
 }

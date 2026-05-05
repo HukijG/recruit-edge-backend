@@ -7,6 +7,8 @@ import { verifyJWT } from './auth.js';
 import { signCallerIdAlias, verifyCallerIdAlias } from './dialpad-aliases.js';
 import { checkAndRecordCall } from './rate-limit.js';
 import { processExtensionCallEvent } from './extension-calls.js';
+import { ExtCallState } from './extension-call-do.js';
+export { ExtCallState };
 import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
@@ -2259,14 +2261,12 @@ async function handleDialpadSmsEndpoint(request, env, corsHeaders) {
 }
 
 // ---------------------------------------------------------------------------
-// /dialpad-hangup — terminate the consultant's active call. Body is just
-// { consultantFirstName }; the worker reads call_id from
-// `extcall:callid:{dialpadUserId}` KV (set by the Dialpad `calling` webhook).
-// 409 if no call_id is set — in normal use the extension only shows Hangup
-// when polling has confirmed in_progress, so 409 means a race or stale UI.
-// Does NOT clear KV directly: the Dialpad `hangup` webhook is the single
-// source of truth for clearing, which fires after Dialpad processes our
-// hangup request.
+// /dialpad-hangup — terminate whatever call_id is currently stored for the
+// consultant. Body is just { consultantFirstName }; the worker reads
+// call_id from the per-user ExtCallState Durable Object (set by the
+// Dialpad `calling` webhook). 409 if no call_id is set. Does NOT clear
+// the DO — the Dialpad `hangup` webhook is the single source of truth
+// for clearing.
 // ---------------------------------------------------------------------------
 
 async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
@@ -2289,8 +2289,8 @@ async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
       });
     }
 
-    const kvKey = `extcall:callid:${user.dialpadId}`;
-    const callId = await env.SYNC_STATE.get(kvKey);
+    const stub = env.EXT_CALL_STATE.get(env.EXT_CALL_STATE.idFromName(user.dialpadId));
+    const callId = await stub.getCallId();
     if (!callId) {
       console.warn({
         message: `[DialpadHangup] no active call_id consultant=${consultantFirstName}`,
@@ -2313,10 +2313,10 @@ async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
 
     const result = await hangupCall({ callId }, env);
 
-    // Do NOT clear KV here. The Dialpad `hangup` webhook will fire (Dialpad
-    // emits it after processing our hangup) and the webhook handler is the
-    // only path that clears extcall:callid. This keeps the "single source of
-    // truth = webhook" invariant intact.
+    // Do NOT clear the DO here. The Dialpad `hangup` webhook will fire
+    // (Dialpad emits it after processing our hangup) and the webhook
+    // handler is the only path that clears. This keeps the "single
+    // source of truth = webhook" invariant intact.
 
     if (!result.ok) {
       const upstreamMsg = result.body?.error || result.body?.message || `HTTP ${result.status}`;
@@ -2388,10 +2388,11 @@ async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
       });
     }
 
-    // Pure KV read. The webhook is the only thing that sets/clears
-    // extcall:callid:{userId}; the polling endpoint never writes.
-    const kvKey = `extcall:callid:${user.dialpadId}`;
-    const callId = await env.SYNC_STATE.get(kvKey);
+    // Strongly-consistent read via the per-user Durable Object. The
+    // webhook is the only thing that sets/clears the stored call_id;
+    // this endpoint never writes.
+    const stub = env.EXT_CALL_STATE.get(env.EXT_CALL_STATE.idFromName(user.dialpadId));
+    const callId = await stub.getCallId();
 
     if (callId) {
       console.log({
