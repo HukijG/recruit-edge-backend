@@ -13,7 +13,7 @@ import {
   searchRFCandidateByEmail, addRFCandidateNote, moveToCallBooked, addRFCandidate,
   listOpenJobs, addCandidateToJob, setJobCandidateConsultantId,
   listCandidateActivities, normalizeToE164, pickConsultantJob,
-  prewarmCandidatesIfMissing,
+  prewarmCandidatesIfMissing, searchCandidatesByJobAndStage, extractLinkedInSlug,
 } from './rf-client.js';
 import {
   cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName,
@@ -159,6 +159,22 @@ export default {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
         }
         return await handleExtensionCallStatusEndpoint(request, env, corsHeaders);
+      }
+
+      if (url.pathname === '/my-sourcing-jobs' && request.method === 'POST') {
+        const extAuth = request.headers.get('X-Extension-Token');
+        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
+          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        }
+        return await handleMySourcingJobsEndpoint(request, env, corsHeaders);
+      }
+
+      if (url.pathname === '/job-pipeline' && request.method === 'POST') {
+        const extAuth = request.headers.get('X-Extension-Token');
+        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
+          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        }
+        return await handleJobPipelineEndpoint(request, env, corsHeaders);
       }
 
       return new Response('Not Found', {
@@ -2490,6 +2506,180 @@ async function handleDialpadExtensionCallsWebhook(request, env) {
     // Return 200 even on error — Dialpad's retry on non-200 would just
     // redeliver the same broken event.
     return new Response('OK', { status: 200 });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /my-sourcing-jobs — return open jobs where the consultant is on the
+// hiring team as a Recruiter AND the job's status is "Sourcing". Drives
+// the mobile PWA's home screen.
+// ---------------------------------------------------------------------------
+
+async function handleMySourcingJobsEndpoint(request, env, corsHeaders) {
+  const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  try {
+    const payload = await request.json();
+    const consultantFirstName = typeof payload.consultantFirstName === 'string'
+      ? payload.consultantFirstName.trim()
+      : '';
+
+    if (!consultantFirstName) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    const consultantRfUserId = resolveRFUserId(consultantFirstName);
+    if (!consultantRfUserId) {
+      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+        status: 403, headers: responseHeaders,
+      });
+    }
+
+    const allJobs = await listOpenJobs(env);
+    const filtered = allJobs.filter(job => {
+      const onHiringTeamAsRecruiter = Array.isArray(job.hiring_team)
+        && job.hiring_team.some(member =>
+          member && member.user_id === consultantRfUserId
+            && typeof member.role === 'string'
+            && member.role.toLowerCase() === 'recruiter');
+      const isSourcing = job.job_status
+        && typeof job.job_status.name === 'string'
+        && job.job_status.name.toLowerCase() === 'sourcing';
+      return onHiringTeamAsRecruiter && isSourcing;
+    });
+
+    const jobs = filtered.map(j => ({
+      id: j.id,
+      name: j.name,
+      company: j.company,
+    }));
+
+    console.log({
+      message: `[MySourcingJobs] consultant=${consultantFirstName} jobs=${jobs.length} (filtered from ${allJobs.length} open)`,
+      source: 'my-sourcing-jobs',
+      consultantFirstName,
+      consultantRfUserId,
+      jobsReturned: jobs.length,
+      jobsTotal: allJobs.length,
+    });
+
+    return new Response(JSON.stringify({ jobs }), {
+      status: 200, headers: responseHeaders,
+    });
+  } catch (error) {
+    console.error({
+      message: `[MySourcingJobs] error: ${error.message}`,
+      source: 'my-sourcing-jobs',
+      stack: error.stack,
+    });
+    return new Response(JSON.stringify({ ok: false, error: 'Internal Server Error' }), {
+      status: 500, headers: responseHeaders,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /job-pipeline — return Sourced-stage candidates for a job, ordered by
+// added_time ASC (oldest-first surfaces stale candidates). Returns just
+// rfId + linkedinUrl per candidate; the PWA fetches full details per-card
+// via the existing /candidate-details route as it traverses prev/next.
+// ---------------------------------------------------------------------------
+
+async function handleJobPipelineEndpoint(request, env, corsHeaders) {
+  const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  try {
+    const payload = await request.json();
+    const consultantFirstName = typeof payload.consultantFirstName === 'string'
+      ? payload.consultantFirstName.trim()
+      : '';
+    const jobIdRaw = payload.jobId;
+    const jobId = typeof jobIdRaw === 'number'
+      ? jobIdRaw
+      : (typeof jobIdRaw === 'string' && /^\d+$/.test(jobIdRaw.trim()) ? parseInt(jobIdRaw.trim(), 10) : null);
+
+    if (!consultantFirstName) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+    if (!jobId) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing or invalid "jobId"' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    const consultantRfUserId = resolveRFUserId(consultantFirstName);
+    if (!consultantRfUserId) {
+      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+        status: 403, headers: responseHeaders,
+      });
+    }
+
+    const { candidates: rawCandidates, totalItems } = await searchCandidatesByJobAndStage(
+      { jobId, stageName: 'Sourced' },
+      env,
+    );
+
+    // Map → filter out missing linkedin → sort by added_time ASC.
+    const enriched = rawCandidates.map(c => {
+      const linkedinRaw = typeof c?.linkedin_profile === 'string' ? c.linkedin_profile.trim() : '';
+      // RF returns the literal string "None" for missing fields.
+      const linkedin = linkedinRaw && linkedinRaw.toLowerCase() !== 'none' ? linkedinRaw : null;
+      const slug = linkedin ? extractLinkedInSlug(linkedin) : null;
+      const linkedinUrl = slug ? `https://www.linkedin.com/in/${slug}` : null;
+      const addedTime = c?.added_time || null;
+      const addedTs = addedTime ? Date.parse(addedTime) : NaN;
+      return {
+        rfId: c?.id,
+        linkedinUrl,
+        addedTime,
+        addedTs: Number.isFinite(addedTs) ? addedTs : null,
+      };
+    }).filter(c => c.rfId && c.linkedinUrl);
+
+    enriched.sort((a, b) => {
+      const aT = a.addedTs ?? Number.POSITIVE_INFINITY;
+      const bT = b.addedTs ?? Number.POSITIVE_INFINITY;
+      return aT - bT;
+    });
+
+    const candidates = enriched.map(c => ({
+      rfId: c.rfId,
+      linkedinUrl: c.linkedinUrl,
+    }));
+
+    console.log({
+      message: `[JobPipeline] consultant=${consultantFirstName} job=${jobId} sourced=${candidates.length} (raw=${rawCandidates.length}, totalItems=${totalItems})`,
+      source: 'job-pipeline',
+      consultantFirstName,
+      consultantRfUserId,
+      jobId,
+      stage: 'Sourced',
+      candidatesReturned: candidates.length,
+      rawCount: rawCandidates.length,
+      totalItems,
+    });
+
+    return new Response(JSON.stringify({
+      jobId,
+      stage: 'Sourced',
+      total: typeof totalItems === 'number' ? totalItems : candidates.length,
+      candidates,
+    }), {
+      status: 200, headers: responseHeaders,
+    });
+  } catch (error) {
+    console.error({
+      message: `[JobPipeline] error: ${error.message}`,
+      source: 'job-pipeline',
+      stack: error.stack,
+    });
+    return new Response(JSON.stringify({ ok: false, error: 'Internal Server Error' }), {
+      status: 500, headers: responseHeaders,
+    });
   }
 }
 

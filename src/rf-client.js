@@ -643,6 +643,11 @@ export async function listOpenJobs(env) {
         id: job.id,
         name: job.name || job.title || '',
         company: job.company?.name || '',
+        // Extra fields used by /my-sourcing-jobs to filter to "MY" jobs;
+        // existing consumers (e.g. /candidates job-picker dropdown) just
+        // ignore them.
+        hiring_team: Array.isArray(job.hiring_team) ? job.hiring_team : [],
+        job_status: job.job_status || null,
       });
     }
 
@@ -651,6 +656,77 @@ export async function listOpenJobs(env) {
   }
 
   return allJobs;
+}
+
+/**
+ * Search RF for candidates matching a job + stage. Used by /job-pipeline
+ * to power the mobile PWA's pipeline view.
+ *
+ * RF's /candidate/search filter docs: `job` is multi-select-by-id, `stage`
+ * is multi-select-by-name. Results paginate; we fetch all pages up to
+ * `maxPages` (default 10 = 1000 candidates at items_per_page=100, plenty
+ * for a single Sourced pipeline).
+ *
+ * Returns the raw candidate array — caller filters / sorts / maps as needed.
+ */
+export async function searchCandidatesByJobAndStage({ jobId, stageName, maxPages = 10 }, env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const perPage = 100;
+  const allCandidates = [];
+  let totalItems = null;
+
+  for (let page = 1; page <= maxPages; page++) {
+    const requestBody = {
+      items_per_page: perPage,
+      current_page: page,
+      conjunction: 'match-all',
+      filters: [
+        { conjunction: 'in', values: [parseInt(jobId, 10)], key: 'job' },
+        { conjunction: 'in', values: [stageName], key: 'stage' },
+      ],
+      include_count: true,
+    };
+
+    const response = await fetch(`${rfBaseUrl}/candidate/search`, {
+      method: 'POST',
+      headers: { 'RF-Api-Key': rfApiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error({
+        message: `RF candidate/search error status=${response.status} body=${errorText}`,
+        source: 'rf-search',
+        jobId,
+        stageName,
+        page,
+      });
+      throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    }
+
+    const result = await response.json();
+    const candidates = Array.isArray(result?.data)
+      ? result.data
+      : Array.isArray(result?.candidates)
+        ? result.candidates
+        : Array.isArray(result)
+          ? result
+          : [];
+    if (typeof result?.total_items === 'number') totalItems = result.total_items;
+
+    allCandidates.push(...candidates);
+
+    if (candidates.length < perPage) break;
+  }
+
+  return { candidates: allCandidates, totalItems };
 }
 
 const JOB_CANDIDATE_CONSULTANT_FIELD_ID = 16;
