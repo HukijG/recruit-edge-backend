@@ -16,6 +16,7 @@
  */
 
 import { getUserByDialpadId } from './users.js';
+import { incrementDailyCallCount } from './cache.js';
 
 const ACTIVE_TRIGGER_STATES = new Set(['calling']);
 const TERMINAL_STATES = new Set(['hangup']);
@@ -60,6 +61,25 @@ export async function processExtensionCallEvent(payload, env) {
   }
 
   if (TERMINAL_STATES.has(eventState)) {
+    // Bump the daily call counter for every monitored outbound hangup,
+    // regardless of whether the DO has a matching call_id. We want this to
+    // catch calls placed via the Dialpad app (no calling event for the DO,
+    // but the hangup still fires) — those still count as "calls done today"
+    // for the consultant's productivity stats.
+    let dailyCount = null;
+    try {
+      dailyCount = await incrementDailyCallCount(user.rfUserId, env);
+    } catch (err) {
+      // Counter failure is non-fatal — log and proceed with the DO clear.
+      console.error({
+        message: `[ExtensionCalls] daily-counter increment failed: ${err.message}`,
+        source: 'dialpad-extension-calls',
+        rfUserId: user.rfUserId,
+        dialpadUserId: user.dialpadId,
+        callId: eventCallId,
+      });
+    }
+
     const result = await stub.clearCallIdIfMatch(eventCallId);
     if (result.cleared) {
       return {
@@ -68,6 +88,7 @@ export async function processExtensionCallEvent(payload, env) {
         targetId,
         dialpadUserId: user.dialpadId,
         callId: eventCallId,
+        dailyCount,
       };
     }
     return {
@@ -76,6 +97,7 @@ export async function processExtensionCallEvent(payload, env) {
       targetId,
       eventCallId,
       recordCallId: result.stored ?? null,
+      dailyCount,
     };
   }
 

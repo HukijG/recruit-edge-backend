@@ -315,3 +315,42 @@ export async function setPrewarmState(rfUserId, jobId, state, env) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Daily call-stats counter (per consultant). Drives the extension's
+// "calls today" badge.
+//
+// One KV key per consultant per day (UTC); incremented on every monitored
+// outbound `hangup` webhook (see src/extension-calls.js). 48-hour TTL covers
+// "yesterday lingers briefly while events trickle in" without needing a
+// cron-driven cleanup. Read by POST /call-stats.
+//
+// Race note: GET → +1 → PUT is non-atomic. For ~10-50 calls/day with
+// seconds between, collisions are essentially zero. If we ever see drift,
+// migrate to a per-user DO counter for atomic increments.
+// ---------------------------------------------------------------------------
+
+const CALL_STATS_TTL_SEC = 48 * 60 * 60;
+
+function todayUTC() {
+  return new Date().toISOString().slice(0, 10); // "2026-05-05"
+}
+
+export function dailyCallStatsKey(rfUserId, dateStr = todayUTC()) {
+  return `callstats:daily:${rfUserId}:${dateStr}`;
+}
+
+export async function incrementDailyCallCount(rfUserId, env) {
+  if (!rfUserId) return null;
+  const key = dailyCallStatsKey(rfUserId);
+  const raw = await env.SYNC_STATE.get(key);
+  const next = (parseInt(raw ?? '0', 10) || 0) + 1;
+  await env.SYNC_STATE.put(key, String(next), { expirationTtl: CALL_STATS_TTL_SEC });
+  return next;
+}
+
+export async function getDailyCallCount(rfUserId, env) {
+  if (!rfUserId) return 0;
+  const raw = await env.SYNC_STATE.get(dailyCallStatsKey(rfUserId));
+  return parseInt(raw ?? '0', 10) || 0;
+}
+

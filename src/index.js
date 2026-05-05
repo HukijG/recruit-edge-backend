@@ -25,6 +25,7 @@ import {
   invalidateCandidateDetailsCache,
   appendToJobBatchIndex, getJobBatchIndex,
   getPrewarmState, setPrewarmState,
+  getDailyCallCount,
 } from './cache.js';
 import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
 import { processCallEvent, parseColdCallActivity, mergeTag } from './cold-call.js';
@@ -177,6 +178,14 @@ export default {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
         }
         return await handleJobPipelineEndpoint(request, env, corsHeaders);
+      }
+
+      if (url.pathname === '/call-stats' && request.method === 'POST') {
+        const extAuth = request.headers.get('X-Extension-Token');
+        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
+          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        }
+        return await handleCallStatsEndpoint(request, env, corsHeaders);
       }
 
       return new Response('Not Found', {
@@ -2676,6 +2685,52 @@ async function handleJobPipelineEndpoint(request, env, corsHeaders) {
     console.error({
       message: `[JobPipeline] error: ${error.message}`,
       source: 'job-pipeline',
+      stack: error.stack,
+    });
+    return new Response(JSON.stringify({ ok: false, error: 'Internal Server Error' }), {
+      status: 500, headers: responseHeaders,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /call-stats — extension's "calls today" badge data. Pure KV read of the
+// per-consultant daily counter, which is incremented by the
+// /webhook/dialpad/extension-calls handler on every monitored outbound
+// `hangup` event. Body: { consultantFirstName }. Returns { daily }.
+// ---------------------------------------------------------------------------
+
+async function handleCallStatsEndpoint(request, env, corsHeaders) {
+  const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  try {
+    const payload = await request.json();
+    const consultantFirstName = typeof payload.consultantFirstName === 'string'
+      ? payload.consultantFirstName.trim()
+      : '';
+
+    if (!consultantFirstName) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    const user = getUserByFirstName(consultantFirstName);
+    if (!user) {
+      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+        status: 403, headers: responseHeaders,
+      });
+    }
+
+    const daily = await getDailyCallCount(user.rfUserId, env);
+
+    return new Response(JSON.stringify({ daily }), {
+      status: 200, headers: responseHeaders,
+    });
+  } catch (error) {
+    console.error({
+      message: `[CallStats] error: ${error.message}`,
+      source: 'call-stats',
       stack: error.stack,
     });
     return new Response(JSON.stringify({ ok: false, error: 'Internal Server Error' }), {

@@ -306,6 +306,205 @@ describe('/webhook/dialpad/extension-calls', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Daily call-counter behaviour driven by hangup webhooks
+// ---------------------------------------------------------------------------
+
+describe('hangup webhook → daily call counter', () => {
+  const JOEL_RF_USER_ID = 900001;
+
+  function todayKey() {
+    const today = new Date().toISOString().slice(0, 10);
+    return `callstats:daily:${JOEL_RF_USER_ID}:${today}`;
+  }
+
+  beforeEach(async () => {
+    await clearDO();
+    await env.SYNC_STATE.delete(todayKey());
+  });
+  afterEach(async () => {
+    globalThis.fetch = originalFetch;
+    await clearDO();
+    await env.SYNC_STATE.delete(todayKey());
+  });
+
+  function webhookReq(jwt) {
+    return new Request('http://example.com/webhook/dialpad/extension-calls', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
+      body: '',
+    });
+  }
+
+  it('increments the counter on every outbound hangup, regardless of DO match', async () => {
+    // First call: matches the DO state
+    await seedDO('111');
+    const jwt1 = await createDialpadJWT({
+      state: 'hangup', direction: 'outbound', call_id: 111, target: { id: JOEL_DIALPAD_ID },
+    });
+    let ctx = createExecutionContext();
+    await worker.fetch(webhookReq(jwt1), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(await env.SYNC_STATE.get(todayKey())).toBe('1');
+
+    // Second call: hangup for a callId not in the DO (e.g., placed via Dialpad app)
+    const jwt2 = await createDialpadJWT({
+      state: 'hangup', direction: 'outbound', call_id: 222, target: { id: JOEL_DIALPAD_ID },
+    });
+    ctx = createExecutionContext();
+    await worker.fetch(webhookReq(jwt2), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(await env.SYNC_STATE.get(todayKey())).toBe('2');
+  });
+
+  it('does NOT increment for inbound hangups', async () => {
+    const jwt = await createDialpadJWT({
+      state: 'hangup', direction: 'inbound', call_id: 333, target: { id: JOEL_DIALPAD_ID },
+    });
+    const ctx = createExecutionContext();
+    await worker.fetch(webhookReq(jwt), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(await env.SYNC_STATE.get(todayKey())).toBeNull();
+  });
+
+  it('does NOT increment for unmonitored target.id', async () => {
+    const jwt = await createDialpadJWT({
+      state: 'hangup', direction: 'outbound', call_id: 444, target: { id: '0000000000000000' },
+    });
+    const ctx = createExecutionContext();
+    await worker.fetch(webhookReq(jwt), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(await env.SYNC_STATE.get(todayKey())).toBeNull();
+  });
+
+  it('does NOT increment for non-hangup states (calling, voicemail, etc.)', async () => {
+    const jwt = await createDialpadJWT({
+      state: 'calling', direction: 'outbound', call_id: 555, target: { id: JOEL_DIALPAD_ID },
+    });
+    const ctx = createExecutionContext();
+    await worker.fetch(webhookReq(jwt), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(await env.SYNC_STATE.get(todayKey())).toBeNull();
+  });
+
+  it('counts each consultant separately', async () => {
+    const ALICE_DIALPAD_ID = '8000000000000002';
+    const ALICE_RF_USER_ID = 900002;
+    const today = new Date().toISOString().slice(0, 10);
+
+    // Joel makes one call
+    await env.SYNC_STATE.delete(`callstats:daily:${JOEL_RF_USER_ID}:${today}`);
+    await env.SYNC_STATE.delete(`callstats:daily:${ALICE_RF_USER_ID}:${today}`);
+
+    const jwtJoel = await createDialpadJWT({
+      state: 'hangup', direction: 'outbound', call_id: 666, target: { id: JOEL_DIALPAD_ID },
+    });
+    let ctx = createExecutionContext();
+    await worker.fetch(webhookReq(jwtJoel), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    // Alice makes two calls
+    const jwtAlice1 = await createDialpadJWT({
+      state: 'hangup', direction: 'outbound', call_id: 777, target: { id: ALICE_DIALPAD_ID },
+    });
+    ctx = createExecutionContext();
+    await worker.fetch(webhookReq(jwtAlice1), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    const jwtAlice2 = await createDialpadJWT({
+      state: 'hangup', direction: 'outbound', call_id: 888, target: { id: ALICE_DIALPAD_ID },
+    });
+    ctx = createExecutionContext();
+    await worker.fetch(webhookReq(jwtAlice2), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(await env.SYNC_STATE.get(`callstats:daily:${JOEL_RF_USER_ID}:${today}`)).toBe('1');
+    expect(await env.SYNC_STATE.get(`callstats:daily:${ALICE_RF_USER_ID}:${today}`)).toBe('2');
+
+    // Cleanup
+    await env.SYNC_STATE.delete(`callstats:daily:${ALICE_RF_USER_ID}:${today}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /call-stats endpoint
+// ---------------------------------------------------------------------------
+
+describe('/call-stats', () => {
+  const JOEL_RF_USER_ID = 900001;
+
+  function todayKey() {
+    const today = new Date().toISOString().slice(0, 10);
+    return `callstats:daily:${JOEL_RF_USER_ID}:${today}`;
+  }
+
+  beforeEach(async () => {
+    await env.SYNC_STATE.delete(todayKey());
+  });
+  afterEach(async () => {
+    await env.SYNC_STATE.delete(todayKey());
+  });
+
+  function statsReq(consultantFirstName = 'Joel') {
+    return new Request('http://example.com/call-stats', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET },
+      body: JSON.stringify({ consultantFirstName }),
+    });
+  }
+
+  it('returns 401 without X-Extension-Token', async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new Request('http://example.com/call-stats', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ consultantFirstName: 'Joel' }),
+    }), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(401);
+  });
+
+  it('returns 400 when consultantFirstName missing', async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new Request('http://example.com/call-stats', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET },
+      body: JSON.stringify({}),
+    }), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(400);
+  });
+
+  it('returns 403 when consultant not in registry', async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(statsReq('Nobody'), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(403);
+  });
+
+  it('returns daily=0 when no calls yet today', async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(statsReq(), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ daily: 0 });
+  });
+
+  it('returns the current daily count', async () => {
+    await env.SYNC_STATE.put(todayKey(), '7');
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(statsReq(), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(await response.json()).toEqual({ daily: 7 });
+  });
+
+  it('handles malformed counter values defensively (returns 0)', async () => {
+    await env.SYNC_STATE.put(todayKey(), 'not-a-number');
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(statsReq(), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(await response.json()).toEqual({ daily: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // /dialpad-hangup (reads call_id from DO; doesn't clear it)
 // ---------------------------------------------------------------------------
 
