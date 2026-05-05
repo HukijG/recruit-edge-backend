@@ -4,13 +4,16 @@
  * Each record maps a consultant's first name to:
  *   - rfUserId: their RecruiterFlow user_id (used for activity_user_id, stage move user_id, lead_owner_id, custom_fields[consultant_id], etc.)
  *   - dialpadId: their Dialpad target.id (used for cold-call attribution)
+ *   - aliases (optional): additional first-name forms that should resolve to
+ *     the same record (e.g. nicknames). Matched case-insensitively.
  *
  * Edits show up in PR diffs. Add/remove entries here when the team changes.
  */
 
 const USERS = [
-  { firstName: 'Joel',  rfUserId: 900001, dialpadId: '8000000000000001' },
-  { firstName: 'Alice', rfUserId: 900002, dialpadId: '8000000000000002' },
+  { firstName: 'Joel',   rfUserId: 900001, dialpadId: '8000000000000001' },
+  { firstName: 'Alice',  rfUserId: 900002, dialpadId: '8000000000000002' },
+  { firstName: 'Bob', rfUserId: 900003, dialpadId: '8000000000000003', aliases: ['Bob'] },
   // TODO: add remaining team members (firstName, rfUserId, dialpadId)
 ];
 
@@ -23,7 +26,10 @@ function normalizeName(name) {
 export function getUserByFirstName(firstName) {
   const key = normalizeName(firstName);
   if (!key) return null;
-  return USERS.find(u => u.firstName.toLowerCase() === key) ?? null;
+  return USERS.find(u =>
+    u.firstName.toLowerCase() === key
+    || (Array.isArray(u.aliases) && u.aliases.some(a => a.toLowerCase() === key))
+  ) ?? null;
 }
 
 export function getUserByDialpadId(dialpadId) {

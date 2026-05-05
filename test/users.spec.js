@@ -28,6 +28,21 @@ describe('getUserByFirstName', () => {
 		expect(getUserByFirstName(null)).toBeNull();
 		expect(getUserByFirstName(undefined)).toBeNull();
 	});
+
+	it('resolves a primary firstName with aliases (Bob)', () => {
+		const u = getUserByFirstName('Bob');
+		expect(u).toMatchObject({ firstName: 'Bob', rfUserId: 900003, dialpadId: '8000000000000003' });
+	});
+
+	it('resolves an alias (Bob → Bob)', () => {
+		const u = getUserByFirstName('Bob');
+		expect(u).toMatchObject({ firstName: 'Bob', rfUserId: 900003 });
+	});
+
+	it('alias resolution is case-insensitive', () => {
+		expect(getUserByFirstName('  bobby  ')).toMatchObject({ firstName: 'Bob' });
+		expect(getUserByFirstName('BOBBY')).toMatchObject({ firstName: 'Bob' });
+	});
 });
 
 describe('getUserByDialpadId', () => {
@@ -68,6 +83,8 @@ describe('resolveRFUserId', () => {
 	it('returns the rfUserId for a known consultant', () => {
 		expect(resolveRFUserId('Joel')).toBe(900001);
 		expect(resolveRFUserId('Alice')).toBe(900002);
+		expect(resolveRFUserId('Bob')).toBe(900003);
+		expect(resolveRFUserId('Bob')).toBe(900003);
 	});
 
 	it('returns null for unknown / empty name', () => {
@@ -80,6 +97,7 @@ describe('getRFUserIdByDialpadId', () => {
 	it('returns the rfUserId for a known dialpad id', () => {
 		expect(getRFUserIdByDialpadId('8000000000000001')).toBe(900001);
 		expect(getRFUserIdByDialpadId('8000000000000002')).toBe(900002);
+		expect(getRFUserIdByDialpadId('8000000000000003')).toBe(900003);
 	});
 
 	it('returns null for unknown id', () => {
