@@ -1,12 +1,14 @@
 /**
- * Tests for the extension Call/Hangup polling flow.
+ * Tests for the extension Call/Hangup polling flow (webhook-driven design).
  *
- * Covers:
- *   - /dialpad-call's KV side-effect (writing the extcall:state JSON record)
- *   - /extension-call-status (KV-first read, discovery branch)
- *   - /webhook/dialpad/extension-calls (hangup webhook, match-or-ignore)
- *   - /dialpad-hangup (new JSON shape, already-ended fast path)
- *   - findCallForBind (pure helper)
+ * The single source of truth for `extcall:callid:{userId}` is the Dialpad
+ * webhook handler:
+ *   - `calling` events SET the key to the event's call_id (overwrite prior).
+ *   - `hangup` events DELETE the key iff their call_id matches what's stored.
+ *
+ * /dialpad-call doesn't touch KV. /dialpad-hangup reads the call_id from KV
+ * to call Dialpad, but doesn't touch KV — the resulting hangup webhook is
+ * what clears it. /extension-call-status is a pure KV read.
  */
 
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
@@ -51,25 +53,24 @@ async function createDialpadJWT(payload) {
     .sign(secret);
 }
 
-const KV_KEY = 'extcall:state:8000000000000001';
+const KV_KEY = 'extcall:callid:8000000000000001';
 
 // ---------------------------------------------------------------------------
-// /dialpad-call → KV write side-effect
+// /dialpad-call no longer writes KV (the calling webhook does that)
 // ---------------------------------------------------------------------------
 
-describe('/dialpad-call writes extcall:state KV record', () => {
+describe('/dialpad-call does not write extcall:callid', () => {
   afterEach(async () => {
     globalThis.fetch = originalFetch;
     await env.SYNC_STATE.delete(KV_KEY);
   });
 
-  it('writes {phoneNumber, initiatedAt, state:in_progress} after Dialpad accepts', async () => {
+  it('does not touch KV on Dialpad accept', async () => {
     const alias = await makeAlias('+14155551212');
     mockFetch([
       { match: '/users/8000000000000001/initiate_call', response: { device: { id: 'native-1' } } },
     ]);
 
-    const before = Date.now();
     const ctx = createExecutionContext();
     const response = await worker.fetch(new Request('http://example.com/dialpad-call', {
       method: 'POST',
@@ -79,22 +80,11 @@ describe('/dialpad-call writes extcall:state KV record', () => {
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(200);
-    const record = JSON.parse(await env.SYNC_STATE.get(KV_KEY));
-    expect(record.phoneNumber).toBe('+447700900123');
-    expect(record.state).toBe('in_progress');
-    expect(record.callId).toBeUndefined();
-    expect(typeof record.initiatedAt).toBe('number');
-    expect(record.initiatedAt).toBeGreaterThanOrEqual(before);
-    expect(record.initiatedAt).toBeLessThanOrEqual(Date.now());
+    expect(await env.SYNC_STATE.get(KV_KEY)).toBeNull();
   });
 
-  it('overwrites a prior call record (clears stale state)', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155559999',
-      initiatedAt: Date.now() - 60_000,
-      callId: 'stale-call-id',
-      state: 'in_progress',
-    }));
+  it('does not clear a prior call_id (only the hangup webhook can clear)', async () => {
+    await env.SYNC_STATE.put(KV_KEY, 'prior-call-id-12345');
     const alias = await makeAlias('+14155551212');
     mockFetch([
       { match: '/users/8000000000000001/initiate_call', response: { device: { id: 'native-1' } } },
@@ -108,31 +98,14 @@ describe('/dialpad-call writes extcall:state KV record', () => {
     }), env, ctx);
     await waitOnExecutionContext(ctx);
 
-    const record = JSON.parse(await env.SYNC_STATE.get(KV_KEY));
-    expect(record.phoneNumber).toBe('+447700900123');
-    expect(record.callId).toBeUndefined();
-  });
-
-  it('does not write extcall:state when Dialpad rejects', async () => {
-    const alias = await makeAlias('+14155551212');
-    mockFetch([
-      { match: '/users/8000000000000001/initiate_call', status: 400, response: { error: 'No autocallable device' } },
-    ]);
-
-    const ctx = createExecutionContext();
-    await worker.fetch(new Request('http://example.com/dialpad-call', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Extension-Token': env.LINKEDIN_EXTENSION_SECRET },
-      body: JSON.stringify({ consultantFirstName: 'Joel', phoneNumber: '+447700900123', callerAliasId: alias }),
-    }), env, ctx);
-    await waitOnExecutionContext(ctx);
-
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBeNull();
+    // Prior call_id remains until either the new calling webhook overwrites
+    // or the matching hangup webhook clears.
+    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('prior-call-id-12345');
   });
 });
 
 // ---------------------------------------------------------------------------
-// /extension-call-status
+// /extension-call-status (pure KV read)
 // ---------------------------------------------------------------------------
 
 describe('/extension-call-status', () => {
@@ -184,93 +157,35 @@ describe('/extension-call-status', () => {
     expect(await response.json()).toEqual({ state: 'ended' });
   });
 
-  it('returns in_progress without touching Dialpad when callId is bound', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 1000, callId: '12345', state: 'in_progress',
-    }));
+  it('returns in_progress when KV has a call_id', async () => {
+    await env.SYNC_STATE.put(KV_KEY, '99999');
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(statusReq(), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ state: 'in_progress' });
+  });
+
+  it('does not call Dialpad regardless of KV state', async () => {
     const calls = mockFetch([]);
 
-    const ctx = createExecutionContext();
-    const response = await worker.fetch(statusReq(), env, ctx);
+    // empty case
+    let ctx = createExecutionContext();
+    await worker.fetch(statusReq(), env, ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ state: 'in_progress' });
-    expect(findCalls(calls, '/api/v2/calls')).toHaveLength(0);
-  });
-
-  it('returns ended when state is already ended', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 1000, callId: '12345', state: 'ended',
-    }));
-    const ctx = createExecutionContext();
-    const response = await worker.fetch(statusReq(), env, ctx);
-    await waitOnExecutionContext(ctx);
-    expect(await response.json()).toEqual({ state: 'ended' });
-  });
-
-  it('discovery: writes callId and returns in_progress when list-calls finds a match', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 500, state: 'in_progress',
-    }));
-    mockFetch([
-      {
-        match: '/api/v2/calls',
-        response: {
-          items: [{ call_id: 99999, state: 'calling', direction: 'outbound', external_number: '+14155551212' }],
-        },
-      },
-    ]);
-
-    const ctx = createExecutionContext();
-    const response = await worker.fetch(statusReq(), env, ctx);
+    // populated case
+    await env.SYNC_STATE.put(KV_KEY, '99999');
+    ctx = createExecutionContext();
+    await worker.fetch(statusReq(), env, ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ state: 'in_progress' });
-
-    const stored = JSON.parse(await env.SYNC_STATE.get(KV_KEY));
-    expect(stored.callId).toBe('99999');
-    expect(stored.state).toBe('in_progress');
-  });
-
-  it('discovery: returns in_progress without writing callId when list-calls has no match', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 500, state: 'in_progress',
-    }));
-    mockFetch([
-      { match: '/api/v2/calls', response: { items: [] } },
-    ]);
-
-    const ctx = createExecutionContext();
-    const response = await worker.fetch(statusReq(), env, ctx);
-    await waitOnExecutionContext(ctx);
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ state: 'in_progress' });
-
-    const stored = JSON.parse(await env.SYNC_STATE.get(KV_KEY));
-    expect(stored.callId).toBeUndefined();
-  });
-
-  it('discovery: returns 502 when Dialpad list-calls fails', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 500, state: 'in_progress',
-    }));
-    mockFetch([
-      { match: '/api/v2/calls', status: 429, response: { error: 'rate limited' } },
-    ]);
-
-    const ctx = createExecutionContext();
-    const response = await worker.fetch(statusReq(), env, ctx);
-    await waitOnExecutionContext(ctx);
-
-    expect(response.status).toBe(502);
+    expect(findCalls(calls, 'dialpad.com')).toHaveLength(0);
   });
 });
 
 // ---------------------------------------------------------------------------
-// /webhook/dialpad/extension-calls
+// /webhook/dialpad/extension-calls (webhook is the only path that writes KV)
 // ---------------------------------------------------------------------------
 
 describe('/webhook/dialpad/extension-calls', () => {
@@ -296,46 +211,35 @@ describe('/webhook/dialpad/extension-calls', () => {
     expect(response.status).toBe(401);
   });
 
-  it('flips state to ended when callId matches', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 1000, callId: '99999', state: 'in_progress',
-    }));
+  it('calling event sets KV[user] = call_id', async () => {
     const jwt = await createDialpadJWT({
-      state: 'hangup', direction: 'outbound', call_id: 99999, target: { id: '8000000000000001' },
+      state: 'calling', direction: 'outbound', call_id: 99999, target: { id: '8000000000000001' },
     });
-
     const ctx = createExecutionContext();
     const response = await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(200);
-    const stored = JSON.parse(await env.SYNC_STATE.get(KV_KEY));
-    expect(stored.state).toBe('ended');
-    expect(stored.callId).toBe('99999');
+    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
   });
 
-  it('drops events when call_id does not match', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 1000, callId: '99999', state: 'in_progress',
-    }));
+  it('calling event overwrites a prior call_id', async () => {
+    await env.SYNC_STATE.put(KV_KEY, 'prior-12345');
     const jwt = await createDialpadJWT({
-      state: 'hangup', direction: 'outbound', call_id: 88888, target: { id: '8000000000000001' },
+      state: 'calling', direction: 'outbound', call_id: 99999, target: { id: '8000000000000001' },
     });
-
     const ctx = createExecutionContext();
-    const response = await worker.fetch(webhookReq(jwt), env, ctx);
+    await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(response.status).toBe(200);
-    const stored = JSON.parse(await env.SYNC_STATE.get(KV_KEY));
-    expect(stored.state).toBe('in_progress');
+    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
   });
 
-  it('drops events when no record exists', async () => {
+  it('hangup event clears KV when call_id matches', async () => {
+    await env.SYNC_STATE.put(KV_KEY, '99999');
     const jwt = await createDialpadJWT({
       state: 'hangup', direction: 'outbound', call_id: 99999, target: { id: '8000000000000001' },
     });
-
     const ctx = createExecutionContext();
     const response = await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
@@ -344,44 +248,70 @@ describe('/webhook/dialpad/extension-calls', () => {
     expect(await env.SYNC_STATE.get(KV_KEY)).toBeNull();
   });
 
-  it('drops events when callId is not yet bound', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 1000, state: 'in_progress',
-    }));
+  it('hangup event drops when call_id does not match (stale event)', async () => {
+    await env.SYNC_STATE.put(KV_KEY, '99999');
+    const jwt = await createDialpadJWT({
+      state: 'hangup', direction: 'outbound', call_id: 88888, target: { id: '8000000000000001' },
+    });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(webhookReq(jwt), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
+    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
+  });
+
+  it('hangup event drops when KV is empty', async () => {
     const jwt = await createDialpadJWT({
       state: 'hangup', direction: 'outbound', call_id: 99999, target: { id: '8000000000000001' },
     });
-
     const ctx = createExecutionContext();
     const response = await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(200);
-    const stored = JSON.parse(await env.SYNC_STATE.get(KV_KEY));
-    expect(stored.state).toBe('in_progress');
-    expect(stored.callId).toBeUndefined();
+    expect(await env.SYNC_STATE.get(KV_KEY)).toBeNull();
   });
 
   it('drops inbound events defensively', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 1000, callId: '99999', state: 'in_progress',
-    }));
+    await env.SYNC_STATE.put(KV_KEY, '99999');
     const jwt = await createDialpadJWT({
-      state: 'hangup', direction: 'inbound', call_id: 99999, target: { id: '8000000000000001' },
+      state: 'calling', direction: 'inbound', call_id: 99999, target: { id: '8000000000000001' },
     });
-
     const ctx = createExecutionContext();
-    const response = await worker.fetch(webhookReq(jwt), env, ctx);
+    await worker.fetch(webhookReq(jwt), env, ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(response.status).toBe(200);
-    const stored = JSON.parse(await env.SYNC_STATE.get(KV_KEY));
-    expect(stored.state).toBe('in_progress');
+    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
+  });
+
+  it('drops events for unmonitored target.id', async () => {
+    const jwt = await createDialpadJWT({
+      state: 'calling', direction: 'outbound', call_id: 99999, target: { id: '0000000000000000' },
+    });
+    const ctx = createExecutionContext();
+    await worker.fetch(webhookReq(jwt), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(await env.SYNC_STATE.get(KV_KEY)).toBeNull();
+  });
+
+  it('drops unsupported states (e.g. connected, voicemail)', async () => {
+    await env.SYNC_STATE.put(KV_KEY, '99999');
+    const jwt = await createDialpadJWT({
+      state: 'voicemail', direction: 'outbound', call_id: 99999, target: { id: '8000000000000001' },
+    });
+    const ctx = createExecutionContext();
+    await worker.fetch(webhookReq(jwt), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    // KV unchanged
+    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
   });
 });
 
 // ---------------------------------------------------------------------------
-// /dialpad-hangup with the new extcall:state JSON shape
+// /dialpad-hangup (reads call_id from KV; doesn't clear it)
 // ---------------------------------------------------------------------------
 
 describe('/dialpad-hangup', () => {
@@ -398,27 +328,15 @@ describe('/dialpad-hangup', () => {
     });
   }
 
-  it('returns 409 when KV has no record', async () => {
+  it('returns 409 when KV has no call_id', async () => {
     const ctx = createExecutionContext();
     const response = await worker.fetch(hangupReq(), env, ctx);
     await waitOnExecutionContext(ctx);
     expect(response.status).toBe(409);
   });
 
-  it('returns 409 when KV record has no callId yet', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 500, state: 'in_progress',
-    }));
-    const ctx = createExecutionContext();
-    const response = await worker.fetch(hangupReq(), env, ctx);
-    await waitOnExecutionContext(ctx);
-    expect(response.status).toBe(409);
-  });
-
-  it('calls Dialpad hangup, clears KV, returns 200 on the normal path', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 1000, callId: '99999', state: 'in_progress',
-    }));
+  it('calls Dialpad hangup with the stored call_id and returns 200', async () => {
+    await env.SYNC_STATE.put(KV_KEY, '99999');
     const calls = mockFetch([
       { match: '/call/99999/actions/hangup', response: {} },
     ]);
@@ -429,28 +347,23 @@ describe('/dialpad-hangup', () => {
 
     expect(response.status).toBe(200);
     expect(findCalls(calls, '/call/99999/actions/hangup')).toHaveLength(1);
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBeNull();
   });
 
-  it('skips Dialpad and returns 200 on the already-ended fast path', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 60_000, callId: '99999', state: 'ended',
-    }));
-    const calls = mockFetch([]);
+  it('does NOT clear KV on success — only the hangup webhook does', async () => {
+    await env.SYNC_STATE.put(KV_KEY, '99999');
+    mockFetch([
+      { match: '/call/99999/actions/hangup', response: {} },
+    ]);
 
     const ctx = createExecutionContext();
-    const response = await worker.fetch(hangupReq(), env, ctx);
+    await worker.fetch(hangupReq(), env, ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(response.status).toBe(200);
-    expect(findCalls(calls, '/actions/hangup')).toHaveLength(0);
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBeNull();
+    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
   });
 
-  it('clears KV even when Dialpad rejects (returns 502)', async () => {
-    await env.SYNC_STATE.put(KV_KEY, JSON.stringify({
-      phoneNumber: '+14155551212', initiatedAt: Date.now() - 1000, callId: '99999', state: 'in_progress',
-    }));
+  it('returns 502 when Dialpad rejects, KV unchanged', async () => {
+    await env.SYNC_STATE.put(KV_KEY, '99999');
     mockFetch([
       { match: '/call/99999/actions/hangup', status: 404, response: { error: 'Call not found' } },
     ]);
@@ -460,78 +373,6 @@ describe('/dialpad-hangup', () => {
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(502);
-    expect(await env.SYNC_STATE.get(KV_KEY)).toBeNull();
-  });
-
-  it('returns 409 on malformed KV value', async () => {
-    await env.SYNC_STATE.put(KV_KEY, 'not-json{{{');
-    const ctx = createExecutionContext();
-    const response = await worker.fetch(hangupReq(), env, ctx);
-    await waitOnExecutionContext(ctx);
-    expect(response.status).toBe(409);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// findCallForBind (pure helper)
-// ---------------------------------------------------------------------------
-
-describe('findCallForBind (discovery filter)', () => {
-  const phoneNumber = '+14155551212';
-
-  it('returns null on empty / null / undefined input', async () => {
-    const { findCallForBind } = await import('../src/extension-calls.js');
-    expect(findCallForBind([], { phoneNumber })).toBeNull();
-    expect(findCallForBind(null, { phoneNumber })).toBeNull();
-    expect(findCallForBind(undefined, { phoneNumber })).toBeNull();
-  });
-
-  it('matches an outbound calling-state call with matching external_number', async () => {
-    const { findCallForBind } = await import('../src/extension-calls.js');
-    const items = [
-      { call_id: 999, state: 'calling', direction: 'outbound', external_number: '+14155551212' },
-    ];
-    expect(findCallForBind(items, { phoneNumber })?.call_id).toBe(999);
-  });
-
-  it('matches connected state too', async () => {
-    const { findCallForBind } = await import('../src/extension-calls.js');
-    const items = [
-      { call_id: 1000, state: 'connected', direction: 'outbound', external_number: '+14155551212' },
-    ];
-    expect(findCallForBind(items, { phoneNumber })?.call_id).toBe(1000);
-  });
-
-  it('rejects terminated calls (state=hangup)', async () => {
-    const { findCallForBind } = await import('../src/extension-calls.js');
-    const items = [
-      { call_id: 999, state: 'hangup', direction: 'outbound', external_number: '+14155551212' },
-    ];
-    expect(findCallForBind(items, { phoneNumber })).toBeNull();
-  });
-
-  it('rejects inbound calls', async () => {
-    const { findCallForBind } = await import('../src/extension-calls.js');
-    const items = [
-      { call_id: 999, state: 'connected', direction: 'inbound', external_number: '+14155551212' },
-    ];
-    expect(findCallForBind(items, { phoneNumber })).toBeNull();
-  });
-
-  it('rejects mismatched external_number', async () => {
-    const { findCallForBind } = await import('../src/extension-calls.js');
-    const items = [
-      { call_id: 999, state: 'calling', direction: 'outbound', external_number: '+14155559999' },
-    ];
-    expect(findCallForBind(items, { phoneNumber })).toBeNull();
-  });
-
-  it('returns the first match (most-recent ordering)', async () => {
-    const { findCallForBind } = await import('../src/extension-calls.js');
-    const items = [
-      { call_id: 1001, state: 'calling', direction: 'outbound', external_number: '+14155551212' },
-      { call_id: 999, state: 'connected', direction: 'outbound', external_number: '+14155551212' },
-    ];
-    expect(findCallForBind(items, { phoneNumber })?.call_id).toBe(1001);
+    expect(await env.SYNC_STATE.get(KV_KEY)).toBe('99999');
   });
 });

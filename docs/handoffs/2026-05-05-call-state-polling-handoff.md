@@ -1,12 +1,24 @@
 # Dialpad Call State — Polling Rewrite Hand-off (Middleware → Extension)
 
-**Date:** 2026-05-05
+**Date:** 2026-05-05 (worker simplification update: 2026-05-06)
 **Direction:** middleware → extension
 **Supersedes:** `2026-05-01-dialpad-call-state-handoff.md` (the SSE design — every
 piece of that doc is now obsolete; you're tearing it out)
 **Companion to:** `2026-05-01-dialpad-middleware-handoff.md` and
 `2026-05-01-dialpad-sms-middleware-handoff.md` (still current; same
 auth/CORS/`consultantFirstName` conventions apply)
+
+> **Architecture update (2026-05-06):** The worker side has been simplified
+> — the request-driven endpoints (`/dialpad-call`, `/dialpad-hangup`,
+> `/extension-call-status`) no longer touch KV at all. The Dialpad
+> `calling` and `hangup` webhooks are the **only** path that writes/clears
+> the per-user `call_id`. Polling is a pure KV read; "Calling…" buffer is
+> now waiting for the calling webhook to land (typically a few hundred ms),
+> not for list-calls discovery. **Nothing in the extension contract below
+> changes** — same endpoints, same request/response shapes, same
+> `{state: "in_progress" | "ended"}` polling response, same 10s give-up
+> clock. The internal mechanism is just simpler now and more resilient to
+> the eventual-consistency edges that broke discovery via list-calls.
 
 ---
 

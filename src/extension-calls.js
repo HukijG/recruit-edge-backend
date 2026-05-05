@@ -1,51 +1,30 @@
 /**
- * Extension call-state helpers — used by the Call/Hangup button polling flow.
+ * Extension call-state webhook handler.
  *
- * Two exports:
+ * Single responsibility: maintain `extcall:callid:{userId}` in KV based on
+ * Dialpad call-state webhook events. The polling endpoint reads that key to
+ * tell the extension whether to show Hangup or Call.
  *
- *   findCallForBind(items, { phoneNumber })
- *     Pure helper used by /extension-call-status's discovery branch. Walks
- *     Dialpad's call-list response in order (Dialpad returns most-recent
- *     first) and returns the first item that matches our extension-initiated
- *     outbound call: outbound direction, matching external_number, and an
- *     in-progress state ("calling" or "connected"). Null on no match.
+ * State transitions are webhook-driven, NOT request-driven:
+ *   - `calling` event for a monitored user → KV[user.dialpadId] = call_id
+ *     (overwrite-on-write, intentionally — a new call replaces any prior).
+ *   - `hangup` event whose call_id matches what's stored → KV.delete
+ *     (no-op if call_id doesn't match; protects against stale-event races).
+ *   - Anything else (`connected`, `voicemail`, inbound direction, etc.) → drop.
  *
- *   processExtensionCallEvent(payload, env)
- *     Webhook handler for terminal Dialpad call-state events on the
- *     extension subscription (hangup-only, configured Dialpad-side). Reads
- *     the user's KV state record, match-guards against the cached call_id,
- *     and on match flips state to "ended" (preserves callId so /dialpad-
- *     hangup's already-ended fast path can fire). On mismatch / no-record /
- *     no-callId-yet, drops the event silently.
+ * No phone-number / external_number matching, no eventual-consistency hooks
+ * from /dialpad-call or /dialpad-hangup. Only the webhook touches KV. This
+ * makes the system robust against missed events at the cost of "the extension
+ * UI lags reality by the webhook delivery delay" — accepted as a nice-to-have
+ * UX feature, not a correctness requirement.
  */
 
 import { getUserByDialpadId } from './users.js';
 
-const IN_PROGRESS_STATES = new Set(['calling', 'connected']);
+const ACTIVE_TRIGGER_STATES = new Set(['calling']);
 const TERMINAL_STATES = new Set(['hangup']);
 const EXTCALL_TTL_SEC = 20 * 60;
 
-/**
- * Find the first Dialpad call-list item that matches our outbound-initiated
- * call to `phoneNumber`. Returns null if no match.
- */
-export function findCallForBind(items, { phoneNumber }) {
-  if (!Array.isArray(items) || items.length === 0) return null;
-  for (const item of items) {
-    if (!item) continue;
-    if (item.direction !== 'outbound') continue;
-    if (item.external_number !== phoneNumber) continue;
-    if (!IN_PROGRESS_STATES.has(item.state)) continue;
-    return item;
-  }
-  return null;
-}
-
-/**
- * Webhook handler for Dialpad extension-call hangup events. Returns a small
- * { processed, reason, ... } object so the route can log a single structured
- * line per event.
- */
 export async function processExtensionCallEvent(payload, env) {
   const direction = payload?.direction;
   const targetId = payload?.target?.id;
@@ -57,8 +36,8 @@ export async function processExtensionCallEvent(payload, env) {
   if (direction !== 'outbound') {
     return { processed: false, reason: 'not-outbound', eventState, eventCallId };
   }
-  if (!TERMINAL_STATES.has(eventState)) {
-    return { processed: false, reason: 'not-terminal', eventState, eventCallId };
+  if (!eventCallId) {
+    return { processed: false, reason: 'no-callid-in-payload', eventState };
   }
 
   const user = getUserByDialpadId(targetId);
@@ -66,34 +45,37 @@ export async function processExtensionCallEvent(payload, env) {
     return { processed: false, reason: 'unmonitored-target', targetId, eventState, eventCallId };
   }
 
-  const kvKey = `extcall:state:${user.dialpadId}`;
-  const raw = await env.SYNC_STATE.get(kvKey);
-  if (!raw) {
-    return { processed: false, reason: 'no-record', targetId, eventCallId };
+  const kvKey = `extcall:callid:${user.dialpadId}`;
+
+  if (ACTIVE_TRIGGER_STATES.has(eventState)) {
+    await env.SYNC_STATE.put(kvKey, eventCallId, { expirationTtl: EXTCALL_TTL_SEC });
+    return {
+      processed: true,
+      reason: 'set-active',
+      targetId,
+      dialpadUserId: user.dialpadId,
+      callId: eventCallId,
+      eventState,
+    };
   }
 
-  let record;
-  try { record = JSON.parse(raw); }
-  catch { return { processed: false, reason: 'malformed-record', targetId, eventCallId }; }
-
-  if (!record?.callId) {
-    return { processed: false, reason: 'no-callid-bound', targetId, eventCallId };
+  if (TERMINAL_STATES.has(eventState)) {
+    const stored = await env.SYNC_STATE.get(kvKey);
+    if (!stored) {
+      return { processed: false, reason: 'no-active-record', targetId, eventCallId };
+    }
+    if (stored !== eventCallId) {
+      return { processed: false, reason: 'callid-mismatch', targetId, eventCallId, recordCallId: stored };
+    }
+    await env.SYNC_STATE.delete(kvKey);
+    return {
+      processed: true,
+      reason: 'cleared-on-hangup',
+      targetId,
+      dialpadUserId: user.dialpadId,
+      callId: eventCallId,
+    };
   }
-  if (String(record.callId) !== eventCallId) {
-    return { processed: false, reason: 'callid-mismatch', targetId, eventCallId, recordCallId: record.callId };
-  }
 
-  await env.SYNC_STATE.put(
-    kvKey,
-    JSON.stringify({ ...record, state: 'ended' }),
-    { expirationTtl: EXTCALL_TTL_SEC },
-  );
-
-  return {
-    processed: true,
-    reason: 'flipped-to-ended',
-    targetId,
-    dialpadUserId: user.dialpadId,
-    callId: eventCallId,
-  };
+  return { processed: false, reason: 'unsupported-state', eventState, eventCallId };
 }
