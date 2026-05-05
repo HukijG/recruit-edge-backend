@@ -293,19 +293,77 @@ export async function listUserCalls({ userId, startedAfterMs }, env) {
   });
   const url = `${dialpadBaseUrl}/calls?${params.toString()}`;
 
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'Accept': 'application/json',
-      'Authorization': `Bearer ${dialpadApiKey}`,
-    },
+  console.log({
+    message: `[Dialpad/list-calls] GET ${url}`,
+    source: 'dialpad-client',
+    op: 'list-calls',
+    url,
+    userId: String(userId),
+    startedAfterMs,
+    startedAfterIso: new Date(startedAfterMs).toISOString(),
   });
 
-  let parsed = null;
+  let response;
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': `Bearer ${dialpadApiKey}`,
+      },
+    });
+  } catch (error) {
+    console.error({
+      message: `[Dialpad/list-calls] fetch threw: ${error.message}`,
+      source: 'dialpad-client',
+      op: 'list-calls',
+      url,
+      stack: error.stack,
+    });
+    throw error;
+  }
+
   const text = await response.text();
+  let parsed = null;
   if (text) {
     try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
   }
+
+  // Always log the response — body sample on success, full body on error so
+  // we can diagnose 4xx/5xx without the next poll re-trying invisibly.
+  if (response.ok) {
+    const items = Array.isArray(parsed?.items) ? parsed.items
+      : Array.isArray(parsed?.calls) ? parsed.calls
+      : [];
+    console.log({
+      message: `[Dialpad/list-calls] ${response.status} OK items=${items.length}`,
+      source: 'dialpad-client',
+      op: 'list-calls',
+      status: response.status,
+      itemsCount: items.length,
+      bodyKeys: parsed && typeof parsed === 'object' ? Object.keys(parsed).slice(0, 10) : null,
+      itemsSample: items.slice(0, 3).map(i => ({
+        call_id: i?.call_id,
+        state: i?.state,
+        direction: i?.direction,
+        external_number: i?.external_number,
+        date_started: i?.date_started,
+      })),
+    });
+  } else {
+    console.error({
+      message: `[Dialpad/list-calls] ${response.status} ${response.statusText} body=${text.slice(0, 500)}`,
+      source: 'dialpad-client',
+      op: 'list-calls',
+      status: response.status,
+      statusText: response.statusText,
+      url,
+      bodySample: text.slice(0, 1000),
+      bodyLength: text.length,
+      parsedKeys: parsed && typeof parsed === 'object' ? Object.keys(parsed).slice(0, 10) : null,
+    });
+  }
+
   return { ok: response.ok, status: response.status, body: parsed };
 }
 

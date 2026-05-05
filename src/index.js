@@ -2116,11 +2116,34 @@ async function handleDialpadCallEndpoint(request, env, corsHeaders) {
       initiatedAt: Date.now(),
       state: 'in_progress',
     };
-    await env.SYNC_STATE.put(
-      `extcall:state:${user.dialpadId}`,
-      JSON.stringify(stateRecord),
-      { expirationTtl: 20 * 60 },
-    );
+    const kvKey = `extcall:state:${user.dialpadId}`;
+    try {
+      await env.SYNC_STATE.put(
+        kvKey,
+        JSON.stringify(stateRecord),
+        { expirationTtl: 20 * 60 },
+      );
+      console.log({
+        message: `[DialpadCall] KV.put ${kvKey} ← {phoneNumber,initiatedAt,state:in_progress}`,
+        source: 'dialpad-call',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        kvKey,
+        record: stateRecord,
+      });
+    } catch (kvErr) {
+      // KV failure here is rare but would silently break the polling flow.
+      // Log loudly; don't fail the request — the call has already been
+      // accepted by Dialpad and the user's phone is ringing.
+      console.error({
+        message: `[DialpadCall] KV.put failed for ${kvKey}: ${kvErr.message}`,
+        source: 'dialpad-call',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        kvKey,
+        stack: kvErr.stack,
+      });
+    }
 
     return new Response(JSON.stringify({ ok: true }), {
       status: 200, headers: responseHeaders,
@@ -2406,6 +2429,10 @@ async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
       : '';
 
     if (!consultantFirstName) {
+      console.warn({
+        message: `[ExtCallStatus] 400 missing consultantFirstName`,
+        source: 'extension-call-status',
+      });
       return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
         status: 400, headers: responseHeaders,
       });
@@ -2413,6 +2440,11 @@ async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
 
     const user = getUserByFirstName(consultantFirstName);
     if (!user) {
+      console.warn({
+        message: `[ExtCallStatus] 403 unknown consultant=${consultantFirstName}`,
+        source: 'extension-call-status',
+        consultantFirstName,
+      });
       return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
         status: 403, headers: responseHeaders,
       });
@@ -2422,6 +2454,14 @@ async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
     const raw = await env.SYNC_STATE.get(kvKey);
 
     if (!raw) {
+      console.log({
+        message: `[ExtCallStatus] poll consultant=${consultantFirstName} branch=kv-empty → state=ended`,
+        source: 'extension-call-status',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        branch: 'kv-empty',
+        returnedState: 'ended',
+      });
       return new Response(JSON.stringify({ state: 'ended' }), {
         status: 200, headers: responseHeaders,
       });
@@ -2431,11 +2471,11 @@ async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
     try { record = JSON.parse(raw); }
     catch {
       console.error({
-        message: `[ExtCallStatus] malformed extcall:state — treating as ended`,
+        message: `[ExtCallStatus] malformed extcall:state — treating as ended consultant=${consultantFirstName}`,
         source: 'extension-call-status',
         consultantFirstName,
         dialpadId: user.dialpadId,
-        rawSample: raw.slice(0, 100),
+        rawSample: raw.slice(0, 200),
       });
       // Don't let a corrupted record jam the polling loop forever.
       await env.SYNC_STATE.delete(kvKey);
@@ -2445,12 +2485,30 @@ async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
     }
 
     if (record.state === 'ended') {
+      console.log({
+        message: `[ExtCallStatus] poll consultant=${consultantFirstName} branch=state-ended → state=ended`,
+        source: 'extension-call-status',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        branch: 'state-ended',
+        callId: record.callId ?? null,
+        returnedState: 'ended',
+      });
       return new Response(JSON.stringify({ state: 'ended' }), {
         status: 200, headers: responseHeaders,
       });
     }
 
     if (record.callId) {
+      console.log({
+        message: `[ExtCallStatus] poll consultant=${consultantFirstName} branch=callid-bound callId=${record.callId} → state=in_progress`,
+        source: 'extension-call-status',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        branch: 'callid-bound',
+        callId: record.callId,
+        returnedState: 'in_progress',
+      });
       return new Response(JSON.stringify({ state: 'in_progress' }), {
         status: 200, headers: responseHeaders,
       });
@@ -2459,7 +2517,24 @@ async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
     // Discovery branch: state="in_progress", no callId yet. Hit Dialpad's
     // call-list to find the call we just placed. 5s buffer on started_after
     // for clock skew.
-    const startedAfterMs = Math.max(0, (record.initiatedAt ?? Date.now()) - 5_000);
+    const initiatedAt = record.initiatedAt ?? Date.now();
+    const elapsedMs = Date.now() - initiatedAt;
+    const startedAfterMs = Math.max(0, initiatedAt - 5_000);
+
+    console.log({
+      message: `[ExtCallStatus] poll consultant=${consultantFirstName} branch=discovery elapsedMs=${elapsedMs} → calling Dialpad list-calls`,
+      source: 'extension-call-status',
+      consultantFirstName,
+      dialpadId: user.dialpadId,
+      branch: 'discovery',
+      phoneNumber: record.phoneNumber,
+      initiatedAt,
+      initiatedAtIso: new Date(initiatedAt).toISOString(),
+      startedAfterMs,
+      startedAfterIso: new Date(startedAfterMs).toISOString(),
+      elapsedMs,
+    });
+
     const listResult = await listUserCalls({
       userId: user.dialpadId,
       startedAfterMs,
@@ -2468,13 +2543,19 @@ async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
     if (!listResult.ok) {
       const upstreamMsg = listResult.body?.error || listResult.body?.message || `HTTP ${listResult.status}`;
       console.error({
-        message: `[ExtCallStatus] Dialpad list-calls rejected: ${upstreamMsg}`,
+        message: `[ExtCallStatus] discovery 502: Dialpad list-calls rejected (${listResult.status}) ${upstreamMsg}`,
         source: 'extension-call-status',
         consultantFirstName,
         dialpadId: user.dialpadId,
+        branch: 'discovery-error',
         upstreamStatus: listResult.status,
+        upstreamMessage: upstreamMsg,
+        upstreamBody: listResult.body, // logged in full so we can diagnose 4xx
+        startedAfterMs,
+        elapsedMs,
+        returnedHttpStatus: 502,
       });
-      return new Response(JSON.stringify({ ok: false, error: 'Dialpad list-calls failed' }), {
+      return new Response(JSON.stringify({ ok: false, error: `Dialpad list-calls failed (${listResult.status}): ${upstreamMsg}` }), {
         status: 502, headers: responseHeaders,
       });
     }
@@ -2495,12 +2576,39 @@ async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
         { expirationTtl: 20 * 60 },
       );
       console.log({
-        message: `[ExtCallStatus] callId bound consultant=${consultantFirstName} callId=${callId}`,
+        message: `[ExtCallStatus] discovery MATCH consultant=${consultantFirstName} callId=${callId} elapsedMs=${elapsedMs} → state=in_progress (KV updated)`,
         source: 'extension-call-status',
         consultantFirstName,
         dialpadId: user.dialpadId,
+        branch: 'discovery-match',
         callId,
-        elapsedMs: Date.now() - (record.initiatedAt ?? Date.now()),
+        matchedItem: {
+          call_id: match.call_id,
+          state: match.state,
+          direction: match.direction,
+          external_number: match.external_number,
+          date_started: match.date_started,
+        },
+        elapsedMs,
+        returnedState: 'in_progress',
+      });
+    } else {
+      console.log({
+        message: `[ExtCallStatus] discovery NO-MATCH consultant=${consultantFirstName} items=${items.length} elapsedMs=${elapsedMs} → state=in_progress (extension keeps polling)`,
+        source: 'extension-call-status',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        branch: 'discovery-no-match',
+        phoneNumber: record.phoneNumber,
+        itemsCount: items.length,
+        itemsSummary: items.slice(0, 5).map(i => ({
+          call_id: i?.call_id,
+          state: i?.state,
+          direction: i?.direction,
+          external_number: i?.external_number,
+        })),
+        elapsedMs,
+        returnedState: 'in_progress',
       });
     }
     // Whether matched or not, return in_progress — the extension owns the
