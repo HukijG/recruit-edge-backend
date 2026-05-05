@@ -1,6 +1,6 @@
 # Architecture & Data Flow
 
-> **Status note (2026-05-03):** Call-state-related sections in this document (anything mentioning `extcall:watch`, `extcall:active`, `EXT_CALL_CHANNEL`, `ExtensionCallStateChannel`, `/webhook/dialpad/extension-calls`, `/extension-call-stream`, or SSE-over-DO fan-out) are obsolete. Cleanup landed first; full polling-based replacement is pending. See `CLAUDE.md` for the current state and `docs/archive/specs/2026-05-03-call-state-polling-design.md` for the target design. The system-overview diagram, file table, and endpoints table below have been trimmed; the detailed code-flow sections still reference the old design and will be rewritten with the implementation.
+> **Status note (2026-05-05):** Call-state architecture has settled on **webhook-driven Durable Object** storage. Per-user `ExtCallState` DO holds the active Dialpad `call_id` with strong consistency. The Dialpad `calling`+`hangup` webhook (`/webhook/dialpad/extension-calls`) is the only writer; `/dialpad-call`, `/dialpad-hangup`, and `/extension-call-status` are read-only. The detailed call-state code-flow section below is current.
 
 ## System Overview
 
@@ -18,9 +18,10 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 │                                Cloudflare Worker (rf-dialpad-sync-dev)                                      │
 │                                                                                                              │
 │  /webhook/recruiterflow  /webhook/dialpad  /webhook/dialpad/calls                                          │
-│  /webhook/calendar  /webhook/krisp  /webhook/apollo                                                         │
+│  /webhook/dialpad/extension-calls  /webhook/calendar  /webhook/krisp  /webhook/apollo                      │
 │  /candidates  /candidates/add-to-job  /candidate-details  /candidate-mark-invalid                           │
 │  /dialpad-user-context  /dialpad-call  /dialpad-sms  /dialpad-hangup  /extension-call-status               │
+│  /my-sourcing-jobs  /job-pipeline                                                                            │
 │  /health                                                                                                     │
 │                                                                                                              │
 │  ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐       │
@@ -39,10 +40,16 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 │  │  batch:job{jobId}                       → ordered rfId array         (30-day TTL)                 │       │
 │  │  prewarm:rec{rfUserId}:job{jobId}       → { lastPrewarmIdx }         (1-hour TTL)                 │       │
 │  │  ratelimit:call:{dialpadUserId}         → JSON [{t,phone}]           (120-sec TTL)                │       │
-│  │  extcall:callid:{dialpadUserId}         → Dialpad call_id string     (20-min TTL)                 │       │
 │  └──────────────────────────────────────────────────────────────────────────────────────────────────┘       │
 │                                                                                                              │
-│  No active Durable Objects. Migration v2 declares `ExtensionCallStateChannel` deletion.                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐       │
+│  │                    Durable Objects: EXT_CALL_STATE                                                 │       │
+│  │  ExtCallState (per-user, idFromName(dialpadUserId))                                                │       │
+│  │    storage.callId  → active Dialpad call_id     (20-min self-clearing alarm)                      │       │
+│  │  Strong consistency — every poll reads the latest webhook write regardless of origin PoP.         │       │
+│  └──────────────────────────────────────────────────────────────────────────────────────────────────┘       │
+│                                                                                                              │
+│  Migration history: v1 created `ExtensionCallStateChannel`; v2 deleted it; v3 added `ExtCallState`.         │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -61,6 +68,8 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `src/rate-limit.js` | Rolling-window rate-limit + cheap dedup gate for `/dialpad-call`. Pure `decideCallRateLimit({timestamps, now, phoneNumber})` returns `{allowed, reason?, retryAfterSec?, nextTimestamps?}`. KV-backed `checkAndRecordCall` reads SYNC_STATE, decides, persists on allow. 5 calls/60s rolling per Dialpad user_id, plus a 3s per-(user,phone) dedup window for double-clicks |
 | `src/krisp.js` | Krisp helpers: note formatting (HTML), candidate email extraction from meeting participants |
 | `src/cold-call.js` | Cold call detection: monitored-user filter (registry-driven), Dialpad transcript fetch, Workers AI classification (Llama 3.3 70B), per-outcome summary extraction (Llama 3.1 8B), RF custom activity + tag/source update + Sourced→Replied stage move, generic `mergeTag(tags, value)` helper, `parseColdCallActivity` for the extension shape |
+| `src/extension-calls.js` | Extension Call/Hangup webhook dispatcher. `processExtensionCallEvent`: filters Dialpad webhook payloads (outbound + monitored target), routes `calling`/`hangup` events to the per-user `ExtCallState` DO (set / clear-if-match). Drops everything else with a structured-log reason |
+| `src/extension-call-do.js` | `ExtCallState` Durable Object class. Per-user store (one instance per Dialpad user, `idFromName(dialpadUserId)`) for the active Dialpad `call_id`. RPC: `setCallId`, `getCallId`, `clearCallIdIfMatch`. 20-min self-clearing alarm on `setCallId`. Replaces the previous KV-backed `extcall:callid:*` design — KV's cross-PoP eventual consistency caused visible lag between calling-webhook write and polling read |
 | `src/apollo-client.js` | Apollo API client: enrichment, search, verification, scoring |
 | `src/enrichment.js` | Enrichment orchestration: ownership check (sourced from `users.js`), LinkedIn verify, fallback search, phone reveal |
 | `src/auth.js` | JWT verification for Dialpad webhooks (HS256 via `jose`) |
@@ -88,10 +97,13 @@ A single Cloudflare Worker (`rf-dialpad-sync-dev`) that keeps candidate/contact 
 | `/candidate-details` | POST | `X-Extension-Token` header | Sidepanel data: rfId, phone (E.164), picked job, cold-call activities |
 | `/candidate-mark-invalid` | POST | `X-Extension-Token` header | Tag candidate `"Number Invalid"` (idempotent) |
 | `/dialpad-user-context` | POST | `X-Extension-Token` header | Caller-ID picker data: `{ callerIds: [{ aliasId, country, label?, isDefault? }] }` (opaque aliases, no raw E.164) |
-| `/dialpad-call` | POST | `X-Extension-Token` header | Initiate call via Dialpad `initiate_call`. Decodes `callerAliasId`; Dialpad auto-rings eligible devices. Clears any cached `extcall:callid` after Dialpad accepts. Response is `{ ok: true }` only (no `callId` — extension never sees it) |
+| `/dialpad-call` | POST | `X-Extension-Token` header | Initiate call via Dialpad `initiate_call`. Decodes `callerAliasId`; Dialpad auto-rings eligible devices. Worker doesn't write call-state — the Dialpad `calling` webhook does. Response is `{ ok: true }` only (no `callId` — extension never sees it) |
 | `/dialpad-sms` | POST | `X-Extension-Token` header | Send a single SMS via Dialpad `/sms`. Decodes `callerAliasId` (optional → Dialpad default sender); text is forwarded verbatim |
-| `/dialpad-hangup` | POST | `X-Extension-Token` header | Terminate the consultant's active call. Body is just `{ consultantFirstName }`; worker reads `call_id` from `extcall:callid` KV. 409 if no call_id cached |
-| `/extension-call-status` | POST | `X-Extension-Token` header | Polled ~every 500ms by extension after a `/dialpad-call`. Returns `{ state: "in_progress" \| "ended" }`. First poll discovers the Dialpad `call_id` via call-list and caches it; subsequent polls read call info |
+| `/dialpad-hangup` | POST | `X-Extension-Token` header | Terminate whatever call is currently stored. Body is just `{ consultantFirstName }`; worker reads `call_id` from the user's `ExtCallState` DO. Worker doesn't clear the DO — the `hangup` webhook does. 409 if no call_id is set |
+| `/extension-call-status` | POST | `X-Extension-Token` header | Polled ~every 500ms by extension after a `/dialpad-call`. Reads from the user's `ExtCallState` DO (strongly consistent). Returns `{ state: "in_progress" \| "ended" }`. Never calls Dialpad |
+| `/webhook/dialpad/extension-calls` | POST | JWT Bearer (HS256) | Dialpad call-state webhook driving the extension button. `calling` event → `DO.setCallId(payload.call_id)`. `hangup` event → `DO.clearCallIdIfMatch(payload.call_id)`. Subscription must be configured for both `calling` and `hangup` states |
+| `/my-sourcing-jobs` | POST | `X-Extension-Token` header | Mobile PWA home screen. Returns open jobs filtered to: consultant on `hiring_team` as Recruiter AND `job_status.name === "Sourcing"` |
+| `/job-pipeline` | POST | `X-Extension-Token` header | Mobile PWA pipeline view. Returns Sourced-stage candidates for a job ordered by `added_time` ASC, as `{ rfId, linkedinUrl }` pairs |
 
 ---
 
@@ -468,26 +480,15 @@ Extension → POST /dialpad-call (consultantFirstName, phoneNumber, callerAliasI
        - Else: append {t: now, phone}, write back (TTL 120s), allow
   → 429 ok=false (reason: "rate_limit" | "duplicate", retryAfterSec, Retry-After header) if blocked
 
-  → clearExtensionCallState(user.dialpadId)   ← one-in-one-out: every fresh
-                                                 call wipes any prior watch +
-                                                 active state for this user
-  → setExtensionCallWatch(user.dialpadId, phoneNumber)   ← MUST happen BEFORE
-                                                 initiateCall — Dialpad's
-                                                 'calling' webhook can land in
-                                                 milliseconds and the extension-
-                                                 calls handler matches against
-                                                 this watch entry
-
   → POST https://dialpad.com/api/v2/users/{user.dialpadId}/initiate_call
        body: { phone_number, outbound_caller_id }   (NO device_id — Dialpad auto-rings)
-  → On 502: clearExtensionCallWatch(user.dialpadId) (no calling event will fire)
   → 502 ok=false ("Dialpad rejected the call: <upstream message>") if non-2xx
-  → Response: { ok: true }   ← callId is NOT returned anymore; worker holds it
+  → Response: { ok: true }   ← worker holds the call_id; extension never sees it
 ```
 
 The rate-limit + dedup is intentionally per-Dialpad-user (i.e. per recruiter), not per-candidate or per-call-id, because Dialpad's own 5/min cap is per outbound user. Mirroring it locally turns "Dialpad silently rejected this" into a clean 429 with a `retryAfterSec` the extension can render directly. Denied attempts deliberately don't consume budget — only allowed calls write back to KV. The read-decide-write isn't transactional; in the worst case two near-simultaneous edge requests both pass through, which Dialpad would reject anyway.
 
-The `extcall:watch` write happens AFTER rate-limit but BEFORE invoking Dialpad. This ordering is critical: if we wrote the watch after `initiateCall` returned, Dialpad's `calling` event could land while the watch slot was still empty and the handler would have nothing to match against, leaving the extension stuck in `calling` state until its 15s client-side timeout.
+The worker does **not** write call-state from this endpoint. The Dialpad `calling` webhook is the single writer of the active-call store (see `/webhook/dialpad/extension-calls` below). So `/dialpad-call` is purely "ask Dialpad to ring the consultant's phone"; everything else flows from the resulting webhooks.
 
 ### `POST /dialpad-sms` — send an SMS
 
@@ -524,131 +525,88 @@ Extension → POST /dialpad-hangup (consultantFirstName)
   → 400 ok=false if consultantFirstName missing
   → resolve consultantFirstName → user via getUserByFirstName(name)
   → 403 ok=false if not in the registry
-  → getActiveExtensionCall(user.dialpadId) → { callId } or null
-  → 409 ok=false ("No active call") if no active entry
+  → stub = EXT_CALL_STATE.get(idFromName(user.dialpadId))
+  → callId = await stub.getCallId()
+  → 409 ok=false ("No active call") if callId is null
   → PUT https://dialpad.com/api/v2/call/{callId}/actions/hangup   (no body)
-  → clearExtensionCallState(user.dialpadId)   ← clears regardless of upstream
-                                                 outcome (per the one-in-one-
-                                                 out invariant)
   → 502 ok=false ("Dialpad rejected the hangup: <upstream message>") if non-2xx
-  → Response: { ok: true }
+  → Response: { ok: true }   ← worker does NOT clear the DO; the resulting
+                                Dialpad `hangup` webhook is the only path
+                                that clears
 ```
 
-The extension never sees the Dialpad `call_id` — the worker holds it in `extcall:active` from the moment the matching `calling` webhook lands. The hangup body is just `{ consultantFirstName }`, the worker reads the call_id server-side.
+The extension never sees the Dialpad `call_id` — the worker reads it from the per-user `ExtCallState` Durable Object, populated by the matching `calling` webhook. The hangup body is just `{ consultantFirstName }`.
 
-The KV clear runs **after** the Dialpad call but **regardless of its outcome**. Reasons:
-- Dialpad rejection is most often "call already terminated" — state is reset upstream too, so clearing locally is correct.
-- A stuck "active" entry would prevent the user from making a new call until its 30min TTL expired.
-- Spam-clicking the Hangup button is safe: the second click 409s ("No active call") instead of double-firing.
-
-If the user hangs up via the Dialpad app instead of the extension, the `hangup` webhook event handles state cleanup (see below). Either path leaves the system consistent.
+If the user hangs up via the Dialpad app instead of the extension, no `/dialpad-hangup` request fires — but the `hangup` webhook still does, and it clears the DO. Either path leaves the system consistent.
 
 ### `POST /webhook/dialpad/extension-calls` — call-state webhook handler
 
-A separate Dialpad webhook subscription, scoped at the company level with category `"all"` (Dialpad doesn't support per-state filtering). We filter to `calling` and `hangup` server-side. Same JWT auth as `/webhook/dialpad/calls` (shared `DIALPAD_WEBHOOK_SECRET`).
+The single writer/clearer of the per-user `ExtCallState` Durable Object. Subscription is configured Dialpad-side for **both `calling` and `hangup`** states on every monitored user; everything else (`connected`, `voicemail`, inbound) is filtered server-side and dropped silently. Same JWT auth as `/webhook/dialpad/calls` (shared `DIALPAD_WEBHOOK_SECRET`).
 
 ```
-Dialpad event (any state) → POST /webhook/dialpad/extension-calls
+Dialpad event → POST /webhook/dialpad/extension-calls
   → JWT verify (HS256, DIALPAD_WEBHOOK_SECRET)
-  → processExtensionCallEvent(payload, env, ctx):
-       targetId = payload.target.id
-       getUserByDialpadId(targetId) → skip if not in registry
-       (Dialpad's company-wide subscription delivers every user's events;
-        this filter is what limits action to monitored users.)
+  → processExtensionCallEvent(payload, env):
+       direction !== 'outbound' → drop (reason: not-outbound)
+       payload.call_id missing → drop (reason: no-callid-in-payload)
+       getUserByDialpadId(payload.target.id) → null → drop (reason: unmonitored-target)
+
+       stub = EXT_CALL_STATE.get(idFromName(user.dialpadId))
 
        IF state === 'calling':
-         direction !== 'outbound' → ignore
-         watch = getExtensionCallWatch(dialpadUserId)
-         no watch → ignore (untracked outbound call)
-         external_number !== watch.phone → ignore (different destination)
-         setActiveExtensionCall(dialpadUserId, call_id, external_number)
-         clearExtensionCallWatch(dialpadUserId)
-         notifyExtensionCallState({ state: 'active', phoneNumber })
-           → EXT_CALL_CHANNEL.getByName(dialpadUserId).pushState(...)
+         await stub.setCallId(payload.call_id)   ← overwrite-on-write,
+                                                    schedules a 20-min
+                                                    self-clearing alarm
+         return { processed: true, reason: 'set-active', callId, ... }
 
        IF state === 'hangup':
-         active = getActiveExtensionCall(dialpadUserId)
-         no active → ignore (hangup for a call we weren't tracking)
-         active.callId !== call_id → ignore (different call)
-         clearActiveExtensionCall(dialpadUserId)
-         notifyExtensionCallState({ state: 'ended', phoneNumber })
+         result = await stub.clearCallIdIfMatch(payload.call_id)
+         match → DO clears; reason: 'cleared-on-hangup'
+         mismatch → DO untouched (stale event for an old call); reason: 'callid-mismatch'
+         no record → reason: 'no-active-record'
 
-       all other states → ignored (we only care about calling + hangup)
+       any other state → drop (reason: 'unsupported-state')
 
-  → 200 (always, even on ignored events — Dialpad just needs the ack)
+  → 200 (always — Dialpad would retry on non-200 and we don't want that)
 ```
 
-The hangup branch handles BOTH user-driven hangups (extension → `/dialpad-hangup` → Dialpad PUT) AND "hung up elsewhere" cases (consultant uses the Dialpad app directly). The first case will hit this handler with `active` already cleared by `/dialpad-hangup` — the `no active → ignore` branch fires, and that's correct (the extension already updated its UI on the 200 response). The second case is the only path that emits a `state: ended` SSE event to flip the button back.
+The `clearCallIdIfMatch` guard protects against stale events: if a new call's `calling` event has already overwritten the DO with `callId_B`, a delayed `hangup` event for the old `callId_A` won't wipe the new state. This is why hangup match-or-ignore is the right semantics, not unconditional clear.
 
-Out-of-order events: Dialpad explicitly warns events may arrive out of order. The `event_timestamp` field is available on every payload; we don't currently sort because the watch/active state machine is naturally idempotent — a stale `calling` event finds no matching watch and is ignored.
+### `POST /extension-call-status` — extension polling endpoint
 
-### `GET /extension-call-stream` — Server-Sent Events stream
+Polled by the extension every ~500ms while a call is active.
 
 ```
-Extension → GET /extension-call-stream?consultantFirstName=Joel
-  → 400 if consultantFirstName missing
+Extension → POST /extension-call-status (consultantFirstName)
+  → Verify X-Extension-Token (401 ok=false on miss)
+  → 400 ok=false if consultantFirstName missing
   → resolve consultantFirstName → user via getUserByFirstName(name)
-  → 403 if not in the registry
-  → 500 if EXT_CALL_CHANNEL binding missing (deploy issue)
-  → stub = EXT_CALL_CHANNEL.getByName(user.dialpadId)
-  → DO request: GET https://do/subscribe?userId={dialpadUserId}
-       (request.signal forwarded so client disconnects propagate to the DO)
-  → ExtensionCallStateChannel.fetch():
-       create TransformStream, get writer
-       send `event: hello\ndata: {"ok":true}\n\n`
-       _readCurrentState(dialpadUserId):
-         active KV → { state: 'active', phoneNumber: active.phone }
-         else watch KV → { state: 'calling', phoneNumber: watch.phone }
-         else { state: 'idle' }
-       send `event: state\ndata: <initial state>\n\n` (replay)
-       writers.add(writer)
-       request.signal.addEventListener('abort', remove + close)
-       schedule alarm (25s) if not already scheduled
-       return Response(readable, { 'content-type': 'text/event-stream', ... })
-  → Worker merges CORS headers onto DO response, returns to extension
+  → 403 ok=false if not in the registry
+  → stub = EXT_CALL_STATE.get(idFromName(user.dialpadId))
+  → callId = await stub.getCallId()
+  → callId set → { state: "in_progress" }
+  → callId null → { state: "ended" }
 ```
 
-**Auth**: Currently unauthenticated. `EventSource` (the browser primitive the extension uses) cannot send custom request headers, and putting `LINKEDIN_EXTENSION_SECRET` in the URL would just leak it into CF Logs. The shared secret isn't a real security boundary anyway (it's bundled into the extension binary). Will gate behind the OTP + session-token auth flow when that lands. The route handler has an explanatory comment so future-me/agents know this isn't an oversight. — see `2026-05-01-dialpad-call-state-handoff.md`.
+Pure DO read — never calls Dialpad. The DO's strong consistency means every poll reads the latest webhook write regardless of which PoP each request hit (KV's cross-PoP eventual consistency was producing 1-5 second visible lag where the calling webhook had landed but polling reads still returned `ended`).
 
-**Push path**:
-```
-notifyExtensionCallState (called from processExtensionCallEvent):
-  stub = EXT_CALL_CHANNEL.getByName(dialpadUserId)
-  stub.pushState({ state, phoneNumber })   ← RPC, NOT fetch — typed call
-  → DO iterates writers Set
-       for each: write `event: state\ndata: <event>\n\n`
-       collect dead writers (write threw); drop from Set
-  → returns { delivered: writers.size } for logging
-```
+The extension owns the give-up decision via its own ~10-second clock from the `/dialpad-call` 200 — if the calling webhook never lands at all, after 10s the extension reverts the button to Call. The worker has no server-side discovery timeout.
 
-The pushed payload deliberately omits `callId`. The extension never holds the Dialpad call_id; the worker's `extcall:active` entry holds it for use on `/dialpad-hangup`.
+**Lifecycle**:
+1. Click Call → `POST /dialpad-call` → 200; extension shows transient `Calling…` disabled-button, starts polling, starts 10s clock.
+2. Polling returns `{state: "in_progress"}` → extension flips to live Hangup, cancels 10s clock, keeps polling.
+3. Polling returns `{state: "ended"}` (after Hangup state) → extension flips back to Call, stops polling.
+4. 10s clock fires while still in `Calling…` (calling webhook never landed) → extension reverts to Call, stops polling.
 
-**Heartbeat** (DO `alarm()`):
-- Fires every 25s while writers exist
-- Broadcasts `: keepalive\n\n` (SSE comment line — `EventSource` silently swallows these)
-- Reschedules itself if writers remain
-- Cancels itself naturally when last writer disconnects (no writers → alarm body returns early without rescheduling)
+### Mobile PWA endpoints
 
-**Reconnect**: handled entirely by `EventSource` natively (browser-managed backoff, no custom client code needed). On every reconnect the DO replays current state from KV in its `_readCurrentState` step, so missed transitions during a disconnect are silently corrected — no polling endpoint exists or is needed.
+Two routes power the mobile PWA's home + pipeline screens. The PWA reuses the rest of the extension routes (`/candidate-details`, `/dialpad-user-context`, `/dialpad-call`, `/dialpad-sms`, `/dialpad-hangup`, `/extension-call-status`) verbatim.
 
-**Multi-tab**: every tab the consultant has open subscribes to the same DO instance (`getByName(dialpadUserId)` is deterministic). The DO holds one writer per open stream and broadcasts every state event to all of them. Cross-tab coordination is automatic.
+- **`POST /my-sourcing-jobs`** — body `{ consultantFirstName }`. Wraps RF `GET /job/list?only_open=1` (paginated). Filters worker-side to jobs where the consultant is on `hiring_team` as `Recruiter` (case-insensitive) AND `job_status.name === "Sourcing"` (case-insensitive). Returns `{ jobs: [{id, name, company}] }`.
 
-**State machine summary (extension-side)**:
-```
-        (sidepanel mounts)         (button clicked)
-   ╔═════════╗  ──────────►  ╔═══════════╗  ──────►  ╔═══════════╗
-   ║  idle   ║  ◄──────────  ║  calling  ║          ║  active   ║
-   ╚═════════╝              ╚═══════════╝            ╚═══════════╝
-        ▲                          ▲                       │
-        │                          │                       │
-        │ SSE                      │ SSE state=calling     │ button → /dialpad-hangup
-        │ state=ended              │ (mid-call replay)     │ OR Dialpad app hangup
-        │                          │                       │ OR SSE state=ended
-        │                          │                       ▼
-        └─────────────────────────────────────────► ╔═══════════╗
-                                                    ║   ended   ║
-                                                    ╚═══════════╝
-```
+- **`POST /job-pipeline`** — body `{ consultantFirstName, jobId }`. Wraps RF `POST /candidate/search` with `{key:"job", values:[jobId]}` + `{key:"stage", values:["Sourced"]}` filters and `include_count: true`. Filters out candidates with no usable `linkedin_profile` (RF returns the literal string `"None"` for missing values), normalizes RF's bare slugs to full `https://www.linkedin.com/in/...` URLs, sorts by `added_time` ASC. Returns `{ jobId, stage: "Sourced", total, candidates: [{rfId, linkedinUrl}] }`.
+
+The PWA loads `/job-pipeline` once per session, then iterates locally with prev/next, calling `/candidate-details` per card. The hand-off doc is at `docs/handoffs/2026-05-06-pwa-handoff.md`.
 
 ### Caller-ID alias signing
 
@@ -734,8 +692,8 @@ A general-purpose cache that stores candidate records and provides O(1) lookups 
 | `batch:job{jobId}` | JSON array of rfId strings in extension-add order | 30 days |
 | `prewarm:rec{rfUserId}:job{jobId}` | `{ lastPrewarmIdx }` per-recruiter+job state | 1 hour |
 | `ratelimit:call:{dialpadUserId}` | JSON `[{t: ms-epoch, phone: E164}]` rolling-window state for `/dialpad-call` rate-limit + dedup | 120 sec |
-| `extcall:watch:{dialpadUserId}` | JSON `{ phone, initiatedAt }` — armed by `/dialpad-call`, matched by Dialpad's `calling` webhook to identify which call belongs to which extension click | 90 sec |
-| `extcall:active:{dialpadUserId}` | JSON `{ callId, phone, startedAt }` — holds the live Dialpad call_id once the watch matches. Read by `/dialpad-hangup` and by the SSE DO's initial-state replay | 30 min |
+
+(Active Dialpad `call_id` per consultant — formerly `extcall:callid:{dialpadUserId}` in KV — now lives in the `ExtCallState` Durable Object, see "Durable Object" below.)
 
 ### Cache Freshness
 
@@ -784,7 +742,7 @@ Example: `https://www.LinkedIn.com/in/John-Smith/?utm_source=share` → `linkedi
 
 ### Test bindings (in `vitest.config.js`, never deployed)
 
-`vitest.config.js`'s `poolOptions.workers.miniflare.bindings` provides non-secret stand-ins for `LINKEDIN_EXTENSION_SECRET`, `RF_API_KEY`, and `DIALPAD_API_KEY` so e2e tests can hit the worker without real credentials. `wrangler.jsonc` is intentionally clean of these values to avoid overwriting Cloudflare-managed production secrets on deploy.
+`vitest.config.js`'s `poolOptions.workers.miniflare.bindings` provides non-secret stand-ins for `LINKEDIN_EXTENSION_SECRET`, `RF_API_KEY`, `DIALPAD_API_KEY`, and `DIALPAD_WEBHOOK_SECRET` so e2e tests can hit the worker (and mint valid Dialpad webhook JWTs) without real credentials. `wrangler.jsonc` is intentionally clean of these values to avoid overwriting Cloudflare-managed production secrets on deploy.
 
 ### Vars (in `wrangler.jsonc`)
 
@@ -802,14 +760,17 @@ Example: `https://www.LinkedIn.com/in/John-Smith/?utm_source=share` → `linkedi
 
 ### Durable Object
 
-`EXT_CALL_CHANNEL` → class `ExtensionCallStateChannel` (defined in `src/extension-call-do.js`, re-exported from `src/index.js` so wrangler picks it up). Migration tag `v1` declares the class via `new_sqlite_classes` (no persistent storage actually used — declaration is required for any new DO class).
+`EXT_CALL_STATE` → class `ExtCallState` (defined in `src/extension-call-do.js`, re-exported from `src/index.js` so wrangler picks it up). One DO instance per Dialpad user, named deterministically via `idFromName(dialpadUserId)`. Strong consistency: every read sees every prior write, regardless of which PoP each request hit.
 
-- One DO instance per Dialpad user, named deterministically via `getByName(dialpadUserId)`.
-- Holds an in-memory `Set<WritableStreamDefaultWriter<Uint8Array>>` of subscribed SSE writers.
-- `fetch()` is the SSE subscribe entry point — returns a streaming `Response` with `Content-Type: text/event-stream`. The worker's `/extension-call-stream` route forwards to this via `stub.fetch(request)` and proxies the response back with CORS headers merged in.
-- `pushState(event)` is the RPC method `notifyExtensionCallState` calls to broadcast a state change to every writer.
-- `alarm()` fires every 25s while writers exist, sending `: keepalive\n\n` (SSE comment lines — `EventSource` silently swallows them) and detecting dead writers via the broadcast write returning rejected.
-- Effectively free for our scale — at most ~2 active instances (one per consultant on registry), billed only while writers are connected. DO is evicted naturally when the last writer disconnects.
+- **Storage**: a single `callId` key. Holds the active Dialpad `call_id` for the user, or absent.
+- **RPC methods**:
+  - `setCallId(callId)` — overwrite-on-write; schedules a 20-min self-clearing alarm.
+  - `getCallId()` — returns the stored value or `null`.
+  - `clearCallIdIfMatch(callId)` — clears iff the stored value matches; otherwise drops with a reason. Used by the hangup webhook to avoid wiping a newer call when a stale event arrives.
+- **Alarm**: fires 20 min after the last `setCallId`. Cleans up abandoned records (Dialpad never delivered a matching hangup webhook). A new `setCallId` resets the alarm.
+- **Migration history**: `v1` created the now-deleted `ExtensionCallStateChannel` (the SSE-fan-out DO from the previous architecture); `v2` deleted it; `v3` added `ExtCallState`.
+
+The previous KV-backed `extcall:callid:*` design was eventually consistent across PoPs — a `calling` webhook landing at one PoP and a poll at another could be 1-5 seconds out-of-sync, producing visible "no active call → ended" windows after the call had already started. Routing every request through a single DO instance eliminates that staleness window.
 
 ---
 
