@@ -1,11 +1,12 @@
 import {
   createOrUpdateDialpadContact, patchDialpadContact, getDialpadContact,
   getUserCallerId, initiateCall, buildCallerIdsFromDialpad, sendSMS,
-  hangupCall,
+  hangupCall, listUserCalls,
 } from './dialpad-client.js';
 import { verifyJWT } from './auth.js';
 import { signCallerIdAlias, verifyCallerIdAlias } from './dialpad-aliases.js';
 import { checkAndRecordCall } from './rate-limit.js';
+import { findCallForBind, processExtensionCallEvent } from './extension-calls.js';
 import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
@@ -74,6 +75,10 @@ export default {
 
       if (url.pathname === '/webhook/dialpad/calls' && request.method === 'POST') {
         return await handleDialpadCallWebhook(request, env);
+      }
+
+      if (url.pathname === '/webhook/dialpad/extension-calls' && request.method === 'POST') {
+        return await handleDialpadExtensionCallsWebhook(request, env);
       }
 
       if (url.pathname === '/webhook/apollo' && request.method === 'POST') {
@@ -146,6 +151,14 @@ export default {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
         }
         return await handleDialpadHangupEndpoint(request, env, corsHeaders);
+      }
+
+      if (url.pathname === '/extension-call-status' && request.method === 'POST') {
+        const extAuth = request.headers.get('X-Extension-Token');
+        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
+          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        }
+        return await handleExtensionCallStatusEndpoint(request, env, corsHeaders);
       }
 
       return new Response('Not Found', {
@@ -2091,12 +2104,23 @@ async function handleDialpadCallEndpoint(request, env, corsHeaders) {
       }), { status: 502, headers: responseHeaders });
     }
 
-    // Clear any cached call_id from a previous call. The extension's first
-    // /extension-call-status poll discovers this call's id via Dialpad's
-    // call-list API and caches it under extcall:callid:{dialpadUserId}.
-    // Deleting AFTER Dialpad accepts avoids wiping a still-valid id from a
-    // prior call if the new attempt is rejected.
-    await env.SYNC_STATE.delete(`extcall:callid:${user.dialpadId}`);
+    // Write a fresh call-state record (overwrite-on-write — implicitly clears
+    // any prior call's record). The extension starts polling
+    // /extension-call-status on this 200; that endpoint reads KV and on the
+    // first poll where callId isn't yet bound, hits Dialpad's call-list to
+    // discover it (Dialpad's call-list typically lags initiate_call by sub-
+    // second to a few seconds, so a one-shot lookup here would miss). The
+    // hangup webhook flips state to "ended" once Dialpad notifies us.
+    const stateRecord = {
+      phoneNumber,
+      initiatedAt: Date.now(),
+      state: 'in_progress',
+    };
+    await env.SYNC_STATE.put(
+      `extcall:state:${user.dialpadId}`,
+      JSON.stringify(stateRecord),
+      { expirationTtl: 20 * 60 },
+    );
 
     return new Response(JSON.stringify({ ok: true }), {
       status: 200, headers: responseHeaders,
@@ -2231,13 +2255,14 @@ async function handleDialpadSmsEndpoint(request, env, corsHeaders) {
 }
 
 // ---------------------------------------------------------------------------
-// /dialpad-hangup — terminate the consultant's active call. The extension
-// only sends consultantFirstName; the worker reads the Dialpad call_id from
-// `extcall:callid:{dialpadUserId}` KV, populated by /extension-call-status
-// polls. 409 if the KV is empty (rare — would mean Hangup was clicked before
-// any status poll cached the id). Clears the KV regardless of Dialpad's
-// upstream response — a hangup request always returns the user to "no active
-// call" state even if Dialpad rejects (e.g. call already terminated).
+// /dialpad-hangup — terminate the consultant's active call. Body is just
+// { consultantFirstName }; the worker reads call_id from
+// `extcall:state:{dialpadUserId}` KV (populated by /extension-call-status
+// polls during discovery). Returns 409 if no call_id is bound — the
+// extension's "Calling…" disabled-button window closes this race in normal
+// use. Fast path: if state is already "ended" (hangup webhook beat us to
+// it), skip the Dialpad call and just clear the KV — avoids a 502 from
+// trying to hangup an already-terminated call.
 // ---------------------------------------------------------------------------
 
 async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
@@ -2260,9 +2285,25 @@ async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
       });
     }
 
-    const kvKey = `extcall:callid:${user.dialpadId}`;
-    const callId = await env.SYNC_STATE.get(kvKey);
-    if (!callId) {
+    const kvKey = `extcall:state:${user.dialpadId}`;
+    const raw = await env.SYNC_STATE.get(kvKey);
+    let record = null;
+    if (raw) {
+      try { record = JSON.parse(raw); }
+      catch {
+        console.error({
+          message: `[DialpadHangup] malformed extcall:state — treating as no active call`,
+          source: 'dialpad-hangup',
+          consultantFirstName,
+          dialpadId: user.dialpadId,
+          rawSample: raw.slice(0, 100),
+        });
+        // Wipe the corrupted record so the next call starts clean.
+        await env.SYNC_STATE.delete(kvKey);
+      }
+    }
+
+    if (!record?.callId) {
       console.warn({
         message: `[DialpadHangup] no call_id cached consultant=${consultantFirstName}`,
         source: 'dialpad-hangup',
@@ -2271,6 +2312,24 @@ async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
       });
       return new Response(JSON.stringify({ ok: false, error: 'No active call' }), {
         status: 409, headers: responseHeaders,
+      });
+    }
+
+    const callId = String(record.callId);
+
+    // Hangup webhook already flipped state to "ended". Skip Dialpad's hangup
+    // (it'd 4xx — call already terminated) and just clean up KV.
+    if (record.state === 'ended') {
+      console.log({
+        message: `[DialpadHangup] already ended (webhook beat us) — KV cleanup only`,
+        source: 'dialpad-hangup',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        callId,
+      });
+      await env.SYNC_STATE.delete(kvKey);
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200, headers: responseHeaders,
       });
     }
 
@@ -2284,7 +2343,7 @@ async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
 
     const result = await hangupCall({ callId }, env);
 
-    // Always clear the cached call_id, regardless of upstream outcome — a
+    // Always clear the cached state, regardless of upstream outcome — a
     // hangup request returns the user to clean state even on Dialpad
     // rejection (already terminated, unknown id, etc.).
     await env.SYNC_STATE.delete(kvKey);
@@ -2318,6 +2377,216 @@ async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
     return new Response(JSON.stringify({ ok: false, error: 'Internal Server Error' }), {
       status: 500, headers: responseHeaders,
     });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /extension-call-status — polled by the extension every ~500ms after a
+// successful /dialpad-call. Returns one of { state: "in_progress" | "ended" }.
+//
+// KV-first: if `extcall:state:{userId}` has a callId bound, the response is a
+// pure KV read. On the discovery branch (record exists, state="in_progress",
+// no callId yet), we hit Dialpad's call-list to find the new call_id and
+// cache it. Subsequent polls then become KV-only until the hangup webhook
+// flips state to "ended".
+//
+// No server-side discovery timeout — the extension's own 10s clock decides
+// give-up. As long as the extension is polling, we keep returning
+// "in_progress" during discovery (so the extension's clock keeps running on
+// the right side of the decision).
+// ---------------------------------------------------------------------------
+
+async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
+  const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  try {
+    const payload = await request.json();
+    const consultantFirstName = typeof payload.consultantFirstName === 'string'
+      ? payload.consultantFirstName.trim()
+      : '';
+
+    if (!consultantFirstName) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+        status: 400, headers: responseHeaders,
+      });
+    }
+
+    const user = getUserByFirstName(consultantFirstName);
+    if (!user) {
+      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+        status: 403, headers: responseHeaders,
+      });
+    }
+
+    const kvKey = `extcall:state:${user.dialpadId}`;
+    const raw = await env.SYNC_STATE.get(kvKey);
+
+    if (!raw) {
+      return new Response(JSON.stringify({ state: 'ended' }), {
+        status: 200, headers: responseHeaders,
+      });
+    }
+
+    let record;
+    try { record = JSON.parse(raw); }
+    catch {
+      console.error({
+        message: `[ExtCallStatus] malformed extcall:state — treating as ended`,
+        source: 'extension-call-status',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        rawSample: raw.slice(0, 100),
+      });
+      // Don't let a corrupted record jam the polling loop forever.
+      await env.SYNC_STATE.delete(kvKey);
+      return new Response(JSON.stringify({ state: 'ended' }), {
+        status: 200, headers: responseHeaders,
+      });
+    }
+
+    if (record.state === 'ended') {
+      return new Response(JSON.stringify({ state: 'ended' }), {
+        status: 200, headers: responseHeaders,
+      });
+    }
+
+    if (record.callId) {
+      return new Response(JSON.stringify({ state: 'in_progress' }), {
+        status: 200, headers: responseHeaders,
+      });
+    }
+
+    // Discovery branch: state="in_progress", no callId yet. Hit Dialpad's
+    // call-list to find the call we just placed. 5s buffer on started_after
+    // for clock skew.
+    const startedAfterMs = Math.max(0, (record.initiatedAt ?? Date.now()) - 5_000);
+    const listResult = await listUserCalls({
+      userId: user.dialpadId,
+      startedAfterMs,
+    }, env);
+
+    if (!listResult.ok) {
+      const upstreamMsg = listResult.body?.error || listResult.body?.message || `HTTP ${listResult.status}`;
+      console.error({
+        message: `[ExtCallStatus] Dialpad list-calls rejected: ${upstreamMsg}`,
+        source: 'extension-call-status',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        upstreamStatus: listResult.status,
+      });
+      return new Response(JSON.stringify({ ok: false, error: 'Dialpad list-calls failed' }), {
+        status: 502, headers: responseHeaders,
+      });
+    }
+
+    // Dialpad's two doc sources disagree on field name; handle both.
+    const items = Array.isArray(listResult.body?.items)
+      ? listResult.body.items
+      : Array.isArray(listResult.body?.calls)
+        ? listResult.body.calls
+        : [];
+
+    const match = findCallForBind(items, { phoneNumber: record.phoneNumber });
+    if (match) {
+      const callId = String(match.call_id);
+      await env.SYNC_STATE.put(
+        kvKey,
+        JSON.stringify({ ...record, callId }),
+        { expirationTtl: 20 * 60 },
+      );
+      console.log({
+        message: `[ExtCallStatus] callId bound consultant=${consultantFirstName} callId=${callId}`,
+        source: 'extension-call-status',
+        consultantFirstName,
+        dialpadId: user.dialpadId,
+        callId,
+        elapsedMs: Date.now() - (record.initiatedAt ?? Date.now()),
+      });
+    }
+    // Whether matched or not, return in_progress — the extension owns the
+    // give-up decision via its own 10s clock.
+    return new Response(JSON.stringify({ state: 'in_progress' }), {
+      status: 200, headers: responseHeaders,
+    });
+  } catch (error) {
+    console.error({
+      message: `[ExtCallStatus] error: ${error.message}`,
+      source: 'extension-call-status',
+      stack: error.stack,
+    });
+    return new Response(JSON.stringify({ ok: false, error: 'Internal Server Error' }), {
+      status: 500, headers: responseHeaders,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /webhook/dialpad/extension-calls — terminal Dialpad call-state events for
+// the extension Call/Hangup flow. Subscription is configured Dialpad-side
+// for hangup events only on the registered users. Auth: JWT (HS256) via
+// DIALPAD_WEBHOOK_SECRET.
+//
+// Match-or-ignore: we only act if the event's call_id matches the call_id
+// currently cached in `extcall:state:{userId}`. On match, flip state to
+// "ended" (preserve callId so /dialpad-hangup's already-ended fast path
+// fires). On any mismatch / missing record / no-callId-yet, drop silently
+// and return 200 (we don't want Dialpad to retry events we deliberately
+// dropped).
+// ---------------------------------------------------------------------------
+
+async function handleDialpadExtensionCallsWebhook(request, env) {
+  try {
+    const authHeader = request.headers.get('Authorization');
+    const bodyText = await request.text();
+
+    let token;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.substring(7);
+    } else {
+      token = bodyText;
+    }
+
+    if (!token) {
+      return new Response('Unauthorized - No token', { status: 401 });
+    }
+
+    const payload = await verifyJWT(token, env.DIALPAD_WEBHOOK_SECRET);
+    if (!payload) {
+      return new Response('Unauthorized - Invalid token', { status: 401 });
+    }
+
+    const result = await processExtensionCallEvent(payload, env);
+
+    if (result.processed) {
+      console.log({
+        message: `[Dialpad/extension-calls] flipped to ended callId=${result.callId}`,
+        source: 'dialpad-extension-calls',
+        callId: result.callId,
+        targetId: result.targetId,
+        dialpadUserId: result.dialpadUserId,
+      });
+    } else {
+      console.log({
+        message: `[Dialpad/extension-calls] dropped: ${result.reason}`,
+        source: 'dialpad-extension-calls',
+        reason: result.reason,
+        eventState: result.eventState,
+        eventCallId: result.eventCallId,
+        targetId: result.targetId,
+        recordCallId: result.recordCallId,
+      });
+    }
+
+    return new Response('OK', { status: 200 });
+  } catch (error) {
+    console.error({
+      message: `[Dialpad/extension-calls] unhandled error: ${error.message}`,
+      source: 'dialpad-extension-calls',
+      stack: error.stack,
+    });
+    // Return 200 even on error — Dialpad's retry on non-200 would just
+    // redeliver the same broken event.
+    return new Response('OK', { status: 200 });
   }
 }
 

@@ -10,6 +10,7 @@ export default defineWorkersConfig({
 						LINKEDIN_EXTENSION_SECRET: 'test-extension-secret',
 						RF_API_KEY: 'test-rf-api-key',
 						DIALPAD_API_KEY: 'test-dialpad-api-key',
+						DIALPAD_WEBHOOK_SECRET: 'test-dialpad-webhook-secret',
 					},
 				},
 			},

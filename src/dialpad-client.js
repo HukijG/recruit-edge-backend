@@ -265,6 +265,51 @@ export async function hangupCall({ callId }, env) {
 }
 
 /**
+ * GET Dialpad's call-list scoped to a single user, since `startedAfterMs`.
+ *
+ * Used by /extension-call-status during the discovery phase: we just placed
+ * a call via initiateCall, but Dialpad's call-list typically reflects the
+ * new call sub-second to a few seconds after acceptance, so the polling
+ * endpoint pulls list-calls until it finds a match. Once matched, the
+ * call_id is cached in KV and subsequent polls skip this call entirely.
+ *
+ * Body shape varies between Dialpad's two doc sources — caller handles
+ * both `body.items` and `body.calls` defensively (we don't presume here).
+ *
+ * Returns { ok, status, body }; no retry inside the client (the polling
+ * endpoint's natural 500ms cadence is the retry cycle).
+ */
+export async function listUserCalls({ userId, startedAfterMs }, env) {
+  const dialpadApiKey = env?.DIALPAD_API_KEY;
+  const dialpadBaseUrl = env?.DIALPAD_API_BASE_URL || 'https://dialpad.com/api/v2';
+  if (!dialpadApiKey) {
+    throw new Error('DIALPAD_API_KEY environment variable is required');
+  }
+
+  const params = new URLSearchParams({
+    target_id: String(userId),
+    target_type: 'user',
+    started_after: String(startedAfterMs),
+  });
+  const url = `${dialpadBaseUrl}/calls?${params.toString()}`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${dialpadApiKey}`,
+    },
+  });
+
+  let parsed = null;
+  const text = await response.text();
+  if (text) {
+    try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
+  }
+  return { ok: response.ok, status: response.status, body: parsed };
+}
+
+/**
  * Send an SMS via Dialpad's POST /api/v2/sms endpoint.
  *
  * Required: userId, toNumbers (array of up to 10 E.164 numbers — a single
