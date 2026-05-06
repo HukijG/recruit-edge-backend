@@ -11,6 +11,7 @@ export default defineWorkersConfig({
 						RF_API_KEY: 'test-rf-api-key',
 						DIALPAD_API_KEY: 'test-dialpad-api-key',
 						DIALPAD_WEBHOOK_SECRET: 'test-dialpad-webhook-secret',
+						CALENDAR_WEBHOOK_SECRET: 'test-calendar-webhook-secret',
 					},
 				},
 			},

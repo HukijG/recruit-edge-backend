@@ -99,11 +99,14 @@ export async function addRFCandidate(candidateData, env) {
 }
 
 /**
- * Check if a LinkedIn answer is actually a valid LinkedIn URL
+ * Check if a LinkedIn answer is actually a valid LinkedIn URL.
+ * Accepts URLs with or without `https?://` and `www.` — Reclaim form
+ * inputs frequently lack the protocol (e.g. "Linkedin.com/in/foo"), and
+ * normalizeLinkedInUrl below canonicalizes both forms to the same key.
  */
 export function isValidLinkedInUrl(answer) {
   if (!answer || typeof answer !== 'string') return false;
-  return /https?:\/\/.*linkedin\.com\/(in|pub)\//i.test(answer.trim());
+  return /linkedin\.com\/(in|pub)\//i.test(answer.trim());
 }
 
 /**

@@ -725,6 +725,65 @@ describe('E2E: Calendar → RF + Dialpad', () => {
 		expect(dialpadCalls.length).toBe(1);
 	});
 
+	it('matches via LinkedIn cache when linkedin_answer lacks protocol', async () => {
+		// Reclaim form input where the candidate typed a protocol-less
+		// LinkedIn URL (e.g. "Linkedin.com/in/foo"). Should still resolve to
+		// the same cached candidate as the full https://www.linkedin.com/... form.
+		const fullCandidate = buildFullRFCandidate({
+			email: [{ email: 'tony@personal.com', is_primary: 1 }],
+			phone_number: [],
+		});
+
+		const calls = mockFetch([
+			rfGetCandidateRoute(fullCandidate),
+			rfUpdateCandidateRoute(),
+			rfMoveStageRoute(),
+			dialpadContactRoute(),
+		]);
+
+		await env.SYNC_STATE.put(
+			'linkedin:linkedin.com/in/jane-doe-000000000',
+			'12345'
+		);
+
+		const calendarPayload = {
+			event_id: 'cal-456',
+			event_title: 'Call with Tony',
+			event_start: '2026-03-31T14:00:00Z',
+			attendee_email: 'tony@work.com',
+			attendee_name: 'Tony',
+			linkedin_answer: 'Linkedin.com/in/jane-doe-000000000',
+			phone_number: '+15555550100',
+		};
+
+		const request = new Request('http://example.com/webhook/calendar', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Calendar-Webhook-Token': env.CALENDAR_WEBHOOK_SECRET,
+			},
+			body: JSON.stringify(calendarPayload),
+		});
+
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+
+		// Cache hit → RF GET to read current candidate
+		const rfGetCalls = findCalls(calls, '/candidate/get');
+		expect(rfGetCalls.length).toBe(1);
+
+		// RF update + stage move + Dialpad upsert all run
+		const rfUpdateCalls = findCalls(calls, '/candidate/update');
+		expect(rfUpdateCalls.length).toBe(1);
+		const moveCalls = findCalls(calls, '/candidate/move-to-stage');
+		expect(moveCalls.length).toBe(1);
+		const dialpadCalls = findCalls(calls, 'dialpad.com');
+		expect(dialpadCalls.length).toBe(1);
+	});
+
 	it('skips when no candidate found via any lookup tier', async () => {
 		const calls = mockFetch([
 			rfSearchRoute([]), // LinkedIn search returns nothing
