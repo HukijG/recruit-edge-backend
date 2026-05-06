@@ -641,6 +641,29 @@ export async function listOpenJobs(env) {
     const jobs = await response.json();
     if (!Array.isArray(jobs) || jobs.length === 0) break;
 
+    // TEMP-DIAG: one-shot per call — log the shape of the first job so we
+    // can pick the real "added/created" field name for /my-sourcing-jobs
+    // sort. Remove once that sort is fixed.
+    if (page === 1 && jobs[0]) {
+      const j0 = jobs[0];
+      const j0Keys = Object.keys(j0);
+      const j0Sample = {};
+      for (const k of j0Keys) {
+        const v = j0[k];
+        if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' || v === null) {
+          j0Sample[k] = v;
+        } else if (Array.isArray(v)) {
+          j0Sample[k] = `[Array length=${v.length} item0Keys=${v[0] ? Object.keys(v[0]).join(',') : ''}]`;
+        } else if (typeof v === 'object') {
+          j0Sample[k] = `[Object keys=${Object.keys(v).join(',')}]`;
+        }
+      }
+      console.log({
+        message: `[listOpenJobs:DIAG] j0Keys=${j0Keys.join(',')} j0Sample=${JSON.stringify(j0Sample)}`,
+        source: 'rf-job-list-diag',
+      });
+    }
+
     for (const job of jobs) {
       allJobs.push({
         id: job.id,
