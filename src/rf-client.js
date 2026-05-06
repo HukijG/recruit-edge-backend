@@ -724,30 +724,6 @@ export async function searchCandidatesByJobAndStage({ jobId, stageName, maxPages
           : [];
     if (typeof result?.total_items === 'number') totalItems = result.total_items;
 
-    // TEMP-DIAG: one-shot per call — log the shape of the first candidate so
-    // we can find the real "added time" field name. Remove once /job-pipeline
-    // sort is fixed.
-    if (page === 1 && candidates.length > 0) {
-      const c0 = candidates[0];
-      const c0Keys = c0 ? Object.keys(c0) : [];
-      const c0Sample = {};
-      for (const k of c0Keys) {
-        const v = c0[k];
-        if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' || v === null) {
-          c0Sample[k] = v;
-        } else if (Array.isArray(v)) {
-          c0Sample[k] = `[Array length=${v.length} item0Keys=${v[0] ? Object.keys(v[0]).join(',') : ''}]`;
-        } else if (typeof v === 'object') {
-          c0Sample[k] = `[Object keys=${Object.keys(v).join(',')}]`;
-        }
-      }
-      console.log({
-        message: `[searchCandidatesByJobAndStage:DIAG] jobId=${jobId} stage=${stageName} c0Keys=${c0Keys.join(',')}`,
-        source: 'rf-search-diag',
-        c0Sample: JSON.stringify(c0Sample),
-      });
-    }
-
     allCandidates.push(...candidates);
 
     if (candidates.length < perPage) break;

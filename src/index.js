@@ -2633,14 +2633,30 @@ async function handleJobPipelineEndpoint(request, env, corsHeaders) {
       env,
     );
 
-    // Map → filter out missing linkedin → sort by added_time ASC.
+    // Map → filter out missing linkedin → sort by per-job added_time ASC.
+    //
+    // RF's /candidate/search response carries `added_time` at TWO levels:
+    //   - top-level `added_time` = candidate-record creation date (when they
+    //     were first added to RF — could be years ago for existing leads)
+    //   - jobs[].added_time = when this candidate was added to that specific
+    //     job (the job-link creation date — what the pipeline view wants)
+    //
+    // Sorting by the top-level field mixes "candidate created in 2022" with
+    // "candidate created today" by their CREATION date, which has no
+    // relationship to the order they were added to this Sourced pipeline
+    // and therefore looks random to the recruiter walking the queue.
     const enriched = rawCandidates.map(c => {
       const linkedinRaw = typeof c?.linkedin_profile === 'string' ? c.linkedin_profile.trim() : '';
       // RF returns the literal string "None" for missing fields.
       const linkedin = linkedinRaw && linkedinRaw.toLowerCase() !== 'none' ? linkedinRaw : null;
       const slug = linkedin ? extractLinkedInSlug(linkedin) : null;
       const linkedinUrl = slug ? `https://www.linkedin.com/in/${slug}` : null;
-      const addedTime = c?.added_time || null;
+      const jobs = Array.isArray(c?.jobs) ? c.jobs : [];
+      const matchingJob = jobs.find(j => Number(j?.job_id) === jobId);
+      // Fall back to top-level added_time only when the per-job entry is
+      // missing (shouldn't happen — RF only returns the candidate because
+      // they matched the job filter — but defensive).
+      const addedTime = matchingJob?.added_time || c?.added_time || null;
       const addedTs = addedTime ? Date.parse(addedTime) : NaN;
       return {
         rfId: c?.id,

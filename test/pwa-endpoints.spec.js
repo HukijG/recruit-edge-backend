@@ -52,15 +52,32 @@ function buildJob(overrides = {}) {
   };
 }
 
-function buildCandidate(overrides = {}) {
+/**
+ * Builds a candidate matching RF's real /candidate/search shape:
+ *   - Top-level `added_time` = when the candidate record was first created in RF
+ *     (the creation date — irrelevant for the pipeline view).
+ *   - `jobs[].added_time` = when the candidate was added to that specific job
+ *     (the job-link creation date — what the pipeline view actually sorts on).
+ *
+ * The default jobs[0].job_id is 980 to match the default pipelineReq below.
+ *
+ * Override `jobAddedTime` to set jobs[0].added_time without rebuilding the
+ * whole jobs array. To exercise multi-job candidates, override `jobs` directly.
+ */
+function buildCandidate({ jobAddedTime, ...overrides } = {}) {
   return {
     id: 12345,
     first_name: 'Tony',
     last_name: 'Doe',
     name: 'Jane Doe',
     linkedin_profile: 'jane-doe-000000000',
-    added_time: '2026-04-30T15:08:04+0000',
-    jobs: [{ job_id: 1, stage_name: 'Sourced', stage_id: 1 }],
+    added_time: '2024-01-15T09:00:00+0000',
+    jobs: [{
+      job_id: 980,
+      stage_name: 'Sourced',
+      stage_id: 1,
+      added_time: jobAddedTime || '2026-04-30T15:08:04+0000',
+    }],
     ...overrides,
   };
 }
@@ -233,15 +250,15 @@ describe('/job-pipeline', () => {
     expect(body.filters).toContainEqual({ conjunction: 'in', values: ['Sourced'], key: 'stage' });
   });
 
-  it('returns rfId + linkedinUrl per candidate, sorted by added_time ASC', async () => {
+  it('returns rfId + linkedinUrl per candidate, sorted by per-job added_time ASC', async () => {
     mockFetch([
       {
         match: '/candidate/search',
         response: {
           data: [
-            buildCandidate({ id: 30, linkedin_profile: 'newest-profile', added_time: '2026-04-30T12:00:00+0000' }),
-            buildCandidate({ id: 10, linkedin_profile: 'oldest-profile', added_time: '2026-04-15T12:00:00+0000' }),
-            buildCandidate({ id: 20, linkedin_profile: 'middle-profile', added_time: '2026-04-22T12:00:00+0000' }),
+            buildCandidate({ id: 30, linkedin_profile: 'newest-profile', jobAddedTime: '2026-04-30T12:00:00+0000' }),
+            buildCandidate({ id: 10, linkedin_profile: 'oldest-profile', jobAddedTime: '2026-04-15T12:00:00+0000' }),
+            buildCandidate({ id: 20, linkedin_profile: 'middle-profile', jobAddedTime: '2026-04-22T12:00:00+0000' }),
           ],
           total_items: 3,
         },
@@ -260,6 +277,89 @@ describe('/job-pipeline', () => {
     expect(json.candidates).toHaveLength(3);
     expect(json.candidates.map(c => c.rfId)).toEqual([10, 20, 30]);
     expect(json.candidates[0].linkedinUrl).toBe('https://www.linkedin.com/in/oldest-profile');
+  });
+
+  it('sorts by jobs[].added_time (per-job link), NOT top-level candidate added_time', async () => {
+    // Realistic scenario: three candidates were all bulk-added to job 980
+    // today. Their candidate records were originally created in RF on
+    // wildly different dates (one in 2022, one in 2024, one today). The
+    // top-level `added_time` is candidate-creation, NOT relevant to the
+    // pipeline view; the per-job-link `added_time` is what determines order.
+    mockFetch([
+      {
+        match: '/candidate/search',
+        response: {
+          data: [
+            buildCandidate({
+              id: 100,
+              linkedin_profile: 'second-added',
+              added_time: '2022-06-01T12:00:00+0000',         // ancient candidate
+              jobs: [{ job_id: 980, stage_name: 'Sourced', added_time: '2026-05-06T13:00:00+0000' }],
+            }),
+            buildCandidate({
+              id: 200,
+              linkedin_profile: 'first-added',
+              added_time: '2026-05-06T09:00:00+0000',         // brand-new candidate
+              jobs: [{ job_id: 980, stage_name: 'Sourced', added_time: '2026-05-06T12:00:00+0000' }],
+            }),
+            buildCandidate({
+              id: 300,
+              linkedin_profile: 'third-added',
+              added_time: '2024-03-15T08:00:00+0000',         // mid-aged candidate
+              jobs: [{ job_id: 980, stage_name: 'Sourced', added_time: '2026-05-06T14:00:00+0000' }],
+            }),
+          ],
+          total_items: 3,
+        },
+      },
+    ]);
+
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(pipelineReq({ consultantFirstName: 'Joel', jobId: 980 }), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    const json = await response.json();
+    // Order MUST follow jobs[].added_time (200 → 100 → 300), NOT top-level
+    // added_time which would give (100 → 300 → 200).
+    expect(json.candidates.map(c => c.rfId)).toEqual([200, 100, 300]);
+  });
+
+  it('picks the jobs[] entry matching queried jobId when candidate is on multiple jobs', async () => {
+    mockFetch([
+      {
+        match: '/candidate/search',
+        response: {
+          data: [
+            buildCandidate({
+              id: 1,
+              linkedin_profile: 'first',
+              jobs: [
+                { job_id: 100, stage_name: 'Hired',   added_time: '2025-01-01T00:00:00+0000' },
+                { job_id: 980, stage_name: 'Sourced', added_time: '2026-05-06T15:00:00+0000' }, // queried job
+                { job_id: 200, stage_name: 'Applied', added_time: '2024-12-31T23:59:00+0000' },
+              ],
+            }),
+            buildCandidate({
+              id: 2,
+              linkedin_profile: 'second',
+              jobs: [
+                { job_id: 980, stage_name: 'Sourced', added_time: '2026-05-06T10:00:00+0000' }, // queried job
+                { job_id: 300, stage_name: 'Sourced', added_time: '2026-05-06T20:00:00+0000' },
+              ],
+            }),
+          ],
+          total_items: 2,
+        },
+      },
+    ]);
+
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(pipelineReq({ consultantFirstName: 'Joel', jobId: 980 }), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    const json = await response.json();
+    // Should sort by jobs[entry where job_id===980].added_time ASC: id 2 at 10:00, id 1 at 15:00.
+    expect(json.candidates.map(c => c.rfId)).toEqual([2, 1]);
   });
 
   it('filters out candidates with missing or "None" linkedin_profile', async () => {
