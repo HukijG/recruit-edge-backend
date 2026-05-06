@@ -250,7 +250,7 @@ describe('/job-pipeline', () => {
     expect(body.filters).toContainEqual({ conjunction: 'in', values: ['Sourced'], key: 'stage' });
   });
 
-  it('returns rfId + linkedinUrl per candidate, sorted by per-job added_time ASC', async () => {
+  it('returns rfId + linkedinUrl per candidate, sorted by per-job added_time DESC (newest first)', async () => {
     mockFetch([
       {
         match: '/candidate/search',
@@ -275,8 +275,8 @@ describe('/job-pipeline', () => {
     expect(json.stage).toBe('Sourced');
     expect(json.total).toBe(3);
     expect(json.candidates).toHaveLength(3);
-    expect(json.candidates.map(c => c.rfId)).toEqual([10, 20, 30]);
-    expect(json.candidates[0].linkedinUrl).toBe('https://www.linkedin.com/in/oldest-profile');
+    expect(json.candidates.map(c => c.rfId)).toEqual([30, 20, 10]);
+    expect(json.candidates[0].linkedinUrl).toBe('https://www.linkedin.com/in/newest-profile');
   });
 
   it('sorts by jobs[].added_time (per-job link), NOT top-level candidate added_time', async () => {
@@ -319,9 +319,9 @@ describe('/job-pipeline', () => {
     await waitOnExecutionContext(ctx);
 
     const json = await response.json();
-    // Order MUST follow jobs[].added_time (200 → 100 → 300), NOT top-level
-    // added_time which would give (100 → 300 → 200).
-    expect(json.candidates.map(c => c.rfId)).toEqual([200, 100, 300]);
+    // Newest-first by jobs[].added_time: 300 (14:00) → 100 (13:00) → 200 (12:00).
+    // Top-level added_time would give a totally different order — that's the bug.
+    expect(json.candidates.map(c => c.rfId)).toEqual([300, 100, 200]);
   });
 
   it('picks the jobs[] entry matching queried jobId when candidate is on multiple jobs', async () => {
@@ -358,8 +358,8 @@ describe('/job-pipeline', () => {
     await waitOnExecutionContext(ctx);
 
     const json = await response.json();
-    // Should sort by jobs[entry where job_id===980].added_time ASC: id 2 at 10:00, id 1 at 15:00.
-    expect(json.candidates.map(c => c.rfId)).toEqual([2, 1]);
+    // Newest-first by jobs[entry where job_id===980].added_time: id 1 at 15:00, then id 2 at 10:00.
+    expect(json.candidates.map(c => c.rfId)).toEqual([1, 2]);
   });
 
   it('filters out candidates with missing or "None" linkedin_profile', async () => {

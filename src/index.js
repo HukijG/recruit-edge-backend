@@ -2592,9 +2592,11 @@ async function handleMySourcingJobsEndpoint(request, env, corsHeaders) {
 
 // ---------------------------------------------------------------------------
 // /job-pipeline — return Sourced-stage candidates for a job, ordered by
-// added_time ASC (oldest-first surfaces stale candidates). Returns just
-// rfId + linkedinUrl per candidate; the PWA fetches full details per-card
-// via the existing /candidate-details route as it traverses prev/next.
+// per-job added_time DESC (newest-first — the recruiter just bulk-added
+// these and wants to walk through them in the order they came in).
+// Returns just rfId + linkedinUrl per candidate; the PWA fetches full
+// details per-card via the existing /candidate-details route as it
+// traverses prev/next.
 // ---------------------------------------------------------------------------
 
 async function handleJobPipelineEndpoint(request, env, corsHeaders) {
@@ -2633,7 +2635,7 @@ async function handleJobPipelineEndpoint(request, env, corsHeaders) {
       env,
     );
 
-    // Map → filter out missing linkedin → sort by per-job added_time ASC.
+    // Map → filter out missing linkedin → sort by per-job added_time DESC.
     //
     // RF's /candidate/search response carries `added_time` at TWO levels:
     //   - top-level `added_time` = candidate-record creation date (when they
@@ -2667,9 +2669,10 @@ async function handleJobPipelineEndpoint(request, env, corsHeaders) {
     }).filter(c => c.rfId && c.linkedinUrl);
 
     enriched.sort((a, b) => {
-      const aT = a.addedTs ?? Number.POSITIVE_INFINITY;
-      const bT = b.addedTs ?? Number.POSITIVE_INFINITY;
-      return aT - bT;
+      // Newest-first; missing timestamps sink to the bottom.
+      const aT = a.addedTs ?? Number.NEGATIVE_INFINITY;
+      const bT = b.addedTs ?? Number.NEGATIVE_INFINITY;
+      return bT - aT;
     });
 
     const candidates = enriched.map(c => ({
