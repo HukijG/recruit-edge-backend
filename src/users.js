@@ -16,6 +16,7 @@ const USERS = [
   { firstName: 'Bob', rfUserId: 900003, dialpadId: '8000000000000003', aliases: ['Bob'] },
   { firstName: 'Carol',  rfUserId: 900004, dialpadId: '8000000000000004' },
   { firstName: 'Dave',    rfUserId: 900005, dialpadId: '8000000000000005' },
+  { firstName: 'Erin',   rfUserId: 900006, dialpadId: '8000000000000006' },
   // TODO: add remaining team members (firstName, rfUserId, dialpadId)
 ];
 
