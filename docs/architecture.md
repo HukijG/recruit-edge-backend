@@ -318,7 +318,7 @@ Dialpad call event (call_transcription or transcription state)
 
 **Dedup before AI**: The dedup flag is set immediately after the dedup check, before transcript fetch or AI classification. This prevents Dialpad retry storms from re-hitting Workers AI on failures. If a step fails after dedup is set, the call won't be retried until the 5-min TTL expires.
 
-**Scope**: Currently Joel + Alice + Bob + Carol via `DIALPAD_TO_RF_USER_ID`. Adding a new recruiter = adding one entry to that map (plus subscribing them on the Dialpad webhook side).
+**Scope**: Currently Joel + Alice + Bob + Carol + Dave via `DIALPAD_TO_RF_USER_ID`. Adding a new recruiter = adding one entry to that map (plus subscribing them on the Dialpad webhook side).
 
 **Numeric IDs**: Dialpad sends `target.id` and `contact.id` as numbers in call webhooks. `isMonitoredDialpadUser()`, `getRFUserIdForDialpadUser()`, and `extractRFIdFromDialpadContact()` all use `String()` coercion.
 

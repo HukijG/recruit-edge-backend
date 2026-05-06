@@ -86,6 +86,7 @@ describe('resolveRFUserId', () => {
 		expect(resolveRFUserId('Bob')).toBe(900003);
 		expect(resolveRFUserId('Bob')).toBe(900003);
 		expect(resolveRFUserId('Carol')).toBe(900004);
+		expect(resolveRFUserId('Dave')).toBe(900005);
 	});
 
 	it('returns null for unknown / empty name', () => {
@@ -100,6 +101,7 @@ describe('getRFUserIdByDialpadId', () => {
 		expect(getRFUserIdByDialpadId('8000000000000002')).toBe(900002);
 		expect(getRFUserIdByDialpadId('8000000000000003')).toBe(900003);
 		expect(getRFUserIdByDialpadId('8000000000000004')).toBe(900004);
+		expect(getRFUserIdByDialpadId('8000000000000005')).toBe(900005);
 	});
 
 	it('returns null for unknown id', () => {
