@@ -71,10 +71,13 @@ async function rfPost(env, path, body, attempt = 0) {
 
 /**
  * GET /candidate/get?id=...
- * Returns the parsed JSON candidate payload (caller knows the shape).
+ * Returns the parsed JSON candidate payload. RF sometimes wraps the candidate
+ * in `{ candidate: {...} }` (matching main worker's getRFCandidate behaviour);
+ * unwrap if present so downstream code sees a uniform shape.
  */
 export async function fetchCandidate(env, id) {
-  return rfGet(env, '/candidate/get', { id: String(id) });
+  const result = await rfGet(env, '/candidate/get', { id: String(id) });
+  return result?.candidate ?? result;
 }
 
 /**
