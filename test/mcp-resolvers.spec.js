@@ -150,6 +150,55 @@ describe('resolveJob', () => {
     expect(r.value.id).toBe(100);
   });
 
+  it('extra-target-token penalty: "SE" wins outright over SEM / SSE', async () => {
+    // Real recruiter pain point — historical bug had `SE` returning all of
+    // these as ambiguous options. The scorer's extra-token penalty is what
+    // resolves this without an alias dictionary.
+    await insertJob(100, 'Sales Engineer', 'Eon');
+    await insertJob(200, 'Sales Engineering Manager', 'Eon');
+    await insertJob(300, 'Senior Support Engineer', 'Eon');
+    const r = await resolveJob(env, 'Eon SE');
+    expect(r.ok).toBe(true);
+    expect(r.value.id).toBe(100);
+  });
+
+  it('two SE-acronym jobs at same company → legitimate ambiguity', async () => {
+    // Sales Engineer and Solutions Engineer both canonicalise to "se" — same
+    // score, same company → genuine ambiguity that should reach the user.
+    await insertJob(100, 'Sales Engineer', 'Eon');
+    await insertJob(200, 'Solutions Engineer', 'Eon');
+    const r = await resolveJob(env, 'Eon SE');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('ambiguous');
+    expect(r.options).toHaveLength(2);
+  });
+
+  it('closed jobs are excluded from fuzzy resolution by default', async () => {
+    // Closed job is the only thing the corpus has under that name → fuzzy
+    // ignores it, returns not_found. Recruiter has to pass an explicit id.
+    await insertJob(100, 'Old Sales Engineer', 'Eon', 0);
+    const r = await resolveJob(env, 'Old Sales Engineer');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('not_found');
+  });
+
+  it('closed job still accessible by numeric id', async () => {
+    // The open-jobs-only filter applies to fuzzy only — explicit numeric ids
+    // still resolve any job. Recruiters who know the id can still address it.
+    await insertJob(100, 'Old Sales Engineer', 'Eon', 0);
+    const r = await resolveJob(env, 100);
+    expect(r.ok).toBe(true);
+    expect(r.value.id).toBe(100);
+  });
+
+  it('open job at the same name beats the closed sibling', async () => {
+    await insertJob(100, 'Sales Engineer', 'Eon', 0);
+    await insertJob(200, 'Sales Engineer', 'Eon', 1);
+    const r = await resolveJob(env, 'Eon SE');
+    expect(r.ok).toBe(true);
+    expect(r.value.id).toBe(200);
+  });
+
   it('matches client company name', async () => {
     await insertJob(100, 'Enterprise AE', 'Nominal');
     await insertJob(200, 'Enterprise AE', 'Other');

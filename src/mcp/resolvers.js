@@ -157,19 +157,24 @@ async function loadJobs(env, { onlyOpen = false } = {}) {
  * Numeric → SELECT FROM jobs WHERE id=?  (or accept as-is when
  *           `validateNumeric: false`).
  * String → score against (name + client_company_name), canonicalised via
- *          canonicalizeJobPhrase so "Eon SE" ↔ "Eon Sales Engineer".
+ *          canonicalizeJobPhrase so "Eon SE" ↔ "Eon Sales Engineer". Closed
+ *          jobs are excluded from fuzzy scoring by default — recruiters
+ *          almost never mean a closed job by name. Pass `onlyOpen: false` to
+ *          opt in to closed-job matching (rare; usually a numeric id is the
+ *          right escape hatch).
  *
  * `restrictTo` (optional): array of `{ job_id, job_name }` from a candidate's
  * jobs[]. When set, the resolver only considers those job ids — used by
  * /mcp/candidate-move-stage and /mcp/candidate-log-interview where the target
- * job must be one the candidate is on.
+ * job must be one the candidate is on. `onlyOpen` is ignored on this path
+ * (the candidate's job list is the universe, regardless of is_open).
  *
  * `validateNumeric: false` skips the SELECT-FROM-jobs lookup for numeric
  * inputs. Used by the search / list endpoints that have their own downstream
  * "no rows for this job" handling — and for which the sync_state.jobs table
  * may legitimately lag the candidate_jobs table by one tick.
  */
-export async function resolveJob(env, input, { restrictTo, onlyOpen = false, validateNumeric = true } = {}) {
+export async function resolveJob(env, input, { restrictTo, onlyOpen = true, validateNumeric = true } = {}) {
   const coerced = coerceInput(input);
   if (!coerced) return { ok: false, reason: 'not_found', input };
 
