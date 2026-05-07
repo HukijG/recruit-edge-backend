@@ -170,7 +170,7 @@ export async function fetchCandidatesUpdatedSince(env, cursor) {
 export async function fetchAllJobs(env) {
   const jobs = [];
   let page = 1;
-  const PAGE_SIZE = 500;
+  const PAGE_SIZE = 100;  // RF caps list endpoints at 100/page
   for (;;) {
     const resp = await rfGet(env, '/job/list', {
       items_per_page: String(PAGE_SIZE),
@@ -189,7 +189,7 @@ export async function fetchAllJobs(env) {
  * Single page of `/candidate/list`. Returns `{ rows, total }`.
  * Caller drives pagination — used by the rebuild path which checkpoints by page.
  */
-export async function fetchCandidateListPage(env, page, pageSize = 500) {
+export async function fetchCandidateListPage(env, page, pageSize = 100) {
   const resp = await rfGet(env, '/candidate/list', {
     items_per_page: String(pageSize),
     current_page: String(page),
@@ -204,7 +204,8 @@ export async function fetchCandidateListPage(env, page, pageSize = 500) {
  * `/user/list` — RF user directory. Returns the array under `data` (or [] if absent).
  */
 export async function fetchUsers(env) {
-  const resp = await rfGet(env, '/user/list', { items_per_page: '500' });
+  // RF user list is small (~tens of rows for our team) — one page at the cap.
+  const resp = await rfGet(env, '/user/list', { items_per_page: '100' });
   return Array.isArray(resp?.data) ? resp.data : [];
 }
 

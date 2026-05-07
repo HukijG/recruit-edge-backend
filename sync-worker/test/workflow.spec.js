@@ -58,7 +58,8 @@ describe('runFullRebuild', () => {
   });
 
   it('stops on partial last page', async () => {
-    const rows = Array.from({ length: 100 }, (_, i) => ({
+    // PAGE_SIZE is 100 (RF cap); a partial page is anything < 100 rows.
+    const rows = Array.from({ length: 50 }, (_, i) => ({
       id: i + 1,
       name: `Cand ${i + 1}`,
       jobs: [],
@@ -77,7 +78,7 @@ describe('runFullRebuild', () => {
     const { results } = await env.RF_MCP_CACHE
       .prepare('SELECT COUNT(*) AS n FROM candidates')
       .all();
-    expect(results[0].n).toBe(100);
+    expect(results[0].n).toBe(50);
   });
 
   it('refreshes jobs/users/activity_types/custom_field_schema in sync_state', async () => {

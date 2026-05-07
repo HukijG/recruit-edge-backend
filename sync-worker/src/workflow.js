@@ -37,7 +37,7 @@ import { writeCandidatesAndLinks, writeJobs } from './d1-write.js';
 import { readSyncState, writeSyncState, deleteSyncState } from './sync-state.js';
 import { rebuildMcpSnapshots } from './snapshots.js';
 
-const PAGE_SIZE = 500;
+const PAGE_SIZE = 100;  // RF caps /candidate/list at 100/page
 const RETRY_OPTS = {
   retries: { limit: 3, delay: '5 seconds', backoff: 'exponential' },
 };
