@@ -20,10 +20,78 @@ import { session } from './d1-read.js';
 import { resolveFields, project } from './projection.js';
 import { getSnapshot } from './snapshot.js';
 import { scoreString, recencyBoost, normalize } from './fuzzy.js';
-import { resolveJob, resolveOwner, disambiguationPayload } from './resolvers.js';
+import { resolveJob, resolveOwner, resolveStage, disambiguationPayload } from './resolvers.js';
 
 const DEFAULT_FIELDS = ['id', 'name'];
 const FUZZY_THRESHOLD = 0.35;
+
+// In-memory custom-field option universes, version-checked against the
+// `last_tail_sync_at` sync_state stamp (same pattern as snapshot.js). Survives
+// across requests within an isolate; refreshed automatically when the sync
+// worker advances the cursor.
+const CF_OPTS_KEY = '__rfMcpCustomFieldOptions';
+
+async function readSyncVersion(env) {
+  const row = await env.RF_MCP_CACHE
+    .prepare("SELECT value FROM sync_state WHERE key = 'last_tail_sync_at'")
+    .first();
+  return row?.value ?? null;
+}
+
+/**
+ * Pull the universe of distinct values for a single custom field by walking
+ * every candidate's `custom_fields` JSON. Cached in worker globals + version-
+ * checked. Returns [] if the field doesn't exist in the corpus — caller falls
+ * back to literal exact-match behaviour in that case.
+ *
+ * `multiSelect=true` walks the inner array (Technology stores `value: [...]`).
+ * `multiSelect=false` reads the single string `value` (Segment, Role).
+ */
+async function getCustomFieldOptions(env, fieldName, multiSelect) {
+  const G = globalThis;
+  G[CF_OPTS_KEY] = G[CF_OPTS_KEY] ?? {};
+  const cacheKey = `${fieldName.toLowerCase()}:${multiSelect ? 'm' : 's'}`;
+  const version = await readSyncVersion(env);
+  const cached = G[CF_OPTS_KEY][cacheKey];
+  if (cached && cached.dataVersion === version) return cached.options;
+
+  const sql = multiSelect
+    ? `SELECT DISTINCT tv.value AS v
+         FROM candidates c, json_each(c.body, '$.custom_fields') AS cf,
+              json_each(json_extract(cf.value, '$.value')) AS tv
+        WHERE LOWER(json_extract(cf.value, '$.name')) = ?
+          AND tv.value IS NOT NULL`
+    : `SELECT DISTINCT json_extract(cf.value, '$.value') AS v
+         FROM candidates c, json_each(c.body, '$.custom_fields') AS cf
+        WHERE LOWER(json_extract(cf.value, '$.name')) = ?
+          AND json_extract(cf.value, '$.value') IS NOT NULL`;
+  const { results } = await session(env)
+    .prepare(sql)
+    .bind(fieldName.toLowerCase())
+    .all();
+  const options = (results ?? [])
+    .map((r) => r.v)
+    .filter((v) => typeof v === 'string' && v.length > 0);
+  G[CF_OPTS_KEY][cacheKey] = { options, dataVersion: version };
+  return options;
+}
+
+/**
+ * Resolve a custom-field user-input string against the universe via the same
+ * primitive `resolveStage` uses (case-insensitive exact, then fuzzy + UNIQUE_GAP).
+ * Returns the standard discriminated union: `{ ok, value }` / `{ ok:false, reason:'ambiguous', ... }`.
+ * On not_found the caller is expected to fall through to literal exact-match
+ * SQL — preserves zero-regression on canonical inputs and on inputs that
+ * fuzzy genuinely can't disambiguate.
+ */
+async function fuzzyResolveCustomFieldValue(env, fieldName, input, multiSelect) {
+  const options = await getCustomFieldOptions(env, fieldName, multiSelect);
+  if (options.length === 0) {
+    return { ok: true, value: { id: input, name: input } };  // schema empty → pass through
+  }
+  const resolvable = options.map((name) => ({ id: name, name }));
+  return resolveStage(input, resolvable);
+}
 
 /**
  * Translate the request body's structured filters into a SQL fragment +
@@ -160,6 +228,61 @@ export async function handleCandidateSearch({ env, body }) {
       return jsonResponse(400, { error: `owner not found: ${JSON.stringify(body.owner)}` });
     }
     ownerId = r.value.id;
+  }
+
+  // Custom-field fuzzy resolve — segment/role (single string) and technology
+  // (multi-select array). Each input is matched against the corpus's
+  // distinct values via the version-cached option universe; canonical case is
+  // substituted before SQL. Ambiguity returns the standard envelope; not_found
+  // falls through to literal exact-match (so unknowns still return empty
+  // matches like they did pre-resolver).
+  if (Array.isArray(body.technology) && body.technology.length) {
+    const resolved = [];
+    for (const v of body.technology) {
+      const r = await fuzzyResolveCustomFieldValue(env, 'technology', v, true);
+      if (!r.ok && r.reason === 'ambiguous') {
+        return jsonResponse(200, disambiguationPayload(r));
+      }
+      resolved.push(r.ok ? r.value.name : v);
+    }
+    body = { ...body, technology: resolved };
+  }
+  if (body.segment) {
+    const r = await fuzzyResolveCustomFieldValue(env, 'segment', body.segment, false);
+    if (!r.ok && r.reason === 'ambiguous') {
+      return jsonResponse(200, disambiguationPayload(r));
+    }
+    if (r.ok) body = { ...body, segment: r.value.name };
+  }
+  if (body.role) {
+    const r = await fuzzyResolveCustomFieldValue(env, 'role', body.role, false);
+    if (!r.ok && r.reason === 'ambiguous') {
+      return jsonResponse(200, disambiguationPayload(r));
+    }
+    if (r.ok) body = { ...body, role: r.value.name };
+  }
+
+  // Stage fuzzy resolve — only applies when a job is set (the SQL only filters
+  // by stage inside the candidate_jobs JOIN, which only fires for `jobId !=
+  // null`). Resolve against the distinct stage names recorded for that job in
+  // candidate_jobs so "sourced" / "1st" / "call booked" land on canonical
+  // names without a round-trip. Ambiguity returns the standard envelope;
+  // not_found falls through to the literal exact-match below — preserves
+  // pre-resolver behaviour for genuinely unknown stages (returns empty).
+  if (body.stage && jobId != null) {
+    const { results: stageRows } = await session(env)
+      .prepare('SELECT DISTINCT stage_name FROM candidate_jobs WHERE job_id = ? AND stage_name IS NOT NULL')
+      .bind(jobId)
+      .all();
+    const distinct = (stageRows ?? []).map((r) => r.stage_name).filter(Boolean);
+    if (distinct.length > 0) {
+      const resolvable = distinct.map((name) => ({ id: name, name }));
+      const r = resolveStage(body.stage, resolvable);
+      if (!r.ok && r.reason === 'ambiguous') {
+        return jsonResponse(200, disambiguationPayload(r));
+      }
+      if (r.ok) body = { ...body, stage: r.value.name };
+    }
   }
 
   const filterShape = buildFilterSql(body, { jobId, ownerId });

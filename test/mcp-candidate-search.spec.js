@@ -209,6 +209,110 @@ describe('/mcp/candidate-search', () => {
     expect(b.matches.map((m) => m.id)).toEqual([1]);
   });
 
+  it('lowercase stage with job filter resolves to canonical', async () => {
+    await env.RF_MCP_CACHE
+      .prepare(
+        `INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(100, JSON.stringify({}), 'Enterprise AE', 'Nominal', 1, new Date().toISOString())
+      .run();
+    await insert(1, 'Alice');
+    await insert(2, 'Bob');
+    await env.RF_MCP_CACHE.prepare(
+      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (1, 100, 'Sourced', 0)`,
+    ).run();
+    await env.RF_MCP_CACHE.prepare(
+      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (2, 100, 'CV Sent', 0)`,
+    ).run();
+    const r = await call({ consultantFirstName: 'Joel', job: 100, stage: 'sourced' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.matches.map((m) => m.id)).toEqual([1]);
+  });
+
+  it('ambiguous stage with job filter → 200 needs_disambiguation kind=stage', async () => {
+    await env.RF_MCP_CACHE
+      .prepare(
+        `INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(100, JSON.stringify({}), 'Enterprise AE', 'Nominal', 1, new Date().toISOString())
+      .run();
+    await insert(1, 'Alice');
+    await insert(2, 'Bob');
+    await insert(3, 'Carol');
+    await env.RF_MCP_CACHE.prepare(
+      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (1, 100, '1st Interview', 0)`,
+    ).run();
+    await env.RF_MCP_CACHE.prepare(
+      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (2, 100, '2nd Interview', 0)`,
+    ).run();
+    await env.RF_MCP_CACHE.prepare(
+      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (3, 100, 'Final Interview', 0)`,
+    ).run();
+    const r = await call({ consultantFirstName: 'Joel', job: 100, stage: 'interview' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.needs_disambiguation).toBe(true);
+    expect(b.kind).toBe('stage');
+    expect(b.options.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('unknown stage with job filter falls through (empty matches, not 400)', async () => {
+    await env.RF_MCP_CACHE
+      .prepare(
+        `INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(100, JSON.stringify({}), 'Enterprise AE', 'Nominal', 1, new Date().toISOString())
+      .run();
+    await insert(1, 'Alice');
+    await env.RF_MCP_CACHE.prepare(
+      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (1, 100, 'Sourced', 0)`,
+    ).run();
+    const r = await call({ consultantFirstName: 'Joel', job: 100, stage: 'totally-not-a-real-stage' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.count).toBe(0);
+  });
+
+  it('lowercase technology resolves to canonical case', async () => {
+    await insert(1, 'Alice', {
+      body: { custom_fields: [{ name: 'Technology', value: ['Kubernetes', 'Go'] }] },
+    });
+    await insert(2, 'Bob', {
+      body: { custom_fields: [{ name: 'Technology', value: ['Postgres'] }] },
+    });
+    const r = await call({ consultantFirstName: 'Joel', technology: ['kubernetes'] });
+    const b = await r.json();
+    expect(b.matches.map((m) => m.id)).toEqual([1]);
+  });
+
+  it('lowercase segment resolves to canonical case', async () => {
+    await insert(1, 'Alice', {
+      body: { custom_fields: [{ name: 'Segment', value: 'Enterprise' }] },
+    });
+    await insert(2, 'Bob', {
+      body: { custom_fields: [{ name: 'Segment', value: 'SMB' }] },
+    });
+    const r = await call({ consultantFirstName: 'Joel', segment: 'enterprise' });
+    const b = await r.json();
+    expect(b.matches.map((m) => m.id)).toEqual([1]);
+  });
+
+  it('lowercase role resolves to canonical case', async () => {
+    await insert(1, 'Alice', {
+      body: { custom_fields: [{ name: 'Role', value: 'AE' }] },
+    });
+    await insert(2, 'Bob', {
+      body: { custom_fields: [{ name: 'Role', value: 'CSM' }] },
+    });
+    const r = await call({ consultantFirstName: 'Joel', role: 'ae' });
+    const b = await r.json();
+    expect(b.matches.map((m) => m.id)).toEqual([1]);
+  });
+
   it('honours fields[] alias projection', async () => {
     await insert(1, 'Jerry', {
       email: 'jerry@x.com',
