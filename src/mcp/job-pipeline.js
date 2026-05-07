@@ -21,7 +21,7 @@
 import { jsonResponse } from './router.js';
 import { session } from './d1-read.js';
 import { resolveFields, project } from './projection.js';
-import { resolveJob, disambiguationPayload } from './resolvers.js';
+import { resolveJob, resolveStage, disambiguationPayload } from './resolvers.js';
 
 const DEFAULT_FIELDS = ['id', 'name', 'stage_moved'];
 const SUBMITTED_STAGES = [
@@ -118,9 +118,23 @@ export async function handleJobPipeline({ env, body }) {
 
   // Apply stage / submitted filters.  `stage` is the more specific filter and
   // wins when both are supplied (callers shouldn't pass both, but be lenient).
+  // `stage` is fuzzy-resolved against the snapshot's own stage names so
+  // "sourced" / "1st" / "call booked" all reach the canonical name without
+  // a round-trip. Ambiguity short-circuits to the standard 200 envelope.
   let stages = snap.stages;
-  if (body.stage) {
-    stages = stages.filter((s) => s.stage_name === body.stage);
+  let stageFilter = body.stage;
+  if (body.stage && stages.length > 0) {
+    const resolvable = stages.map((s) => ({ id: s.stage_name, name: s.stage_name }));
+    const r = resolveStage(body.stage, resolvable);
+    if (!r.ok && r.reason === 'ambiguous') {
+      return jsonResponse(200, disambiguationPayload(r));
+    }
+    if (r.ok) stageFilter = r.value.name;
+    // not_found falls through to the literal exact-match below — keeps the
+    // pre-resolver behaviour for genuinely unknown stages (returns empty).
+  }
+  if (stageFilter) {
+    stages = stages.filter((s) => s.stage_name === stageFilter);
   } else if (body.submitted) {
     stages = stages.filter((s) => SUBMITTED_STAGES.includes(s.stage_name));
   }

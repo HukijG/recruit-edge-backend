@@ -186,4 +186,70 @@ describe('/mcp/job-pipeline', () => {
     const r = await call({ consultantFirstName: 'Joel', job: 'totally-not-a-real-job' });
     expect(r.status).toBe(404);
   });
+
+  it('lowercase stage name resolves to canonical', async () => {
+    const snap = {
+      job: { id: 100, name: 'J', client_company_name: 'C' },
+      stages: [
+        { stage_name: 'Sourced', count: 1, candidates: [{ id: 1, name: 'A', stage_moved: 't' }] },
+        { stage_name: 'CV Sent', count: 1, candidates: [{ id: 2, name: 'B', stage_moved: 't' }] },
+      ],
+    };
+    await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify(snap));
+    const r = await call({ consultantFirstName: 'Joel', job: 100, stage: 'sourced' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.stages).toHaveLength(1);
+    expect(b.stages[0].stage_name).toBe('Sourced');
+    expect(b.stages[0].candidates[0].id).toBe(1);
+  });
+
+  it('prefix stage name resolves ("1st" → "1st Interview")', async () => {
+    const snap = {
+      job: { id: 100, name: 'J', client_company_name: 'C' },
+      stages: [
+        { stage_name: 'Sourced', count: 1, candidates: [{ id: 1, name: 'A', stage_moved: 't' }] },
+        { stage_name: '1st Interview', count: 1, candidates: [{ id: 2, name: 'B', stage_moved: 't' }] },
+      ],
+    };
+    await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify(snap));
+    const r = await call({ consultantFirstName: 'Joel', job: 100, stage: '1st' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.stages).toHaveLength(1);
+    expect(b.stages[0].stage_name).toBe('1st Interview');
+  });
+
+  it('ambiguous stage ("interview") → 200 needs_disambiguation kind=stage', async () => {
+    const snap = {
+      job: { id: 100, name: 'J', client_company_name: 'C' },
+      stages: [
+        { stage_name: '1st Interview', count: 1, candidates: [{ id: 1, name: 'A', stage_moved: 't' }] },
+        { stage_name: '2nd Interview', count: 1, candidates: [{ id: 2, name: 'B', stage_moved: 't' }] },
+        { stage_name: 'Final Interview', count: 1, candidates: [{ id: 3, name: 'C', stage_moved: 't' }] },
+      ],
+    };
+    await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify(snap));
+    const r = await call({ consultantFirstName: 'Joel', job: 100, stage: 'interview' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.needs_disambiguation).toBe(true);
+    expect(b.kind).toBe('stage');
+    expect(b.options.length).toBeGreaterThanOrEqual(2);
+    expect(b.hint).toMatch(/multiple/i);
+  });
+
+  it('unknown stage name falls through to filter (empty stages, not 404)', async () => {
+    const snap = {
+      job: { id: 100, name: 'J', client_company_name: 'C' },
+      stages: [
+        { stage_name: 'Sourced', count: 1, candidates: [{ id: 1, name: 'A', stage_moved: 't' }] },
+      ],
+    };
+    await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify(snap));
+    const r = await call({ consultantFirstName: 'Joel', job: 100, stage: 'totally-not-a-real-stage' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.stages).toEqual([]);
+  });
 });
