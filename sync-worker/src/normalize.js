@@ -33,17 +33,22 @@ const CURATED_KEYS = [
  * @param {string|null|undefined} url
  * @returns {string|null}
  */
-function normalizeLinkedInSlug(url) {
-  if (!url || typeof url !== 'string') return null;
-  const s = url
+function normalizeLinkedInSlug(input) {
+  if (!input || typeof input !== 'string') return null;
+  const s = input
     .trim()
     .toLowerCase()
     .replace(/^https?:\/\//, '')
     .replace(/^www\./, '')
-    .replace(/[?#].*$/, '');
-  const m = s.match(/linkedin\.com\/(?:in|pub)\/([^/]+)/);
-  if (!m) return null;
-  return m[1].replace(/\/$/, '');
+    .replace(/[?#].*$/, '')
+    .replace(/\/$/, '');
+  // Form 1: full URL like "linkedin.com/in/<slug>" or "linkedin.com/pub/<slug>"
+  const urlMatch = s.match(/linkedin\.com\/(?:in|pub)\/([^/]+)/);
+  if (urlMatch) return urlMatch[1];
+  // Form 2: RF often returns the bare slug only (no URL). Accept any token of
+  // alphanumeric / hyphen / underscore as a slug if it doesn't look like a URL.
+  if (!s.includes('/') && !s.includes('.') && /^[a-z0-9_-]+$/i.test(s)) return s;
+  return null;
 }
 
 /**
@@ -106,6 +111,17 @@ export function toCandidateRow(rf) {
   const source = rf.source ?? rf.source_name ?? null;
   if (source && curated.source == null) curated.source = source;
 
+  // Normalise job entries inside body so downstream consumers (snapshots,
+  // projection.js dot-paths like `jobs.*.job_name`) see canonical names.
+  if (Array.isArray(rf.jobs)) {
+    curated.jobs = rf.jobs.map(j => ({
+      ...j,
+      job_name: j.job_name ?? j.name ?? null,        // RF uses `name` on /list and /get
+      added_to_job: j.added_to_job ?? j.added_time ?? null,
+      // Preserve RF's stages[] array (only on /get) verbatim — used by move-stage.
+    }));
+  }
+
   // Synthesise custom_fields_by_name from the custom_fields array.
   // Keys are lowercased for case-insensitive lookup (projection.js aliases use lowercased names).
   // The whole entry is preserved so callers can access .value, .id, etc.
@@ -159,12 +175,20 @@ export function toCandidateJobRows(rf) {
   return rf.jobs.map(j => ({
     candidate_id: rf.id,
     job_id: j.job_id,
+    // RF /candidate/list and /candidate/get both lack `stage_id` on job links;
+    // /candidate/get's `stages[]` array carries IDs but jobs don't reference them
+    // by id directly. Leave null and use stage_name everywhere.
     stage_id: j.stage_id ?? null,
     stage_name: j.stage_name ?? null,
     stage_moved: j.stage_moved ?? null,
-    added_to_job: j.added_to_job ?? null,
+    // RF returns the per-job "added" timestamp under `added_time` — accept the
+    // internal `added_to_job` name as a fallback for forward compatibility.
+    added_to_job: j.added_to_job ?? j.added_time ?? null,
     added_to_job_by_id: j.added_to_job_by?.id ?? null,
-    disqualified: j.disqualified ? 1 : 0,
+    // RF has no boolean `disqualified` field on job links — derive from the
+    // stage name. Any stage explicitly named "Disqualified" counts as DQ.
+    disqualified: (typeof j.disqualified === 'boolean' ? j.disqualified
+                  : j.stage_name === 'Disqualified') ? 1 : 0,
     disqualification_reason: j.disqualification_reason ?? null,
   }));
 }

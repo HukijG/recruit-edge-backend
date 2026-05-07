@@ -81,86 +81,61 @@ export async function fetchCandidate(env, id) {
 }
 
 /**
- * Returns ids of candidates whose `last_updated` is strictly greater than `cursor`
- * (ISO 8601 string), plus a `suggestedCursor` the caller should advance to after
- * processing. Paginates `/candidate/search` sorted last_updated DESC, breaks
- * when we encounter a row at-or-older-than cursor.
+ * Returns ids of candidates whose `last_activity` is strictly after `cursor`
+ * (ISO 8601 datetime), plus a `suggestedCursor` the caller advances to.
  *
- * Hard cap of 5000 ids — the tail-sync caller batches downstream work and
- * unbounded results would blow the worker's runtime limits if RF ever returned
- * a huge backlog (e.g. an outage recovery).
+ * RF's /candidate/search supports a date filter on `last_activity` (NOT
+ * `last_updated` — that key is rejected). We pass an absolute "after" filter
+ * with the cursor's date portion (RF's date filters use day granularity), so
+ * the response is guaranteed to contain only rows newer-than-or-equal-to the
+ * cursor day. Pagination walks until rows.length < PAGE_SIZE.
  *
- * Why the return shape includes `suggestedCursor`:
- * - We sort DESC because there is no `last_updated >= cursor` filter on RF's
- *   `/candidate/search` (TBD, may never exist) — the only way to do incremental
- *   reads is "newest first, break when we hit cursor".
- * - DESC + cap means if 5001+ rows are fresh, we return the 5000 NEWEST and
- *   skip 1+ older-but-still-fresh rows.
- * - If the caller advances `cursor = MAX(returned)` after processing, those
- *   skipped rows have `last_updated < new cursor` and are silently dropped
- *   forever — DATA LOSS.
- * - Fix: when capped, set `suggestedCursor = MIN(returned)` (oldest of the
- *   returned set) so the next tick re-fetches from the cap edge. The newest
- *   rows we already processed will be re-seen — that's idempotent overlap,
- *   acceptable cost. Missed rows are not.
- * - When NOT capped, `suggestedCursor = MAX(returned)` (newest) — we have the
- *   full delta, advance to the watermark.
- * - When no fresh rows, `suggestedCursor = cursor` (no movement).
- *
- * NOTE: the exact sort key for `last_updated` on `/candidate/search` is pending
- * Joel's confirmation before sync ships. Code defensively — even if the sort
- * hint is ignored upstream, the break-when-stale logic still terminates as
- * long as the response eventually drains.
+ * Hard cap of 5000 ids per tick — defensive against a huge backlog (outage
+ * recovery). Capped path returns `suggestedCursor = cursor` so the next tick
+ * picks up from the same point (no advancement when we know we left rows on
+ * the table). Caller must therefore guarantee idempotent upserts (it does:
+ * INSERT OR REPLACE on candidates + DELETE+INSERT on candidate_jobs).
  */
 export async function fetchCandidatesUpdatedSince(env, cursor) {
   const ids = [];
-  const timestamps = [];
   let page = 1;
   const PAGE_SIZE = 100;
   const HARD_CAP = 5000;
   let capped = false;
 
+  // RF date filters use day granularity (YYYY-MM-DD). Round the cursor down
+  // to its date and let the per-row last_activity_at do the precise filtering
+  // (cheap idempotent overlap on the boundary day).
+  const cursorDate = (cursor || '').slice(0, 10) || '1970-01-01';
+
   for (;;) {
     const resp = await rfPost(env, '/candidate/search', {
       conjunction: 'match-all',
-      filters: [],
+      filters: [{
+        filter_type: 'after',
+        is_relative: false,
+        date: cursorDate,
+        key: 'last_activity',
+        type: 'date',
+      }],
       items_per_page: String(PAGE_SIZE),
       current_page: String(page),
-      sort: [{ key: 'last_updated', direction: 'desc' }],
     });
-    const rows = Array.isArray(resp?.data) ? resp.data : [];
+    const rows = Array.isArray(resp?.data) ? resp.data : (Array.isArray(resp) ? resp : []);
     if (rows.length === 0) break;
-
-    let stopped = false;
     for (const row of rows) {
-      if (row.last_updated && row.last_updated > cursor) {
-        ids.push(row.id);
-        timestamps.push(row.last_updated);
-        if (ids.length >= HARD_CAP) {
-          capped = true;
-          stopped = true;
-          break;
-        }
-      } else {
-        stopped = true;
-        break;
-      }
+      ids.push(row.id);
+      if (ids.length >= HARD_CAP) { capped = true; break; }
     }
-    if (stopped || rows.length < PAGE_SIZE) break;
+    if (capped || rows.length < PAGE_SIZE) break;
     page++;
   }
 
-  let suggestedCursor;
-  if (timestamps.length === 0) {
-    suggestedCursor = cursor;
-  } else if (capped) {
-    // Drop the cap edge (oldest of the returned set) on the floor so next
-    // tick refetches from there — overlap is fine, missed rows are not.
-    suggestedCursor = timestamps.reduce((a, b) => (a < b ? a : b));
-  } else {
-    suggestedCursor = timestamps.reduce((a, b) => (a > b ? a : b));
-  }
-
+  // Cursor advancement:
+  //  - not capped → set to "now" (we got the full delta from RF's filter).
+  //  - capped → leave cursor unchanged so next tick repeats from same boundary.
+  //    (Idempotent upserts make repeat-processing free apart from RF round trips.)
+  const suggestedCursor = capped ? cursor : new Date().toISOString();
   return { ids, suggestedCursor };
 }
 

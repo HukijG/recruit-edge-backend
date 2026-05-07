@@ -128,7 +128,9 @@ export async function writeJobs(env, jobs) {
       j.id,
       JSON.stringify(j),
       j.name ?? null,
-      j.client_company_name ?? null,
+      // RF /job/list returns the client company nested as `company: {id, name}`.
+      // /candidate/get's jobs[] uses `client_company_name` directly. Accept both.
+      j.client_company_name ?? j.company?.name ?? null,
       j.is_open ? 1 : 0,
       now,
     )
