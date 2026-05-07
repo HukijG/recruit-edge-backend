@@ -82,6 +82,22 @@ export async function buildJobSnapshots(env, jobId, jobMeta) {
 
   const entries = results.map(buildEntry);
 
+  // Extract this job's pipeline order from any candidate's `body.jobs[k].stages`.
+  // RF's `/candidate/get` response carries the full pipeline definition on
+  // each job link, so any non-DQ candidate on this job is sufficient. Falls
+  // back to [] if no candidate has it — main worker's reader treats absent
+  // `pipeline_stages` as "no range filter possible" and returns the populated
+  // stages unfiltered.
+  let pipelineStages = [];
+  for (const row of results ?? []) {
+    const body = JSON.parse(row.body || '{}');
+    const link = (body.jobs ?? []).find((j) => Number(j.job_id) === Number(jobId));
+    if (Array.isArray(link?.stages) && link.stages.length > 0) {
+      pipelineStages = link.stages.map((s) => ({ id: s.id, name: s.name }));
+      break;
+    }
+  }
+
   // Group by stage worker-side. Map preserves insertion order (which is
   // c.name ASC from the SQL ORDER BY), so candidates inside each stage
   // bucket also stay in that name order.
@@ -97,6 +113,7 @@ export async function buildJobSnapshots(env, jobId, jobMeta) {
       name: jobMeta?.name ?? null,
       client_company_name: jobMeta?.client_company_name ?? null,
     },
+    pipeline_stages: pipelineStages,
     stages: [...stagesMap.entries()].map(([stage_name, candidates]) => ({
       stage_name,
       count: candidates.length,

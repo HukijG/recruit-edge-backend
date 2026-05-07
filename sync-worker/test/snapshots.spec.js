@@ -101,6 +101,30 @@ describe('snapshots', () => {
     expect(await env.SYNC_STATE.get('mcp:job-candidates:200')).toBeNull();
   });
 
+  it('pipeline snap includes pipeline_stages extracted from candidate body', async () => {
+    const stages = [
+      { id: 1, name: 'Sourced' },
+      { id: 2, name: 'Replied' },
+      { id: 3, name: 'Phone Screen' },  // job-specific custom stage
+      { id: 4, name: 'CV Sent' },
+      { id: 5, name: 'Take-home' },     // job-specific custom stage
+      { id: 6, name: 'Onsite' },
+      { id: 7, name: 'Offer' },
+      { id: 8, name: 'Hired' },
+    ];
+    await writeJobs(env, [
+      { id: 100, name: 'Eng', client_company_name: 'Acme', is_open: 1 },
+    ]);
+    await writeCandidatesAndLinks(env, [
+      cand(1, [{ job_id: 100, stage_name: 'Sourced', disqualified: false, added_to_job_by: { id: 1 }, stages }]),
+    ]);
+
+    await rebuildMcpSnapshots(env, null);
+
+    const pipe = JSON.parse(await env.SYNC_STATE.get('mcp:pipeline:100'));
+    expect(pipe.pipeline_stages).toEqual(stages);
+  });
+
   it('affectedJobIds filters to specific jobs', async () => {
     await writeJobs(env, [
       { id: 100, name: 'A', client_company_name: 'Acme',  is_open: 1 },

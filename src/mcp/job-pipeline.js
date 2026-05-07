@@ -7,12 +7,33 @@
  * (writing the result back to KV with a 1h TTL — the next scheduled rebuild
  * will overwrite well before that fires).
  *
- * Filtering options:
- *   - `stage`     — narrow to a single stage by name
- *   - `submitted` — narrow to the post-CV-Sent stages (CV Sent → Hired)
+ * Filtering options (mutually applied):
+ *   - `stage`         — narrow to a single stage by name (fuzzy-resolved
+ *                       against the snapshot's populated stage names;
+ *                       ambiguous → 200 envelope, not_found → falls through
+ *                       to literal exact-match → empty stages)
+ *   - `from` / `to`   — fuzzy-resolved against THIS JOB'S pipeline (the
+ *                       `pipeline_stages` array carried on the snapshot,
+ *                       which is whatever stages RF defined for that job).
+ *                       `from: "Replied"` means "Replied → end of pipeline",
+ *                       `to: "1st"` means "start → 1st Interview". Combined:
+ *                       custom range. Ambiguous → 200 envelope.
+ *   - `submitted`     — explicit shortcut: "CV Sent → end" on this job's
+ *                       pipeline (whatever the last stage actually is).
  *
- * `stage` and `submitted` are mutually exclusive in practice: if both are
- * provided, `stage` wins (it's the more specific filter).
+ * Default (none of the above set): CV Sent → Offer on this job's pipeline,
+ * if both names resolve. Falls back to "show everything" if either doesn't
+ * — a job with a non-standard pipeline isn't going to be silently filtered.
+ * Recruiters glancing at a job typically want the actively-progressing
+ * window; Sourced / Replied are usually noise. To see them anyway, pass
+ * `from: "Sourced"` (or any earlier stage), or `stage: "Sourced"` for that
+ * single stage.
+ *
+ * Per-job pipelines: there is NO global canonical stage list. Each job in
+ * RF can define its own pipeline (custom stages, screening loops, etc.).
+ * The `pipeline_stages` array on the snapshot is the source of truth — both
+ * range filters and `submitted` resolve their landmark stages ("CV Sent",
+ * "Offer", "Hired") against it via the same fuzzy resolver Claude uses.
  *
  * Field projection follows the same alias-driven path as /mcp/candidate-search;
  * unresolved fields surface in `_meta.unresolved_fields`.
@@ -24,20 +45,82 @@ import { resolveFields, project } from './projection.js';
 import { resolveJob, resolveStage, disambiguationPayload } from './resolvers.js';
 
 const DEFAULT_FIELDS = ['id', 'name', 'stage_moved'];
-const SUBMITTED_STAGES = [
-  'CV Sent',
-  '1st Interview',
-  '2nd Interview',
-  '3rd Interview',
-  'Final Interview',
-  'Offer',
-  'Hired',
-];
+
+// Landmark stage names used by the range-filter defaults / submitted shortcut.
+// These are matched fuzzily against THIS JOB'S pipeline_stages — they're the
+// names recruiters use, not a hardcoded global list. If a job's pipeline
+// doesn't include a "CV Sent" stage at all, the default range falls back to
+// the whole pipeline (rather than silently filtering to nothing).
+const LANDMARK_DEFAULT_FROM = 'CV Sent';
+const LANDMARK_DEFAULT_TO = 'Offer';
+const LANDMARK_SUBMITTED_FROM = 'CV Sent';
+
+/**
+ * Resolve a stage name to its index in this job's pipeline. Wraps the
+ * standard resolveStage so ambiguity surfaces as `{ ambiguous }` for the
+ * caller to short-circuit; not_found surfaces as `{ idx: -1 }` so callers
+ * can decide whether to fall back (defaults) or treat it as an error
+ * (explicit `from`/`to` from the user — we'd rather just leave the bound
+ * open than fail the call).
+ */
+function resolveStageIdx(input, pipelineStages) {
+  const list = pipelineStages.map((s, id) => ({ id, name: s.name }));
+  const r = resolveStage(input, list);
+  if (!r.ok && r.reason === 'ambiguous') return { ambiguous: r };
+  if (r.ok) return { idx: r.value.id };
+  return { idx: -1 };
+}
+
+/**
+ * Build the [fromIdx, toIdx] index pair into the job's pipeline_stages.
+ * Returns `{ ok: true, range }` on success, `{ ok: false, ambiguous }`
+ * when from/to fuzzy-resolves ambiguously (caller emits the standard
+ * envelope).
+ */
+function resolveStageRange(body, pipelineStages) {
+  const lastIdx = pipelineStages.length - 1;
+
+  if (body.submitted) {
+    const r = resolveStageIdx(LANDMARK_SUBMITTED_FROM, pipelineStages);
+    if (r.ambiguous) return { ok: false, ambiguous: r.ambiguous };
+    return { ok: true, range: [r.idx >= 0 ? r.idx : 0, lastIdx] };
+  }
+
+  let fromIdx;
+  let toIdx;
+  if (body.from || body.to) {
+    fromIdx = 0;
+    toIdx = lastIdx;
+    if (body.from) {
+      const r = resolveStageIdx(body.from, pipelineStages);
+      if (r.ambiguous) return { ok: false, ambiguous: r.ambiguous };
+      if (r.idx >= 0) fromIdx = r.idx;
+    }
+    if (body.to) {
+      const r = resolveStageIdx(body.to, pipelineStages);
+      if (r.ambiguous) return { ok: false, ambiguous: r.ambiguous };
+      if (r.idx >= 0) toIdx = r.idx;
+    }
+  } else {
+    // Default: CV Sent → Offer, fuzzily against this job's pipeline.
+    // If a landmark isn't present in the pipeline (custom stage names),
+    // fall back to the open end — better to over-include than silently
+    // hide a job's actual stages.
+    const fromR = resolveStageIdx(LANDMARK_DEFAULT_FROM, pipelineStages);
+    if (fromR.ambiguous) return { ok: false, ambiguous: fromR.ambiguous };
+    const toR = resolveStageIdx(LANDMARK_DEFAULT_TO, pipelineStages);
+    if (toR.ambiguous) return { ok: false, ambiguous: toR.ambiguous };
+    fromIdx = fromR.idx >= 0 ? fromR.idx : 0;
+    toIdx = toR.idx >= 0 ? toR.idx : lastIdx;
+  }
+  return { ok: true, range: [fromIdx, toIdx] };
+}
 
 /**
  * Live-build the pipeline snapshot from D1 when KV misses.  Mirrors the shape
- * sync-worker writes to `mcp:pipeline:{jobId}`. Returns null if the job_id is
- * unknown so the caller can return 404.
+ * sync-worker writes to `mcp:pipeline:{jobId}` — including the per-job
+ * `pipeline_stages` array, extracted from any candidate's `body.jobs[k].stages`.
+ * Returns null if the job_id is unknown so the caller can return 404.
  */
 async function buildPipelineFromD1(env, jobId) {
   const meta = await session(env)
@@ -57,10 +140,17 @@ async function buildPipelineFromD1(env, jobId) {
     .bind(jobId)
     .all();
 
+  let pipelineStages = [];
   const stages = new Map();
   for (const r of results ?? []) {
     if (!stages.has(r.stage_name)) stages.set(r.stage_name, []);
     const body = JSON.parse(r.body || '{}');
+    if (pipelineStages.length === 0) {
+      const link = (body.jobs ?? []).find((j) => Number(j.job_id) === Number(jobId));
+      if (Array.isArray(link?.stages) && link.stages.length > 0) {
+        pipelineStages = link.stages.map((s) => ({ id: s.id, name: s.name }));
+      }
+    }
     stages.get(r.stage_name).push({
       id: r.id,
       name: r.name,
@@ -75,6 +165,7 @@ async function buildPipelineFromD1(env, jobId) {
       name: meta.name,
       client_company_name: meta.client_company_name,
     },
+    pipeline_stages: pipelineStages,
     stages: [...stages.entries()].map(([stage_name, candidates]) => ({
       stage_name,
       count: candidates.length,
@@ -116,11 +207,15 @@ export async function handleJobPipeline({ env, body }) {
     );
   }
 
-  // Apply stage / submitted filters.  `stage` is the more specific filter and
-  // wins when both are supplied (callers shouldn't pass both, but be lenient).
-  // `stage` is fuzzy-resolved against the snapshot's own stage names so
-  // "sourced" / "1st" / "call booked" all reach the canonical name without
-  // a round-trip. Ambiguity short-circuits to the standard 200 envelope.
+  // Filter pipeline.  Precedence:
+  //   1. `stage` (single-stage filter; fuzzy-resolved against the snapshot)
+  //   2. `from` / `to` / `submitted` (range filters; fuzzy-resolved against
+  //      the canonical PIPELINE_ORDER)
+  //   3. Default: CV Sent → Offer.
+  //
+  // `stage` and the range filters are mutually exclusive in spirit. When
+  // both are passed, `stage` wins (it's more specific) and the range
+  // filters are ignored — this matches the legacy behaviour for `submitted`.
   let stages = snap.stages;
   let stageFilter = body.stage;
   if (body.stage && stages.length > 0) {
@@ -135,8 +230,24 @@ export async function handleJobPipeline({ env, body }) {
   }
   if (stageFilter) {
     stages = stages.filter((s) => s.stage_name === stageFilter);
-  } else if (body.submitted) {
-    stages = stages.filter((s) => SUBMITTED_STAGES.includes(s.stage_name));
+  } else {
+    // Range filter — resolved against THIS JOB'S pipeline (carried on the
+    // snapshot as `pipeline_stages`). When the snapshot pre-dates the
+    // pipeline_stages addition (legacy KV write still in flight), skip the
+    // range filter and return everything; the next sync tick will populate
+    // it and the default kicks in then.
+    const pipelineStages = Array.isArray(snap.pipeline_stages) ? snap.pipeline_stages : [];
+    if (pipelineStages.length > 0) {
+      const rangeRes = resolveStageRange(body, pipelineStages);
+      if (!rangeRes.ok) {
+        return jsonResponse(200, disambiguationPayload(rangeRes.ambiguous));
+      }
+      const [fromIdx, toIdx] = rangeRes.range;
+      const allowed = new Set(
+        pipelineStages.slice(fromIdx, toIdx + 1).map((s) => s.name),
+      );
+      stages = stages.filter((s) => allowed.has(s.stage_name));
+    }
   }
 
   // Resolve requested fields against a representative candidate so custom

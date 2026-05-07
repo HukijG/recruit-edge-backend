@@ -77,7 +77,7 @@ describe('/mcp/job-pipeline', () => {
     const snap = {
       job: { id: 100, name: 'Eng Lead', client_company_name: 'Acme' },
       stages: [
-        { stage_name: 'Sourced', count: 1, candidates: [{ id: 1, name: 'A', stage_moved: '2026-05-01T00:00:00Z' }] },
+        { stage_name: 'CV Sent', count: 1, candidates: [{ id: 1, name: 'A', stage_moved: '2026-05-01T00:00:00Z' }] },
       ],
     };
     await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify(snap));
@@ -92,14 +92,16 @@ describe('/mcp/job-pipeline', () => {
   it('falls back to D1 build on KV miss + writes back to KV', async () => {
     await insertJob(100, 'Eng Lead', 'Acme');
     await insertCandidate(1, 'Alice');
-    await linkJob(1, 100, 'Sourced');
+    // CV Sent is in the default range (CV Sent → Offer) so the no-param call
+    // surfaces the candidate.
+    await linkJob(1, 100, 'CV Sent');
 
     expect(await env.SYNC_STATE.get('mcp:pipeline:100')).toBeNull();
     const r = await call({ consultantFirstName: 'Joel', job: 100 });
     expect(r.status).toBe(200);
     const b = await r.json();
     expect(b.job.id).toBe(100);
-    expect(b.stages[0].stage_name).toBe('Sourced');
+    expect(b.stages[0].stage_name).toBe('CV Sent');
     expect(b.stages[0].candidates[0].id).toBe(1);
 
     // KV writeback so subsequent reads skip D1.
@@ -126,9 +128,16 @@ describe('/mcp/job-pipeline', () => {
     expect(b.stages[0].candidates[0].id).toBe(2);
   });
 
-  it('submitted: true filters to CV Sent → Hired stages', async () => {
+  it('submitted: true filters from CV Sent to end of this job\'s pipeline', async () => {
     const snap = {
       job: { id: 100, name: 'J', client_company_name: 'C' },
+      pipeline_stages: [
+        { id: 1, name: 'Sourced' },
+        { id: 2, name: 'Replied' },
+        { id: 3, name: 'CV Sent' },
+        { id: 4, name: '1st Interview' },
+        { id: 5, name: 'Hired' },
+      ],
       stages: [
         { stage_name: 'Sourced', count: 1, candidates: [{ id: 1, name: 'A', stage_moved: 't' }] },
         { stage_name: 'Replied', count: 1, candidates: [{ id: 2, name: 'B', stage_moved: 't' }] },
@@ -152,7 +161,7 @@ describe('/mcp/job-pipeline', () => {
   it('numeric job id passed as string still works', async () => {
     await insertJob(100, 'Eng Lead', 'Acme');
     await insertCandidate(1, 'Alice');
-    await linkJob(1, 100, 'Sourced');
+    await linkJob(1, 100, 'CV Sent');
     const r = await call({ consultantFirstName: 'Joel', job: '100' });
     expect(r.status).toBe(200);
     const b = await r.json();
@@ -163,7 +172,7 @@ describe('/mcp/job-pipeline', () => {
     await insertJob(100, 'Enterprise AE', 'Nominal');
     await insertJob(200, 'CSM Lead', 'Other');
     await insertCandidate(1, 'Alice');
-    await linkJob(1, 100, 'Sourced');
+    await linkJob(1, 100, 'CV Sent');
     const r = await call({ consultantFirstName: 'Joel', job: 'Enterprise AE' });
     expect(r.status).toBe(200);
     const b = await r.json();
@@ -251,5 +260,135 @@ describe('/mcp/job-pipeline', () => {
     expect(r.status).toBe(200);
     const b = await r.json();
     expect(b.stages).toEqual([]);
+  });
+
+  // Helper: snapshot for a job whose pipeline mirrors the standard recruiting
+  // taxonomy. Each candidate sits in one stage; the `pipeline_stages` array
+  // carries the per-job pipeline order (this is what sync-worker extracts
+  // from a candidate's body.jobs[k].stages and writes alongside `stages`).
+  const fullSnap = (jobId = 100) => {
+    const pipeline_stages = [
+      { id: 1, name: 'Sourced' },
+      { id: 2, name: 'Replied' },
+      { id: 3, name: 'Call Booked' },
+      { id: 4, name: 'CV Sent' },
+      { id: 5, name: '1st Interview' },
+      { id: 6, name: '2nd Interview' },
+      { id: 7, name: 'Final Interview' },
+      { id: 8, name: 'Offer' },
+      { id: 9, name: 'Hired' },
+    ];
+    return {
+      job: { id: jobId, name: 'Eng Lead', client_company_name: 'Acme' },
+      pipeline_stages,
+      stages: pipeline_stages.map((s, i) => ({
+        stage_name: s.name,
+        count: 1,
+        candidates: [{ id: 11 + i, name: String.fromCharCode(97 + i), stage_moved: 't' }],
+      })),
+    };
+  };
+
+  it('default (no params) returns CV Sent → Offer only', async () => {
+    await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify(fullSnap()));
+    const r = await call({ consultantFirstName: 'Joel', job: 100 });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    const names = b.stages.map((s) => s.stage_name);
+    expect(names).toEqual(['CV Sent', '1st Interview', '2nd Interview', 'Final Interview', 'Offer']);
+  });
+
+  it('from: "Replied" returns Replied → Hired', async () => {
+    await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify(fullSnap()));
+    const r = await call({ consultantFirstName: 'Joel', job: 100, from: 'Replied' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    const names = b.stages.map((s) => s.stage_name);
+    expect(names).toEqual([
+      'Replied', 'Call Booked', 'CV Sent', '1st Interview',
+      '2nd Interview', 'Final Interview', 'Offer', 'Hired',
+    ]);
+  });
+
+  it('to: "1st Interview" returns Sourced → 1st Interview', async () => {
+    await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify(fullSnap()));
+    const r = await call({ consultantFirstName: 'Joel', job: 100, to: '1st Interview' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    const names = b.stages.map((s) => s.stage_name);
+    expect(names).toEqual(['Sourced', 'Replied', 'Call Booked', 'CV Sent', '1st Interview']);
+  });
+
+  it('from + to combine into a custom range', async () => {
+    await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify(fullSnap()));
+    const r = await call({
+      consultantFirstName: 'Joel', job: 100,
+      from: 'Replied', to: 'CV Sent',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    const names = b.stages.map((s) => s.stage_name);
+    expect(names).toEqual(['Replied', 'Call Booked', 'CV Sent']);
+  });
+
+  it('lowercase from is fuzzy-resolved', async () => {
+    await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify(fullSnap()));
+    const r = await call({ consultantFirstName: 'Joel', job: 100, from: 'replied' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.stages[0].stage_name).toBe('Replied');
+  });
+
+  it('ambiguous from ("interview") returns 200 needs_disambiguation kind=stage', async () => {
+    await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify(fullSnap()));
+    const r = await call({ consultantFirstName: 'Joel', job: 100, from: 'interview' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.needs_disambiguation).toBe(true);
+    expect(b.kind).toBe('stage');
+    expect(b.options.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('per-job pipeline: custom stages resolve fuzzy and filter correctly', async () => {
+    // This job has a non-standard pipeline (Phone Screen + Take-home + Onsite
+    // — no "Final Interview"). Range and `submitted` semantics resolve
+    // landmarks ("CV Sent", "Offer") fuzzily against THIS pipeline; custom
+    // stages between the landmarks survive the default range too.
+    const snap = {
+      job: { id: 100, name: 'Backend Eng', client_company_name: 'CustomCorp' },
+      pipeline_stages: [
+        { id: 1, name: 'Sourced' },
+        { id: 2, name: 'Phone Screen' },
+        { id: 3, name: 'CV Sent' },
+        { id: 4, name: 'Take-home' },
+        { id: 5, name: 'Onsite' },
+        { id: 6, name: 'Offer' },
+        { id: 7, name: 'Hired' },
+      ],
+      stages: [
+        { stage_name: 'Sourced',      count: 1, candidates: [{ id: 1, name: 'A', stage_moved: 't' }] },
+        { stage_name: 'Phone Screen', count: 1, candidates: [{ id: 2, name: 'B', stage_moved: 't' }] },
+        { stage_name: 'CV Sent',      count: 1, candidates: [{ id: 3, name: 'C', stage_moved: 't' }] },
+        { stage_name: 'Take-home',    count: 1, candidates: [{ id: 4, name: 'D', stage_moved: 't' }] },
+        { stage_name: 'Onsite',       count: 1, candidates: [{ id: 5, name: 'E', stage_moved: 't' }] },
+        { stage_name: 'Offer',        count: 1, candidates: [{ id: 6, name: 'F', stage_moved: 't' }] },
+        { stage_name: 'Hired',        count: 1, candidates: [{ id: 7, name: 'G', stage_moved: 't' }] },
+      ],
+    };
+    await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify(snap));
+
+    // Default (CV Sent → Offer, fuzzy on this pipeline) — picks up the
+    // custom Take-home and Onsite stages between the landmarks.
+    const dflt = await (await call({ consultantFirstName: 'Joel', job: 100 })).json();
+    expect(dflt.stages.map((s) => s.stage_name)).toEqual([
+      'CV Sent', 'Take-home', 'Onsite', 'Offer',
+    ]);
+
+    // Fuzzy `from: "phone"` resolves to the custom "Phone Screen" stage and
+    // returns everything from there to the end.
+    const phone = await (await call({ consultantFirstName: 'Joel', job: 100, from: 'phone' })).json();
+    expect(phone.stages.map((s) => s.stage_name)).toEqual([
+      'Phone Screen', 'CV Sent', 'Take-home', 'Onsite', 'Offer', 'Hired',
+    ]);
   });
 });
