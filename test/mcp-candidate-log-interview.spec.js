@@ -203,6 +203,77 @@ describe('/mcp/candidate-log-interview', () => {
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
+  it('post-narrow: two Jordans, only one is on the specified job → auto-commits', async () => {
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    // Jordan Chen is on job 100; Jordan Patel is on job 999. Caller asks for
+    // log-interview on job 100 — post-narrow should drop Patel and commit.
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(
+      42, JSON.stringify({
+        id: 42, name: 'Jordan Chen',
+        jobs: [{ job_id: 100, job_name: 'Eng', disqualified: false }],
+      }),
+      'Jordan Chen', 'Acme', 'AE', new Date().toISOString()
+    ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(
+      43, JSON.stringify({
+        id: 43, name: 'Jordan Patel',
+        jobs: [{ job_id: 999, job_name: 'PM', disqualified: false }],
+      }),
+      'Jordan Patel', 'Globex', 'CSM', new Date().toISOString()
+    ).run();
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 555 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 'Jordan',
+      job: 'Eng',
+      kind: '1st Interview',
+      start_time: '2026-05-08T10:00:00+01:00',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.ok).toBe(true);
+    expect(b.activity.candidate_id).toBe(42);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('post-narrow: two Jordans, neither on the specified job → 400', async () => {
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(
+      42, JSON.stringify({
+        id: 42, name: 'Jordan Chen',
+        jobs: [{ job_id: 999, job_name: 'PM', disqualified: false }],
+      }),
+      'Jordan Chen', 'Acme', 'AE', new Date().toISOString()
+    ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(
+      43, JSON.stringify({
+        id: 43, name: 'Jordan Patel',
+        jobs: [{ job_id: 888, job_name: 'CSM Lead', disqualified: false }],
+      }),
+      'Jordan Patel', 'Globex', 'CSM', new Date().toISOString()
+    ).run();
+    globalThis.fetch = vi.fn();
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 'Jordan',
+      job: 'Eng',
+      kind: '1st Interview',
+      start_time: '2026-05-08T10:00:00+01:00',
+    });
+    expect(r.status).toBe(400);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
   it('returns 502 if RF activity-create fails', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(
       new Response('rf went boom', { status: 500 }),

@@ -16,7 +16,8 @@
  */
 
 import { jsonResponse } from './router.js';
-import { resolveCandidate, resolveJob, disambiguationPayload } from './resolvers.js';
+import { getCandidateById } from './d1-read.js';
+import { resolveCandidate, resolveJob } from './resolvers.js';
 
 const DEFAULT_DURATION_MIN = 60;
 // Fallback only — used if the sync-worker hasn't yet populated
@@ -76,34 +77,60 @@ export async function handleCandidateLogInterview({ env, body, consultant }) {
     return jsonResponse(400, { error: 'candidate is required' });
   }
 
-  // Candidate — number, digit-string, or fuzzy name. Ambiguous → 200
-  // disambiguation; not_found → 404.
+  // Resolve candidate(s). Single id / unique fuzzy → one option. Ambiguous →
+  // load all top-K bodies for post-narrow consideration so we can drop any
+  // candidates that don't match the optional `body.job` filter.
   const candRes = await resolveCandidate(env, body.candidate);
-  if (!candRes.ok) {
-    if (candRes.reason === 'ambiguous') {
-      return jsonResponse(200, disambiguationPayload(candRes));
-    }
+  let candidateOptions;
+  if (candRes.ok) {
+    candidateOptions = [candRes.value];
+  } else if (candRes.reason === 'ambiguous') {
+    const bodies = await Promise.all(
+      candRes.options.map((o) => getCandidateById(env, o.id)),
+    );
+    candidateOptions = bodies.filter(Boolean);
+  } else {
     return jsonResponse(404, { error: 'candidate not found' });
   }
-  const candidate = candRes.value;
 
-  // Job (optional). When provided, must resolve uniquely against the
-  // candidate's own jobs[]. Ambiguous → 200 disambiguation; not_found → 400.
+  // If `body.job` is set, validate that each candidate has a non-DQ link to
+  // that job. Drop candidates that don't — auto-narrow win when only one
+  // ambiguous candidate is on the requested job. The job context itself
+  // isn't used by RF's activity-create (activities attach to a candidate,
+  // not a candidate-job link); resolution runs to filter the candidate set.
   if (body.job != null) {
-    const jobRes = await resolveJob(env, body.job, {
-      restrictTo: (candidate.jobs ?? []).filter((j) => !j.disqualified),
-    });
-    if (!jobRes.ok) {
-      if (jobRes.reason === 'ambiguous') {
-        return jsonResponse(200, disambiguationPayload(jobRes));
-      }
-      return jsonResponse(400, { error: 'job not found on this candidate' });
+    const validated = [];
+    for (const c of candidateOptions) {
+      const nonDq = (c.jobs ?? []).filter((j) => !j.disqualified);
+      if (nonDq.length === 0) continue;
+      const jobRes = await resolveJob(env, body.job, { restrictTo: nonDq });
+      if (jobRes.ok || jobRes.reason === 'ambiguous') validated.push(c);
     }
-    // Note: job context isn't used by the RF activity-create call (RF
-    // attributes activities to the candidate, not a specific job link).
-    // Resolution still runs so a bad `job` field surfaces as an error
-    // instead of being silently ignored.
+    candidateOptions = validated;
   }
+
+  if (candidateOptions.length === 0) {
+    return jsonResponse(400, {
+      error: 'no candidate matches the given filters',
+    });
+  }
+
+  if (candidateOptions.length > 1) {
+    // Multiple candidates pass the filter → lean kind='candidate' envelope.
+    return jsonResponse(200, {
+      needs_disambiguation: true,
+      kind: 'candidate',
+      options: candidateOptions.map((c) => ({
+        id: c.id,
+        name: c.name,
+        current_organization: c.current_organization ?? null,
+        current_title: c.current_title ?? null,
+      })),
+      hint: 'Multiple candidates match — please be more specific.',
+    });
+  }
+
+  const candidate = candidateOptions[0];
 
   const start = new Date(body.start_time);
   const end = body.end_time
