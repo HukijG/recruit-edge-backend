@@ -176,7 +176,9 @@ export async function fetchAllJobs(env) {
       items_per_page: String(PAGE_SIZE),
       current_page: String(page),
     });
-    const rows = Array.isArray(resp?.data) ? resp.data : [];
+    // RF returns a bare JSON array; handle envelope form too.
+    const rows = Array.isArray(resp) ? resp
+      : Array.isArray(resp?.data) ? resp.data : [];
     if (rows.length === 0) break;
     jobs.push(...rows);
     if (rows.length < PAGE_SIZE) break;
@@ -194,8 +196,12 @@ export async function fetchCandidateListPage(env, page, pageSize = 100) {
     items_per_page: String(pageSize),
     current_page: String(page),
   });
+  // RF returns a bare JSON array for /candidate/list (and /job/list).
+  // Older envelope shape was { data: [...] } — handle both defensively.
+  const rows = Array.isArray(resp) ? resp
+    : Array.isArray(resp?.data) ? resp.data : [];
   return {
-    rows: Array.isArray(resp?.data) ? resp.data : [],
+    rows,
     total: typeof resp?.total === 'number' ? resp.total : null,
   };
 }
@@ -206,6 +212,7 @@ export async function fetchCandidateListPage(env, page, pageSize = 100) {
 export async function fetchUsers(env) {
   // RF user list is small (~tens of rows for our team) — one page at the cap.
   const resp = await rfGet(env, '/user/list', { items_per_page: '100' });
+  if (Array.isArray(resp)) return resp;
   return Array.isArray(resp?.data) ? resp.data : [];
 }
 

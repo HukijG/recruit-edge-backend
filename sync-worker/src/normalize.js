@@ -65,12 +65,46 @@ function normalizeLinkedInSlug(url) {
  *   cached_at: string
  * }}
  */
+/**
+ * Pull the first email address out of RF's `email` field.
+ * RF returns an array — entries can be plain strings or objects ({ email, type, ... }).
+ */
+function firstEmail(rf) {
+  // Prefer top-level `primary_email` if a caller pre-populated it (defensive).
+  if (typeof rf.primary_email === 'string' && rf.primary_email) {
+    return rf.primary_email.toLowerCase();
+  }
+  const arr = Array.isArray(rf.email) ? rf.email : (Array.isArray(rf.emails) ? rf.emails : null);
+  if (!arr || !arr.length) return null;
+  const first = arr[0];
+  if (typeof first === 'string') return first.toLowerCase();
+  if (first && typeof first.email === 'string') return first.email.toLowerCase();
+  return null;
+}
+
 export function toCandidateRow(rf) {
   // Build curated body — only the listed keys, heavy fields excluded.
   const curated = {};
   for (const k of CURATED_KEYS) {
     if (rf[k] !== undefined) curated[k] = rf[k];
   }
+
+  // RF→internal alias mapping. RF returns several fields under different names
+  // depending on endpoint (/list, /search, /get). The internal canonical names
+  // are what projection.js + snapshots + handlers consume.
+  const primary_email = firstEmail(rf);
+  if (primary_email && curated.primary_email == null) curated.primary_email = primary_email;
+  if (rf.email !== undefined && curated.emails == null) curated.emails = rf.email;
+  if (Array.isArray(rf.phone_number) && curated.phone_numbers == null) {
+    curated.phone_numbers = rf.phone_number;
+  }
+  const current_title = rf.current_title ?? rf.current_designation ?? null;
+  if (current_title && curated.current_title == null) curated.current_title = current_title;
+  const last_activity_at = rf.last_activity_at ?? rf.latest_activity_time ?? null;
+  if (last_activity_at && curated.last_activity_at == null) curated.last_activity_at = last_activity_at;
+  // /candidate/get has `source`; /candidate/list has `source_name`.
+  const source = rf.source ?? rf.source_name ?? null;
+  if (source && curated.source == null) curated.source = source;
 
   // Synthesise custom_fields_by_name from the custom_fields array.
   // Keys are lowercased for case-insensitive lookup (projection.js aliases use lowercased names).
@@ -90,14 +124,14 @@ export function toCandidateRow(rf) {
     id: rf.id,
     body: JSON.stringify(curated),
     name: rf.name ?? ([rf.first_name, rf.last_name].filter(Boolean).join(' ') || null),
-    primary_email: rf.primary_email != null ? rf.primary_email.toLowerCase() : null,
+    primary_email,
     linkedin_profile: normalizeLinkedInSlug(rf.linkedin_profile),
     current_organization: rf.current_organization ?? null,
-    current_title: rf.current_title ?? null,
+    current_title,
     lead_owner_id: rf.lead_owner?.id ?? null,
     added_time: rf.added_time ?? null,
-    last_updated: rf.last_updated ?? null,
-    last_activity_at: rf.last_activity_at ?? null,
+    last_updated: rf.last_updated ?? null,  // /list lacks this; rebuild compensates via global cursor
+    last_activity_at,
     cached_at: new Date().toISOString(),
   };
 }

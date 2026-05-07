@@ -120,8 +120,41 @@ describe('normalize', () => {
   });
 
   it('returns null primary_email when missing', () => {
-    const row = toCandidateRow({ ...sample, primary_email: undefined });
+    // Drop top-level primary_email and BOTH email array fallbacks (RF `email`, internal `emails`).
+    const row = toCandidateRow({ ...sample, primary_email: undefined, email: undefined, emails: undefined });
     expect(row.primary_email).toBeNull();
+  });
+
+  it('derives primary_email from RF email array (string entries)', () => {
+    const row = toCandidateRow({
+      ...sample, primary_email: undefined,
+      email: ['JERRY@example.com', 'alt@example.com'],
+    });
+    expect(row.primary_email).toBe('jerry@example.com');
+  });
+
+  it('derives primary_email from RF email array (object entries)', () => {
+    const row = toCandidateRow({
+      ...sample, primary_email: undefined,
+      email: [{ email: 'Jerry@Example.com', type: 'work' }],
+    });
+    expect(row.primary_email).toBe('jerry@example.com');
+  });
+
+  it('aliases RF current_designation -> current_title', () => {
+    const row = toCandidateRow({ ...sample, current_title: undefined, current_designation: 'Engineer' });
+    expect(row.current_title).toBe('Engineer');
+  });
+
+  it('aliases RF latest_activity_time -> last_activity_at', () => {
+    const row = toCandidateRow({ ...sample, last_activity_at: undefined, latest_activity_time: '2026-05-01T00:00:00Z' });
+    expect(row.last_activity_at).toBe('2026-05-01T00:00:00Z');
+  });
+
+  it('mirrors RF phone_number -> phone_numbers in body', () => {
+    const row = toCandidateRow({ ...sample, phone_numbers: undefined, phone_number: ['+1234567890'] });
+    const body = JSON.parse(row.body);
+    expect(body.phone_numbers).toEqual(['+1234567890']);
   });
 
   it('job row nulls missing optional fields', () => {
