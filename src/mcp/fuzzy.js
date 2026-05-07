@@ -239,7 +239,16 @@ export function scoreAny(query, targets) {
   return best;
 }
 
-/** Up to +20 % boost for records active in the last 180 days. */
+/**
+ * Up to +20% boost for records active in the last 30 days. Decays linearly
+ * to 0 at day 30, stays 0 beyond that.
+ *
+ * Tightened from the original 180-day curve so a recently-active record
+ * (`Jerry` you spoke to last week) wins outright over a stale one
+ * (`Jerry` from two months ago) when their name scores are otherwise within
+ * UNIQUE_GAP. Recruiters typing first names almost always mean the recent
+ * person; the tighter window matches that expectation.
+ */
 export function recencyBoost(record, now = new Date()) {
   const dateStr = record.last_activity_at || record.added_time;
   if (!dateStr) return 0;
@@ -247,5 +256,5 @@ export function recencyBoost(record, now = new Date()) {
   if (Number.isNaN(t)) return 0;
   const ageDays = (now.getTime() - t) / (1000 * 60 * 60 * 24);
   if (ageDays < 0) return 0.2;
-  return Math.max(0, 0.2 * (1 - ageDays / 180));
+  return Math.max(0, 0.2 * (1 - ageDays / 30));
 }

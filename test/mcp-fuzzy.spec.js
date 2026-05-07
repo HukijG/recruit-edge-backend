@@ -23,4 +23,16 @@ describe('fuzzy', () => {
     expect(recencyBoost({ last_activity_at: new Date().toISOString() })).toBeGreaterThan(0.15);
     expect(recencyBoost({ last_activity_at: '2020-01-01T00:00:00Z' })).toBe(0);
   });
+  it('recencyBoost decays over a 30-day window', () => {
+    const now = new Date('2026-05-07T12:00:00Z');
+    const day = (n) => new Date(now.getTime() - n * 86400_000).toISOString();
+    // Today → ~0.2 (max).
+    expect(recencyBoost({ last_activity_at: day(0) }, now)).toBeCloseTo(0.2, 2);
+    // 15 days → ~0.1 (half).
+    expect(recencyBoost({ last_activity_at: day(15) }, now)).toBeCloseTo(0.1, 1);
+    // 31 days → 0 (just past the window).
+    expect(recencyBoost({ last_activity_at: day(31) }, now)).toBe(0);
+    // 60 days → 0 (long out of window).
+    expect(recencyBoost({ last_activity_at: day(60) }, now)).toBe(0);
+  });
 });
