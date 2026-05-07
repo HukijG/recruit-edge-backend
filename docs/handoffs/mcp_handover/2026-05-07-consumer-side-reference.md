@@ -15,6 +15,12 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
 
 > **Names, not ids.** The middleware resolves `candidate`, `job`, `stage`, and `owner` references on every endpoint that accepts them — pass a string and the worker fuzzy-matches it server-side. Numeric ids still work as a fallback. See "Ambiguity / disambiguation" near the end of this doc for the standard envelope when a name resolves to multiple candidates.
 
+> **Open jobs only.** Fuzzy job resolution defaults to `is_open=1`. Closed jobs are reachable only by explicit numeric id — recruiters typing a job name almost never mean a closed one. Same idea applies to candidate fuzzy: the recency boost weights the last 30 days heavily, so the Jerry you spoke to last week wins outright over a Jerry from two months ago.
+
+> **Lean envelopes.** Disambiguation responses are deliberately minimal — just enough to render distinct lines and pick a winner. Never expect full bodies in `options[]`. If you need more detail on a candidate, follow up with `candidate-get`.
+
+> **Post-narrow on writes.** `candidate-move-stage` and `candidate-log-interview` enumerate every valid `(candidate, job, stage?)` tuple before deciding. When fuzzy-candidate is ambiguous but only one match also has the requested job/stage, the worker auto-commits — no disambiguation round-trip. When ≥2 valid tuples remain, the `kind` is the smallest level of variation across them (candidates differ → `candidate`, same candidate but jobs differ → `job`, etc.).
+
 ---
 
 ## Endpoints
@@ -241,14 +247,18 @@ All three references are fuzzy-resolvable. Resolution runs sequentially and shor
 {
   "consultantFirstName": "Joel",
   "job": "Enterprise AE",                 // numeric id OR fuzzy job name (acronyms folded)
-  "stage": "sourced",                     // optional — fuzzy + case-insensitive; resolves against this job's stage_names. Ambiguity returns the standard envelope (kind: "stage").
-  "submitted": false,                     // optional — shortcut: CV Sent → Hired stages only
+  "stage": "sourced",                     // optional — fuzzy single-stage filter, resolved against this job's populated stages. When set, takes precedence over from/to/submitted/default.
+  "from": "replied",                      // optional — fuzzy lower bound, resolved against THIS JOB'S pipeline. "from: 'Replied'" → Replied through end of pipeline.
+  "to": "1st",                            // optional — fuzzy upper bound, same pipeline. "to: '1st Interview'" → start through 1st Interview. Combine with `from` for a custom range.
+  "submitted": false,                     // optional — shortcut: CV Sent → end of this job's pipeline.
   "include_closed": false,                // not yet wired
   "fields": ["linkedin", "phone", "email"]
 }
 ```
 
-Ambiguous job names return the standard `needs_disambiguation: true, kind: "job"` envelope.
+Ambiguous job names return the standard `needs_disambiguation: true, kind: "job"` envelope. Ambiguous `from`/`to` (e.g. `from: "interview"` against a pipeline with multiple Interview stages) returns the same envelope with `kind: "stage"`.
+
+**Default range** when none of `stage`, `from`, `to`, or `submitted` is set: **CV Sent → Offer**, fuzzy-resolved against **this job's** pipeline. Sourced and Replied are usually noise to recruiters glancing at a job — pass `from: "Sourced"` (or any earlier stage) to widen. Different jobs have different pipelines (some include Phone Screen, Take-home, etc); the resolver matches landmarks against whatever pipeline this specific job has, falling back gracefully when a landmark isn't present.
 
 **Default response:**
 ```json
@@ -256,13 +266,13 @@ Ambiguous job names return the standard `needs_disambiguation: true, kind: "job"
   "job": { "id": 999, "name": "Enterprise AE - NYC", "client_company_name": "Nominal" },
   "stages": [
     {
-      "stage_name": "Sourced",
-      "count": 65,
+      "stage_name": "CV Sent",
+      "count": 12,
       "candidates": [
         { "id": 5000, "name": "Steve Carlson", "stage_moved": "2026-05-07T16:56:51+0000" }
       ]
     },
-    { "stage_name": "Replied", "count": 4, "candidates": [...] }
+    { "stage_name": "1st Interview", "count": 4, "candidates": [...] }
   ]
 }
 ```
