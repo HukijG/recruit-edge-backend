@@ -34,6 +34,7 @@ describe('tailSync', () => {
       last_updated: '2026-05-07T12:00:00Z',
       jobs: [],
     });
+    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
     // Stub snapshot rebuild — exercising it would require open jobs in D1
     // and isn't what this test is verifying.
     vi.spyOn(snapshots, 'rebuildMcpSnapshots').mockResolvedValue(undefined);
@@ -57,6 +58,7 @@ describe('tailSync', () => {
     const fetchSpy = vi
       .spyOn(rfClient, 'fetchCandidatesUpdatedSince')
       .mockResolvedValue({ ids: [], suggestedCursor: '2026-05-07T13:00:00Z' });
+    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
 
     await tailSync(env);
 
@@ -71,6 +73,7 @@ describe('tailSync', () => {
       suggestedCursor: '2026-05-07T14:00:00Z',
     });
     const fetchCandSpy = vi.spyOn(rfClient, 'fetchCandidate');
+    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
     const rebuildSpy = vi
       .spyOn(snapshots, 'rebuildMcpSnapshots')
       .mockResolvedValue(undefined);
@@ -85,6 +88,25 @@ describe('tailSync', () => {
     expect(await readSyncState(env, 'in_flight')).toBeNull();
   });
 
+  it('refreshes jobs every tick (even when no candidate updates)', async () => {
+    vi.spyOn(rfClient, 'fetchCandidatesUpdatedSince').mockResolvedValue({
+      ids: [],
+      suggestedCursor: '2026-05-07T16:00:00Z',
+    });
+    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([
+      { id: 7001, name: 'New Job', is_open: true },
+    ]);
+    vi.spyOn(snapshots, 'rebuildMcpSnapshots').mockResolvedValue(undefined);
+
+    await tailSync(env);
+
+    const row = await env.RF_MCP_CACHE
+      .prepare('SELECT id, name FROM jobs WHERE id = 7001')
+      .first();
+    expect(row).toBeTruthy();
+    expect(row.name).toBe('New Job');
+  });
+
   it('failure mid-batch does not advance cursor', async () => {
     await writeSyncState(env, 'last_tail_sync_at', '2026-05-01T00:00:00Z');
 
@@ -96,6 +118,7 @@ describe('tailSync', () => {
       if (id === 2) throw new Error('simulated upstream failure');
       return { id, name: `C${id}`, primary_email: `c${id}@x.com`, jobs: [] };
     });
+    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
     vi.spyOn(snapshots, 'rebuildMcpSnapshots').mockResolvedValue(undefined);
 
     await tailSync(env);

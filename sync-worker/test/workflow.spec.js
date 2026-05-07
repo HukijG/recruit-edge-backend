@@ -108,7 +108,7 @@ describe('runFullRebuild', () => {
     expect(jobRow.name).toBe('Job A');
   });
 
-  it('writes last_full_rebuild_at on success', async () => {
+  it('writes last_full_rebuild_at AND last_tail_sync_at on success', async () => {
     vi.spyOn(rfClient, 'fetchCandidateListPage').mockResolvedValueOnce({
       rows: [],
       total: null,
@@ -120,10 +120,14 @@ describe('runFullRebuild', () => {
 
     await runFullRebuild(env, stepShim, 'test-instance');
 
-    const stamp = await readSyncState(env, 'last_full_rebuild_at');
-    expect(stamp).toBeTruthy();
-    // Parseable ISO 8601 timestamp.
-    expect(Number.isFinite(Date.parse(stamp))).toBe(true);
+    const fullStamp = await readSyncState(env, 'last_full_rebuild_at');
+    const tailStamp = await readSyncState(env, 'last_tail_sync_at');
+    expect(fullStamp).toBeTruthy();
+    expect(tailStamp).toBeTruthy();
+    expect(Number.isFinite(Date.parse(fullStamp))).toBe(true);
+    expect(Number.isFinite(Date.parse(tailStamp))).toBe(true);
+    // Same atomic step writes both — should be identical.
+    expect(fullStamp).toBe(tailStamp);
   });
 
   it('releases in_flight on success', async () => {

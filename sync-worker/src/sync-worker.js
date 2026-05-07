@@ -1,5 +1,5 @@
 import * as rfClient from './rf-list-client.js';
-import { writeCandidatesAndLinks } from './d1-write.js';
+import { writeCandidatesAndLinks, writeJobs } from './d1-write.js';
 import { readSyncState, writeSyncState, deleteSyncState } from './sync-state.js';
 import { rebuildMcpSnapshots } from './snapshots.js';
 
@@ -79,6 +79,12 @@ export async function tailSync(env) {
       await writeCandidatesAndLinks(env, candidates);
       upserted += candidates.length;
     }
+
+    // Refresh jobs every tick. New jobs and open-status flips don't otherwise
+    // surface until the next manual full rebuild — `/job/list` is only a few
+    // hundred rows so the cost is negligible compared to the candidate fetch.
+    const allJobs = await rfClient.fetchAllJobs(env);
+    await writeJobs(env, allJobs);
 
     if (upserted > 0) {
       await rebuildMcpSnapshots(env, null);

@@ -105,9 +105,14 @@ export async function runFullRebuild(env, step, instanceId) {
       rebuildMcpSnapshots(env, null),
     );
 
-    await step.do('record completion', async () =>
-      writeSyncState(env, 'last_full_rebuild_at', new Date().toISOString()),
-    );
+    await step.do('record completion', async () => {
+      const now = new Date().toISOString();
+      await writeSyncState(env, 'last_full_rebuild_at', now);
+      // Bump `last_tail_sync_at` too — the main worker keys its in-memory
+      // fuzzy snapshot off this stamp; without the bump the snapshot stays
+      // pinned to a stale version and post-rebuild reads serve old rows.
+      await writeSyncState(env, 'last_tail_sync_at', now);
+    });
   } finally {
     // MUST run on both success and failure paths — a mid-run throw without
     // this would leave `in_flight` stuck until the 6h watchdog clears it.
