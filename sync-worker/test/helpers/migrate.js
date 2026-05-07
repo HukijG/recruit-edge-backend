@@ -41,6 +41,9 @@ export async function applyMigration(db) {
   }
 
   // Apply all migrations. Split on ';' followed by optional whitespace + newline.
+  // Assumes statement-per-line SQL (current style of 0001_init.sql). Will need
+  // a smarter splitter if a future migration introduces CREATE TRIGGER blocks
+  // (semicolons inside BEGIN..END) or quoted strings containing ";\n".
   const stmts = SCHEMA.split(/;\s*\n/)
     .map(s => s.trim())
     .filter(Boolean);
