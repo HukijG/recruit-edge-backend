@@ -2,6 +2,10 @@ import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
 
 export default defineWorkersConfig({
 	test: {
+		// Main worker tests only. The sync-worker has its own vitest.config.js
+		// and its own bindings; running from sync-worker/ via `npm test` there.
+		include: ['test/**/*.{test,spec}.?(c|m)[jt]s?(x)'],
+		exclude: ['sync-worker/**', 'node_modules/**'],
 		poolOptions: {
 			workers: {
 				wrangler: { configPath: './wrangler.jsonc' },
