@@ -211,16 +211,34 @@ export async function fetchUsers(env) {
 
 /**
  * `/activity-type/list` — RF activity type catalogue.
+ * Returns [] on 404 (the path may not exist in RF; reference data is best-effort).
  */
 export async function fetchActivityTypes(env) {
-  const resp = await rfGet(env, '/activity-type/list');
-  return Array.isArray(resp?.data) ? resp.data : [];
+  try {
+    const resp = await rfGet(env, '/activity-type/list');
+    return Array.isArray(resp?.data) ? resp.data : [];
+  } catch (err) {
+    if (/\b404\b/.test(err.message)) {
+      console.warn('[rf] /activity-type/list returned 404; skipping');
+      return [];
+    }
+    throw err;
+  }
 }
 
 /**
  * `/customfield/list` — RF custom field schema across entities.
+ * Returns [] on 404 (best-effort like activity types).
  */
 export async function fetchCustomFieldSchema(env) {
-  const resp = await rfGet(env, '/customfield/list');
-  return Array.isArray(resp?.data) ? resp.data : [];
+  try {
+    const resp = await rfGet(env, '/customfield/list');
+    return Array.isArray(resp?.data) ? resp.data : [];
+  } catch (err) {
+    if (/\b404\b/.test(err.message)) {
+      console.warn('[rf] /customfield/list returned 404; skipping');
+      return [];
+    }
+    throw err;
+  }
 }
