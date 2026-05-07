@@ -154,7 +154,8 @@ async function loadJobs(env, { onlyOpen = false } = {}) {
 
 /**
  * Resolve a job reference.
- * Numeric → SELECT FROM jobs WHERE id=?.
+ * Numeric → SELECT FROM jobs WHERE id=?  (or accept as-is when
+ *           `validateNumeric: false`).
  * String → score against (name + client_company_name), canonicalised via
  *          canonicalizeJobPhrase so "Eon SE" ↔ "Eon Sales Engineer".
  *
@@ -162,8 +163,13 @@ async function loadJobs(env, { onlyOpen = false } = {}) {
  * jobs[]. When set, the resolver only considers those job ids — used by
  * /mcp/candidate-move-stage and /mcp/candidate-log-interview where the target
  * job must be one the candidate is on.
+ *
+ * `validateNumeric: false` skips the SELECT-FROM-jobs lookup for numeric
+ * inputs. Used by the search / list endpoints that have their own downstream
+ * "no rows for this job" handling — and for which the sync_state.jobs table
+ * may legitimately lag the candidate_jobs table by one tick.
  */
-export async function resolveJob(env, input, { restrictTo, onlyOpen = false } = {}) {
+export async function resolveJob(env, input, { restrictTo, onlyOpen = false, validateNumeric = true } = {}) {
   const coerced = coerceInput(input);
   if (!coerced) return { ok: false, reason: 'not_found', input };
 
@@ -172,6 +178,9 @@ export async function resolveJob(env, input, { restrictTo, onlyOpen = false } = 
       const hit = restrictTo.find((j) => Number(j.job_id) === coerced.value);
       if (!hit) return { ok: false, reason: 'not_found', input };
       return { ok: true, value: hit };
+    }
+    if (!validateNumeric) {
+      return { ok: true, value: { id: coerced.value, name: null, client_company_name: null } };
     }
     const row = await session(env)
       .prepare('SELECT id, name, client_company_name FROM jobs WHERE id = ?')

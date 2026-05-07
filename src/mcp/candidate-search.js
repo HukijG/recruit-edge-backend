@@ -20,6 +20,7 @@ import { session } from './d1-read.js';
 import { resolveFields, project } from './projection.js';
 import { getSnapshot } from './snapshot.js';
 import { scoreString, recencyBoost, normalize } from './fuzzy.js';
+import { resolveJob, resolveOwner, disambiguationPayload } from './resolvers.js';
 
 const DEFAULT_FIELDS = ['id', 'name'];
 const FUZZY_THRESHOLD = 0.35;
@@ -27,17 +28,20 @@ const FUZZY_THRESHOLD = 0.35;
 /**
  * Translate the request body's structured filters into a SQL fragment +
  * bound args. All user input is bound (?) — never concatenated into SQL.
+ *
+ * `resolved` carries the post-resolver numeric ids (or `null`) for `job` and
+ * `owner` so this builder doesn't have to know about fuzzy resolution.
  */
-function buildFilterSql(body) {
+function buildFilterSql(body, resolved = {}) {
   const where = [];
   const args = [];
   if (body.email) {
     where.push('c.primary_email = ?');
     args.push(String(body.email).toLowerCase());
   }
-  if (body.owner) {
+  if (resolved.ownerId != null) {
     where.push('c.lead_owner_id = ?');
-    args.push(Number(body.owner));
+    args.push(resolved.ownerId);
   }
   if (body.added_after) {
     where.push('c.added_time >= ?');
@@ -86,13 +90,13 @@ function buildFilterSql(body) {
   }
 
   let from = 'FROM candidates c';
-  if (body.job != null) {
+  if (resolved.jobId != null) {
     // Default: only non-disqualified job links. `include_disqualified=true`
     // drops the guard so DQ'd links are included.
     const dqGuard = body.include_disqualified ? '' : ' AND cj.disqualified = 0';
     from += ' JOIN candidate_jobs cj ON cj.candidate_id = c.id' + dqGuard;
     where.push('cj.job_id = ?');
-    args.push(Number(body.job));
+    args.push(resolved.jobId);
     if (body.stage) {
       where.push('cj.stage_name = ?');
       args.push(body.stage);
@@ -128,8 +132,38 @@ async function pureFuzzy(env, body, limit) {
 
 export async function handleCandidateSearch({ env, body }) {
   const limit = Math.min(body.limit ?? 5, 50);
-  const filterShape = buildFilterSql(body);
-  const hasFilters = !!filterShape.where || body.job != null;
+
+  // Resolve `job` (number or fuzzy name) and `owner` (RF id, our-team name,
+  // or full RF user fuzzy match). Ambiguous → 200 disambiguation; not_found
+  // on either is a 400 since the user gave a filter we couldn't apply.
+  let jobId = null;
+  if (body.job != null) {
+    // search itself emits {count:0, matches:[]} when the job has no candidates,
+    // so a numeric id that doesn't appear in the jobs table is fine — the
+    // join just returns zero rows.
+    const r = await resolveJob(env, body.job, { validateNumeric: false });
+    if (!r.ok) {
+      if (r.reason === 'ambiguous') {
+        return jsonResponse(200, disambiguationPayload(r));
+      }
+      return jsonResponse(400, { error: `job not found: ${JSON.stringify(body.job)}` });
+    }
+    jobId = r.value.id;
+  }
+  let ownerId = null;
+  if (body.owner != null) {
+    const r = await resolveOwner(env, body.owner);
+    if (!r.ok) {
+      if (r.reason === 'ambiguous') {
+        return jsonResponse(200, disambiguationPayload(r));
+      }
+      return jsonResponse(400, { error: `owner not found: ${JSON.stringify(body.owner)}` });
+    }
+    ownerId = r.value.id;
+  }
+
+  const filterShape = buildFilterSql(body, { jobId, ownerId });
+  const hasFilters = !!filterShape.where || jobId != null;
   const hasQuery = !!body.query;
 
   let matches;

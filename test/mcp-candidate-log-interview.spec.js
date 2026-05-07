@@ -1,6 +1,7 @@
 import { env, createExecutionContext } from 'cloudflare:test';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { applyMigration } from './helpers/d1-migrate.js';
+import { resetSnapshot } from '../src/mcp/snapshot.js';
 import worker from '../src';
 
 const originalFetch = globalThis.fetch;
@@ -16,6 +17,11 @@ async function call(body) {
 beforeEach(async () => {
   await applyMigration(env);
   await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+  resetSnapshot();
+  await env.RF_MCP_CACHE
+    .prepare("INSERT INTO sync_state (key, value) VALUES ('last_tail_sync_at', ?)")
+    .bind(new Date().toISOString())
+    .run();
   await env.RF_MCP_CACHE.prepare(
     'INSERT INTO candidates (id, body, name, cached_at) VALUES (42, ?, ?, ?)'
   ).bind(
@@ -137,6 +143,64 @@ describe('/mcp/candidate-log-interview', () => {
     expect(b.outlook_url).not.toContain('t%40x.com');
     expect(b.outlook_url).not.toContain('t@x.com');
     expect(new URL(b.outlook_url).searchParams.has('to')).toBe(false);
+  });
+
+  it('fuzzy candidate name resolves uniquely', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 999 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 'Test Candidate',
+      kind: '1st Interview',
+      start_time: '2026-05-08T10:00:00+01:00',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.activity.candidate_id).toBe(42);
+  });
+
+  it('numeric candidate id as string still works', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 999 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: '42',
+      kind: '1st Interview',
+      start_time: '2026-05-08T10:00:00+01:00',
+    });
+    expect(r.status).toBe(200);
+  });
+
+  it('ambiguous fuzzy candidate name → needs_disambiguation kind=candidate', async () => {
+    // Use distinct names that the fuzzy scorer treats as similarly-good
+    // matches for "Jordan" — neither is an exact match.
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(
+      42, JSON.stringify({ id: 42, name: 'Jordan Chen' }),
+      'Jordan Chen', 'Acme', 'AE', new Date().toISOString()
+    ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(
+      43, JSON.stringify({ id: 43, name: 'Jordan Patel' }),
+      'Jordan Patel', 'Globex', 'CSM', new Date().toISOString()
+    ).run();
+    globalThis.fetch = vi.fn();
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 'Jordan',
+      kind: '1st Interview',
+      start_time: '2026-05-08T10:00:00+01:00',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.needs_disambiguation).toBe(true);
+    expect(b.kind).toBe('candidate');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
   it('returns 502 if RF activity-create fails', async () => {

@@ -16,7 +16,7 @@
  */
 
 import { jsonResponse } from './router.js';
-import { getCandidateById } from './d1-read.js';
+import { resolveCandidate, resolveJob, disambiguationPayload } from './resolvers.js';
 
 const DEFAULT_DURATION_MIN = 60;
 // Fallback only — used if the sync-worker hasn't yet populated
@@ -72,12 +72,38 @@ function buildGcalHint({ subject, body, start, end }) {
 
 export async function handleCandidateLogInterview({ env, body, consultant }) {
   if (!body.start_time) return jsonResponse(400, { error: 'start_time is required' });
-  if (typeof body.candidate !== 'number') {
-    return jsonResponse(400, { error: 'candidate must be numeric id' });
+  if (body.candidate == null) {
+    return jsonResponse(400, { error: 'candidate is required' });
   }
 
-  const candidate = await getCandidateById(env, body.candidate);
-  if (!candidate) return jsonResponse(404, { error: 'candidate not found' });
+  // Candidate — number, digit-string, or fuzzy name. Ambiguous → 200
+  // disambiguation; not_found → 404.
+  const candRes = await resolveCandidate(env, body.candidate);
+  if (!candRes.ok) {
+    if (candRes.reason === 'ambiguous') {
+      return jsonResponse(200, disambiguationPayload(candRes));
+    }
+    return jsonResponse(404, { error: 'candidate not found' });
+  }
+  const candidate = candRes.value;
+
+  // Job (optional). When provided, must resolve uniquely against the
+  // candidate's own jobs[]. Ambiguous → 200 disambiguation; not_found → 400.
+  if (body.job != null) {
+    const jobRes = await resolveJob(env, body.job, {
+      restrictTo: (candidate.jobs ?? []).filter((j) => !j.disqualified),
+    });
+    if (!jobRes.ok) {
+      if (jobRes.reason === 'ambiguous') {
+        return jsonResponse(200, disambiguationPayload(jobRes));
+      }
+      return jsonResponse(400, { error: 'job not found on this candidate' });
+    }
+    // Note: job context isn't used by the RF activity-create call (RF
+    // attributes activities to the candidate, not a specific job link).
+    // Resolution still runs so a bad `job` field surfaces as an error
+    // instead of being silently ignored.
+  }
 
   const start = new Date(body.start_time);
   const end = body.end_time

@@ -153,4 +153,35 @@ describe('/mcp/job-candidates-filter', () => {
     const r = await call({ consultantFirstName: 'Joel', job: 999 });
     expect(r.status).toBe(404);
   });
+
+  it('numeric job id as string still works', async () => {
+    await insertJob(100, 'Eng Lead');
+    await insertCandidate(1, 'Alice');
+    await linkJob(1, 100, 'Sourced');
+    const r = await call({ consultantFirstName: 'Joel', job: '100' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.job.id).toBe(100);
+  });
+
+  it('fuzzy job name resolves uniquely', async () => {
+    await insertJob(100, 'Enterprise AE');
+    await insertJob(200, 'CSM Lead');
+    await insertCandidate(1, 'Alice');
+    await linkJob(1, 100, 'Sourced');
+    const r = await call({ consultantFirstName: 'Joel', job: 'Enterprise AE' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.job.id).toBe(100);
+  });
+
+  it('ambiguous fuzzy job name → needs_disambiguation', async () => {
+    await insertJob(100, 'Enterprise AE');
+    await insertJob(200, 'Enterprise AE');
+    const r = await call({ consultantFirstName: 'Joel', job: 'Enterprise AE' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.needs_disambiguation).toBe(true);
+    expect(b.kind).toBe('job');
+  });
 });

@@ -21,6 +21,7 @@
 import { jsonResponse } from './router.js';
 import { session } from './d1-read.js';
 import { resolveFields, project } from './projection.js';
+import { resolveJob, disambiguationPayload } from './resolvers.js';
 
 const DEFAULT_FIELDS = ['id', 'name', 'stage_moved'];
 const SUBMITTED_STAGES = [
@@ -83,10 +84,21 @@ async function buildPipelineFromD1(env, jobId) {
 }
 
 export async function handleJobPipeline({ env, body }) {
-  const jobId = Number(body.job);
-  if (!Number.isFinite(jobId)) {
-    return jsonResponse(400, { error: 'job must be numeric id' });
+  if (body.job == null) {
+    return jsonResponse(400, { error: 'job is required' });
   }
+  // Resolve `job` — number, digit-string, or fuzzy name. Numeric inputs
+  // skip the jobs-table validation: the KV snapshot may exist before the
+  // sync-worker has rebuilt the jobs row, and the D1 fallback below
+  // returns its own 404 when both KV and the jobs row are missing.
+  const jobRes = await resolveJob(env, body.job, { validateNumeric: false });
+  if (!jobRes.ok) {
+    if (jobRes.reason === 'ambiguous') {
+      return jsonResponse(200, disambiguationPayload(jobRes));
+    }
+    return jsonResponse(404, { error: 'unknown job' });
+  }
+  const jobId = jobRes.value.id;
 
   // Try the pre-built KV snapshot first.
   let snap = null;

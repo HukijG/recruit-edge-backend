@@ -1,21 +1,36 @@
 /**
  * /mcp/candidate-move-stage — move a candidate to a new stage on a job.
  *
- * D1 is read-only here: we look up the candidate snapshot to resolve the job
- * (single non-disqualified job, or by `job` body param) and the stage (by id
- * or name within that job's `stages[]`). The actual write goes to RF, then
- * we invalidate the two job-scoped KV snapshots so the next read repopulates
- * after the next sync tick catches up.
+ * Resolution flow (sequential, ambiguity short-circuits at the FIRST
+ * unresolved step):
  *
- * Fuzzy candidate resolution is intentionally not wired in yet — callers must
- * pass a numeric candidate id (the MCP-facing tools resolve this upstream via
- * /mcp/candidate-search). Returns `needs_disambiguation` when the candidate
- * has multiple non-DQ jobs and no `job` was specified, mirroring the protocol
- * used by /mcp/candidate-search for ambiguous matches.
+ *   1. resolveCandidate(body.candidate)
+ *      → number / digit-string → D1 lookup
+ *      → name → fuzzy via the in-memory snapshot
+ *      → ambiguous → 200 { needs_disambiguation, kind: "candidate", options }
+ *      → not_found → 404
+ *
+ *   2. resolveJob(body.job, { restrictTo: candidate.jobs[non-DQ] })
+ *      → unset + single non-DQ job → use that job
+ *      → unset + multiple non-DQ jobs → 200 { needs_disambiguation, kind: "job" }
+ *      → set → must resolve uniquely against the candidate's own jobs
+ *
+ *   3. resolveStage(body.stage, targetJob.stages)
+ *      → numeric id → exact match against stages[]
+ *      → name → fuzzy ("call booked" → "Call Booked", "1st" → "1st Interview")
+ *      → ambiguous → 200 { needs_disambiguation, kind: "stage" }
+ *
+ * Only when all three resolve uniquely do we POST to RF /candidate/move-to-stage
+ * and invalidate the affected KV snapshots.
  */
 
 import { jsonResponse } from './router.js';
-import { getCandidateById } from './d1-read.js';
+import {
+  resolveCandidate,
+  resolveJob,
+  resolveStage,
+  disambiguationPayload,
+} from './resolvers.js';
 
 async function callRfMoveStage(env, payload) {
   const r = await fetch(`${env.RF_API_BASE_URL}/candidate/move-to-stage`, {
@@ -28,29 +43,44 @@ async function callRfMoveStage(env, payload) {
 }
 
 export async function handleCandidateMoveStage({ env, body, consultant }) {
-  const candidateId = typeof body.candidate === 'number'
-    ? body.candidate
-    : (Number.isFinite(Number(body.candidate)) ? Number(body.candidate) : null);
-  if (candidateId == null) {
-    return jsonResponse(400, {
-      error: 'candidate must be numeric id; fuzzy candidate resolution not yet wired into move-stage',
-    });
+  if (body.candidate == null) {
+    return jsonResponse(400, { error: 'candidate is required' });
+  }
+  if (body.stage == null) {
+    return jsonResponse(400, { error: 'stage is required' });
   }
 
-  const candidate = await getCandidateById(env, candidateId);
-  if (!candidate) return jsonResponse(404, { error: 'candidate not found' });
+  // 1. Candidate.
+  const candRes = await resolveCandidate(env, body.candidate);
+  if (!candRes.ok) {
+    if (candRes.reason === 'ambiguous') {
+      return jsonResponse(200, disambiguationPayload(candRes));
+    }
+    return jsonResponse(404, { error: 'candidate not found' });
+  }
+  const candidate = candRes.value;
 
-  // Resolve target job — only consider non-disqualified job links.
+  // 2. Job — restrict resolution to the candidate's own non-DQ jobs.
   const nonDq = (candidate.jobs ?? []).filter((j) => !j.disqualified);
+  if (nonDq.length === 0) {
+    return jsonResponse(400, { error: 'candidate has no non-disqualified jobs' });
+  }
   let targetJob;
   if (body.job != null) {
-    targetJob = nonDq.find(
-      (j) => String(j.job_id) === String(body.job) || j.job_name === body.job,
-    );
-    if (!targetJob) return jsonResponse(400, { error: 'job not found on this candidate' });
+    const jobRes = await resolveJob(env, body.job, { restrictTo: nonDq });
+    if (!jobRes.ok) {
+      if (jobRes.reason === 'ambiguous') {
+        return jsonResponse(200, disambiguationPayload(jobRes));
+      }
+      return jsonResponse(400, { error: 'job not found on this candidate' });
+    }
+    targetJob = jobRes.value;
   } else if (nonDq.length === 1) {
     targetJob = nonDq[0];
   } else {
+    // Preserve the legacy disambiguation shape used by this endpoint —
+    // {kind:'job', options:[{job_id, job_name, stage_name}]} — so existing
+    // callers don't break.
     return jsonResponse(200, {
       needs_disambiguation: true,
       kind: 'job',
@@ -59,18 +89,21 @@ export async function handleCandidateMoveStage({ env, body, consultant }) {
         job_name: j.job_name,
         stage_name: j.stage_name,
       })),
+      hint: 'Candidate is on multiple jobs — please specify which.',
     });
   }
 
-  // Resolve target stage — match by id or by name on the job's stages[].
-  const targetStage = targetJob.stages?.find(
-    (s) => String(s.id) === String(body.stage) || s.name === body.stage,
-  );
-  if (!targetStage) {
+  // 3. Stage — fuzzy match against the target job's stages[].
+  const stageRes = resolveStage(body.stage, targetJob.stages ?? []);
+  if (!stageRes.ok) {
+    if (stageRes.reason === 'ambiguous') {
+      return jsonResponse(200, disambiguationPayload(stageRes));
+    }
     return jsonResponse(400, { error: `stage "${body.stage}" not found on job` });
   }
+  const targetStage = stageRes.value;
 
-  // RF write — surface upstream failures as 502 to the caller.
+  // RF write — surface upstream failures as 502.
   try {
     await callRfMoveStage(env, {
       id: candidate.id,

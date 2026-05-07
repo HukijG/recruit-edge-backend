@@ -1,6 +1,7 @@
 import { env, createExecutionContext } from 'cloudflare:test';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { applyMigration } from './helpers/d1-migrate.js';
+import { resetSnapshot } from '../src/mcp/snapshot.js';
 import worker from '../src';
 
 const originalFetch = globalThis.fetch;
@@ -16,6 +17,11 @@ async function call(body) {
 beforeEach(async () => {
   await applyMigration(env);
   await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+  resetSnapshot();
+  await env.RF_MCP_CACHE
+    .prepare("INSERT INTO sync_state (key, value) VALUES ('last_tail_sync_at', ?)")
+    .bind(new Date().toISOString())
+    .run();
   await env.RF_MCP_CACHE.prepare(
     'INSERT INTO candidates (id, body, name, cached_at) VALUES (?, ?, ?, ?)'
   ).bind(42, JSON.stringify({
@@ -23,7 +29,13 @@ beforeEach(async () => {
     jobs: [{
       job_id: 100, job_name: 'Eng', stage_id: 1, stage_name: 'Sourced',
       disqualified: false,
-      stages: [{ id: 1, name: 'Sourced' }, { id: 2, name: 'Replied' }],
+      stages: [
+        { id: 1, name: 'Sourced' },
+        { id: 2, name: 'Replied' },
+        { id: 3, name: 'Call Booked' },
+        { id: 4, name: '1st Interview' },
+        { id: 5, name: '2nd Interview' },
+      ],
     }],
   }), 'Jerry Smith', new Date().toISOString()).run();
 });
@@ -102,6 +114,102 @@ describe('/mcp/candidate-move-stage', () => {
     const b = await r.json();
     expect(b.error).toContain('NotARealStage');
     expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('fuzzy candidate name resolves uniquely and round-trips to RF', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const r = await call({ consultantFirstName: 'Joel', candidate: 'Jerry Smith', stage: 'Replied' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.ok).toBe(true);
+    expect(b.moved.candidate_id).toBe(42);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('numeric candidate id passed as string still works', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const r = await call({ consultantFirstName: 'Joel', candidate: '42', stage: 'Replied' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.moved.candidate_id).toBe(42);
+  });
+
+  it('ambiguous fuzzy candidate name returns needs_disambiguation kind=candidate', async () => {
+    // Insert a second Jerry to force ambiguity.
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(
+      43, JSON.stringify({ id: 43, name: 'Kevin Park' }),
+      'Kevin Park', 'Globex', 'CSM', new Date().toISOString()
+    ).run();
+    globalThis.fetch = vi.fn();
+    const r = await call({ consultantFirstName: 'Joel', candidate: 'Jerry', stage: 'Replied' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.needs_disambiguation).toBe(true);
+    expect(b.kind).toBe('candidate');
+    expect(b.options.length).toBeGreaterThanOrEqual(2);
+    expect(b.options[0]).toHaveProperty('current_organization');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('fuzzy stage name resolves ("call booked" → Call Booked)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const r = await call({ consultantFirstName: 'Joel', candidate: 42, stage: 'call booked' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.moved.to_stage).toBe('Call Booked');
+  });
+
+  it('fuzzy stage name partial match ("1st" → 1st Interview)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const r = await call({ consultantFirstName: 'Joel', candidate: 42, stage: '1st' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.moved.to_stage).toBe('1st Interview');
+  });
+
+  it('ambiguous stage name returns needs_disambiguation kind=stage', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({ consultantFirstName: 'Joel', candidate: 42, stage: 'Interview' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.needs_disambiguation).toBe(true);
+    expect(b.kind).toBe('stage');
+    const names = b.options.map((o) => o.name).sort();
+    expect(names).toContain('1st Interview');
+    expect(names).toContain('2nd Interview');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('fuzzy job name resolves against the candidate jobs[]', async () => {
+    // Add a second job to the candidate so `job` actually has work to do.
+    await env.RF_MCP_CACHE.prepare(
+      'UPDATE candidates SET body = ? WHERE id = 42'
+    ).bind(JSON.stringify({
+      id: 42, name: 'Jerry Smith',
+      jobs: [
+        { job_id: 100, job_name: 'Enterprise AE', stage_name: 'Sourced', disqualified: false,
+          stages: [{ id: 1, name: 'Sourced' }, { id: 2, name: 'Replied' }] },
+        { job_id: 200, job_name: 'CSM Lead', stage_name: 'Sourced', disqualified: false,
+          stages: [{ id: 1, name: 'Sourced' }, { id: 2, name: 'Replied' }] },
+      ],
+    })).run();
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const r = await call({ consultantFirstName: 'Joel', candidate: 42, job: 'Enterprise AE', stage: 'Replied' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.moved.job_id).toBe(100);
   });
 
   it('invalidates KV snapshots after successful RF call', async () => {

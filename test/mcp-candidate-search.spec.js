@@ -169,6 +169,46 @@ describe('/mcp/candidate-search', () => {
     expect(b.matches.map((m) => m.id)).toEqual([1]);
   });
 
+  it('owner accepts our-team first name (Joel → 900001)', async () => {
+    await insert(1, 'Alice', { owner: 900001 });
+    await insert(2, 'Bob', { owner: 200 });
+    const r = await call({ consultantFirstName: 'Joel', owner: 'Joel' });
+    const b = await r.json();
+    expect(b.matches.map((m) => m.id)).toEqual([1]);
+  });
+
+  it('owner accepts numeric id as string', async () => {
+    await insert(1, 'Alice', { owner: 900001 });
+    await insert(2, 'Bob', { owner: 200 });
+    const r = await call({ consultantFirstName: 'Joel', owner: '900001' });
+    const b = await r.json();
+    expect(b.matches.map((m) => m.id)).toEqual([1]);
+  });
+
+  it('owner unknown fuzzy name → 400', async () => {
+    await insert(1, 'Alice', { owner: 900001 });
+    const r = await call({ consultantFirstName: 'Joel', owner: 'NonexistentPerson' });
+    expect(r.status).toBe(400);
+  });
+
+  it('job accepts a fuzzy job name', async () => {
+    await env.RF_MCP_CACHE
+      .prepare(
+        `INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(100, JSON.stringify({}), 'Enterprise AE', 'Nominal', 1, new Date().toISOString())
+      .run();
+    await insert(1, 'Alice');
+    await env.RF_MCP_CACHE.prepare(
+      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (1, 100, 'Sourced', 0)`,
+    ).run();
+    const r = await call({ consultantFirstName: 'Joel', job: 'Enterprise AE' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.matches.map((m) => m.id)).toEqual([1]);
+  });
+
   it('honours fields[] alias projection', async () => {
     await insert(1, 'Jerry', {
       email: 'jerry@x.com',

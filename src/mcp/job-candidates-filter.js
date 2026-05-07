@@ -14,6 +14,7 @@
 import { jsonResponse } from './router.js';
 import { session } from './d1-read.js';
 import { resolveFields, project } from './projection.js';
+import { resolveJob, disambiguationPayload } from './resolvers.js';
 
 const DEFAULT_FIELDS = ['id', 'name', 'stage_name'];
 const DEFAULT_LIMIT = 100;
@@ -61,10 +62,19 @@ async function buildListFromD1(env, jobId) {
 }
 
 export async function handleJobCandidatesFilter({ env, body }) {
-  const jobId = Number(body.job);
-  if (!Number.isFinite(jobId)) {
-    return jsonResponse(400, { error: 'job must be numeric id' });
+  if (body.job == null) {
+    return jsonResponse(400, { error: 'job is required' });
   }
+  // Numeric ids skip jobs-table validation; KV first, D1 fallback's own
+  // 404 below handles "really unknown job".
+  const jobRes = await resolveJob(env, body.job, { validateNumeric: false });
+  if (!jobRes.ok) {
+    if (jobRes.reason === 'ambiguous') {
+      return jsonResponse(200, disambiguationPayload(jobRes));
+    }
+    return jsonResponse(404, { error: 'unknown job' });
+  }
+  const jobId = jobRes.value.id;
   const limit = Math.min(body.limit ?? DEFAULT_LIMIT, MAX_LIMIT);
 
   // KV-first read — sync-worker rebuilds these on each tick.

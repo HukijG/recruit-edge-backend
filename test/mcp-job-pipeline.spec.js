@@ -148,4 +148,42 @@ describe('/mcp/job-pipeline', () => {
     const r = await call({ consultantFirstName: 'Joel', job: 999 });
     expect(r.status).toBe(404);
   });
+
+  it('numeric job id passed as string still works', async () => {
+    await insertJob(100, 'Eng Lead', 'Acme');
+    await insertCandidate(1, 'Alice');
+    await linkJob(1, 100, 'Sourced');
+    const r = await call({ consultantFirstName: 'Joel', job: '100' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.job.id).toBe(100);
+  });
+
+  it('fuzzy job name resolves and returns the right pipeline', async () => {
+    await insertJob(100, 'Enterprise AE', 'Nominal');
+    await insertJob(200, 'CSM Lead', 'Other');
+    await insertCandidate(1, 'Alice');
+    await linkJob(1, 100, 'Sourced');
+    const r = await call({ consultantFirstName: 'Joel', job: 'Enterprise AE' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.job.id).toBe(100);
+  });
+
+  it('ambiguous fuzzy job name → needs_disambiguation kind=job', async () => {
+    await insertJob(100, 'Enterprise AE', 'Acme');
+    await insertJob(200, 'Enterprise AE', 'Globex');
+    const r = await call({ consultantFirstName: 'Joel', job: 'Enterprise AE' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.needs_disambiguation).toBe(true);
+    expect(b.kind).toBe('job');
+    expect(b.options).toHaveLength(2);
+  });
+
+  it('unknown fuzzy job name → 404', async () => {
+    await insertJob(100, 'Enterprise AE', 'Nominal');
+    const r = await call({ consultantFirstName: 'Joel', job: 'totally-not-a-real-job' });
+    expect(r.status).toBe(404);
+  });
 });
