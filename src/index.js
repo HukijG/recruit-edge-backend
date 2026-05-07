@@ -49,6 +49,12 @@ export default {
     }
 
     try {
+      if (url.pathname.startsWith('/mcp/')) {
+        const { routeMcp } = await import('./mcp/router.js');
+        const { handlers } = await import('./mcp/handlers-registry.js');
+        return routeMcp(request, env, ctx, handlers);
+      }
+
       if (url.pathname === '/health') {
         return new Response('RF-Dialpad Sync Middleware - OK', {
           status: 200,
