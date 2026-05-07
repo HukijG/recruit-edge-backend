@@ -25,6 +25,13 @@
       "preview_id": "REDACTED_KV_PREVIEW_NAMESPACE_ID"
     }
   ],
+  "d1_databases": [
+    {
+      "binding": "RF_MCP_CACHE",
+      "database_name": "rf-mcp-cache",
+      "database_id": "00000000-0000-0000-0000-000000000001"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       { "name": "EXT_CALL_STATE", "class_name": "ExtCallState" }
