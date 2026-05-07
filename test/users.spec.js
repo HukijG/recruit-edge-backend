@@ -11,7 +11,7 @@ import {
 describe('getUserByFirstName', () => {
 	it('returns the record for a known first name', () => {
 		const u = getUserByFirstName('Joel');
-		expect(u).toEqual({ firstName: 'Joel', rfUserId: 900001, dialpadId: '8000000000000001' });
+		expect(u).toEqual({ firstName: 'Joel', rfUserId: 900001, dialpadId: '8000000000000001', calendarMode: 'outlook' });
 	});
 
 	it('is case-insensitive and trims whitespace', () => {

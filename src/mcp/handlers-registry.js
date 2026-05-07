@@ -4,6 +4,7 @@ import { handleCandidateSearch } from './candidate-search.js';
 import { handleJobPipeline } from './job-pipeline.js';
 import { handleJobCandidatesFilter } from './job-candidates-filter.js';
 import { handleCandidateMoveStage } from './candidate-move-stage.js';
+import { handleCandidateLogInterview } from './candidate-log-interview.js';
 
 export const handlers = {
   '/mcp/cache-status': handleCacheStatus,
@@ -12,4 +13,5 @@ export const handlers = {
   '/mcp/job-pipeline': handleJobPipeline,
   '/mcp/job-candidates-filter': handleJobCandidatesFilter,
   '/mcp/candidate-move-stage': handleCandidateMoveStage,
+  '/mcp/candidate-log-interview': handleCandidateLogInterview,
 };
