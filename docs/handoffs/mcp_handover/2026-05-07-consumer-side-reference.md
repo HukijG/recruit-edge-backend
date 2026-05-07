@@ -13,6 +13,8 @@ Local MCP responsibilities are minimal:
 
 Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuilds) lives server-side.
 
+> **Names, not ids.** The middleware resolves `candidate`, `job`, `stage`, and `owner` references on every endpoint that accepts them — pass a string and the worker fuzzy-matches it server-side. Numeric ids still work as a fallback. See "Ambiguity / disambiguation" near the end of this doc for the standard envelope when a name resolves to multiple candidates.
+
 ---
 
 ## Endpoints
@@ -26,9 +28,9 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
 {
   "consultantFirstName": "Joel",
   "query": "jerry",                       // optional — fuzzy name match
-  "job": 999,                             // optional — numeric job id
+  "job": "Enterprise AE",                 // optional — numeric id OR fuzzy job name (acronyms folded: "SE" ↔ "Sales Engineer")
   "stage": "Sourced",                     // optional
-  "owner": 900001,                        // optional — numeric RF user id
+  "owner": "Joel",                        // optional — RF user id, our-team first name, or fuzzy full-name
   "company": "SAP",                       // optional — substring match
   "email": "jerry@example.com",           // optional — exact, case-insensitive
   "technology": ["Kubernetes", "Go"],     // optional — multi-select, ANY match
@@ -43,6 +45,8 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
   "fields": ["name", "linkedin"]          // optional — see "Fields" below
 }
 ```
+
+`job` and `owner` accept names; ambiguous names return `needs_disambiguation` (see envelope below).
 
 **Default response shape:**
 ```json
@@ -129,11 +133,13 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
 ```json
 {
   "consultantFirstName": "Joel",
-  "candidate": 51507,                     // numeric id only (fuzzy not yet wired)
-  "job": 999,                             // optional — defaults to the candidate's single non-DQ job
-  "stage": "Replied"                      // stage name OR id
+  "candidate": "Jane Doe",              // numeric id, "42" digit-string, OR fuzzy name
+  "job": "Enterprise AE",                 // optional — numeric id OR fuzzy name within the candidate's jobs[]
+  "stage": "call booked"                  // numeric id OR fuzzy name ("call booked" → "Call Booked", "1st" → "1st Interview")
 }
 ```
+
+All three references are fuzzy-resolvable. Resolution runs sequentially and short-circuits on the **first** ambiguous step — if `candidate` is ambiguous you'll get `kind: "candidate"` options without the worker even looking at `job`/`stage`.
 
 **Default response:**
 ```json
@@ -150,19 +156,43 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
 }
 ```
 
-**Disambiguation** (when candidate is on multiple non-DQ jobs and no `job` specified):
+**Disambiguation** envelopes — same shape across `candidate`, `job`, `stage`:
+
 ```json
+// Ambiguous candidate (e.g. candidate: "Jerry" with two Jerries):
+{
+  "needs_disambiguation": true,
+  "kind": "candidate",
+  "options": [
+    { "id": 1, "name": "Jane Doe", "score": 0.92, "current_organization": "Acme",   "current_title": "AE" },
+    { "id": 2, "name": "Kevin Park",  "score": 0.91, "current_organization": "Globex", "current_title": "CSM" }
+  ],
+  "hint": "Multiple candidates match \"jerry\" — please be more specific."
+}
+
+// Ambiguous job (legacy "candidate has multiple non-DQ jobs and no job specified" path):
 {
   "needs_disambiguation": true,
   "kind": "job",
   "options": [
-    { "job_id": 999, "job_name": "Enterprise AE - NYC", "stage_name": "Sourced" },
-    { "job_id": 1000, "job_name": "AE - SF", "stage_name": "Sourced" }
+    { "job_id": 999,  "job_name": "Enterprise AE - NYC", "stage_name": "Sourced" },
+    { "job_id": 1000, "job_name": "AE - SF",             "stage_name": "Sourced" }
   ]
+}
+
+// Ambiguous stage (e.g. stage: "Interview" matches both "1st Interview" and "2nd Interview"):
+{
+  "needs_disambiguation": true,
+  "kind": "stage",
+  "options": [
+    { "id": 4, "name": "1st Interview", "score": 0.85 },
+    { "id": 5, "name": "2nd Interview", "score": 0.85 }
+  ],
+  "hint": "Multiple stages match \"interview\" — please be more specific."
 }
 ```
 
-**Errors:** `400` (candidate must be numeric / job not on candidate / stage not on job), `404` (candidate not found), `502` (RF rejected).
+**Errors:** `400` (job not on candidate / stage not on job / candidate empty), `404` (candidate not found), `502` (RF rejected).
 
 ---
 
@@ -174,13 +204,16 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
 ```json
 {
   "consultantFirstName": "Joel",
-  "candidate": 51507,                     // numeric id
+  "candidate": "Marcus Delgado",           // numeric id, digit-string, OR fuzzy name
+  "job": "Enterprise AE",                 // optional — numeric id OR fuzzy name within candidate's jobs[]
   "kind": "1st Interview",                // verbatim — "1st Interview" / "2nd Interview" / "Final Interview" / etc
   "start_time": "2026-05-08T10:00:00+01:00",  // REQUIRED, ISO 8601 with TZ
   "end_time": "2026-05-08T11:00:00+01:00",    // optional, default = start + 60min
   "context": "Asked about prior fintech...\nFollow-up on compensation expectations"  // optional, one bullet per newline
 }
 ```
+
+`candidate` and `job` go through the same resolver as `candidate-move-stage`; ambiguous names return `needs_disambiguation` (200) with the standard envelope.
 
 **Default response:**
 ```json
@@ -207,13 +240,15 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
 ```json
 {
   "consultantFirstName": "Joel",
-  "job": 999,                             // numeric id (string name resolution not yet wired)
-  "stage": "Sourced",                     // optional — narrow to one stage
+  "job": "Enterprise AE",                 // numeric id OR fuzzy job name (acronyms folded)
+  "stage": "Sourced",                     // optional — narrow to one stage (exact match)
   "submitted": false,                     // optional — shortcut: CV Sent → Hired stages only
   "include_closed": false,                // not yet wired
   "fields": ["linkedin", "phone", "email"]
 }
 ```
+
+Ambiguous job names return the standard `needs_disambiguation: true, kind: "job"` envelope.
 
 **Default response:**
 ```json
@@ -246,12 +281,14 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
 ```json
 {
   "consultantFirstName": "Joel",
-  "job": 999,
-  "stage": "Sourced",                     // optional
+  "job": "Enterprise AE",                 // numeric id OR fuzzy job name
+  "stage": "Sourced",                     // optional — exact match
   "limit": 100,                           // default 100, max 500
   "fields": ["linkedin", "phone"]
 }
 ```
+
+Ambiguous job names return `needs_disambiguation` (kind: "job").
 
 **Default response:**
 ```json
@@ -331,6 +368,51 @@ The `fields` array on every read endpoint accepts **any reasonable English-ish n
 ```
 
 The MCP tool definition presented to Claude should say something like *"`fields` accepts any reasonable name — `email`, `phone`, `linkedin`, `salary`, `tech stack`, `current company`, `stage`. Common defaults are returned without specifying."*
+
+---
+
+## Ambiguity / disambiguation
+
+Every endpoint that accepts a `candidate`, `job`, `stage`, or `owner` reference can return a disambiguation response when the user's name resolves to multiple candidates within `UNIQUE_GAP=0.08` of each other. **All such responses are HTTP 200** — disambiguation is a successful response asking the caller to refine, not an error.
+
+### Standard envelope
+
+```json
+{
+  "needs_disambiguation": true,
+  "kind": "candidate" | "job" | "stage" | "owner",
+  "options": [
+    { "id": 123, "name": "...", "score": 0.92, "...kindSpecific": "..." }
+  ],
+  "hint": "Multiple candidates match \"john\" — please be more specific."
+}
+```
+
+The kind-specific extras on each option:
+
+| `kind` | extras |
+|---|---|
+| `candidate` | `current_organization`, `current_title` |
+| `job` | `client_company_name` (or legacy `job_id` / `job_name` / `stage_name` shape from candidate-move-stage's "multiple non-DQ jobs" path) |
+| `stage` | (none — just `id`, `name`, `score`) |
+| `owner` | `email` |
+
+### How resolution sequences
+
+`/mcp/candidate-move-stage` resolves three references in order — `candidate` → `job` → `stage` — and returns disambiguation at the **first** ambiguous step, never aggregated. If `candidate: "Jerry"` is ambiguous you get `kind: "candidate"` options; only after the consumer disambiguates and retries does the worker even look at `job`/`stage`.
+
+### What the consumer should do
+
+The local MCP can either:
+
+1. **Auto-narrow.** Re-issue the same request with a more specific reference (e.g. `"Jane Doe"` instead of `"Jerry"`).
+2. **Surface the options.** Render the `options[]` to the user and let them pick. Each option has `id` — pass that back as the next request's reference field.
+
+Don't blindly pick the first option — the whole point of disambiguation is that the worker isn't sure.
+
+### What it doesn't mean
+
+`needs_disambiguation: true` is **not** "no match". A "no match" outcome is a `400` (filter we couldn't apply) or `404` (entity didn't exist). Disambiguation specifically means "we found ≥2 plausible matches".
 
 ---
 
@@ -426,3 +508,4 @@ If all four return 200 with sensible data, the surface is healthy.
 - **Sync worker:** `sync-worker/src/`
 - **Field aliases:** `src/mcp/projection.js` (`ALIASES` constant)
 - **Fuzzy scorer:** `src/mcp/fuzzy.js`
+- **Entity resolvers:** `src/mcp/resolvers.js` (resolveCandidate / resolveJob / resolveStage / resolveOwner)
