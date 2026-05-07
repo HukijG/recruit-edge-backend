@@ -1,2 +1,7 @@
-// Populated as endpoint handlers are added in subsequent tasks (16-21).
-export const handlers = {};
+import { handleCacheStatus } from './cache-status.js';
+import { handleCandidateGet } from './candidate-get.js';
+
+export const handlers = {
+  '/mcp/cache-status': handleCacheStatus,
+  '/mcp/candidate-get': handleCandidateGet,
+};
