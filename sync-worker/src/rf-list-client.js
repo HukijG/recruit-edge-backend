@@ -16,7 +16,7 @@ function baseUrl(env) {
   return env.RF_API_BASE_URL || DEFAULT_BASE_URL;
 }
 
-async function rfGet(env, path, params = {}) {
+async function rfGet(env, path, params = {}, attempt = 0) {
   if (!env.RF_API_KEY) {
     throw new Error('RF_API_KEY environment variable is required');
   }
@@ -31,6 +31,12 @@ async function rfGet(env, path, params = {}) {
       'Content-Type': 'application/json',
     },
   });
+  // RF's edge produces transient 502s on read paths; one retry is far cheaper
+  // than failing the caller. Mirror `getRFCandidate` in the main worker.
+  if (r.status === 502 && attempt === 0) {
+    console.warn(`[rf] 502 on GET ${path}, retrying once`);
+    return rfGet(env, path, params, 1);
+  }
   if (!r.ok) {
     const text = await r.text();
     throw new Error(`RF GET ${path} ${r.status} ${text}`);
@@ -38,7 +44,7 @@ async function rfGet(env, path, params = {}) {
   return r.json();
 }
 
-async function rfPost(env, path, body) {
+async function rfPost(env, path, body, attempt = 0) {
   if (!env.RF_API_KEY) {
     throw new Error('RF_API_KEY environment variable is required');
   }
@@ -50,6 +56,12 @@ async function rfPost(env, path, body) {
     },
     body: JSON.stringify(body),
   });
+  // Same one-shot 502 retry as rfGet — RF's edge occasionally bounces these
+  // and the search/list reads here are idempotent so retry is safe.
+  if (r.status === 502 && attempt === 0) {
+    console.warn(`[rf] 502 on POST ${path}, retrying once`);
+    return rfPost(env, path, body, 1);
+  }
   if (!r.ok) {
     const text = await r.text();
     throw new Error(`RF POST ${path} ${r.status} ${text}`);
@@ -67,25 +79,43 @@ export async function fetchCandidate(env, id) {
 
 /**
  * Returns ids of candidates whose `last_updated` is strictly greater than `cursor`
- * (ISO 8601 string). Paginates `/candidate/search` sorted last_updated DESC, breaks
+ * (ISO 8601 string), plus a `suggestedCursor` the caller should advance to after
+ * processing. Paginates `/candidate/search` sorted last_updated DESC, breaks
  * when we encounter a row at-or-older-than cursor.
  *
  * Hard cap of 5000 ids — the tail-sync caller batches downstream work and
  * unbounded results would blow the worker's runtime limits if RF ever returned
- * a huge backlog (e.g. an outage recovery). If we hit the cap, the caller will
- * naturally pick up where this left off on the next tick because it advances
- * the cursor only after processing the returned ids.
+ * a huge backlog (e.g. an outage recovery).
  *
- * NOTE: the exact filter/sort key for `last_updated` on `/candidate/search` is
- * pending Joel's confirmation before sync ships. Code defensively — even if the
- * sort hint is ignored upstream, the break-when-stale logic still terminates
- * the loop as long as the response eventually drains.
+ * Why the return shape includes `suggestedCursor`:
+ * - We sort DESC because there is no `last_updated >= cursor` filter on RF's
+ *   `/candidate/search` (TBD, may never exist) — the only way to do incremental
+ *   reads is "newest first, break when we hit cursor".
+ * - DESC + cap means if 5001+ rows are fresh, we return the 5000 NEWEST and
+ *   skip 1+ older-but-still-fresh rows.
+ * - If the caller advances `cursor = MAX(returned)` after processing, those
+ *   skipped rows have `last_updated < new cursor` and are silently dropped
+ *   forever — DATA LOSS.
+ * - Fix: when capped, set `suggestedCursor = MIN(returned)` (oldest of the
+ *   returned set) so the next tick re-fetches from the cap edge. The newest
+ *   rows we already processed will be re-seen — that's idempotent overlap,
+ *   acceptable cost. Missed rows are not.
+ * - When NOT capped, `suggestedCursor = MAX(returned)` (newest) — we have the
+ *   full delta, advance to the watermark.
+ * - When no fresh rows, `suggestedCursor = cursor` (no movement).
+ *
+ * NOTE: the exact sort key for `last_updated` on `/candidate/search` is pending
+ * Joel's confirmation before sync ships. Code defensively — even if the sort
+ * hint is ignored upstream, the break-when-stale logic still terminates as
+ * long as the response eventually drains.
  */
 export async function fetchCandidatesUpdatedSince(env, cursor) {
   const ids = [];
+  const timestamps = [];
   let page = 1;
   const PAGE_SIZE = 100;
   const HARD_CAP = 5000;
+  let capped = false;
 
   for (;;) {
     const resp = await rfPost(env, '/candidate/search', {
@@ -102,7 +132,9 @@ export async function fetchCandidatesUpdatedSince(env, cursor) {
     for (const row of rows) {
       if (row.last_updated && row.last_updated > cursor) {
         ids.push(row.id);
+        timestamps.push(row.last_updated);
         if (ids.length >= HARD_CAP) {
+          capped = true;
           stopped = true;
           break;
         }
@@ -114,7 +146,19 @@ export async function fetchCandidatesUpdatedSince(env, cursor) {
     if (stopped || rows.length < PAGE_SIZE) break;
     page++;
   }
-  return ids;
+
+  let suggestedCursor;
+  if (timestamps.length === 0) {
+    suggestedCursor = cursor;
+  } else if (capped) {
+    // Drop the cap edge (oldest of the returned set) on the floor so next
+    // tick refetches from there — overlap is fine, missed rows are not.
+    suggestedCursor = timestamps.reduce((a, b) => (a < b ? a : b));
+  } else {
+    suggestedCursor = timestamps.reduce((a, b) => (a > b ? a : b));
+  }
+
+  return { ids, suggestedCursor };
 }
 
 /**
