@@ -98,6 +98,77 @@ describe('/mcp/candidate-search', () => {
     expect(r.status).toBe(400);
   });
 
+  it('technology filter matches when ANY value present', async () => {
+    await insert(1, 'Alice', {
+      body: { custom_fields: [{ name: 'Technology', value: ['Kubernetes', 'Go'] }] },
+    });
+    await insert(2, 'Bob', {
+      body: { custom_fields: [{ name: 'Technology', value: ['Postgres'] }] },
+    });
+    const r = await call({ consultantFirstName: 'Joel', technology: ['Kubernetes'] });
+    const b = await r.json();
+    expect(b.matches.map((m) => m.id)).toEqual([1]);
+  });
+
+  it('technology filter ORs across array', async () => {
+    await insert(1, 'Alice', {
+      body: { custom_fields: [{ name: 'Technology', value: ['Kubernetes', 'Go'] }] },
+    });
+    await insert(2, 'Bob', {
+      body: { custom_fields: [{ name: 'Technology', value: ['Postgres'] }] },
+    });
+    await insert(3, 'Carol', {
+      body: { custom_fields: [{ name: 'Technology', value: ['Java'] }] },
+    });
+    const r = await call({ consultantFirstName: 'Joel', technology: ['Postgres', 'Go'] });
+    const b = await r.json();
+    expect(b.matches.map((m) => m.id).sort()).toEqual([1, 2]);
+  });
+
+  it('segment filter exact-matches', async () => {
+    await insert(1, 'Alice', {
+      body: { custom_fields: [{ name: 'Segment', value: 'Enterprise' }] },
+    });
+    await insert(2, 'Bob', {
+      body: { custom_fields: [{ name: 'Segment', value: 'SMB' }] },
+    });
+    const hit = await (await call({ consultantFirstName: 'Joel', segment: 'Enterprise' })).json();
+    expect(hit.matches.map((m) => m.id)).toEqual([1]);
+    const miss = await (await call({ consultantFirstName: 'Joel', segment: 'Mid-Market' })).json();
+    expect(miss.count).toBe(0);
+  });
+
+  it('role filter exact-matches', async () => {
+    await insert(1, 'Alice', {
+      body: { custom_fields: [{ name: 'Role', value: 'AE' }] },
+    });
+    await insert(2, 'Bob', {
+      body: { custom_fields: [{ name: 'Role', value: 'CSM' }] },
+    });
+    const hit = await (await call({ consultantFirstName: 'Joel', role: 'AE' })).json();
+    expect(hit.matches.map((m) => m.id)).toEqual([1]);
+  });
+
+  it('include_disqualified=false (default) excludes DQ candidates from job filter', async () => {
+    await insert(1, 'Alice');
+    await env.RF_MCP_CACHE.prepare(
+      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (1, 100, 'Sourced', 1)`,
+    ).run();
+    const r = await call({ consultantFirstName: 'Joel', job: 100 });
+    const b = await r.json();
+    expect(b.count).toBe(0);
+  });
+
+  it('include_disqualified=true includes DQ candidates', async () => {
+    await insert(1, 'Alice');
+    await env.RF_MCP_CACHE.prepare(
+      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (1, 100, 'Sourced', 1)`,
+    ).run();
+    const r = await call({ consultantFirstName: 'Joel', job: 100, include_disqualified: true });
+    const b = await r.json();
+    expect(b.matches.map((m) => m.id)).toEqual([1]);
+  });
+
   it('honours fields[] alias projection', async () => {
     await insert(1, 'Jerry', {
       email: 'jerry@x.com',

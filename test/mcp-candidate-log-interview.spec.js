@@ -87,6 +87,58 @@ describe('/mcp/candidate-log-interview', () => {
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
+  it('uses interview activity_type_id from sync_state.activity_types when present', async () => {
+    await env.RF_MCP_CACHE.prepare(
+      "INSERT INTO sync_state (key, value) VALUES ('activity_types', ?)"
+    ).bind(JSON.stringify([
+      { id: 1002, name: 'Cold Call' },
+      { id: 4242, name: 'Interview' },
+    ])).run();
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 999 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 42,
+      kind: '1st Interview',
+      start_time: '2026-05-08T10:00:00+01:00',
+    });
+    expect(r.status).toBe(200);
+    const sent = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    expect(sent.activity_type_id).toBe(4242);
+  });
+
+  it('falls back to 1003 when sync_state.activity_types is unset', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 999 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 42,
+      kind: '1st Interview',
+      start_time: '2026-05-08T10:00:00+01:00',
+    });
+    expect(r.status).toBe(200);
+    const sent = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    expect(sent.activity_type_id).toBe(1003);
+  });
+
+  it('outlook_url does NOT include the candidate email (recruiter-only block)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 999 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 42,
+      kind: '1st Interview',
+      start_time: '2026-05-08T10:00:00+01:00',
+    });
+    const b = await r.json();
+    expect(b.outlook_url).not.toContain('t%40x.com');
+    expect(b.outlook_url).not.toContain('t@x.com');
+    expect(new URL(b.outlook_url).searchParams.has('to')).toBe(false);
+  });
+
   it('returns 502 if RF activity-create fails', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(
       new Response('rf went boom', { status: 500 }),

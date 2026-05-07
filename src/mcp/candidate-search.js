@@ -60,9 +60,37 @@ function buildFilterSql(body) {
     args.push(`%${body.company}%`);
   }
 
+  // Single-value custom-field exact matches (`segment`, `role`). Each scans the
+  // `custom_fields` array via JSON1 looking for the field by case-insensitive
+  // name, then exact-matches the value.
+  if (body.segment) {
+    where.push("EXISTS (SELECT 1 FROM json_each(c.body, '$.custom_fields') WHERE LOWER(json_extract(value, '$.name')) = 'segment' AND json_extract(value, '$.value') = ?)");
+    args.push(body.segment);
+  }
+  if (body.role) {
+    where.push("EXISTS (SELECT 1 FROM json_each(c.body, '$.custom_fields') WHERE LOWER(json_extract(value, '$.name')) = 'role' AND json_extract(value, '$.value') = ?)");
+    args.push(body.role);
+  }
+
+  // Multi-select `technology`: ANY-match across the requested array. The
+  // candidate's Technology custom field is itself a JSON array of strings, so
+  // we OR-group one EXISTS-over-json_each per requested value.
+  if (Array.isArray(body.technology) && body.technology.length) {
+    const orClauses = body.technology
+      .map(() =>
+        "EXISTS (SELECT 1 FROM json_each(c.body, '$.custom_fields') AS cf WHERE LOWER(json_extract(cf.value, '$.name')) = 'technology' AND EXISTS (SELECT 1 FROM json_each(json_extract(cf.value, '$.value')) AS tv WHERE tv.value = ?))"
+      )
+      .join(' OR ');
+    where.push(`(${orClauses})`);
+    for (const tech of body.technology) args.push(tech);
+  }
+
   let from = 'FROM candidates c';
   if (body.job != null) {
-    from += ' JOIN candidate_jobs cj ON cj.candidate_id = c.id AND cj.disqualified = 0';
+    // Default: only non-disqualified job links. `include_disqualified=true`
+    // drops the guard so DQ'd links are included.
+    const dqGuard = body.include_disqualified ? '' : ' AND cj.disqualified = 0';
+    from += ' JOIN candidate_jobs cj ON cj.candidate_id = c.id' + dqGuard;
     where.push('cj.job_id = ?');
     args.push(Number(body.job));
     if (body.stage) {

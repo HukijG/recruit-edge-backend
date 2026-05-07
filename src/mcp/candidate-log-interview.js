@@ -19,17 +19,40 @@ import { jsonResponse } from './router.js';
 import { getCandidateById } from './d1-read.js';
 
 const DEFAULT_DURATION_MIN = 60;
-// Joel: confirm during deploy that this matches the RF custom-activity type
-// for "Interview" — otherwise the activity will land under the wrong type.
-const ACTIVITY_TYPE_INTERVIEW_ID = 1003;
+// Fallback only — used if the sync-worker hasn't yet populated
+// `sync_state.activity_types` (e.g. before the first full rebuild).
+const ACTIVITY_TYPE_INTERVIEW_FALLBACK = 1003;
 
-function buildOutlookUrl({ subject, body, start, end, attendeeEmail }) {
+/**
+ * Resolve the RF activity-type id whose name matches "interview" (case-
+ * insensitive) from the cached `sync_state.activity_types`. The cache is
+ * populated by the sync-worker's full-rebuild flow as a JSON-encoded
+ * `[{id,name},...]`. Falls back to the legacy hardcoded id if the cache
+ * isn't available yet.
+ */
+async function getInterviewActivityTypeId(env) {
+  const row = await env.RF_MCP_CACHE
+    .prepare("SELECT value FROM sync_state WHERE key = 'activity_types'")
+    .first();
+  if (!row?.value) return ACTIVITY_TYPE_INTERVIEW_FALLBACK;
+  let types;
+  try {
+    types = JSON.parse(row.value);
+  } catch {
+    return ACTIVITY_TYPE_INTERVIEW_FALLBACK;
+  }
+  const interview = Array.isArray(types)
+    ? types.find((t) => t?.name && /interview/i.test(t.name))
+    : null;
+  return interview?.id ?? ACTIVITY_TYPE_INTERVIEW_FALLBACK;
+}
+
+function buildOutlookUrl({ subject, body, start, end }) {
   const u = new URL('https://outlook.live.com/calendar/0/deeplink/compose');
   u.searchParams.set('subject', subject);
   u.searchParams.set('body', body);
   u.searchParams.set('startdt', start);
   u.searchParams.set('enddt', end);
-  if (attendeeEmail) u.searchParams.set('to', attendeeEmail);
   return u.toString();
 }
 
@@ -70,12 +93,13 @@ export async function handleCandidateLogInterview({ env, body, consultant }) {
         .join('<br>')
     : '';
 
+  const activity_type_id = await getInterviewActivityTypeId(env);
   const r = await fetch(`${env.RF_API_BASE_URL}/custom-activity/create`, {
     method: 'POST',
     headers: { 'RF-Api-Key': env.RF_API_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       candidate_id: candidate.id,
-      activity_type_id: ACTIVITY_TYPE_INTERVIEW_ID,
+      activity_type_id,
       activity_text: text || `${body.kind ?? 'Interview'} scheduled`,
       activity_user_id: consultant.rfUserId,
       start_time: start.toISOString(),
@@ -86,6 +110,9 @@ export async function handleCandidateLogInterview({ env, body, consultant }) {
   const activity = await r.json();
 
   const calendarMode = consultant.calendarMode ?? 'outlook';
+  // Recruiter-only calendar block — never include the candidate's email in
+  // the calendar deeplink (the recruiter adds attendees themselves once the
+  // event lands on their calendar). See spec § "log-interview".
   const out = {
     ok: true,
     activity: { id: activity.id, candidate_id: candidate.id, kind: body.kind },
@@ -95,7 +122,6 @@ export async function handleCandidateLogInterview({ env, body, consultant }) {
       body: text,
       start: start.toISOString(),
       end: end.toISOString(),
-      attendeeEmail: candidate.primary_email,
     }),
   };
   if (calendarMode === 'gcal' || calendarMode === 'both') {
