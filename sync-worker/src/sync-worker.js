@@ -3,6 +3,38 @@ import { writeCandidatesAndLinks } from './d1-write.js';
 import { readSyncState, writeSyncState, deleteSyncState } from './sync-state.js';
 import { rebuildMcpSnapshots } from './snapshots.js';
 
+function timingSafeEqual(a, b) {
+  const ea = new TextEncoder().encode(a);
+  const eb = new TextEncoder().encode(b);
+  if (ea.length !== eb.length) {
+    // still iterate to avoid timing leak on length
+    let dummy = 0;
+    for (let i = 0; i < ea.length; i++) dummy |= ea[i];
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < ea.length; i++) diff |= ea[i] ^ eb[i];
+  return diff === 0;
+}
+
+async function handleAdmin(request, env, ctx) {
+  const token = request.headers.get('X-Admin-Token');
+  if (!env.ADMIN_SECRET || !token || !timingSafeEqual(token, env.ADMIN_SECRET)) {
+    return Response.json({ ok: false, error: 'auth' }, { status: 401 });
+  }
+
+  const url = new URL(request.url);
+  if (url.pathname === '/admin/full-rebuild' && request.method === 'POST') {
+    const instance = await env.REBUILD_WORKFLOW.create({
+      id: crypto.randomUUID(),
+      params: { startedAt: new Date().toISOString() },
+    });
+    return Response.json({ ok: true, workflow_id: instance.id }, { status: 202 });
+  }
+
+  return new Response('not found', { status: 404 });
+}
+
 const WATCHDOG_HOURS = 6;
 
 function chunks(arr, n) {
@@ -67,7 +99,9 @@ export default {
     ctx.waitUntil(tailSync(env));
   },
   async fetch(request, env, ctx) {
-    return new Response('not implemented', { status: 501 });
+    const url = new URL(request.url);
+    if (url.pathname.startsWith('/admin/')) return handleAdmin(request, env, ctx);
+    return new Response('not found', { status: 404 });
   },
 };
 
