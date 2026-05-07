@@ -29,13 +29,13 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
   "consultantFirstName": "Joel",
   "query": "jerry",                       // optional — fuzzy name match
   "job": "Enterprise AE",                 // optional — numeric id OR fuzzy job name (acronyms folded: "SE" ↔ "Sales Engineer")
-  "stage": "Sourced",                     // optional
+  "stage": "sourced",                     // optional — fuzzy when `job` is set ("sourced" → "Sourced", "1st" → "1st Interview")
   "owner": "Joel",                        // optional — RF user id, our-team first name, or fuzzy full-name
   "company": "SAP",                       // optional — substring match
   "email": "jerry@example.com",           // optional — exact, case-insensitive
-  "technology": ["Kubernetes", "Go"],     // optional — multi-select, ANY match
-  "segment": "Enterprise",                // optional — exact custom field
-  "role": "AE",                           // optional — exact custom field
+  "technology": ["kubernetes", "go"],     // optional — multi-select, ANY match; fuzzy + case-insensitive
+  "segment": "enterprise",                // optional — fuzzy + case-insensitive against custom field options
+  "role": "ae",                           // optional — fuzzy + case-insensitive against custom field options
   "added_after": "2026-04-01",            // optional — ISO date
   "added_before": "2026-05-01",
   "updated_after": "2026-04-01",
@@ -46,7 +46,7 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
 }
 ```
 
-`job` and `owner` accept names; ambiguous names return `needs_disambiguation` (see envelope below).
+`job`, `owner`, `stage` (when `job` is also set), and the custom-field filters (`technology[]`, `segment`, `role`) all accept fuzzy strings; ambiguous resolutions return `needs_disambiguation` (see envelope below). `not_found` resolutions fall through to literal exact-match SQL — unknown values produce `count: 0` rather than an error.
 
 **Default response shape:**
 ```json
@@ -241,7 +241,7 @@ All three references are fuzzy-resolvable. Resolution runs sequentially and shor
 {
   "consultantFirstName": "Joel",
   "job": "Enterprise AE",                 // numeric id OR fuzzy job name (acronyms folded)
-  "stage": "Sourced",                     // optional — narrow to one stage (exact match)
+  "stage": "sourced",                     // optional — fuzzy + case-insensitive; resolves against this job's stage_names. Ambiguity returns the standard envelope (kind: "stage").
   "submitted": false,                     // optional — shortcut: CV Sent → Hired stages only
   "include_closed": false,                // not yet wired
   "fields": ["linkedin", "phone", "email"]
@@ -282,7 +282,7 @@ Ambiguous job names return the standard `needs_disambiguation: true, kind: "job"
 {
   "consultantFirstName": "Joel",
   "job": "Enterprise AE",                 // numeric id OR fuzzy job name
-  "stage": "Sourced",                     // optional — exact match
+  "stage": "sourced",                     // optional — fuzzy + case-insensitive; resolves against this job's stage_names. Ambiguity returns the standard envelope (kind: "stage").
   "limit": 100,                           // default 100, max 500
   "fields": ["linkedin", "phone"]
 }

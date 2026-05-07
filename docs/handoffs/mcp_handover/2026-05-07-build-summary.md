@@ -98,7 +98,7 @@ These are noted in the design spec under "Future work":
 
 2. **FTS5 over candidate names in D1.** If pure-fuzzy queries (~50k corpus) get slow, promote name matching to FTS5. Snapshot pattern is sufficient today.
 
-3. **Resolver expansion.** The user explicitly said any input that goes to RF should be fuzzy-resolved. We covered `candidate`, `job`, `stage`, `owner`. Not yet covered: `technology`, `segment`, `role` (custom-field values — exact match today). If a recruiter consistently mistypes "k8s" vs "Kubernetes", expand the resolver — don't add normalisation to the consumer.
+3. **Synonym aliases for custom-field values.** As of the resolver-coverage pass, `technology`, `segment`, and `role` filters on `candidate-search` are fuzzy + case-insensitive against the corpus's distinct values (memoised, version-checked). What still isn't covered: explicit synonym mapping like "k8s" → "Kubernetes" or "rev ops" → "Revenue Operations" — these need an alias dictionary because they're orthographically too distant for fuzzy. Add aliases to a future `WORD_CANONICAL`-style table, don't push normalisation onto the consumer.
 
 ## Development notes for future sessions
 
