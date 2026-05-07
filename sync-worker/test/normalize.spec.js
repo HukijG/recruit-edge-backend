@@ -137,4 +137,35 @@ describe('normalize', () => {
     expect(rows[0].added_to_job_by_id).toBeNull();
     expect(rows[0].disqualification_reason).toBeNull();
   });
+
+  it('synthesises custom_fields_by_name from custom_fields array (lowercased keys)', () => {
+    const row = toCandidateRow({
+      ...sample,
+      custom_fields: [
+        { id: 1, name: 'Expected Compensation', value: '100k' },
+        { id: 2, name: 'Tech Stack', value: ['Go', 'Postgres'] },
+      ],
+    });
+    const body = JSON.parse(row.body);
+    expect(body.custom_fields_by_name).toBeDefined();
+    expect(body.custom_fields_by_name['expected compensation'].value).toBe('100k');
+    expect(body.custom_fields_by_name['tech stack'].value).toEqual(['Go', 'Postgres']);
+    expect(body.custom_fields_by_name['expected compensation'].id).toBe(1);
+  });
+
+  it('preserves existing custom_fields_by_name if already present (defensive)', () => {
+    const row = toCandidateRow({
+      ...sample,
+      custom_fields: [{ id: 1, name: 'Foo', value: 'a' }],
+      custom_fields_by_name: { foo: { name: 'Foo', value: 'b', id: 99 } },
+    });
+    const body = JSON.parse(row.body);
+    expect(body.custom_fields_by_name.foo.value).toBe('b');
+  });
+
+  it('omits custom_fields_by_name when no custom_fields array', () => {
+    const row = toCandidateRow({ ...sample, custom_fields: undefined });
+    const body = JSON.parse(row.body);
+    expect(body.custom_fields_by_name).toBeUndefined();
+  });
 });

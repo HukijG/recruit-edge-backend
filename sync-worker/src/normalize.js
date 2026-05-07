@@ -72,6 +72,20 @@ export function toCandidateRow(rf) {
     if (rf[k] !== undefined) curated[k] = rf[k];
   }
 
+  // Synthesise custom_fields_by_name from the custom_fields array.
+  // Keys are lowercased for case-insensitive lookup (projection.js aliases use lowercased names).
+  // The whole entry is preserved so callers can access .value, .id, etc.
+  // Use ??= so a pre-existing custom_fields_by_name on the input is never stomped.
+  if (Array.isArray(rf.custom_fields)) {
+    const byName = {};
+    for (const cf of rf.custom_fields) {
+      if (cf?.name) {
+        byName[cf.name.toLowerCase()] = cf;
+      }
+    }
+    curated.custom_fields_by_name ??= byName;
+  }
+
   return {
     id: rf.id,
     body: JSON.stringify(curated),
