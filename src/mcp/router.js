@@ -13,17 +13,41 @@ export function jsonResponse(status, payload) {
   });
 }
 
+/**
+ * Emit a structured log line for every /mcp/* response. CF Logs picks the
+ * object form up as queryable JSON; the `message` string is the human-
+ * readable line used by `wrangler tail`. Consultant first-name is included
+ * when known (early auth/parse failures don't have it).
+ */
+function logged(tool, t0, response, consultantFirstName) {
+  const took_ms = Date.now() - t0;
+  const entry = { tool, status: response.status, took_ms };
+  if (consultantFirstName) entry.consultant = consultantFirstName;
+  entry.message = `[mcp] ${tool} status=${response.status} took_ms=${took_ms}`
+    + (consultantFirstName ? ` consultant=${consultantFirstName}` : '');
+  console.log(entry);
+  return response;
+}
+
 export async function routeMcp(request, env, ctx, handlers) {
+  const t0 = Date.now();
+  const url = new URL(request.url);
+  const tool = url.pathname;
+
   const token = request.headers.get('X-MCP-Token') ?? '';
   if (!env.MCP_EXTENSION_SECRET || !timingSafeEqual(token, env.MCP_EXTENSION_SECRET)) {
-    return jsonResponse(401, { ok: false, error: 'auth' });
+    return logged(tool, t0, jsonResponse(401, { ok: false, error: 'auth' }));
   }
-  const url = new URL(request.url);
   let body = {};
   try { body = await request.json(); } catch {}
   const consultant = getUserByFirstName(body.consultantFirstName);
-  if (!consultant) return jsonResponse(403, { ok: false, error: 'Unknown consultant' });
+  if (!consultant) {
+    return logged(tool, t0, jsonResponse(403, { ok: false, error: 'Unknown consultant' }));
+  }
   const handler = handlers[url.pathname];
-  if (!handler) return jsonResponse(404, { ok: false, error: 'not found' });
-  return handler({ env, ctx, body, consultant });
+  if (!handler) {
+    return logged(tool, t0, jsonResponse(404, { ok: false, error: 'not found' }), consultant.firstName);
+  }
+  const res = await handler({ env, ctx, body, consultant });
+  return logged(tool, t0, res, consultant.firstName);
 }
