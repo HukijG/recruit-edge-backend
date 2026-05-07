@@ -14,7 +14,7 @@
 import { jsonResponse } from './router.js';
 import { session } from './d1-read.js';
 import { resolveFields, project } from './projection.js';
-import { resolveJob, disambiguationPayload } from './resolvers.js';
+import { resolveJob, resolveStage, disambiguationPayload } from './resolvers.js';
 
 const DEFAULT_FIELDS = ['id', 'name', 'stage_name'];
 const DEFAULT_LIMIT = 100;
@@ -96,8 +96,24 @@ export async function handleJobCandidatesFilter({ env, body }) {
   // Apply the optional `stage` filter, then truncate to `limit`.  Truncation
   // reflects the post-filter list, so `truncated` means "more matched the
   // filter than fit in this response".
+  // `stage` is fuzzy-resolved against the snapshot's distinct stage_names so
+  // recruiter/Claude inputs like "cv sent" / "1st" land on canonical names
+  // without a round-trip. Ambiguity returns the standard 200 envelope;
+  // not_found falls through to the literal exact-match (returns empty).
   let matched = snap.matched;
-  if (body.stage) matched = matched.filter((c) => c.stage_name === body.stage);
+  let stageFilter = body.stage;
+  if (body.stage) {
+    const distinct = Array.from(new Set(matched.map((c) => c.stage_name).filter(Boolean)));
+    if (distinct.length > 0) {
+      const resolvable = distinct.map((name) => ({ id: name, name }));
+      const r = resolveStage(body.stage, resolvable);
+      if (!r.ok && r.reason === 'ambiguous') {
+        return jsonResponse(200, disambiguationPayload(r));
+      }
+      if (r.ok) stageFilter = r.value.name;
+    }
+  }
+  if (stageFilter) matched = matched.filter((c) => c.stage_name === stageFilter);
   const truncated = matched.length > limit;
   matched = matched.slice(0, limit);
 
