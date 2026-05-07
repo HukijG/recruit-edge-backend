@@ -139,11 +139,24 @@ describe('/mcp/candidate-move-stage', () => {
   });
 
   it('ambiguous fuzzy candidate name returns needs_disambiguation kind=candidate', async () => {
-    // Insert a second Jerry to force ambiguity.
+    // Insert a second Jerry to force ambiguity. With post-narrow, the second
+    // Jerry needs a job + Replied stage so it produces a valid tuple too;
+    // otherwise post-narrow would auto-resolve to the first Jerry as the
+    // sole owner of a valid (candidate, job, stage) chain.
     await env.RF_MCP_CACHE.prepare(
       'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
     ).bind(
-      43, JSON.stringify({ id: 43, name: 'Kevin Park' }),
+      43, JSON.stringify({
+        id: 43, name: 'Kevin Park',
+        jobs: [{
+          job_id: 200, job_name: 'CSM Lead', stage_id: 1, stage_name: 'Sourced',
+          disqualified: false,
+          stages: [
+            { id: 1, name: 'Sourced' },
+            { id: 2, name: 'Replied' },
+          ],
+        }],
+      }),
       'Kevin Park', 'Globex', 'CSM', new Date().toISOString()
     ).run();
     globalThis.fetch = vi.fn();
@@ -155,6 +168,87 @@ describe('/mcp/candidate-move-stage', () => {
     expect(b.options.length).toBeGreaterThanOrEqual(2);
     expect(b.options[0]).toHaveProperty('current_organization');
     expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('post-narrow: two Jerries but only one is on the specified job → auto-commits', async () => {
+    // Jerry-1 (id=42) is on Eng (job_id=100). Insert Jerry-2 on a DIFFERENT
+    // job (job_id=300, "Sales Lead"). Caller asks for "Jerry to Replied on
+    // Eng" — only Jerry-1 has Eng, so the post-narrow should collapse to a
+    // unique tuple and commit without disambiguation.
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(
+      43, JSON.stringify({
+        id: 43, name: 'Kevin Park',
+        jobs: [{
+          job_id: 300, job_name: 'Sales Lead', stage_id: 1, stage_name: 'Sourced',
+          disqualified: false,
+          stages: [{ id: 1, name: 'Sourced' }, { id: 2, name: 'Replied' }],
+        }],
+      }),
+      'Kevin Park', 'Globex', 'CSM', new Date().toISOString()
+    ).run();
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 'Jerry',
+      job: 'Eng',
+      stage: 'Replied',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.ok).toBe(true);
+    expect(b.moved.candidate_id).toBe(42);
+    expect(b.moved.job_id).toBe(100);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('post-narrow: two Jerries on differently-named jobs, both share Replied → kind=candidate options carry job context', async () => {
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(
+      43, JSON.stringify({
+        id: 43, name: 'Kevin Park',
+        jobs: [{
+          job_id: 300, job_name: 'CSM Lead', stage_id: 1, stage_name: 'Sourced',
+          disqualified: false,
+          stages: [{ id: 1, name: 'Sourced' }, { id: 2, name: 'Replied' }],
+        }],
+      }),
+      'Kevin Park', 'Globex', 'CSM', new Date().toISOString()
+    ).run();
+    globalThis.fetch = vi.fn();
+    // No `job` filter — both Jerries produce a valid (Replied) tuple.
+    const r = await call({ consultantFirstName: 'Joel', candidate: 'Jerry', stage: 'Replied' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.needs_disambiguation).toBe(true);
+    expect(b.kind).toBe('candidate');
+    expect(b.options).toHaveLength(2);
+    // Each option should carry both candidate identity AND the per-tuple job
+    // context so the consumer renders an unambiguous line per option.
+    for (const opt of b.options) {
+      expect(opt).toHaveProperty('id');           // candidate id
+      expect(opt).toHaveProperty('name');         // candidate name
+      expect(opt).toHaveProperty('current_organization');
+      expect(opt).toHaveProperty('job_name');     // tuple context
+      expect(opt).toHaveProperty('to_stage');
+    }
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('post-narrow: single candidate, single job, ambiguous stage → kind=stage (legacy preserved)', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({ consultantFirstName: 'Joel', candidate: 42, stage: 'Interview' });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.needs_disambiguation).toBe(true);
+    expect(b.kind).toBe('stage');
+    const names = b.options.map((o) => o.name).sort();
+    expect(names).toContain('1st Interview');
+    expect(names).toContain('2nd Interview');
   });
 
   it('fuzzy stage name resolves ("call booked" → Call Booked)', async () => {
