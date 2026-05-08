@@ -115,10 +115,6 @@ export async function handleCandidateMoveStage({ env, body, consultant }) {
       console.error('move-stage RF call failed:', err);
       return jsonResponse(502, { error: 'RF move-to-stage failed' });
     }
-    await Promise.all([
-      env.SYNC_STATE.delete(`mcp:pipeline:${link.job_id}`),
-      env.SYNC_STATE.delete(`mcp:job-candidates:${link.job_id}`),
-    ]);
     return jsonResponse(200, {
       ok: true,
       moved: {
@@ -192,10 +188,6 @@ export async function handleCandidateMoveStage({ env, body, consultant }) {
       console.error('move-stage RF call failed:', err);
       return jsonResponse(502, { error: 'RF move-to-stage failed' });
     }
-    await Promise.all([
-      env.SYNC_STATE.delete(`mcp:pipeline:${t.job.job_id}`),
-      env.SYNC_STATE.delete(`mcp:job-candidates:${t.job.job_id}`),
-    ]);
     return jsonResponse(200, {
       ok: true,
       moved: {

@@ -306,22 +306,6 @@ describe('/mcp/candidate-move-stage', () => {
     expect(b.moved.job_id).toBe(100);
   });
 
-  it('invalidates KV snapshots after successful RF call', async () => {
-    // Pre-seed both snapshots.
-    await env.SYNC_STATE.put('mcp:pipeline:100', JSON.stringify({ stale: true }));
-    await env.SYNC_STATE.put('mcp:job-candidates:100', JSON.stringify({ stale: true }));
-
-    globalThis.fetch = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ ok: true }), { status: 200 }),
-    );
-
-    const r = await call({ consultantFirstName: 'Joel', candidate: 42, stage: 'Replied' });
-    expect(r.status).toBe(200);
-
-    expect(await env.SYNC_STATE.get('mcp:pipeline:100')).toBeNull();
-    expect(await env.SYNC_STATE.get('mcp:job-candidates:100')).toBeNull();
-  });
-
   it('candidate_id + job_id + stage_id = direct commit, no resolver', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: true }), { status: 200 }),

@@ -1,7 +1,6 @@
 import * as rfClient from './rf-list-client.js';
 import { writeCandidatesAndLinks, writeJobs } from './d1-write.js';
 import { readSyncState, writeSyncState, deleteSyncState } from './sync-state.js';
-import { rebuildMcpSnapshots } from './snapshots.js';
 
 function timingSafeEqual(a, b) {
   const ea = new TextEncoder().encode(a);
@@ -86,10 +85,6 @@ export async function tailSync(env) {
     // hundred rows so the cost is negligible compared to the candidate fetch.
     const allJobs = await rfClient.fetchAllJobs(env);
     await writeJobs(env, allJobs);
-
-    if (upserted > 0) {
-      await rebuildMcpSnapshots(env, null);
-    }
 
     await writeSyncState(env, 'last_tail_sync_at', suggestedCursor);
     await writeSyncState(env, 'last_tail_sync_count', String(upserted));

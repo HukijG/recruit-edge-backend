@@ -3,7 +3,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { applyMigration } from './helpers/migrate.js';
 import worker, { tailSync } from '../src/sync-worker.js';
 import * as rfClient from '../src/rf-list-client.js';
-import * as snapshots from '../src/snapshots.js';
 import { readSyncState, writeSyncState } from '../src/sync-state.js';
 
 beforeEach(async () => {
@@ -35,9 +34,6 @@ describe('tailSync', () => {
       jobs: [],
     });
     vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
-    // Stub snapshot rebuild — exercising it would require open jobs in D1
-    // and isn't what this test is verifying.
-    vi.spyOn(snapshots, 'rebuildMcpSnapshots').mockResolvedValue(undefined);
 
     await tailSync(env);
 
@@ -67,27 +63,6 @@ describe('tailSync', () => {
     expect(await readSyncState(env, 'in_flight')).toBeNull();
   });
 
-  it('empty ids array does not call rebuildMcpSnapshots', async () => {
-    vi.spyOn(rfClient, 'fetchCandidatesUpdatedSince').mockResolvedValue({
-      ids: [],
-      suggestedCursor: '2026-05-07T14:00:00Z',
-    });
-    const fetchCandSpy = vi.spyOn(rfClient, 'fetchCandidate');
-    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
-    const rebuildSpy = vi
-      .spyOn(snapshots, 'rebuildMcpSnapshots')
-      .mockResolvedValue(undefined);
-
-    await tailSync(env);
-
-    expect(fetchCandSpy).not.toHaveBeenCalled();
-    expect(rebuildSpy).not.toHaveBeenCalled();
-    // Cursor still advances on empty, even with no upserts.
-    expect(await readSyncState(env, 'last_tail_sync_at')).toBe('2026-05-07T14:00:00Z');
-    expect(await readSyncState(env, 'last_tail_sync_count')).toBe('0');
-    expect(await readSyncState(env, 'in_flight')).toBeNull();
-  });
-
   it('refreshes jobs every tick (even when no candidate updates)', async () => {
     vi.spyOn(rfClient, 'fetchCandidatesUpdatedSince').mockResolvedValue({
       ids: [],
@@ -96,7 +71,6 @@ describe('tailSync', () => {
     vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([
       { id: 7001, name: 'New Job', is_open: true },
     ]);
-    vi.spyOn(snapshots, 'rebuildMcpSnapshots').mockResolvedValue(undefined);
 
     await tailSync(env);
 
@@ -119,7 +93,6 @@ describe('tailSync', () => {
       return { id, name: `C${id}`, primary_email: `c${id}@x.com`, jobs: [] };
     });
     vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
-    vi.spyOn(snapshots, 'rebuildMcpSnapshots').mockResolvedValue(undefined);
 
     await tailSync(env);
 
