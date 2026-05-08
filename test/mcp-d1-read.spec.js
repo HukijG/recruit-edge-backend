@@ -82,3 +82,13 @@ describe('d1-read', () => {
     expect(await countTable(env, 'candidates')).toBe(2);
   });
 });
+
+describe('job_pipelines migration', () => {
+  it('creates the table', async () => {
+    await applyMigration(env);
+    const row = await env.RF_MCP_CACHE
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='job_pipelines'")
+      .first();
+    expect(row?.name).toBe('job_pipelines');
+  });
+});
