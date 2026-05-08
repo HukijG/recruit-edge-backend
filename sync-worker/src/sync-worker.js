@@ -25,9 +25,10 @@ async function handleAdmin(request, env, ctx) {
 
   const url = new URL(request.url);
   if (url.pathname === '/admin/full-rebuild' && request.method === 'POST') {
+    const only = url.searchParams.get('only');  // null | 'candidates' | 'jobs' | 'pipelines'
     const instance = await env.REBUILD_WORKFLOW.create({
       id: crypto.randomUUID(),
-      params: { startedAt: new Date().toISOString() },
+      params: { startedAt: new Date().toISOString(), only },
     });
     return Response.json({ ok: true, workflow_id: instance.id }, { status: 202 });
   }

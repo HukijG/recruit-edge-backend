@@ -60,4 +60,32 @@ describe('/admin/full-rebuild', () => {
     );
     expect(res.status).toBe(401);
   });
+
+  it('passes only=jobs through as workflow params', async () => {
+    const create = vi.fn().mockResolvedValue({ id: 'wf-1' });
+    const testEnv = { ...env, REBUILD_WORKFLOW: { create } };
+    const req = makeRequest('/admin/full-rebuild?only=jobs', { token: ADMIN_SECRET });
+    await worker.fetch(req, testEnv, {});
+    expect(create.mock.calls[0][0].params).toMatchObject({ only: 'jobs' });
+  });
+
+  it('passes only=candidates / only=pipelines through', async () => {
+    const create = vi.fn().mockResolvedValue({ id: 'wf-2' });
+    const testEnv = { ...env, REBUILD_WORKFLOW: { create } };
+    const req1 = makeRequest('/admin/full-rebuild?only=candidates', { token: ADMIN_SECRET });
+    await worker.fetch(req1, testEnv, {});
+    expect(create.mock.calls[0][0].params).toMatchObject({ only: 'candidates' });
+
+    const req2 = makeRequest('/admin/full-rebuild?only=pipelines', { token: ADMIN_SECRET });
+    await worker.fetch(req2, testEnv, {});
+    expect(create.mock.calls[1][0].params).toMatchObject({ only: 'pipelines' });
+  });
+
+  it('only=null when no query param', async () => {
+    const create = vi.fn().mockResolvedValue({ id: 'wf-3' });
+    const testEnv = { ...env, REBUILD_WORKFLOW: { create } };
+    const req = makeRequest('/admin/full-rebuild', { token: ADMIN_SECRET });
+    await worker.fetch(req, testEnv, {});
+    expect(create.mock.calls[0][0].params.only).toBeNull();
+  });
 });

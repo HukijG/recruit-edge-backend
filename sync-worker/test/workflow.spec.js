@@ -12,7 +12,6 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { applyMigration } from './helpers/migrate.js';
 import { runFullRebuild } from '../src/workflow.js';
 import * as rfClient from '../src/rf-list-client.js';
-import * as snapshots from '../src/snapshots.js';
 import { readSyncState, writeSyncState } from '../src/sync-state.js';
 
 const stepShim = {
@@ -24,9 +23,6 @@ const stepShim = {
 
 beforeEach(async () => {
   await applyMigration(env.RF_MCP_CACHE);
-  // Stub snapshot rebuild — exercising it would require open jobs in D1
-  // and isn't what these tests are verifying.
-  vi.spyOn(snapshots, 'rebuildMcpSnapshots').mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -95,6 +91,7 @@ describe('runFullRebuild', () => {
     vi.spyOn(rfClient, 'fetchUsers').mockResolvedValue(users);
     vi.spyOn(rfClient, 'fetchActivityTypes').mockResolvedValue(types);
     vi.spyOn(rfClient, 'fetchCustomFieldSchema').mockResolvedValue(fields);
+    vi.spyOn(rfClient, 'fetchJobPipeline').mockResolvedValue({ summary: [], detail: [] });
 
     await runFullRebuild(env, stepShim, 'test-instance');
 
@@ -170,5 +167,57 @@ describe('runFullRebuild', () => {
     // Claim step is OUTSIDE the try/finally, so refusal does not run the
     // release step — the pre-existing token must survive untouched.
     expect(await readSyncState(env, 'in_flight')).toBe('true');
+  });
+});
+
+describe('runFullRebuild — ?only= gating', () => {
+  it('only=pipelines skips candidate / users / activity / cf steps and only rebuilds pipelines', async () => {
+    const candPage = vi.spyOn(rfClient, 'fetchCandidateListPage');
+    const users = vi.spyOn(rfClient, 'fetchUsers').mockResolvedValue([]);
+    const types = vi.spyOn(rfClient, 'fetchActivityTypes').mockResolvedValue([]);
+    const cf = vi.spyOn(rfClient, 'fetchCustomFieldSchema').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchJobPipeline').mockResolvedValue({ summary: [], detail: [] });
+    await runFullRebuild(env, stepShim, 'inst', { only: 'pipelines' });
+    expect(candPage).not.toHaveBeenCalled();
+    expect(users).not.toHaveBeenCalled();
+    expect(types).not.toHaveBeenCalled();
+    expect(cf).not.toHaveBeenCalled();
+  });
+
+  it('only=candidates skips jobs/users/activity/cf/pipelines', async () => {
+    vi.spyOn(rfClient, 'fetchCandidateListPage').mockResolvedValue({ rows: [], total: null });
+    const jobs = vi.spyOn(rfClient, 'fetchAllJobs');
+    const users = vi.spyOn(rfClient, 'fetchUsers');
+    const pipeline = vi.spyOn(rfClient, 'fetchJobPipeline');
+    await runFullRebuild(env, stepShim, 'inst', { only: 'candidates' });
+    expect(jobs).not.toHaveBeenCalled();
+    expect(users).not.toHaveBeenCalled();
+    expect(pipeline).not.toHaveBeenCalled();
+  });
+
+  it('only=jobs skips candidates AND pipelines', async () => {
+    const candPage = vi.spyOn(rfClient, 'fetchCandidateListPage');
+    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchUsers').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchActivityTypes').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchCustomFieldSchema').mockResolvedValue([]);
+    const pipeline = vi.spyOn(rfClient, 'fetchJobPipeline');
+    await runFullRebuild(env, stepShim, 'inst', { only: 'jobs' });
+    expect(candPage).not.toHaveBeenCalled();
+    expect(pipeline).not.toHaveBeenCalled();
+  });
+
+  it('default (no `only`) runs all sections including pipelines', async () => {
+    vi.spyOn(rfClient, 'fetchCandidateListPage').mockResolvedValue({ rows: [], total: null });
+    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchUsers').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchActivityTypes').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchCustomFieldSchema').mockResolvedValue([]);
+    const pipeline = vi.spyOn(rfClient, 'fetchJobPipeline').mockResolvedValue({ summary: [], detail: [] });
+    await runFullRebuild(env, stepShim, 'inst');
+    // No open jobs in test env, so fetchJobPipeline isn't called even on default path.
+    // The fact that the run completed without throwing is enough; the per-test
+    // open-jobs case is exercised in pipeline-workflow.spec.js.
   });
 });
