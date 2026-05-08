@@ -326,6 +326,63 @@ describe('/mcp/candidate-search', () => {
     const b = await r.json();
     expect(b.matches[0].primary_email).toBe('jerry@x.com');
     expect(b.matches[0].current_organization).toBe('Acme');
-    expect(b.matches[0].linkedin_profile).toBe('jerry-x');
+    expect(b.matches[0].linkedin_profile).toBe('https://www.linkedin.com/in/jerry-x');
+  });
+
+  it('default fields are id, name, current_title, linkedin_profile only', async () => {
+    await insert(1, 'A', { body: { current_title: 'CTO', linkedin_profile: 'a-slug', primary_email: 'a@x.com' } });
+    const r = await call({ consultantFirstName: 'Joel', query: 'A' });
+    const body = await r.json();
+    const m = body.matches[0];
+    expect(Object.keys(m).filter((k) => k !== 'score').sort()).toEqual(
+      ['current_title', 'id', 'linkedin_profile', 'name'],
+    );
+  });
+
+  it('LinkedIn returned as URL', async () => {
+    await insert(1, 'A', { body: { linkedin_profile: 'a-slug' } });
+    const r = await call({ consultantFirstName: 'Joel', query: 'A' });
+    const body = await r.json();
+    expect(body.matches[0].linkedin_profile).toBe('https://www.linkedin.com/in/a-slug');
+  });
+
+  it('fields extends defaults', async () => {
+    await insert(1, 'A', { body: { current_organization: 'Acme', linkedin_profile: 'a' } });
+    const r = await call({ consultantFirstName: 'Joel', query: 'A', fields: ['company'] });
+    const body = await r.json();
+    const m = body.matches[0];
+    expect(m.id).toBe(1);
+    expect(m.linkedin_profile).toBe('https://www.linkedin.com/in/a');
+    expect(m.current_organization).toBe('Acme');
+  });
+
+  it('job_id bypasses fuzzy resolver', async () => {
+    // Seed a job + a candidate linked to it via candidate_jobs.
+    await env.RF_MCP_CACHE.prepare(
+      `INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at)
+       VALUES (?, ?, ?, ?, 1, ?)`
+    ).bind(50, JSON.stringify({ id: 50, name: 'Sales' }), 'Sales', 'Acme', new Date().toISOString()).run();
+    await insert(1, 'A');
+    await env.RF_MCP_CACHE.prepare(
+      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_id, stage_name, stage_moved, added_to_job, added_to_job_by_id, disqualified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(1, 50, 1, 'Sourced', '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z', 100, 0).run();
+    const r = await call({ consultantFirstName: 'Joel', job_id: 50 });
+    const body = await r.json();
+    expect(body.matches.map((m) => m.id)).toEqual([1]);
+  });
+
+  it('owner_id bypasses fuzzy resolver', async () => {
+    await insert(1, 'A', { owner: 9999 });
+    const r = await call({ consultantFirstName: 'Joel', owner_id: 9999 });
+    const body = await r.json();
+    expect(body.matches.map((m) => m.id)).toContain(1);
+  });
+
+  it('_meta omitted on clean calls', async () => {
+    await insert(1, 'A');
+    const r = await call({ consultantFirstName: 'Joel', query: 'A' });
+    const body = await r.json();
+    expect(body._meta).toBeUndefined();
   });
 });

@@ -17,12 +17,13 @@
 
 import { jsonResponse } from './router.js';
 import { session } from './d1-read.js';
-import { resolveFields, project } from './projection.js';
+import { resolveFieldsWithDefaults } from './projection.js';
+import { projectWithLinkedIn } from './linkedin.js';
 import { getSnapshot } from './snapshot.js';
 import { scoreString, recencyBoost, normalize } from './fuzzy.js';
 import { resolveJob, resolveOwner, resolveStage, disambiguationPayload } from './resolvers.js';
 
-const DEFAULT_FIELDS = ['id', 'name'];
+const DEFAULT_FIELDS = ['id', 'name', 'current_title', 'linkedin_profile'];
 const FUZZY_THRESHOLD = 0.35;
 
 // In-memory custom-field option universes, version-checked against the
@@ -205,7 +206,11 @@ export async function handleCandidateSearch({ env, body }) {
   // or full RF user fuzzy match). Ambiguous → 200 disambiguation; not_found
   // on either is a 400 since the user gave a filter we couldn't apply.
   let jobId = null;
-  if (body.job != null) {
+  if (body.job_id != null) {
+    const id = Number(body.job_id);
+    if (!Number.isFinite(id)) return jsonResponse(400, { error: 'job_id must be numeric' });
+    jobId = id;
+  } else if (body.job != null) {
     // search itself emits {count:0, matches:[]} when the job has no candidates,
     // so a numeric id that doesn't appear in the jobs table is fine — the
     // join just returns zero rows.
@@ -219,7 +224,11 @@ export async function handleCandidateSearch({ env, body }) {
     jobId = r.value.id;
   }
   let ownerId = null;
-  if (body.owner != null) {
+  if (body.owner_id != null) {
+    const id = Number(body.owner_id);
+    if (!Number.isFinite(id)) return jsonResponse(400, { error: 'owner_id must be numeric' });
+    ownerId = id;
+  } else if (body.owner != null) {
     const r = await resolveOwner(env, body.owner);
     if (!r.ok) {
       if (r.reason === 'ambiguous') {
@@ -341,23 +350,11 @@ export async function handleCandidateSearch({ env, body }) {
     matches = matches.map((m) => ({ ...m, _body: byId.get(m.id) }));
   }
 
-  // Project + aggregate unresolved-field errors / alias notes (deduped).
-  const requested = body.fields ?? DEFAULT_FIELDS;
-  const errs = [];
-  const notesAgg = [];
   const projected = matches.map((m) => {
     const c = JSON.parse(m._body || '{}');
-    const { paths, errors, notes } = resolveFields(requested, c, c);
-    for (const e of errors) if (!errs.includes(e)) errs.push(e);
-    for (const n of notes) if (!notesAgg.includes(n)) notesAgg.push(n);
-    return { ...project(c, paths), score: m.score };
+    const { paths } = resolveFieldsWithDefaults(body.fields, DEFAULT_FIELDS, c, c);
+    return { ...projectWithLinkedIn(c, paths), score: m.score };
   });
 
-  const response = { count: projected.length, matches: projected };
-  if (errs.length || notesAgg.length) {
-    response._meta = {};
-    if (errs.length) response._meta.unresolved_fields = errs;
-    if (notesAgg.length) response._meta.notes = notesAgg;
-  }
-  return jsonResponse(200, response);
+  return jsonResponse(200, { count: projected.length, matches: projected });
 }
