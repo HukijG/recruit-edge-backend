@@ -47,7 +47,7 @@ describe('/mcp/candidate-get', () => {
     const r = await call({ consultantFirstName: 'Joel', id: 42, fields: ['name', 'linkedin', 'company'] });
     const body = await r.json();
     expect(body.candidate.name).toBe('Jerry Smith');
-    expect(body.candidate.linkedin_profile).toBe('jerry-smith');
+    expect(body.candidate.linkedin_profile).toBe('https://www.linkedin.com/in/jerry-smith');
   });
 
   it('returns 400 if neither id nor query provided', async () => {
@@ -86,5 +86,36 @@ describe('/mcp/candidate-get', () => {
   it('fuzzy query with no matches returns 404', async () => {
     const r = await call({ consultantFirstName: 'Joel', query: 'zzzzzzzzzz' });
     expect(r.status).toBe(404);
+  });
+
+  it('returns LinkedIn as a full URL', async () => {
+    const r = await call({ consultantFirstName: 'Joel', id: 42 });
+    const body = await r.json();
+    expect(body.candidate.linkedin_profile).toBe('https://www.linkedin.com/in/jerry-smith');
+  });
+
+  it('fields extends defaults — does not replace them', async () => {
+    const r = await call({ consultantFirstName: 'Joel', id: 42, fields: ['title'] });
+    const body = await r.json();
+    // Defaults still present:
+    expect(body.candidate.id).toBe(42);
+    expect(body.candidate.primary_email).toBe('jerry@x.com');
+    expect(body.candidate.linkedin_profile).toBe('https://www.linkedin.com/in/jerry-smith');
+  });
+
+  it('_meta absent on a clean call', async () => {
+    const r = await call({ consultantFirstName: 'Joel', id: 42 });
+    const body = await r.json();
+    expect(body._meta).toBeUndefined();
+  });
+
+  it('default rich set includes current_organization + linkedin_profile', async () => {
+    // Seeded candidate has linkedin_profile and a job's client_company_name but
+    // not a top-level current_organization. Confirm linkedin_profile (URL) is
+    // returned by default, and the new field set doesn't crash if
+    // current_organization is missing.
+    const r = await call({ consultantFirstName: 'Joel', id: 42 });
+    const body = await r.json();
+    expect(body.candidate.linkedin_profile).toBe('https://www.linkedin.com/in/jerry-smith');
   });
 });
