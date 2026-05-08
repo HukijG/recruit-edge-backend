@@ -1,272 +1,180 @@
 /**
- * /mcp/job-pipeline — pre-shaped pipeline view for one job, KV-first.
+ * /mcp/job-pipeline — pipeline view for one job, sourced from `job_pipelines`.
  *
- * The sync-worker rebuilds `mcp:pipeline:{jobId}` snapshots in KV every tick
- * (see sync-worker/src/snapshots.js).  This handler reads that snapshot
- * directly when present and falls back to a live D1 build on cache miss
- * (writing the result back to KV with a 1h TTL — the next scheduled rebuild
- * will overwrite well before that fires).
+ * Reads RF's canonical `summary[]` (verbatim) and per-stage active-candidate
+ * IDs from the `job_pipelines` row that the sync-worker rebuilds every 15
+ * min. Hydrates candidate detail with one batched SELECT against the
+ * `candidates` table.
  *
- * Filtering options (mutually applied):
- *   - `stage`         — narrow to a single stage by name (fuzzy-resolved
- *                       against the snapshot's populated stage names;
- *                       ambiguous → 200 envelope, not_found → falls through
- *                       to literal exact-match → empty stages)
- *   - `from` / `to`   — fuzzy-resolved against THIS JOB'S pipeline (the
- *                       `pipeline_stages` array carried on the snapshot,
- *                       which is whatever stages RF defined for that job).
- *                       `from: "Replied"` means "Replied → end of pipeline",
- *                       `to: "1st"` means "start → 1st Interview". Combined:
- *                       custom range. Ambiguous → 200 envelope.
- *   - `submitted`     — explicit shortcut: "CV Sent → end" on this job's
- *                       pipeline (whatever the last stage actually is).
+ * Filtering precedence:
+ *   1. `stage`                — single-stage exact match (fuzzy fallback);
+ *                               ambiguity → 200 disambiguation.
+ *   2. `from` / `to`          — exact match on either bound (fuzzy fallback);
+ *                               output range = summary[fromIdx..toIdx].
+ *   3. `submitted: true` OR no filters — exact match on "CV Sent" (no fuzzy);
+ *                               on miss, return the full pipeline + warning.
  *
- * Default (none of the above set): CV Sent → Offer on this job's pipeline,
- * if both names resolve. Falls back to "show everything" if either doesn't
- * — a job with a non-standard pipeline isn't going to be silently filtered.
- * Recruiters glancing at a job typically want the actively-progressing
- * window; Sourced / Replied are usually noise. To see them anyway, pass
- * `from: "Sourced"` (or any earlier stage), or `stage: "Sourced"` for that
- * single stage.
+ * Disqualified stage excluded from output unless `include_disqualified: true`.
  *
- * Per-job pipelines: there is NO global canonical stage list. Each job in
- * RF can define its own pipeline (custom stages, screening loops, etc.).
- * The `pipeline_stages` array on the snapshot is the source of truth — both
- * range filters and `submitted` resolve their landmark stages ("CV Sent",
- * "Offer", "Hired") against it via the same fuzzy resolver Claude uses.
- *
- * Field projection follows the same alias-driven path as /mcp/candidate-search;
- * unresolved fields surface in `_meta.unresolved_fields`.
+ * Cold cache (no job_pipelines row): 200 with empty payload + warning. The
+ * next 15-min tick will populate it. Main worker does not trigger an
+ * out-of-band rebuild — that would break the writer-isolation invariant.
  */
 
 import { jsonResponse } from './router.js';
 import { session } from './d1-read.js';
-import { resolveFields, project } from './projection.js';
+import { resolveFieldsWithDefaults } from './projection.js';
+import { projectWithLinkedIn } from './linkedin.js';
 import { resolveJob, resolveStage, disambiguationPayload } from './resolvers.js';
 
-const DEFAULT_FIELDS = ['id', 'name', 'stage_moved'];
+const DEFAULT_FIELDS = ['id', 'name', 'linkedin_profile'];
+const SUBMITTED_LANDMARK = 'CV Sent';
 
-// Landmark stage names used by the range-filter defaults / submitted shortcut.
-// These are matched fuzzily against THIS JOB'S pipeline_stages — they're the
-// names recruiters use, not a hardcoded global list. If a job's pipeline
-// doesn't include a "CV Sent" stage at all, the default range falls back to
-// the whole pipeline (rather than silently filtering to nothing).
-const LANDMARK_DEFAULT_FROM = 'CV Sent';
-const LANDMARK_DEFAULT_TO = 'Offer';
-const LANDMARK_SUBMITTED_FROM = 'CV Sent';
+async function loadJobMeta(env, jobId) {
+  return session(env)
+    .prepare('SELECT id, name, client_company_name FROM jobs WHERE id = ?')
+    .bind(jobId)
+    .first();
+}
+
+async function loadPipelineRow(env, jobId) {
+  return session(env)
+    .prepare('SELECT summary_json, stage_candidates_json FROM job_pipelines WHERE job_id = ?')
+    .bind(jobId)
+    .first();
+}
 
 /**
- * Resolve a stage name to its index in this job's pipeline. Wraps the
- * standard resolveStage so ambiguity surfaces as `{ ambiguous }` for the
- * caller to short-circuit; not_found surfaces as `{ idx: -1 }` so callers
- * can decide whether to fall back (defaults) or treat it as an error
- * (explicit `from`/`to` from the user — we'd rather just leave the bound
- * open than fail the call).
+ * Find a stage's index in summary[] by exact name first, then fuzzy. Returns
+ * `{ idx, ambiguous? }` — caller short-circuits on ambiguous.
  */
-function resolveStageIdx(input, pipelineStages) {
-  const list = pipelineStages.map((s, id) => ({ id, name: s.name }));
-  const r = resolveStage(input, list);
-  if (!r.ok && r.reason === 'ambiguous') return { ambiguous: r };
-  if (r.ok) return { idx: r.value.id };
+function locateStageInSummary(stageName, summary) {
+  const exact = summary.findIndex((s) => s.name === stageName);
+  if (exact >= 0) return { idx: exact };
+  const r = resolveStage(stageName, summary.map((s) => ({ id: s.name, name: s.name })));
+  if (!r.ok && r.reason === 'ambiguous') return { idx: -1, ambiguous: r };
+  if (r.ok) return { idx: summary.findIndex((s) => s.name === r.value.name) };
   return { idx: -1 };
 }
 
 /**
- * Build the [fromIdx, toIdx] index pair into the job's pipeline_stages.
- * Returns `{ ok: true, range }` on success, `{ ok: false, ambiguous }`
- * when from/to fuzzy-resolves ambiguously (caller emits the standard
- * envelope).
+ * Pick the stages for the response based on body filters.
+ * Returns either { stages, warnings } on success or { ambiguous } when a
+ * fuzzy-resolved stage is too ambiguous.
  */
-function resolveStageRange(body, pipelineStages) {
-  const lastIdx = pipelineStages.length - 1;
+function selectStages(body, summary) {
+  const warnings = [];
 
-  if (body.submitted) {
-    const r = resolveStageIdx(LANDMARK_SUBMITTED_FROM, pipelineStages);
-    if (r.ambiguous) return { ok: false, ambiguous: r.ambiguous };
-    return { ok: true, range: [r.idx >= 0 ? r.idx : 0, lastIdx] };
+  // Single-stage filter.
+  if (body.stage) {
+    const r = locateStageInSummary(body.stage, summary);
+    if (r.ambiguous) return { ambiguous: r.ambiguous };
+    if (r.idx < 0) return { stages: [], warnings: [`unknown stage "${body.stage}" — empty result`] };
+    return { stages: [summary[r.idx]], warnings };
   }
 
-  let fromIdx;
-  let toIdx;
+  // Range filter via from/to.
   if (body.from || body.to) {
-    fromIdx = 0;
-    toIdx = lastIdx;
+    let fromIdx = 0;
+    let toIdx = summary.length - 1;
     if (body.from) {
-      const r = resolveStageIdx(body.from, pipelineStages);
-      if (r.ambiguous) return { ok: false, ambiguous: r.ambiguous };
+      const r = locateStageInSummary(body.from, summary);
+      if (r.ambiguous) return { ambiguous: r.ambiguous };
       if (r.idx >= 0) fromIdx = r.idx;
+      else warnings.push(`unknown 'from' stage "${body.from}" — defaulting to start of pipeline`);
     }
     if (body.to) {
-      const r = resolveStageIdx(body.to, pipelineStages);
-      if (r.ambiguous) return { ok: false, ambiguous: r.ambiguous };
+      const r = locateStageInSummary(body.to, summary);
+      if (r.ambiguous) return { ambiguous: r.ambiguous };
       if (r.idx >= 0) toIdx = r.idx;
+      else warnings.push(`unknown 'to' stage "${body.to}" — defaulting to end of pipeline`);
     }
-  } else {
-    // Default: CV Sent → Offer, fuzzily against this job's pipeline.
-    // If a landmark isn't present in the pipeline (custom stage names),
-    // fall back to the open end — better to over-include than silently
-    // hide a job's actual stages.
-    const fromR = resolveStageIdx(LANDMARK_DEFAULT_FROM, pipelineStages);
-    if (fromR.ambiguous) return { ok: false, ambiguous: fromR.ambiguous };
-    const toR = resolveStageIdx(LANDMARK_DEFAULT_TO, pipelineStages);
-    if (toR.ambiguous) return { ok: false, ambiguous: toR.ambiguous };
-    fromIdx = fromR.idx >= 0 ? fromR.idx : 0;
-    toIdx = toR.idx >= 0 ? toR.idx : lastIdx;
-  }
-  return { ok: true, range: [fromIdx, toIdx] };
-}
-
-/**
- * Live-build the pipeline snapshot from D1 when KV misses.  Mirrors the shape
- * sync-worker writes to `mcp:pipeline:{jobId}` — including the per-job
- * `pipeline_stages` array, extracted from any candidate's `body.jobs[k].stages`.
- * Returns null if the job_id is unknown so the caller can return 404.
- */
-async function buildPipelineFromD1(env, jobId) {
-  const meta = await session(env)
-    .prepare('SELECT id, name, client_company_name FROM jobs WHERE id = ?')
-    .bind(jobId)
-    .first();
-  if (!meta) return null;
-
-  const { results } = await session(env)
-    .prepare(
-      `SELECT cj.candidate_id AS id, c.name, c.body, cj.stage_name, cj.stage_moved
-       FROM candidate_jobs cj
-       JOIN candidates c ON c.id = cj.candidate_id
-       WHERE cj.job_id = ? AND cj.disqualified = 0
-       ORDER BY cj.stage_name, c.name`,
-    )
-    .bind(jobId)
-    .all();
-
-  let pipelineStages = [];
-  const stages = new Map();
-  for (const r of results ?? []) {
-    if (!stages.has(r.stage_name)) stages.set(r.stage_name, []);
-    const body = JSON.parse(r.body || '{}');
-    if (pipelineStages.length === 0) {
-      const link = (body.jobs ?? []).find((j) => Number(j.job_id) === Number(jobId));
-      if (Array.isArray(link?.stages) && link.stages.length > 0) {
-        pipelineStages = link.stages.map((s) => ({ id: s.id, name: s.name }));
-      }
-    }
-    stages.get(r.stage_name).push({
-      id: r.id,
-      name: r.name,
-      stage_moved: r.stage_moved,
-      ...body,
-    });
+    return { stages: summary.slice(fromIdx, toIdx + 1), warnings };
   }
 
-  return {
-    job: {
-      id: meta.id,
-      name: meta.name,
-      client_company_name: meta.client_company_name,
-    },
-    pipeline_stages: pipelineStages,
-    stages: [...stages.entries()].map(([stage_name, candidates]) => ({
-      stage_name,
-      count: candidates.length,
-      candidates,
-    })),
-  };
+  // Default + submitted: exact "CV Sent" → end of pipeline.
+  const cvSentIdx = summary.findIndex((s) => s.name === SUBMITTED_LANDMARK);
+  if (cvSentIdx < 0) {
+    warnings.push(`job pipeline has no '${SUBMITTED_LANDMARK}' stage — returning full pipeline`);
+    return { stages: summary.slice(), warnings };
+  }
+  return { stages: summary.slice(cvSentIdx), warnings };
 }
 
 export async function handleJobPipeline({ env, body }) {
-  if (body.job == null) {
-    return jsonResponse(400, { error: 'job is required' });
-  }
-  // Resolve `job` — number, digit-string, or fuzzy name. Numeric inputs
-  // skip the jobs-table validation: the KV snapshot may exist before the
-  // sync-worker has rebuilt the jobs row, and the D1 fallback below
-  // returns its own 404 when both KV and the jobs row are missing.
-  const jobRes = await resolveJob(env, body.job, { validateNumeric: false });
-  if (!jobRes.ok) {
-    if (jobRes.reason === 'ambiguous') {
-      return jsonResponse(200, disambiguationPayload(jobRes));
+  // Resolve job (id short-circuit if `job_id` present).
+  let jobMeta;
+  if (body.job_id != null) {
+    const id = Number(body.job_id);
+    if (!Number.isFinite(id)) return jsonResponse(400, { error: 'job_id must be numeric' });
+    jobMeta = await loadJobMeta(env, id);
+    if (!jobMeta) return jsonResponse(404, { error: 'unknown job', job_id: id });
+  } else if (body.job != null) {
+    const r = await resolveJob(env, body.job, { validateNumeric: true });
+    if (!r.ok) {
+      if (r.reason === 'ambiguous') return jsonResponse(200, disambiguationPayload(r));
+      return jsonResponse(404, { error: 'unknown job' });
     }
-    return jsonResponse(404, { error: 'unknown job' });
-  }
-  const jobId = jobRes.value.id;
-
-  // Try the pre-built KV snapshot first.
-  let snap = null;
-  const cached = await env.SYNC_STATE.get(`mcp:pipeline:${jobId}`);
-  if (cached) snap = JSON.parse(cached);
-
-  // Cache miss → build from D1, write back so subsequent reads hit KV.
-  if (!snap) {
-    snap = await buildPipelineFromD1(env, jobId);
-    if (!snap) return jsonResponse(404, { error: 'unknown job' });
-    await env.SYNC_STATE.put(
-      `mcp:pipeline:${jobId}`,
-      JSON.stringify(snap),
-      { expirationTtl: 3600 },
-    );
-  }
-
-  // Filter pipeline.  Precedence:
-  //   1. `stage` (single-stage filter; fuzzy-resolved against the snapshot)
-  //   2. `from` / `to` / `submitted` (range filters; fuzzy-resolved against
-  //      the canonical PIPELINE_ORDER)
-  //   3. Default: CV Sent → Offer.
-  //
-  // `stage` and the range filters are mutually exclusive in spirit. When
-  // both are passed, `stage` wins (it's more specific) and the range
-  // filters are ignored — this matches the legacy behaviour for `submitted`.
-  let stages = snap.stages;
-  let stageFilter = body.stage;
-  if (body.stage && stages.length > 0) {
-    const resolvable = stages.map((s) => ({ id: s.stage_name, name: s.stage_name }));
-    const r = resolveStage(body.stage, resolvable);
-    if (!r.ok && r.reason === 'ambiguous') {
-      return jsonResponse(200, disambiguationPayload(r));
-    }
-    if (r.ok) stageFilter = r.value.name;
-    // not_found falls through to the literal exact-match below — keeps the
-    // pre-resolver behaviour for genuinely unknown stages (returns empty).
-  }
-  if (stageFilter) {
-    stages = stages.filter((s) => s.stage_name === stageFilter);
+    jobMeta = { id: r.value.id, name: r.value.name, client_company_name: r.value.client_company_name };
   } else {
-    // Range filter — resolved against THIS JOB'S pipeline (carried on the
-    // snapshot as `pipeline_stages`). When the snapshot pre-dates the
-    // pipeline_stages addition (legacy KV write still in flight), skip the
-    // range filter and return everything; the next sync tick will populate
-    // it and the default kicks in then.
-    const pipelineStages = Array.isArray(snap.pipeline_stages) ? snap.pipeline_stages : [];
-    if (pipelineStages.length > 0) {
-      const rangeRes = resolveStageRange(body, pipelineStages);
-      if (!rangeRes.ok) {
-        return jsonResponse(200, disambiguationPayload(rangeRes.ambiguous));
-      }
-      const [fromIdx, toIdx] = rangeRes.range;
-      const allowed = new Set(
-        pipelineStages.slice(fromIdx, toIdx + 1).map((s) => s.name),
-      );
-      stages = stages.filter((s) => allowed.has(s.stage_name));
-    }
+    return jsonResponse(400, { error: 'job or job_id is required' });
   }
 
-  // Resolve requested fields against a representative candidate so custom
-  // fields and aliases work the same as the candidate-search handler.
-  const requested = body.fields ?? DEFAULT_FIELDS;
-  const sample = stages[0]?.candidates?.[0] ?? {};
-  const { paths, errors, notes } = resolveFields(requested, sample, sample);
-
-  const projectedStages = stages.map((s) => ({
-    stage_name: s.stage_name,
-    count: s.count,
-    candidates: s.candidates.map((c) => project(c, paths)),
-  }));
-
-  const response = { job: snap.job, stages: projectedStages };
-  if (errors.length || notes.length) {
-    response._meta = {};
-    if (errors.length) response._meta.unresolved_fields = errors;
-    if (notes.length) response._meta.notes = notes;
+  // Read pipeline row.
+  const row = await loadPipelineRow(env, jobMeta.id);
+  if (!row) {
+    return jsonResponse(200, {
+      job: { id: jobMeta.id, name: jobMeta.name, client_company_name: jobMeta.client_company_name },
+      stage_breakdown: [],
+      stages: {},
+      _meta: { warnings: ['pipeline cache not yet built for this job — try again after the next 15-min sync tick'] },
+    });
   }
+  const summary = JSON.parse(row.summary_json);
+  const byStage = JSON.parse(row.stage_candidates_json);
+
+  // Pick stages.
+  const sel = selectStages(body, summary);
+  if (sel.ambiguous) return jsonResponse(200, disambiguationPayload(sel.ambiguous));
+  let selected = sel.stages;
+  const warnings = [...sel.warnings];
+
+  // DQ exclusion (default).
+  if (!body.include_disqualified) {
+    selected = selected.filter((s) => s.name !== 'Disqualified');
+  }
+
+  // Hydrate candidates: collect all ids in selected stages, single SELECT.
+  const allIds = selected.flatMap((s) => byStage[s.name] ?? []);
+  let bodyById = new Map();
+  if (allIds.length) {
+    const placeholders = allIds.map(() => '?').join(', ');
+    const { results } = await session(env)
+      .prepare(`SELECT id, body FROM candidates WHERE id IN (${placeholders})`)
+      .bind(...allIds)
+      .all();
+    bodyById = new Map((results ?? []).map((r) => [r.id, JSON.parse(r.body || '{}')]));
+  }
+
+  // Build per-stage projection.
+  const stages = {};
+  const stage_breakdown = selected.map((s) => {
+    const ids = byStage[s.name] ?? [];
+    stages[s.name] = ids
+      .map((id) => bodyById.get(id))
+      .filter(Boolean)
+      .map((c) => {
+        const { paths } = resolveFieldsWithDefaults(body.fields, DEFAULT_FIELDS, c, c);
+        return projectWithLinkedIn(c, paths);
+      });
+    return { stage_name: s.name, count: ids.length };
+  });
+
+  const response = {
+    job: { id: jobMeta.id, name: jobMeta.name, client_company_name: jobMeta.client_company_name },
+    stage_breakdown,
+    stages,
+  };
+  if (warnings.length) response._meta = { warnings };
   return jsonResponse(200, response);
 }
