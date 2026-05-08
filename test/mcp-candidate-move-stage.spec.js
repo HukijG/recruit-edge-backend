@@ -321,4 +321,51 @@ describe('/mcp/candidate-move-stage', () => {
     expect(await env.SYNC_STATE.get('mcp:pipeline:100')).toBeNull();
     expect(await env.SYNC_STATE.get('mcp:job-candidates:100')).toBeNull();
   });
+
+  it('candidate_id + job_id + stage_id = direct commit, no resolver', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const r = await call({ consultantFirstName: 'Joel', candidate_id: 42, job_id: 100, stage_id: 2 });
+    expect(r.status).toBe(200);
+    const body = await r.json();
+    expect(body.ok).toBe(true);
+    expect(body.moved.candidate_id).toBe(42);
+    expect(body.moved.to_stage).toBe('Replied');
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('candidate_id alone falls through to fuzzy job/stage path', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const r = await call({ consultantFirstName: 'Joel', candidate_id: 42, stage: 'replied' });
+    expect(r.status).toBe(200);
+    const body = await r.json();
+    expect(body.moved.to_stage).toBe('Replied');
+  });
+
+  it('candidate_id with non-existent id returns 404', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const r = await call({ consultantFirstName: 'Joel', candidate_id: 99999, job_id: 100, stage_id: 2 });
+    expect(r.status).toBe(404);
+  });
+
+  it('candidate_id + wrong job_id returns 404', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const r = await call({ consultantFirstName: 'Joel', candidate_id: 42, job_id: 999, stage_id: 2 });
+    expect(r.status).toBe(404);
+  });
+
+  it('candidate_id + job_id + bad stage_id returns 404', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const r = await call({ consultantFirstName: 'Joel', candidate_id: 42, job_id: 100, stage_id: 9999 });
+    expect(r.status).toBe(404);
+  });
 });
