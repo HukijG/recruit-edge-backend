@@ -224,3 +224,16 @@ export async function fetchCustomFieldSchema(env) {
     throw err;
   }
 }
+
+/**
+ * GET /job/pipeline?job_id=…
+ * RF returns { summary: [{id, name, count}, …], detail: [{candidate, stages: []}, …] }.
+ * `summary[]` is the canonical, ordered pipeline (includes 0-count stages and
+ * Disqualified). `detail[]` carries each candidate's full stage movement
+ * history — the most recent `stages[].time` `to` is their current stage.
+ *
+ * No pagination at this scale (largest job's detail[] is ~few hundred).
+ */
+export async function fetchJobPipeline(env, jobId) {
+  return rfGet(env, '/job/pipeline', { job_id: String(jobId) });
+}

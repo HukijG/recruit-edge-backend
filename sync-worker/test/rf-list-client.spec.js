@@ -3,6 +3,7 @@ import {
   fetchCandidate,
   fetchCandidatesUpdatedSince,
   fetchAllJobs,
+  fetchJobPipeline,
 } from '../src/rf-list-client.js';
 
 const env = { RF_API_KEY: 'test', RF_API_BASE_URL: 'https://api.recruiterflow.com/api/external' };
@@ -147,5 +148,22 @@ describe('rf-list-client', () => {
     const { ids } = await fetchCandidatesUpdatedSince(env, cursor);
     expect(ids).toEqual([1]);
     expect(global.fetch.mock.calls.length).toBe(2);
+  });
+
+  it('fetchJobPipeline GETs /job/pipeline?job_id=… and returns the parsed body', async () => {
+    const sample = {
+      summary: [{ id: 1, name: 'Sourced', count: 2 }],
+      detail: [
+        { candidate: { id: 100, name: 'A' }, stages: [{ from: null, time: '2026-05-01T00:00:00+0000', to: 'Sourced' }] },
+      ],
+    };
+    global.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(sample)));
+    const out = await fetchJobPipeline(env, 984);
+    expect(out).toEqual(sample);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    const [url, init] = global.fetch.mock.calls[0];
+    expect(url).toContain('/job/pipeline');
+    expect(url).toContain('job_id=984');
+    expect(init.headers['RF-Api-Key']).toBe('test');
   });
 });
