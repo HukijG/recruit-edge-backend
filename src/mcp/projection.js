@@ -485,6 +485,30 @@ export function project(obj, paths) {
 }
 
 /**
+ * Build a projection path list from defaults + caller-supplied extras.
+ * Defaults always present; extras append. Dedupe is by RESOLVED dot-path —
+ * so `name` and `who` (both → `name`) collapse to one path.
+ *
+ * Unknown / unresolvable extras are silently dropped — no `_meta` errors.
+ * That's the intentional contract change in the 2026-05-08 spec: callers
+ * never need to babysit field-name typos.
+ */
+export function resolveFieldsWithDefaults(requestedExtras, defaultFields, sample, candidate) {
+  const topKeys = Object.keys(sample);
+  const seen = new Set();
+  const paths = [];
+  const all = [...defaultFields, ...(requestedExtras ?? [])];
+  for (const f of all) {
+    const r = resolveFieldName(f, topKeys, candidate);
+    if (!('path' in r)) continue;  // unresolvable → silent drop
+    if (seen.has(r.path)) continue;
+    seen.add(r.path);
+    paths.push(r.path);
+  }
+  return { paths };
+}
+
+/**
  * Resolve a batch of user field names against an object, returning canonical
  * paths (for use with `project`) plus any errors / alias mappings.
  * If `candidate` is passed (the actual target), custom-field names are in scope.

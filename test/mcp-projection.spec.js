@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolveFieldName, resolveFields, project, getPath } from '../src/mcp/projection.js';
+import { resolveFieldName, resolveFields, project, getPath, resolveFieldsWithDefaults } from '../src/mcp/projection.js';
 
 const sample = {
   id: 1, name: 'X', primary_email: 'x@y.com',
@@ -33,5 +33,38 @@ describe('projection', () => {
   });
   it('getPath supports * wildcard for arrays', () => {
     expect(getPath(sample, 'jobs.*.stage_name')).toEqual(['Sourced']);
+  });
+});
+
+describe('resolveFieldsWithDefaults', () => {
+  it('returns defaults when extras is empty/undefined', () => {
+    const r = resolveFieldsWithDefaults(undefined, ['id', 'name'], sample, sample);
+    expect(r.paths).toEqual(['id', 'name']);
+  });
+
+  it('extends defaults with extras', () => {
+    const r = resolveFieldsWithDefaults(['linkedin'], ['id', 'name'], sample, sample);
+    expect(r.paths).toEqual(['id', 'name', 'linkedin_profile']);
+  });
+
+  it('dedupes by resolved path (extras request a default)', () => {
+    const r = resolveFieldsWithDefaults(['name', 'who'], ['id', 'name'], sample, sample);
+    // 'who' aliases to 'name' — both collapse to one path.
+    expect(r.paths).toEqual(['id', 'name']);
+  });
+
+  it('drops unknown field names silently', () => {
+    const r = resolveFieldsWithDefaults(['totally_unknown_xyz'], ['id', 'name'], sample, sample);
+    expect(r.paths).toEqual(['id', 'name']);
+  });
+
+  it('preserves default order and appends extras after', () => {
+    const r = resolveFieldsWithDefaults(['linkedin'], ['name', 'id'], sample, sample);
+    expect(r.paths).toEqual(['name', 'id', 'linkedin_profile']);
+  });
+
+  it('resolves alias on extras (company → current_organization)', () => {
+    const r = resolveFieldsWithDefaults(['company'], ['id'], sample, sample);
+    expect(r.paths).toEqual(['id', 'current_organization']);
   });
 });
