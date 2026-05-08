@@ -23,6 +23,11 @@
       "binding": "REBUILD_WORKFLOW",
       "name": "rf-mcp-rebuild",
       "class_name": "FullRebuildWorkflow"
+    },
+    {
+      "binding": "PIPELINE_REBUILD_WORKFLOW",
+      "name": "rf-mcp-pipeline-rebuild",
+      "class_name": "PipelineRebuildWorkflow"
     }
   ],
   "triggers": { "crons": ["*/15 * * * *"] },

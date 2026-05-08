@@ -102,7 +102,15 @@ export async function tailSync(env) {
 
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(tailSync(env));
+    ctx.waitUntil((async () => {
+      await tailSync(env);
+      if (env.PIPELINE_REBUILD_WORKFLOW?.create) {
+        await env.PIPELINE_REBUILD_WORKFLOW.create({
+          id: crypto.randomUUID(),
+          params: { startedAt: new Date().toISOString() },
+        });
+      }
+    })());
   },
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -112,3 +120,4 @@ export default {
 };
 
 export { FullRebuildWorkflow } from './workflow.js';
+export { PipelineRebuildWorkflow } from './pipeline-workflow.js';

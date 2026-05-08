@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:test';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { applyMigration } from './helpers/migrate.js';
-import { tailSync } from '../src/sync-worker.js';
+import worker, { tailSync } from '../src/sync-worker.js';
 import * as rfClient from '../src/rf-list-client.js';
 import * as snapshots from '../src/snapshots.js';
 import { readSyncState, writeSyncState } from '../src/sync-state.js';
@@ -127,5 +127,22 @@ describe('tailSync', () => {
     expect(await readSyncState(env, 'in_flight')).toBeNull();
     // cursor not advanced — still at the prior value
     expect(await readSyncState(env, 'last_tail_sync_at')).toBe('2026-05-01T00:00:00Z');
+  });
+});
+
+describe('scheduled() triggers PipelineRebuildWorkflow after tailSync', () => {
+  it('calls PIPELINE_REBUILD_WORKFLOW.create after tailSync completes', async () => {
+    vi.spyOn(rfClient, 'fetchCandidatesUpdatedSince').mockResolvedValue({ ids: [], suggestedCursor: '2026-05-08T00:00:00Z' });
+    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
+    const create = vi.fn().mockResolvedValue({ id: 'wf-1' });
+    const testEnv = {
+      ...env,
+      PIPELINE_REBUILD_WORKFLOW: { create },
+    };
+    let waitUntilPromise;
+    const ctx = { waitUntil: (p) => { waitUntilPromise = p; } };
+    await worker.scheduled({}, testEnv, ctx);
+    await waitUntilPromise;
+    expect(create).toHaveBeenCalledTimes(1);
   });
 });
