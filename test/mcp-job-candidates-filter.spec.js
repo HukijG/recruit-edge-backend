@@ -175,6 +175,14 @@ describe('/mcp/job-candidates-filter', () => {
     expect(body.job.id).toBe(100);
   });
 
+  it('returns top-level job block with id, name, client_company_name', async () => {
+    await insertJob(100, 'Eng Lead', 'Acme.io');
+    await insertPipeline(100, [{ id: 1, name: 'Sourced', count: 0 }], { Sourced: [] });
+    const r = await call({ job: 100 });
+    const body = await r.json();
+    expect(body.job).toEqual({ id: 100, name: 'Eng Lead', client_company_name: 'Acme.io' });
+  });
+
   it('fields extends defaults', async () => {
     await insertJob(100);
     await insertCandidate(1, 'A', { linkedin_profile: 'a', current_organization: 'Acme' });

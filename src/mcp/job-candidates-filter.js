@@ -20,7 +20,7 @@ export async function handleJobCandidatesFilter({ env, body }) {
   if (body.job_id != null) {
     const id = Number(body.job_id);
     if (!Number.isFinite(id)) return jsonResponse(400, { error: 'job_id must be numeric' });
-    jobMeta = await session(env).prepare('SELECT id, name FROM jobs WHERE id = ?').bind(id).first();
+    jobMeta = await session(env).prepare('SELECT id, name, client_company_name FROM jobs WHERE id = ?').bind(id).first();
     if (!jobMeta) return jsonResponse(404, { error: 'unknown job', job_id: id });
   } else if (body.job != null) {
     const r = await resolveJob(env, body.job, { validateNumeric: true });
@@ -28,7 +28,7 @@ export async function handleJobCandidatesFilter({ env, body }) {
       if (r.reason === 'ambiguous') return jsonResponse(200, disambiguationPayload(r));
       return jsonResponse(404, { error: 'unknown job' });
     }
-    jobMeta = { id: r.value.id, name: r.value.name };
+    jobMeta = { id: r.value.id, name: r.value.name, client_company_name: r.value.client_company_name };
   } else {
     return jsonResponse(400, { error: 'job or job_id is required' });
   }
