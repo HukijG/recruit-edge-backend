@@ -139,3 +139,22 @@ export async function writeJobs(env, jobs) {
     await env.RF_MCP_CACHE.batch(stmts.slice(i, i + D1_BATCH_CAP));
   }
 }
+
+const JP_COLS = ['job_id', 'summary_json', 'stage_candidates_json', 'fetched_at'];
+const JP_INSERT_SQL = `INSERT OR REPLACE INTO job_pipelines (${JP_COLS.join(', ')}) VALUES (?, ?, ?, ?)`;
+
+/**
+ * Upsert one job's pipeline cache row.
+ *
+ * @param {object} env
+ * @param {number} jobId
+ * @param {Array} summary - RF /job/pipeline summary[] verbatim
+ * @param {Object<string, number[]>} stageCandidates - per-stage active-candidate ids (DQ excluded)
+ */
+export async function writeJobPipeline(env, jobId, summary, stageCandidates) {
+  const now = new Date().toISOString();
+  await env.RF_MCP_CACHE
+    .prepare(JP_INSERT_SQL)
+    .bind(jobId, JSON.stringify(summary ?? []), JSON.stringify(stageCandidates ?? {}), now)
+    .run();
+}

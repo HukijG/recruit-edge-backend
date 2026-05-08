@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:test';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { applyMigration } from './helpers/migrate.js';
-import { writeCandidatesAndLinks, writeJobs } from '../src/d1-write.js';
+import { writeCandidatesAndLinks, writeJobs, writeJobPipeline } from '../src/d1-write.js';
 
 beforeEach(async () => {
   await applyMigration(env.RF_MCP_CACHE);
@@ -168,5 +168,29 @@ describe('d1-write', () => {
       .prepare('SELECT COUNT(*) AS n FROM candidates')
       .all();
     expect(results[0].n).toBe(0);
+  });
+});
+
+describe('writeJobPipeline', () => {
+  it('inserts a new row', async () => {
+    await writeJobPipeline(env, 984, [{ id: 1, name: 'Sourced', count: 5 }], { Sourced: [10, 11] });
+    const row = await env.RF_MCP_CACHE
+      .prepare('SELECT job_id, summary_json, stage_candidates_json FROM job_pipelines WHERE job_id = ?')
+      .bind(984)
+      .first();
+    expect(row.job_id).toBe(984);
+    expect(JSON.parse(row.summary_json)).toEqual([{ id: 1, name: 'Sourced', count: 5 }]);
+    expect(JSON.parse(row.stage_candidates_json)).toEqual({ Sourced: [10, 11] });
+  });
+
+  it('replaces an existing row', async () => {
+    await writeJobPipeline(env, 984, [{ id: 1, name: 'A', count: 1 }], { A: [1] });
+    await writeJobPipeline(env, 984, [{ id: 1, name: 'B', count: 0 }], { B: [] });
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT * FROM job_pipelines WHERE job_id = ?')
+      .bind(984)
+      .all();
+    expect(results.length).toBe(1);
+    expect(JSON.parse(results[0].summary_json)).toEqual([{ id: 1, name: 'B', count: 0 }]);
   });
 });
