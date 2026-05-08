@@ -59,13 +59,13 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
 {
   "count": 3,
   "matches": [
-    { "id": 49243, "name": "Jane Doe", "score": 0.93 },
-    { "id": 50300, "name": "Kevin Park",  "score": 0.91 }
+    { "id": 49243, "name": "Jane Doe", "current_title": "Account Executive", "linkedin_profile": "https://www.linkedin.com/in/jane-doe", "score": 0.93 },
+    { "id": 50300, "name": "Kevin Park",  "current_title": "CSM", "linkedin_profile": "https://www.linkedin.com/in/kevin-park", "score": 0.91 }
   ]
 }
 ```
 
-`score` is included on fuzzy/scored matches (always present when `query` is set). With `fields`, results include the projected fields too.
+Default fields: `id, name, current_title, linkedin_profile`. `score` is included on fuzzy/scored matches (always present when `query` is set). `fields` extends these defaults — does not replace them.
 
 **Disambiguation:** never blocks — top-K matches are always returned. Caller decides how to disambiguate.
 
@@ -90,10 +90,14 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
 {
   "candidate": {
     "id": 51507,
+    "name": "Marcus Delgado",
     "first_name": "Eric",
     "last_name": "Stagnaro",
     "primary_email": null,
     "phone_numbers": ["+16105550188"],
+    "current_title": "Senior Account Executive - SAP Taulia",
+    "current_organization": "SAP Taulia",
+    "linkedin_profile": "https://www.linkedin.com/in/marcusdelgado",
     "jobs": [
       { "client_company_name": "Nominal", "job_name": "Enterprise AE - NYC", "stage_name": "Sourced" }
     ]
@@ -101,25 +105,26 @@ Everything else (caching, fuzzy resolution, projection, RF API, snapshot rebuild
 }
 ```
 
-**With `fields`:**
+**With `fields` (e.g. `fields: ["salary"]`):**
 ```json
 {
   "candidate": {
+    "id": 51507,
     "name": "Marcus Delgado",
-    "linkedin_profile": "marcusdelgado",
+    "first_name": "Eric",
+    "last_name": "Stagnaro",
+    "primary_email": null,
+    "phone_numbers": ["+16105550188"],
+    "current_title": "Senior Account Executive - SAP Taulia",
     "current_organization": "SAP Taulia",
-    "current_title": "Senior Account Executive - SAP Taulia"
-  },
-  "_meta": {
-    "notes": [
-      "\"linkedin\" → linkedin_profile",
-      "\"company\" → current_organization",
-      "\"title\" → current_title",
-      "\"email\" → primary_email"
-    ]
+    "linkedin_profile": "https://www.linkedin.com/in/marcusdelgado",
+    "jobs": [...],
+    "custom_fields_by_name": { "expected compensation": { "value": "£90k" } }
   }
 }
 ```
+
+`fields` extends the defaults — unknown names are dropped silently. No `_meta.notes` or `_meta.unresolved_fields` — alias resolution is transparent.
 
 **Errors:**
 - `400` — missing both `id` and `query`
@@ -240,7 +245,7 @@ All three references are fuzzy-resolvable. Resolution runs sequentially and shor
 
 ### `POST /mcp/job-pipeline`
 
-**Purpose:** Pipeline view for one job, candidates grouped by stage. **KV-cached** (sync rebuilds every 15 min) — fast.
+**Purpose:** Pipeline view for one job, candidates grouped by stage. **D1-backed** (sync rebuilds every 15 min via `PipelineRebuildWorkflow`) — fast.
 
 **Body:**
 ```json
@@ -263,29 +268,35 @@ Ambiguous job names return the standard `needs_disambiguation: true, kind: "job"
 **Default response:**
 ```json
 {
-  "job": { "id": 999, "name": "Enterprise AE - NYC", "client_company_name": "Nominal" },
-  "stages": [
-    {
-      "stage_name": "CV Sent",
-      "count": 12,
-      "candidates": [
-        { "id": 5000, "name": "Steve Carlson", "stage_moved": "2026-05-07T16:56:51+0000" }
-      ]
-    },
-    { "stage_name": "1st Interview", "count": 4, "candidates": [...] }
-  ]
+  "job": { "id": 984, "name": "Sales Engineer", "client_company_name": "Eon.io" },
+  "stage_breakdown": [
+    { "stage_name": "CV Sent", "count": 1 },
+    { "stage_name": "1st Interview", "count": 0 },
+    { "stage_name": "Final Interview", "count": 0 },
+    { "stage_name": "Offer", "count": 0 },
+    { "stage_name": "Hired", "count": 0 }
+  ],
+  "stages": {
+    "CV Sent":         [{ "id": 50976, "name": "Greg Hansen", "linkedin_profile": "https://www.linkedin.com/in/greg-hansen" }],
+    "1st Interview":   [],
+    "Final Interview": [],
+    "Offer":           [],
+    "Hired":           []
+  }
 }
 ```
 
-`fields` extends each candidate object — see "Fields" below.
+`stage_breakdown` is an ordered array (canonical pipeline order, restricted to the requested window). `stages` is a map keyed by stage name; iteration order follows `stage_breakdown`. Empty buckets included for every stage in the window, so consumers see the full shape.
 
-**Errors:** `400` (job not numeric), `404` (unknown job).
+Per-candidate defaults: `id, name, linkedin_profile`. `fields` extends these defaults.
+
+**Errors:** `400` (missing job reference), `404` (unknown job). Cold-cache (job just opened, pipeline not yet built): `200` with empty `stage_breakdown` and `stages` plus `_meta.warnings`.
 
 ---
 
 ### `POST /mcp/job-candidates-filter`
 
-**Purpose:** Flat candidate list for one job (vs. `job-pipeline` which groups by stage). Same KV-cached path.
+**Purpose:** Flat candidate list for one job (vs. `job-pipeline` which groups by stage). Same D1-backed path.
 
 **Body:**
 ```json
@@ -303,15 +314,15 @@ Ambiguous job names return `needs_disambiguation` (kind: "job").
 **Default response:**
 ```json
 {
-  "job": { "id": 999, "name": "Enterprise AE - NYC" },
+  "job": { "id": 999, "name": "Enterprise AE - NYC", "client_company_name": "Nominal" },
   "total": 70,
   "matched": [
-    { "id": 5000, "name": "Steve Carlson", "stage_name": "Sourced" }
+    { "id": 5000, "name": "Steve Carlson", "linkedin_profile": "https://www.linkedin.com/in/steve-carlson", "stage_name": "Sourced" }
   ]
 }
 ```
 
-`truncated: true` is added if `total > limit`.
+Per-candidate defaults: `id, name, linkedin_profile`. `stage_name` always included (it's the bucket key context). `truncated: true` is added if `total > limit`.
 
 ---
 
@@ -365,19 +376,34 @@ The `fields` array on every read endpoint accepts **any reasonable English-ish n
 | `tech stack` | `custom_fields_by_name.tech stack.value` |
 | `industry` / `vertical` | `custom_fields_by_name.sells to (industry).value` |
 
-**Unresolvable names don't fail the call** — they're dropped silently and listed in `_meta.unresolved_fields`. Successful aliases are listed in `_meta.notes` for transparency.
+**Unresolvable names don't fail the call** — they're dropped silently. No `_meta.unresolved_fields` or `_meta.notes` are emitted. Alias resolution is transparent.
 
-```json
-{
-  "matches": [...],
-  "_meta": {
-    "unresolved_fields": ["totally_made_up_field"],
-    "notes": ["\"linkedin\" → linkedin_profile"]
-  }
-}
-```
+`_meta` is only present when the response carries warnings: `{ "_meta": { "warnings": ["..."] } }`. Warnings are brief strings for cases where a request would otherwise silently succeed-but-not-as-expected (e.g. cold cache, missing landmark stage).
 
-The MCP tool definition presented to Claude should say something like *"`fields` accepts any reasonable name — `email`, `phone`, `linkedin`, `salary`, `tech stack`, `current company`, `stage`. Common defaults are returned without specifying."*
+The MCP tool definition presented to Claude should say something like *"`fields` accepts any reasonable name — `email`, `phone`, `linkedin`, `salary`, `tech stack`, `current company`, `stage`. Common defaults are returned without specifying. `fields` extends defaults, not replaces them."*
+
+---
+
+## LinkedIn URLs
+
+LinkedIn fields come back as full URLs (`https://www.linkedin.com/in/<slug>`) for any endpoint that returns candidate detail. D1 stores bare slugs; the URL prefix is added at output time. Pass-through for any value that's already a URL or doesn't match the slug shape.
+
+---
+
+## ID short-circuit / `*_id` body fields
+
+Every endpoint that accepts a candidate, job, stage, or owner reference also accepts a corresponding `*_id` body field for deterministic lookup. When present, the `*_id` field bypasses fuzzy resolution entirely — direct row lookup. The corresponding fuzzy-name field (`candidate`, `job`, etc.) is ignored when the ID is present.
+
+Use after a previous response surfaces an `id` to avoid re-resolving by name on follow-up turns.
+
+| Endpoint | Short-circuit fields |
+|---|---|
+| `/mcp/candidate-get` | existing `id` field (no change) |
+| `/mcp/candidate-search` | `job_id`, `owner_id` |
+| `/mcp/candidate-move-stage` | `candidate_id`, `job_id`, `stage_id` — when ALL THREE present, fast-path direct commit |
+| `/mcp/candidate-log-interview` | `candidate_id`, `job_id` |
+| `/mcp/job-pipeline` | `job_id` |
+| `/mcp/job-candidates-filter` | `job_id` |
 
 ---
 
@@ -462,9 +488,9 @@ GET /accounts/<acct>/workflows/rf-mcp-rebuild/instances/<id>
 
 Cron `*/15 * * * *` on `rf-mcp-cache-sync`. No action needed.
 
-### Snapshots
+### Pipeline cache
 
-Sync writes `mcp:pipeline:{jobId}` and `mcp:job-candidates:{jobId}` to KV every cron tick. Reads are KV-fetch + tiny projection. Miss-path falls back to D1.
+`PipelineRebuildWorkflow` runs every 15-min cron tick, fetching RF `/job/pipeline` for each open job and writing to the `job_pipelines` D1 table. The main worker reads from D1 — no KV snapshot layer for pipeline data.
 
 ---
 
@@ -472,7 +498,7 @@ Sync writes `mcp:pipeline:{jobId}` and `mcp:job-candidates:{jobId}` to KV every 
 
 - **Don't read the D1 binding directly.** The middleware hides D1 — the local MCP is just an HTTP forwarder.
 - **Don't do fuzzy resolution client-side.** The middleware's `fuzzy.js` is the source of truth. Pass `query` and let the server score.
-- **Don't keep its own caches.** The middleware is fast (KV reads ~10ms, D1 reads ~30ms). Local caching adds drift risk.
+- **Don't keep its own caches.** The middleware is fast (D1 reads ~30ms). Local caching adds drift risk.
 - **Don't translate field names.** Pass whatever Claude wrote; the server resolves aliases.
 - **Don't loop to handle pagination or rebuild orchestration.** `cache-status` and `/admin/full-rebuild` are the only operational surfaces; everything else is a single round-trip.
 
