@@ -2,6 +2,8 @@
 
 > Snapshot of the project state at hand-off. For the consumer-side API contract see `2026-05-07-consumer-side-reference.md`. For the design rationale see `docs/archive/specs/2026-05-07-mcp-middleware-design.md`. For the original brief see `2026-05-07-mcp-middleware-handover.md`.
 
+> **POST-BUILD UPDATE (2026-05-08) — parts of this snapshot are SUPERSEDED.** The 2026-05-08 rewrite replaced the KV pipeline snapshots (`mcp:pipeline:{jobId}` and `mcp:job-candidates:{jobId}`) and `sync-worker/src/snapshots.js` with a new `job_pipelines` D1 table populated by `PipelineRebuildWorkflow` from RF `/job/pipeline`. `_meta.notes` and `_meta.unresolved_fields` are gone — only `_meta.warnings` remains, and only when something genuinely warrants surfacing. `fields` is now additive (extends per-endpoint defaults, doesn't replace). Every endpoint accepts `*_id` body fields for deterministic ID short-circuit on follow-up turns. LinkedIn returned as full URL on output (D1 still stores bare slugs). For current state: `docs/mcp-middleware.md` and `2026-05-07-consumer-side-reference.md` (already updated). Design history: `docs/archive/specs/2026-05-08-mcp-defaults-and-pipeline.md`.
+
 **Status: live, deployed, verified.**
 
 ## What was built

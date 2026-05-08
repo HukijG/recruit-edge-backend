@@ -3,8 +3,10 @@
 Server side of the local MCP migration. A thin router (`src/mcp/router.js`) under `/mcp/*` resolves `consultantFirstName` → registry user, then dispatches to per-tool middleware handlers in `src/mcp/`. Read-only against a shared D1 cache (`RF_MCP_CACHE`); pipeline data sourced from the `job_pipelines` table (rebuilt every 15 min by the sync worker).
 
 **Reference design:**
-- Spec: `docs/archive/specs/2026-05-07-mcp-middleware-design.md`
-- Plan: `docs/archive/plans/2026-05-07-mcp-middleware.md`
+- Latest spec: `docs/archive/specs/2026-05-08-mcp-defaults-and-pipeline.md` (defaults union, `*_id` short-circuit, `job_pipelines` D1 table, lean `_meta`, LinkedIn URL output)
+- Latest plan: `docs/archive/plans/2026-05-08-mcp-defaults-and-pipeline.md`
+- Original spec (partially superseded): `docs/archive/specs/2026-05-07-mcp-middleware-design.md`
+- Original plan (partially superseded): `docs/archive/plans/2026-05-07-mcp-middleware.md`
 
 ## Mental model
 
@@ -122,6 +124,29 @@ All under `/mcp/*`, authed via `X-MCP-Token` header.
 Notes:
 - `fields` extends defaults — does not replace. Unknown field names dropped silently.
 - LinkedIn returned as full URL (`https://www.linkedin.com/in/...`) regardless of D1 storage shape (bare slug).
+
+### Adding a new endpoint
+
+Recipe for a new `/mcp/<name>` endpoint:
+
+1. **Handler.** Create `src/mcp/<name>.js` exporting `handle<Name>({ env, body, consultant })`. Return `Response` via `jsonResponse(status, payload)` from `./router.js`.
+2. **Register.** Add to `src/mcp/handlers-registry.js` under the `'/mcp/<name>'` key.
+3. **Resolvers.** If the body takes a `candidate` / `job` / `stage` / `owner` reference, use `resolveCandidate` / `resolveJob` / `resolveStage` / `resolveOwner` from `./resolvers.js`. They handle numeric short-circuit + fuzzy + ambiguity envelope. Add a `*_id` body field for deterministic lookups (see "ID short-circuit" above).
+4. **Field projection.** If the response carries candidate detail, declare `const DEFAULT_FIELDS = [...]` and project via:
+   ```js
+   import { resolveFieldsWithDefaults } from './projection.js';
+   import { projectWithLinkedIn } from './linkedin.js';
+   const { paths } = resolveFieldsWithDefaults(body.fields, DEFAULT_FIELDS, sample, candidate);
+   const projected = projectWithLinkedIn(candidate, paths);
+   ```
+   Defaults always present; `body.fields` extends. LinkedIn slugs auto-normalized to URLs at output.
+5. **`_meta`.** Don't emit it on success. If the caller did something they should know about (cold cache, missing landmark, falling back), accumulate `warnings: string[]` and emit `_meta: { warnings }` only when non-empty. Each warning ≤ ~80 chars.
+6. **D1 reads.** Use `session(env)` from `./d1-read.js` to get a session-pinned reader (sync-worker writes are read-after-write consistent within the session). NEVER write to D1 from the main worker — that's the sync worker's exclusive responsibility.
+7. **Tests.** Add `test/mcp-<name>.spec.js` modeled on the existing specs (e.g. `test/mcp-job-pipeline.spec.js`). Use `import { env, createExecutionContext } from 'cloudflare:test';` and `applyMigration(env)` in `beforeEach`. Set `'X-MCP-Token': 'test-mcp-extension-secret'` and include `consultantFirstName: 'Joel'` in the body for auth.
+8. **Consumer doc.** If the new endpoint is meant for the local MCP, update `docs/handoffs/mcp_handover/2026-05-07-consumer-side-reference.md` with the body params, response shape, and the default field set so the LLM agent's tool descriptions can sync.
+9. **Endpoint table.** Add a row to the table above. If the endpoint adds a new `*_id` body field, add it to the ID short-circuit table too.
+
+If the new endpoint requires data NOT already in D1, that's a sync-worker change — extend the rebuild workflow, not the read path. Read paths must never call RF directly except for the four write endpoints (`move-stage`, `log-interview`, etc.) where it's intentional.
 
 ### Per-job pipelines, not a global canonical list
 
