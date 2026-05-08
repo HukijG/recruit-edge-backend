@@ -72,6 +72,17 @@ function buildGcalHint({ subject, body, start, end }) {
 }
 
 export async function handleCandidateLogInterview({ env, body, consultant }) {
+  // ─── ID short-circuit (deterministic path on follow-up turns) ────────
+  // candidate_id / job_id coerced onto the fuzzy fields. resolveCandidate /
+  // resolveJob already short-circuit numeric inputs to direct row lookups,
+  // so this single coercion is enough — no separate fast-path branch.
+  if (body.candidate_id != null && body.candidate == null) {
+    body = { ...body, candidate: Number(body.candidate_id) };
+  }
+  if (body.job_id != null && body.job == null) {
+    body = { ...body, job: Number(body.job_id) };
+  }
+
   if (!body.start_time) return jsonResponse(400, { error: 'start_time is required' });
   if (body.candidate == null) {
     return jsonResponse(400, { error: 'candidate is required' });

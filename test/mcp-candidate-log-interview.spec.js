@@ -274,6 +274,35 @@ describe('/mcp/candidate-log-interview', () => {
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
+  it('candidate_id + job_id bypass fuzzy resolvers', async () => {
+    // Re-seed candidate 42 with a jobs array so job_id: 100 passes the filter.
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, cached_at) VALUES (42, ?, ?, ?)'
+    ).bind(
+      JSON.stringify({
+        id: 42, name: 'Test Candidate', primary_email: 't@x.com',
+        jobs: [{ job_id: 100, job_name: 'Eng', disqualified: false }],
+      }),
+      'Test Candidate',
+      new Date().toISOString(),
+    ).run();
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, id: 999 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate_id: 42,
+      job_id: 100,
+      summary: 'Quick chat',
+      start_time: '2026-05-08T10:00:00+01:00',
+    });
+    expect(r.status).toBe(200);
+    const body = await r.json();
+    expect(body.ok).toBe(true);
+    expect(body.activity.candidate_id).toBe(42);
+  });
+
   it('returns 502 if RF activity-create fails', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(
       new Response('rf went boom', { status: 500 }),
