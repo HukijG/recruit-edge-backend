@@ -166,6 +166,10 @@ dist
 !.env.example
 .wrangler/
 
-# Claude Code worktrees
-/.claude
+# Claude Code — local/personal state stays untracked.
+.claude/settings.local.json
+.claude/*.local.json
 Screenshot*.png
+
+# Local stdio MCP reference source — kept for porting / dev/debug only, not part of this monorepo's deployable code
+recruiterflow-mcp-current/
