@@ -22,6 +22,13 @@ function authedRequest(body: string) {
   });
 }
 
+async function parseRpcResponse(res: Response): Promise<{ result?: any; error?: any }> {
+  const text = await res.text();
+  const dataLines = text.split("\n").filter(l => l.startsWith("data: "));
+  const lastJson = dataLines.length > 0 ? dataLines[dataLines.length - 1].slice(6) : text;
+  return JSON.parse(lastJson);
+}
+
 async function callTool(testEnv: typeof env, toolName: string, args: Record<string, unknown> = {}) {
   // MCP requires initialize before tools/call.
   await worker.fetch(
@@ -64,10 +71,7 @@ describe("tool dispatch", () => {
     // Verify the worker's response body actually carries the middleware payload
     // back through respond() to the caller. The MCP transport may emit SSE-framed
     // (data: ...) lines or plain JSON depending on the Accept header negotiation.
-    const text = await res.text();
-    const dataLines = text.split("\n").filter(l => l.startsWith("data: "));
-    const lastJson = dataLines.length > 0 ? dataLines[dataLines.length - 1].slice(6) : text;
-    const payload = JSON.parse(lastJson);
+    const payload = await parseRpcResponse(res);
     const innerText = payload.result?.content?.[0]?.text;
     expect(innerText).toBeDefined();
     expect(JSON.parse(innerText)).toEqual({ ok: true, candidates: 0, last_sync_at: null });
@@ -89,10 +93,7 @@ describe("tool dispatch", () => {
     // JSON-RPC envelope, not at HTTP layer.
     expect(res.status).toBe(200);
 
-    const text = await res.text();
-    const dataLines = text.split("\n").filter(l => l.startsWith("data: "));
-    const lastJson = dataLines.length > 0 ? dataLines[dataLines.length - 1].slice(6) : text;
-    const payload = JSON.parse(lastJson);
+    const payload = await parseRpcResponse(res);
     const result = payload.result;
     expect(result?.isError).toBe(true);
     const errorText = result?.content?.[0]?.text;
@@ -121,10 +122,7 @@ describe("tool dispatch", () => {
     expect(res.status).toBe(200);
 
     // Streamable HTTP responses can be SSE-framed; parse the data line(s).
-    const text = await res.text();
-    const dataLines = text.split("\n").filter(l => l.startsWith("data: "));
-    const lastJson = dataLines.length > 0 ? dataLines[dataLines.length - 1].slice(6) : text;
-    const payload = JSON.parse(lastJson);
+    const payload = await parseRpcResponse(res);
     const toolNames = (payload.result?.tools ?? []).map((t: { name: string }) => t.name);
 
     expect(toolNames.sort()).toEqual([
