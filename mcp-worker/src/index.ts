@@ -1,3 +1,8 @@
+import { createMcpHandler } from "agents/mcp";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { registerTools } from "./tools.js";
+import { SERVER_INSTRUCTIONS } from "./instructions.js";
+
 export interface Env {
   MIDDLEWARE: Fetcher;
   MCP_EXTENSION_SECRET: string;
@@ -6,6 +11,17 @@ export interface Env {
 export interface RequestCtx {
   env: Env;
   consultantFirstName: string;
+}
+
+function createServer(ctx: RequestCtx): McpServer {
+  // Factory-per-request — required by MCP SDK >= 1.26.0 (CVE GHSA-345p-7cg4-v4c7).
+  // Do NOT hoist to module scope.
+  const server = new McpServer(
+    { name: "rf-mcp", version: "0.7.0" },
+    { instructions: SERVER_INSTRUCTIONS },
+  );
+  registerTools(server, ctx);
+  return server;
 }
 
 function timingSafeEqStr(a: string, b: string): boolean {
@@ -26,7 +42,7 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 export default {
-  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, execCtx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/health") {
@@ -46,7 +62,7 @@ export default {
       return jsonResponse(400, { ok: false, error: "Missing X-RF-Consultant header" });
     }
 
-    // MCP dispatch wired in Task 6.
-    return jsonResponse(501, { ok: false, error: "MCP dispatch not yet wired" });
+    const server = createServer({ env, consultantFirstName });
+    return createMcpHandler(server)(request, env, execCtx);
   },
 } satisfies ExportedHandler<Env>;

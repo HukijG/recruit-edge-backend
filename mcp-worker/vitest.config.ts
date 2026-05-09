@@ -2,6 +2,17 @@ import { defineWorkersConfig } from "@cloudflare/vitest-pool-workers/config";
 
 export default defineWorkersConfig({
   test: {
+    // The MCP SDK pulls in ajv (CJS, requires JSON) which the Workers
+    // module-fallback loader can't handle directly. Pre-bundle via Vite SSR
+    // optimizer so they reach the runtime as ESM with JSON inlined.
+    deps: {
+      optimizer: {
+        ssr: {
+          enabled: true,
+          include: ["ajv", "ajv-formats"],
+        },
+      },
+    },
     poolOptions: {
       workers: {
         wrangler: { configPath: "./wrangler.mcp.jsonc" },
