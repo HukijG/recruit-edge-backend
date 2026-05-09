@@ -3,6 +3,8 @@ import { env } from "cloudflare:test";
 import worker from "../src/index.js";
 
 const MCP_SECRET = "test-mcp-secret";
+const EMPTY_CTX = {} as ExecutionContext;
+type ErrorBody = { ok: boolean; error: string };
 
 function makeRequest(opts: { token?: string; consultant?: string; method?: string; path?: string } = {}) {
   const { token, consultant, method = "POST", path = "/mcp" } = opts;
@@ -18,9 +20,9 @@ function makeRequest(opts: { token?: string; consultant?: string; method?: strin
 
 describe("auth gate", () => {
   it("returns 401 when X-MCP-Token is missing", async () => {
-    const res = await worker.fetch(makeRequest({ consultant: "Joel" }), env, {} as ExecutionContext);
+    const res = await worker.fetch(makeRequest({ consultant: "Joel" }), env, EMPTY_CTX);
     expect(res.status).toBe(401);
-    const body = await res.json() as { ok: boolean; error: string };
+    const body = await res.json() as ErrorBody;
     expect(body.ok).toBe(false);
     expect(body.error).toMatch(/X-MCP-Token/i);
   });
@@ -29,7 +31,7 @@ describe("auth gate", () => {
     const res = await worker.fetch(
       makeRequest({ token: "wrong-secret", consultant: "Joel" }),
       env,
-      {} as ExecutionContext,
+      EMPTY_CTX,
     );
     expect(res.status).toBe(401);
   });
@@ -38,10 +40,10 @@ describe("auth gate", () => {
     const res = await worker.fetch(
       makeRequest({ token: MCP_SECRET }),
       env,
-      {} as ExecutionContext,
+      EMPTY_CTX,
     );
     expect(res.status).toBe(400);
-    const body = await res.json() as { ok: boolean; error: string };
+    const body = await res.json() as ErrorBody;
     expect(body.error).toMatch(/X-RF-Consultant/i);
   });
 
@@ -49,7 +51,7 @@ describe("auth gate", () => {
     const res = await worker.fetch(
       makeRequest({ token: MCP_SECRET, consultant: "   " }),
       env,
-      {} as ExecutionContext,
+      EMPTY_CTX,
     );
     expect(res.status).toBe(400);
   });
@@ -58,7 +60,7 @@ describe("auth gate", () => {
     const res = await worker.fetch(
       makeRequest({ method: "GET", path: "/health" }),
       env,
-      {} as ExecutionContext,
+      EMPTY_CTX,
     );
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -68,7 +70,7 @@ describe("auth gate", () => {
     const res = await worker.fetch(
       makeRequest({ method: "GET", path: "/nope" }),
       env,
-      {} as ExecutionContext,
+      EMPTY_CTX,
     );
     expect(res.status).toBe(404);
   });

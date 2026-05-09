@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { mwFetch, MwClientError } from "./mw-client.js";
 import type { RequestCtx } from "./index.js";
 
+// ~140k chars ≈ 35k tokens — leaves headroom in Claude's tool-result budget.
 const MAX_RESULT_CHARS = 140_000;
 
 type ToolReturn = {

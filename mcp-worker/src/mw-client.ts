@@ -1,3 +1,13 @@
+/**
+ * Thin client over the MIDDLEWARE service binding to the /mcp/* surface.
+ *
+ * Behaviour contract:
+ *   - 4xx / 5xx → throws MwClientError (loud, install-shaped failures).
+ *   - HTTP 200 with { ok: false, ... } body → passes through verbatim
+ *     (recoverable conditions: needs_disambiguation, unknown stage, etc.).
+ *   - Auth-derived consultantFirstName always overrides any caller-supplied
+ *     value in `body` — the auth gate is the source of truth for identity.
+ */
 import type { RequestCtx } from "./index.js";
 
 export class MwClientError extends Error {

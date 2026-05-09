@@ -5,6 +5,8 @@ export default defineWorkersConfig({
     // The MCP SDK pulls in ajv (CJS, requires JSON) which the Workers
     // module-fallback loader can't handle directly. Pre-bundle via Vite SSR
     // optimizer so they reach the runtime as ESM with JSON inlined.
+    // If a future test fails with a similar `SyntaxError: Unexpected token`
+    // from another node_modules CJS dep, add that package to this list.
     deps: {
       optimizer: {
         ssr: {
