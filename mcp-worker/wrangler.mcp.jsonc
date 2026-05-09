@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rf-mcp-remote",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-09",
+  "services": [
+    { "binding": "MIDDLEWARE", "service": "rf-dialpad-sync-dev" }
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": { "head_sampling_rate": 1 }
+  }
+}
