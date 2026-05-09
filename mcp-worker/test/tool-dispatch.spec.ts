@@ -99,4 +99,42 @@ describe("tool dispatch", () => {
     expect(errorText).toMatch(/Middleware error \(HTTP 500\)/);
     expect(errorText).toContain("internal middleware crash detail");
   });
+
+  it("tools/list returns all 7 tools", async () => {
+    const middlewareFetch = vi.fn();
+    const testEnv = { ...env, MIDDLEWARE: { fetch: middlewareFetch } as unknown as Fetcher };
+
+    await worker.fetch(
+      authedRequest(rpc("initialize", {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "vitest", version: "0.0.0" },
+      })),
+      testEnv,
+      EMPTY_CTX,
+    );
+    const res = await worker.fetch(
+      authedRequest(rpc("tools/list")),
+      testEnv,
+      EMPTY_CTX,
+    );
+    expect(res.status).toBe(200);
+
+    // Streamable HTTP responses can be SSE-framed; parse the data line(s).
+    const text = await res.text();
+    const dataLines = text.split("\n").filter(l => l.startsWith("data: "));
+    const lastJson = dataLines.length > 0 ? dataLines[dataLines.length - 1].slice(6) : text;
+    const payload = JSON.parse(lastJson);
+    const toolNames = (payload.result?.tools ?? []).map((t: { name: string }) => t.name);
+
+    expect(toolNames.sort()).toEqual([
+      "rf_cache_status",
+      "rf_candidate_get",
+      "rf_candidate_log_interview",
+      "rf_candidate_move_stage",
+      "rf_candidate_search",
+      "rf_job_candidates_filter",
+      "rf_job_pipeline",
+    ]);
+  });
 });
