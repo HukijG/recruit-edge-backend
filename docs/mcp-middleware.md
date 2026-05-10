@@ -1,16 +1,12 @@
 # MCP Middleware
 
-Server side of the local MCP migration. A thin router (`src/mcp/router.js`) under `/mcp/*` resolves `consultantFirstName` → registry user, then dispatches to per-tool middleware handlers in `src/mcp/`. Read-only against a shared D1 cache (`RF_MCP_CACHE`); pipeline data sourced from the `job_pipelines` table (rebuilt every 15 min by the sync worker).
+Server side of the MCP layer. A thin router (`src/mcp/router.js`) under `/mcp/*` resolves the consultant from a verified Access JWT (`consultantEmail` body field, forwarded over the service binding from `rf-mcp-remote` — see `docs/security.md`), then dispatches to per-tool middleware handlers in `src/mcp/`. Read-only against a shared D1 cache (`RF_MCP_CACHE`); pipeline data sourced from the `job_pipelines` table (rebuilt every 15 min by the sync worker — though the cron is currently OFF; see `docs/architecture.md` § Sync worker).
 
-**Reference design:**
-- Latest spec: `docs/archive/specs/2026-05-08-mcp-defaults-and-pipeline.md` (defaults union, `*_id` short-circuit, `job_pipelines` D1 table, lean `_meta`, LinkedIn URL output)
-- Latest plan: `docs/archive/plans/2026-05-08-mcp-defaults-and-pipeline.md`
-- Original spec (partially superseded): `docs/archive/specs/2026-05-07-mcp-middleware-design.md`
-- Original plan (partially superseded): `docs/archive/plans/2026-05-07-mcp-middleware.md`
+The `rf-mcp-remote` MCP worker (`mcp-worker/`) is the public Streamable-HTTP front; it validates the Access JWT, then service-binds into this `/mcp/*` surface. Architecture overview in `docs/architecture.md`. Auth shape in `docs/security.md`.
 
 ## Mental model
 
-Claude never has ids — it has names. The middleware does ALL alias / fuzzy / acronym resolution server-side. The local MCP is a transparent forwarder that injects auth + `consultantFirstName` and returns the JSON verbatim. **Do NOT add client-side normalisation on the consumer.** If a query is hard to resolve, expand the resolver, not the consumer.
+Claude never has ids — it has names. The middleware does ALL alias / fuzzy / acronym resolution server-side. The MCP worker is a transparent forwarder that injects the verified `consultantEmail` (from the Access JWT) and returns the JSON verbatim. **Do NOT add client-side normalisation on the consumer.** If a query is hard to resolve, expand the resolver, not the consumer.
 
 ## The two-worker split
 
@@ -31,12 +27,11 @@ Tail sync re-fetches `/job/list` every tick so new jobs and open-status flips su
 
 Pipeline data lives in the `job_pipelines` D1 table, populated by `PipelineRebuildWorkflow` every 15 min from RF `/job/pipeline`. The old `mcp:pipeline:{jobId}` and `mcp:job-candidates:{jobId}` KV keys are gone.
 
-## Auth secrets
+## Auth
 
-- `MCP_EXTENSION_SECRET` — shared, in `X-MCP-Token` header for `/mcp/*`. Same secret used by `rf-mcp-remote` (the remote MCP worker in `mcp-worker/`) on its outbound service-binding call to `/mcp/*` — so a rotation has to land on both workers together.
-- `ADMIN_SECRET` — sync worker only, in `X-Admin-Token` header for `POST /admin/full-rebuild`
-
-> **The header-based shared-secret model is mid-rework.** claude.ai's custom-connector UI requires OAuth, and Joel intends to put the LinkedIn extension behind OAuth as well. When OAuth lands, `MCP_EXTENSION_SECRET` (and very likely `X-Extension-Token` + `consultantFirstName`-in-body) gets replaced with per-user issued credentials — and `users.js` likely retires too. Nothing has been designed yet; see `docs/oauth-current-state.md` for the open questions and the shape of the work.
+- `/mcp/*` (main worker) accepts only service-binding traffic from `rf-mcp-remote`. Identity arrives as the `consultantEmail` body field; no shared-secret header. `MCP_EXTENSION_SECRET` was retired 2026-05-10. See `docs/security.md` for the JWT validation flow.
+- A transitional `consultantFirstName` body fallback survives in `src/mcp/router.js` for legacy local-MCP installs; it logs `[mcp] legacy consultantFirstName fallback` and is dropped when Spec B Phase 3 lands.
+- `ADMIN_SECRET` — sync worker only, in `X-Admin-Token` header for `POST /admin/full-rebuild`. Internal admin path; not user-facing.
 
 ## Entity-reference resolvers
 
@@ -100,7 +95,7 @@ Ambiguity returns the standard envelope; not_found on the read-side endpoints fa
 
 ## Endpoints
 
-All under `/mcp/*`, authed via `X-MCP-Token` header.
+All under `/mcp/*`. Identity is the verified `consultantEmail` body field (forwarded by `rf-mcp-remote` from the Access JWT). No header auth — service-binding traffic is trust-local within the Cloudflare account boundary.
 
 | Endpoint | Purpose |
 |---|---|
@@ -144,8 +139,8 @@ Recipe for a new `/mcp/<name>` endpoint:
    Defaults always present; `body.fields` extends. LinkedIn slugs auto-normalized to URLs at output.
 5. **`_meta`.** Don't emit it on success. If the caller did something they should know about (cold cache, missing landmark, falling back), accumulate `warnings: string[]` and emit `_meta: { warnings }` only when non-empty. Each warning ≤ ~80 chars.
 6. **D1 reads.** Use `session(env)` from `./d1-read.js` to get a session-pinned reader (sync-worker writes are read-after-write consistent within the session). NEVER write to D1 from the main worker — that's the sync worker's exclusive responsibility.
-7. **Tests.** Add `test/mcp-<name>.spec.js` modeled on the existing specs (e.g. `test/mcp-job-pipeline.spec.js`). Use `import { env, createExecutionContext } from 'cloudflare:test';` and `applyMigration(env)` in `beforeEach`. Set `'X-MCP-Token': 'test-mcp-extension-secret'` and include `consultantFirstName: 'Joel'` in the body for auth.
-8. **Consumer doc.** If the new endpoint is meant for the local MCP, update `docs/handoffs/mcp_handover/2026-05-07-consumer-side-reference.md` with the body params, response shape, and the default field set so the LLM agent's tool descriptions can sync.
+7. **Tests.** Add `test/mcp-<name>.spec.js` modeled on the existing specs (e.g. `test/mcp-job-pipeline.spec.js`). Use `import { env, createExecutionContext } from 'cloudflare:test';` and `applyMigration(env)` in `beforeEach`. Identity arrives in the body — pass either `consultantEmail: 'joel@<test-domain>'` (current path) or `consultantFirstName: 'Joel'` (legacy fallback path, exercised by existing specs while it remains wired). The `X-MCP-Token` header is no longer validated; specs that still set it work fine but the header is a no-op.
+8. **Consumer surface.** Tool registrations + descriptions live in `mcp-worker/src/tools.ts` (`registerTools`). Add a `server.registerTool(...)` block there with the body params, response shape, and the default field set so the LLM client's tool list reflects the new endpoint. If the new tool is the read endpoint Claude should always have loaded, set `_meta: { "anthropic/alwaysLoad": true }`.
 9. **Endpoint table.** Add a row to the table above. If the endpoint adds a new `*_id` body field, add it to the ID short-circuit table too.
 
 If the new endpoint requires data NOT already in D1, that's a sync-worker change — extend the rebuild workflow, not the read path. Read paths must never call RF directly except for the four write endpoints (`move-stage`, `log-interview`, etc.) where it's intentional.
