@@ -183,7 +183,6 @@ describe('/mcp/candidate-add-note', () => {
 
   it('ambiguous candidate + job auto-narrows to single survivor → commits', async () => {
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
-    await env.RF_MCP_CACHE.exec('DELETE FROM candidate_jobs');
     await env.RF_MCP_CACHE.exec('DELETE FROM jobs');
     // Two Jordans; only id=42 is on the Eon SE job.
     await env.RF_MCP_CACHE.prepare(
@@ -262,5 +261,87 @@ describe('/mcp/candidate-add-note', () => {
     const b = await r.json();
     expect(b.error).toBe('no candidate matches the given filters');
     expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('candidate_id + job_id short-circuit: bypasses fuzzy, commits', async () => {
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    await env.RF_MCP_CACHE.exec('DELETE FROM jobs');
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, cached_at) VALUES (?, ?, ?, ?)'
+    ).bind(
+      42, JSON.stringify({
+        id: 42,
+        name: 'Test Candidate',
+        jobs: [{ job_id: 100, job_name: 'Eon SE', disqualified: false, stages: [], stage_name: 'Sourced' }],
+      }),
+      'Test Candidate', new Date().toISOString(),
+    ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at) VALUES (?, ?, ?, ?, 1, ?)'
+    ).bind(100, JSON.stringify({ id: 100, name: 'Eon SE' }), 'Eon SE', 'Eon', new Date().toISOString()).run();
+    resetSnapshot();
+
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 111 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate_id: 42,
+      job_id: 100,
+      note: 'short-circuit path',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.ok).toBe(true);
+    expect(b.note.id).toBe(111);
+    expect(b.note.candidate_id).toBe(42);
+  });
+
+  it('RF non-2xx response → 502', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response('upstream blew up', { status: 500 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 42,
+      note: 'RF will reject',
+    });
+    expect(r.status).toBe(502);
+    const b = await r.json();
+    expect(b.error).toMatch(/RF notes\/add failed/);
+  });
+
+  it('attribution always comes from the JWT-resolved consultant', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 1 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 42,
+      note: 'attribution check',
+      user: 999999, // attempt to override — should be ignored (no such field on the surface)
+    });
+    expect(r.status).toBe(200);
+    const sent = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    // Joel's rfUserId from the test users migration is 900001.
+    expect(sent.created_by).toBe(900001);
+  });
+
+  it('markdown bold + line break + list renders in the RF payload', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 222 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 42,
+      note: '**summary**\nspoke to him about:\n* SE role\n* timing',
+    });
+    expect(r.status).toBe(200);
+    const sent = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    expect(sent.value).toContain('<strong>summary</strong>');
+    expect(sent.value).toMatch(/<br\s*\/?>/);
+    expect(sent.value).toContain('<ul>');
+    expect(sent.value).toContain('<li>SE role</li>');
+    expect(sent.value).toContain('<li>timing</li>');
   });
 });
