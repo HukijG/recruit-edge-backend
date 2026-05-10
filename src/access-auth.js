@@ -15,7 +15,10 @@ let jwks = null;
  *
  * @param {Request} request
  * @param {{ ACCESS_TEAM_DOMAIN: string }} env
- * @param {string} expectedAud
+ * @param {string} expectedAud - 64-char hex Application Audience (AUD) tag from
+ *   the Cloudflare Access dashboard. NOT a URL or redirect URI. JWTs minted for
+ *   a different App's audience will be silently rejected (this is the
+ *   audience-binding contract that prevents token reuse across resources).
  * @returns {Promise<{ email: string, sub: string } | null>}
  */
 export async function verifyAccessJwt(request, env, expectedAud) {
@@ -51,5 +54,8 @@ export async function verifyAccessJwt(request, env, expectedAud) {
  * @param {{ keys: object[] } | null} jwkSet
  */
 export function _setJwksForTests(jwkSet) {
-  jwks = jwkSet === null ? null : createLocalJWKSet(jwkSet);
+  // == null catches both null and undefined — defensive against an accidental
+  // _setJwksForTests() with no args, which would otherwise crash inside
+  // createLocalJWKSet(undefined) with a confusing "JWK Set malformed" error.
+  jwks = jwkSet == null ? null : createLocalJWKSet(jwkSet);
 }
