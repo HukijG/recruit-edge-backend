@@ -45,4 +45,16 @@ describe('mcp router', () => {
     const r = await call('/mcp/does-not-exist', { consultantEmail: 'joel@test.local' });
     expect(r.status).toBe(404);
   });
+
+  it('email takes priority when both consultantEmail and consultantFirstName are present', async () => {
+    // If the if/else-if ever flips to two `if` blocks, this catches it: an
+    // unknown email + valid firstName should 403, NOT fall through to the
+    // legacy resolver. Once Access is live, the JWT-derived email is the
+    // verified identity — letting a stale name override it would be a hole.
+    const r = await call('/mcp/cache-status', {
+      consultantEmail: 'nobody@test.local',
+      consultantFirstName: 'Joel',
+    });
+    expect(r.status).toBe(403);
+  });
 });
