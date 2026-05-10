@@ -16,7 +16,6 @@ export default defineConfig({
             ),
         },
         bindings: {
-          MCP_EXTENSION_SECRET: "test-mcp-secret",
           ACCESS_TEAM_DOMAIN: "https://test.cloudflareaccess.com",
           ACCESS_AUD_MCP: "a".repeat(64),
         },

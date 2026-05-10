@@ -20,7 +20,6 @@ export default defineWorkersConfig({
 						RF_WEBHOOK_SECRET: 'test-rf-webhook-secret',
 						KRISP_WEBHOOK_SECRET: 'test-krisp-webhook-secret',
 						APOLLO_WEBHOOK_SECRET: 'test-apollo-webhook-secret',
-						MCP_EXTENSION_SECRET: 'test-mcp-extension-secret',
 						ACCESS_TEAM_DOMAIN: 'https://test.cloudflareaccess.com',
 						ACCESS_AUD_MCP: 'a'.repeat(64),  // 64-char hex shape matches production Access AUD format
 					},
