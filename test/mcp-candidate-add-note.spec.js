@@ -180,4 +180,87 @@ describe('/mcp/candidate-add-note', () => {
     expect(b.options.every((o) => 'current_title' in o)).toBe(true);
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
+
+  it('ambiguous candidate + job auto-narrows to single survivor → commits', async () => {
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidate_jobs');
+    await env.RF_MCP_CACHE.exec('DELETE FROM jobs');
+    // Two Jordans; only id=42 is on the Eon SE job.
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, cached_at) VALUES (?, ?, ?, ?)'
+    ).bind(
+      42, JSON.stringify({
+        id: 42,
+        name: 'Jordan Chen',
+        jobs: [{ job_id: 100, job_name: 'Eon SE', disqualified: false, stages: [], stage_name: 'Sourced' }],
+      }),
+      'Jordan Chen', new Date().toISOString(),
+    ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, cached_at) VALUES (?, ?, ?, ?)'
+    ).bind(
+      43, JSON.stringify({
+        id: 43,
+        name: 'Jordan Patel',
+        jobs: [{ job_id: 200, job_name: 'Acme CSM', disqualified: false, stages: [], stage_name: 'Sourced' }],
+      }),
+      'Jordan Patel', new Date().toISOString(),
+    ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at) VALUES (100, ?, ?, ?, 1, ?)'
+    ).bind(JSON.stringify({ id: 100, name: 'Eon SE' }), 'Eon SE', 'Eon', new Date().toISOString()).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at) VALUES (200, ?, ?, ?, 1, ?)'
+    ).bind(JSON.stringify({ id: 200, name: 'Acme CSM' }), 'Acme CSM', 'Acme', new Date().toISOString()).run();
+    resetSnapshot();
+
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 888 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 'Jordan',
+      job: 'Eon SE',
+      note: 'auto-narrowed via job filter',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.ok).toBe(true);
+    expect(b.note.candidate_id).toBe(42);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('job filter with no surviving candidate → 400 no-match, no RF call', async () => {
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    await env.RF_MCP_CACHE.exec('DELETE FROM jobs');
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, cached_at) VALUES (?, ?, ?, ?)'
+    ).bind(
+      42, JSON.stringify({
+        id: 42,
+        name: 'Test Candidate',
+        jobs: [{ job_id: 100, job_name: 'Eon SE', disqualified: false, stages: [], stage_name: 'Sourced' }],
+      }),
+      'Test Candidate', new Date().toISOString(),
+    ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at) VALUES (100, ?, ?, ?, 1, ?)'
+    ).bind(JSON.stringify({ id: 100, name: 'Eon SE' }), 'Eon SE', 'Eon', new Date().toISOString()).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at) VALUES (300, ?, ?, ?, 1, ?)'
+    ).bind(JSON.stringify({ id: 300, name: 'Globex SRE' }), 'Globex SRE', 'Globex', new Date().toISOString()).run();
+    resetSnapshot();
+
+    globalThis.fetch = vi.fn();
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 42,
+      job: 'Globex SRE', // candidate 42 has no link to job 300
+      note: 'should be filtered out',
+    });
+    expect(r.status).toBe(400);
+    const b = await r.json();
+    expect(b.error).toBe('no candidate matches the given filters');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
 });
