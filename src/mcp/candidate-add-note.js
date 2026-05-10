@@ -27,6 +27,9 @@ import { addRFCandidateNote } from '../rf-client.js';
  * {ok, note} envelope the HTTP handler emits.
  */
 export async function addNoteForCandidate({ env, candidate, noteMd, consultant }) {
+  if (!String(noteMd ?? '').trim()) {
+    return { ok: false, status: 400, error: 'note is required' };
+  }
   const html = mdToHtml(noteMd);
   let result;
   try {
