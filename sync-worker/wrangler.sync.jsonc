@@ -30,7 +30,15 @@
       "class_name": "PipelineRebuildWorkflow"
     }
   ],
-  "triggers": { "crons": ["*/15 * * * *"] },
+  // Cron disabled 2026-05-10. Every 15-min tick fired BOTH tail-sync AND
+  // PipelineRebuildWorkflow, which INSERT-OR-REPLACEs the entire job_pipelines
+  // table (and tail-sync similarly REPLACEs every job in `jobs`) regardless
+  // of whether anything actually changed — driving ~1M D1 writes/day with
+  // zero active consumers (Joel-only MCP, claude desktop closed). Do NOT
+  // re-enable until both sync paths (writeJobs, writeCandidatesAndLinks,
+  // writeJobPipeline) are gated to skip unchanged rows (compare new payload
+  // hash / last_updated against current row before writing).
+  // "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
     "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external"
   },
