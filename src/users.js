@@ -1,27 +1,27 @@
 /**
- * Team registry — single source of truth for consultant-to-system-id mappings.
+ * Team registry — D1-backed lookups, async.
  *
- * Each record maps a consultant's first name to:
- *   - rfUserId: their RecruiterFlow user_id (used for activity_user_id, stage move user_id, lead_owner_id, custom_fields[consultant_id], etc.)
- *   - dialpadId: their Dialpad target.id (used for cold-call attribution)
- *   - calendarMode: 'outlook' | 'gcal' | 'both' — drives which calendar
- *     deeplink shape /mcp/candidate-log-interview returns. Default 'outlook'
- *     for the whole team; Joel can flip to 'gcal' or 'both' later.
- *   - aliases (optional): additional first-name forms that should resolve to
- *     the same record (e.g. nicknames). Matched case-insensitively.
+ * Identity records live in `env.USERS_DB.users`, keyed by lowercase email.
+ * Every public function takes `env` as its first argument and returns a
+ * Promise (call sites must `await`).
  *
- * Edits show up in PR diffs. Add/remove entries here when the team changes.
+ * Caching:
+ *   - Module-level cache populated on first call after Worker boot via a
+ *     single bulk `SELECT * FROM users`.
+ *   - Concurrent first-call requests share the same in-flight Promise so
+ *     they collapse to one D1 read (avoids a thundering-herd on cold start).
+ *   - The cache is invalidated only on Worker restart. Updating D1 directly
+ *     (e.g. `wrangler d1 execute --remote ... INSERT`) will NOT show up in
+ *     the running isolate; deploy a new Worker version (or wait for a cold
+ *     start) to pick up changes. This is acceptable: team membership changes
+ *     happen quarterly, not continuously.
+ *
+ * Public function names and order match the previous in-memory module so
+ * grep-driven call-site sweeps stay clean.
  */
 
-const USERS = [
-  { firstName: 'Joel',   rfUserId: 900001, dialpadId: '8000000000000001', calendarMode: 'outlook' },
-  { firstName: 'Alice',  rfUserId: 900002, dialpadId: '8000000000000002', calendarMode: 'outlook' },
-  { firstName: 'Bob', rfUserId: 900003, dialpadId: '8000000000000003', calendarMode: 'outlook', aliases: ['Bob'] },
-  { firstName: 'Carol',  rfUserId: 900004, dialpadId: '8000000000000004', calendarMode: 'outlook' },
-  { firstName: 'Dave',    rfUserId: 900005, dialpadId: '8000000000000005', calendarMode: 'outlook' },
-  { firstName: 'Erin',   rfUserId: 900006, dialpadId: '8000000000000006', calendarMode: 'outlook' },
-  // TODO: add remaining team members (firstName, rfUserId, dialpadId, calendarMode)
-];
+let cache = null;
+let inflight = null;
 
 function normalizeName(name) {
   if (typeof name !== 'string') return null;
@@ -29,34 +29,105 @@ function normalizeName(name) {
   return trimmed || null;
 }
 
-export function getUserByFirstName(firstName) {
+function normalizeEmail(email) {
+  if (typeof email !== 'string') return null;
+  const trimmed = email.trim().toLowerCase();
+  return trimmed || null;
+}
+
+function rowToRecord(row) {
+  return {
+    email: row.email,
+    rfUserId: row.rf_user_id,
+    dialpadId: row.dialpad_id,
+    firstName: row.first_name,
+    calendarMode: row.calendar_mode,
+    aliases: row.aliases ? JSON.parse(row.aliases) : null,
+  };
+}
+
+async function loadCache(env) {
+  const { results } = await env.USERS_DB
+    .prepare('SELECT email, rf_user_id, dialpad_id, first_name, calendar_mode, aliases FROM users')
+    .all();
+  const records = (results ?? []).map(rowToRecord);
+
+  // byFirstName: aliases are inserted FIRST, then primary firstNames second,
+  // so a primary firstName always wins over a colliding alias on another
+  // record (Map.set replaces). This is the correct semantics: if anyone is
+  // ever named "Bob" as their primary, their record beats Bob's alias.
+  const byFirstName = new Map();
+  for (const r of records) {
+    if (Array.isArray(r.aliases)) {
+      for (const a of r.aliases) byFirstName.set(a.toLowerCase(), r);
+    }
+  }
+  for (const r of records) byFirstName.set(r.firstName.toLowerCase(), r);
+
+  return {
+    byEmail: new Map(records.map((r) => [r.email, r])),
+    byDialpadId: new Map(records.map((r) => [r.dialpadId, r])),
+    byRFUserId: new Map(records.map((r) => [r.rfUserId, r])),
+    byFirstName,
+  };
+}
+
+async function ensureCache(env) {
+  if (cache) return cache;
+  if (!env?.USERS_DB) throw new Error('USERS_DB binding missing');
+  // Memoize the in-flight Promise so concurrent first-callers share one read.
+  if (!inflight) {
+    inflight = loadCache(env)
+      .then((c) => { cache = c; return c; })
+      .finally(() => { inflight = null; });
+  }
+  return inflight;
+}
+
+export async function getUserByEmail(env, email) {
+  const key = normalizeEmail(email);
+  if (!key) return null;
+  const c = await ensureCache(env);
+  return c.byEmail.get(key) ?? null;
+}
+
+export async function getUserByFirstName(env, firstName) {
   const key = normalizeName(firstName);
   if (!key) return null;
-  return USERS.find(u =>
-    u.firstName.toLowerCase() === key
-    || (Array.isArray(u.aliases) && u.aliases.some(a => a.toLowerCase() === key))
-  ) ?? null;
+  const c = await ensureCache(env);
+  return c.byFirstName.get(key) ?? null;
 }
 
-export function getUserByDialpadId(dialpadId) {
+export async function getUserByDialpadId(env, dialpadId) {
   if (dialpadId === null || dialpadId === undefined) return null;
   const key = String(dialpadId);
-  return USERS.find(u => u.dialpadId === key) ?? null;
+  const c = await ensureCache(env);
+  return c.byDialpadId.get(key) ?? null;
 }
 
-export function getUserByRFUserId(rfUserId) {
+export async function getUserByRFUserId(env, rfUserId) {
   if (rfUserId === null || rfUserId === undefined) return null;
-  return USERS.find(u => u.rfUserId === rfUserId) ?? null;
+  const c = await ensureCache(env);
+  return c.byRFUserId.get(rfUserId) ?? null;
 }
 
-export function resolveRFUserId(firstName) {
-  return getUserByFirstName(firstName)?.rfUserId ?? null;
+export async function resolveRFUserId(env, firstName) {
+  return (await getUserByFirstName(env, firstName))?.rfUserId ?? null;
 }
 
-export function getRFUserIdByDialpadId(dialpadId) {
-  return getUserByDialpadId(dialpadId)?.rfUserId ?? null;
+export async function getRFUserIdByDialpadId(env, dialpadId) {
+  return (await getUserByDialpadId(env, dialpadId))?.rfUserId ?? null;
 }
 
-export function isMonitoredDialpadUser(dialpadId) {
-  return getUserByDialpadId(dialpadId) !== null;
+export async function isMonitoredDialpadUser(env, dialpadId) {
+  return (await getUserByDialpadId(env, dialpadId)) !== null;
+}
+
+/**
+ * Test-only: clear the module-level cache so the next call re-reads D1.
+ * Called from `beforeEach` in the unit tests; do not use in production code.
+ */
+export function _resetCacheForTests() {
+  cache = null;
+  inflight = null;
 }
