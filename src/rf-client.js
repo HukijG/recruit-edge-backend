@@ -298,9 +298,11 @@ export async function searchRFCandidateByEmail(email, env) {
 }
 
 /**
- * Add a note to an RF candidate.
+ * Add a note to an RF candidate. Attribution (`createdBy`) is required —
+ * callers pass the consultant's RF user id (resolved from the Access JWT
+ * upstream in the /mcp/* surface).
  */
-export async function addRFCandidateNote(candidateId, htmlContent, env) {
+export async function addRFCandidateNote(candidateId, htmlContent, createdBy, env) {
   const rfApiKey = env.RF_API_KEY;
   const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
 
@@ -309,8 +311,7 @@ export async function addRFCandidateNote(candidateId, htmlContent, env) {
   }
 
   const payload = {
-    // TODO: route via users.js when Krisp template webhook support returns (currently dead code).
-    created_by: 900001,
+    created_by: createdBy,
     id: parseInt(candidateId, 10),
     mentions: [],
     value: htmlContent
