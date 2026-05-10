@@ -73,7 +73,7 @@ When a `*_id` field is present, the corresponding fuzzy-name field (`candidate`,
 
 ### Post-narrow disambiguation on writes
 
-`candidate-move-stage` and `candidate-log-interview` enumerate every valid `(candidate, job, stage)` tuple and only ambiguate when ≥2 valid tuples remain.
+`candidate-move-stage`, `candidate-log-interview`, and `candidate-add-note` enumerate every valid candidate (and `(candidate, job, stage)` tuple where relevant) and only ambiguate when ≥2 valid options remain.
 
 - When candidate is fuzzy-ambiguous but only one match has the requested job/stage → worker auto-commits, no round-trip.
 - When ≥2 tuples remain → `kind` is the smallest level of variation (candidates differ → `candidate`, same candidate but jobs differ → `job`, etc.) and options carry just enough tuple context to disambiguate at that level.
