@@ -22,7 +22,7 @@ export default defineWorkersConfig({
 						APOLLO_WEBHOOK_SECRET: 'test-apollo-webhook-secret',
 						MCP_EXTENSION_SECRET: 'test-mcp-extension-secret',
 						ACCESS_TEAM_DOMAIN: 'https://test.cloudflareaccess.com',
-						ACCESS_AUD_MCP: 'test-aud-mcp-64hex',
+						ACCESS_AUD_MCP: 'a'.repeat(64),  // 64-char hex shape matches production Access AUD format
 					},
 					d1Databases: {
 						RF_MCP_CACHE: 'rf-mcp-cache-test',
