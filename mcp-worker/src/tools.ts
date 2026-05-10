@@ -185,6 +185,8 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
         "Post-narrow auto-commit: even if `candidate` alone is ambiguous, if (candidate, job, stage) uniquely identifies a single tuple after applying all three refs, the move commits with no extra round-trip. Success returns the resolved identity in `moved`.",
         "",
         "Recoverable failures (no candidate match, unknown stage on this job, etc.) come back at HTTP 200 as `{ok: false, kind, error, ...recovery_hints}`. Use the hints to clarify with the user; don't crash.",
+        "",
+        "Attribution is always the consultant whose Access JWT signed this MCP session — there is no override field.",
       ].join("\n"),
       inputSchema: {
         candidate: ref,
@@ -215,6 +217,8 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
         "NEVER add the candidate as an attendee — recruiter-only calendar block.",
         "",
         "`kind` is verbatim ('1st Interview' / '2nd Interview' / ... / 'Final Interview'). `start_time` MUST include a timezone offset. Default duration is 60 min.",
+        "",
+        "Attribution is always the consultant whose Access JWT signed this MCP session — there is no override field.",
       ].join("\n"),
       inputSchema: {
         candidate: ref,
