@@ -7,6 +7,9 @@
   "services": [
     { "binding": "MIDDLEWARE", "service": "rf-dialpad-sync-dev" }
   ],
+  "vars": {
+    "ACCESS_TEAM_DOMAIN": "https://example-team.cloudflareaccess.com"
+  },
   "observability": {
     "enabled": true,
     "logs": { "head_sampling_rate": 1 }
