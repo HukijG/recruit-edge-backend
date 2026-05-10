@@ -12,7 +12,7 @@ export { ExtCallState };
 import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
-  searchRFCandidateByEmail, addRFCandidateNote, moveToCallBooked, addRFCandidate,
+  searchRFCandidateByEmail, moveToCallBooked, addRFCandidate,
   listOpenJobs, addCandidateToJob, setJobCandidateConsultantId,
   listCandidateActivities, normalizeToE164, pickConsultantJob,
   prewarmCandidatesIfMissing, searchCandidatesByJobAndStage, extractLinkedInSlug,
@@ -832,57 +832,26 @@ async function handleKrispWebhook(request, env) {
   }
 }
 
-async function processKrispMeetingNotes(meeting, content, env) {
-  const candidateEmail = extractCandidateEmail(meeting.participants);
-  if (!candidateEmail) {
-    console.log({
-      message: '[Krisp] → skipped: no candidate email in participants',
-      source: 'krisp',
-      meetingId: meeting.id,
-      meetingTitle: meeting.title,
-      participants: meeting.participants,
-    });
-    return false;
-  }
-
-  if (!Array.isArray(content) || content.length === 0) {
-    console.log({ message: '[Krisp] → skipped: no content sections', source: 'krisp', meetingId: meeting.id });
-    return false;
-  }
-
-  // Look up RF candidate — cache first, then RF search API fallback
-  let candidateId = await lookupByEmail(candidateEmail, env);
-  let lookupMethod = candidateId ? 'email-cache' : null;
-
-  if (!candidateId) {
-    const searchResult = await searchRFCandidateByEmail(candidateEmail, env);
-    if (searchResult) {
-      candidateId = String(searchResult.id);
-      lookupMethod = 'email-api';
-      await cacheCandidate(searchResult, env);
-    }
-  }
-
-  if (!candidateId) {
-    console.log({ message: `[Krisp] → no candidate found, skipping`, source: 'krisp', candidateEmail, meetingId: meeting.id });
-    return false;
-  }
-
-  const htmlContent = formatKrispNotesAsHtml(meeting, content);
-  await addRFCandidateNote(candidateId, htmlContent, env);
-
+/**
+ * STUBBED 2026-05-10. The underlying `addRFCandidateNote` RF client helper
+ * was repurposed for the new MCP write-tool surface, which requires explicit
+ * `createdBy` attribution. The Krisp note-posting path historically inherited
+ * a hardcoded Joel attribution, which is the wrong long-term answer (probably
+ * should be the consultant on the meeting, parsed from `meeting.participants`
+ * against the users table). Krisp webhook firings are rare in practice; this
+ * stub keeps `handleKrispWebhook` returning 200 OK so Krisp doesn't retry,
+ * but no note is posted.
+ *
+ * TODO: refactor with per-meeting consultant attribution, or remove the
+ * webhook handler entirely if the integration is being retired.
+ */
+async function processKrispMeetingNotes(meeting, _content, _env) {
   console.log({
-    message: `[Krisp] → RF note posted for candidate=${candidateId}`,
+    message: '[Krisp] STUBBED — would have posted note',
     source: 'krisp',
-    action: 'note_posted',
-    candidateId,
-    candidateEmail,
-    lookupMethod,
-    meetingId: meeting.id,
-    meetingTitle: meeting.title,
+    meetingId: meeting?.id ?? null,
   });
-
-  return true;
+  return false;
 }
 
 async function handleDialpadCallWebhook(request, env) {

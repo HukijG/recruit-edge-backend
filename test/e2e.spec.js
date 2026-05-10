@@ -876,7 +876,8 @@ describe('E2E: Calendar → RF + Dialpad', () => {
 describe('E2E: Krisp → RF (meeting notes)', () => {
 	afterEach(() => { globalThis.fetch = originalFetch; });
 
-	it('adds meeting notes to RF candidate via email lookup', async () => {
+	// SKIPPED 2026-05-10: processKrispMeetingNotes is stubbed pending attribution decision.
+	it.skip('adds meeting notes to RF candidate via email lookup', async () => {
 		const calls = mockFetch([
 			rfAddNoteRoute(),
 		]);
@@ -932,7 +933,8 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 		expect(dedup).toBe('true');
 	});
 
-	it('skips duplicate meeting (dedup flag already set)', async () => {
+	// SKIPPED 2026-05-10: processKrispMeetingNotes is stubbed pending attribution decision.
+	it.skip('skips duplicate meeting (dedup flag already set)', async () => {
 		const calls = mockFetch([]);
 
 		// Pre-seed dedup flag
@@ -965,7 +967,8 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 		expect(calls.length).toBe(0);
 	});
 
-	it('searches RF by email when not in cache', async () => {
+	// SKIPPED 2026-05-10: processKrispMeetingNotes is stubbed pending attribution decision.
+	it.skip('searches RF by email when not in cache', async () => {
 		const searchResult = {
 			id: 12345,
 			first_name: 'Tony',
