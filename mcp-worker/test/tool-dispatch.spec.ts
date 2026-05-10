@@ -118,7 +118,7 @@ describe("tool dispatch", () => {
     expect(errorText).toContain("internal middleware crash detail");
   });
 
-  it("tools/list returns all 7 tools", async () => {
+  it("tools/list returns all 8 tools", async () => {
     const middlewareFetch = vi.fn();
     const testEnv = { ...env, MIDDLEWARE: { fetch: middlewareFetch } as unknown as Fetcher };
 
@@ -146,6 +146,7 @@ describe("tool dispatch", () => {
 
     expect(toolNames.sort()).toEqual([
       "rf_cache_status",
+      "rf_candidate_add_note",
       "rf_candidate_get",
       "rf_candidate_log_interview",
       "rf_candidate_move_stage",

@@ -357,4 +357,34 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
         return respond(data);
       }),
   );
+
+  // ─── rf_candidate_add_note ──────────────────────────────────────────
+  server.registerTool(
+    "rf_candidate_add_note",
+    {
+      title: "Add a note to a candidate's RF timeline (markdown body)",
+      description: [
+        "Writes a note onto a candidate's RF profile. Pass natural strings — middleware fuzzy-matches candidate (and the optional `job` for auto-narrow when multiple candidates match the name). Numeric (or numeric-string) ids bypass fuzzy.",
+        "",
+        "`note` is markdown; the worker renders to HTML before sending to RF. A bare newline becomes <br>; bold/italic/lists/links/autolinks all supported.",
+        "",
+        "Optional `job` is purely a disambiguator — notes attach to the candidate, not to a job link. Post-narrow auto-commit: even when candidate is fuzzy-ambiguous, if exactly one candidate is on the requested job, the note commits with no round-trip.",
+        "",
+        "Recoverable failures (no candidate match, no candidate on the requested job, etc.) come back at HTTP 200 as `{ok:false, kind, error}` — apologise, clarify with the user, retry. 4xx / 5xx are loud install or transport errors.",
+        "",
+        "Attribution is always the consultant whose Access JWT signed this MCP session — there is no override field.",
+      ].join("\n"),
+      inputSchema: {
+        candidate: ref,
+        note: z.string().min(1).describe("Markdown body of the note. Server renders to HTML before sending to RF."),
+        job: ref.optional(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false },
+    },
+    async (args) =>
+      guarded(async () => {
+        const data = await mwFetch(ctx, "/mcp/candidate-add-note", args as Record<string, unknown>);
+        return respond(data);
+      }),
+  );
 }
