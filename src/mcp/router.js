@@ -40,7 +40,7 @@ export async function routeMcp(request, env, ctx, handlers) {
   }
   let body = {};
   try { body = await request.json(); } catch {}
-  const consultant = getUserByFirstName(body.consultantFirstName);
+  const consultant = await getUserByFirstName(env, body.consultantFirstName);
   if (!consultant) {
     return logged(tool, t0, jsonResponse(403, { ok: false, error: 'Unknown consultant' }));
   }

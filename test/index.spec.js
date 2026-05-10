@@ -1,5 +1,7 @@
 import { env, createExecutionContext, waitOnExecutionContext, SELF } from 'cloudflare:test';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { applyUsersMigration } from './helpers/users-migrate.js';
+import { _resetCacheForTests } from '../src/users.js';
 import worker from '../src';
 import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
 import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob, convertDialpadContactToRFUpdate, findJobsForStageMove } from '../src/rf-client.js';
@@ -12,6 +14,11 @@ import { isJoelCandidate, enrichCandidate } from '../src/enrichment.js';
 import { signCallerIdAlias, verifyCallerIdAlias } from '../src/dialpad-aliases.js';
 import { buildCallerIdsFromDialpad, sendSMS } from '../src/dialpad-client.js';
 import { decideCallRateLimit, checkAndRecordCall, CALL_RATE_WINDOW_MS, CALL_RATE_LIMIT, CALL_DEDUP_WINDOW_MS } from '../src/rate-limit.js';
+
+beforeEach(async () => {
+	await applyUsersMigration(env);
+	_resetCacheForTests();
+});
 
 describe('RF-Dialpad Sync Worker', () => {
 	it('/health returns 200 with status message', async () => {
@@ -312,47 +319,47 @@ describe('createRFCustomActivity', () => {
 // ---------------------------------------------------------------------------
 
 describe('isMonitoredDialpadUser', () => {
-	it('returns true for Joel Dialpad user ID as string', () => {
-		expect(isMonitoredDialpadUser('8000000000000001')).toBe(true);
+	it('returns true for Joel Dialpad user ID as string', async () => {
+		expect(await isMonitoredDialpadUser(env, '8000000000000001')).toBe(true);
 	});
 
-	it('returns true for Joel Dialpad user ID as number', () => {
-		expect(isMonitoredDialpadUser(8000000000000001)).toBe(true);
+	it('returns true for Joel Dialpad user ID as number', async () => {
+		expect(await isMonitoredDialpadUser(env, 8000000000000001)).toBe(true);
 	});
 
-	it('returns true for Alice Dialpad user ID', () => {
-		expect(isMonitoredDialpadUser('8000000000000002')).toBe(true);
+	it('returns true for Alice Dialpad user ID', async () => {
+		expect(await isMonitoredDialpadUser(env, '8000000000000002')).toBe(true);
 	});
 
-	it('returns false for other user IDs', () => {
-		expect(isMonitoredDialpadUser('9999999999999999')).toBe(false);
+	it('returns false for other user IDs', async () => {
+		expect(await isMonitoredDialpadUser(env, '9999999999999999')).toBe(false);
 	});
 
-	it('returns false for undefined', () => {
-		expect(isMonitoredDialpadUser(undefined)).toBe(false);
+	it('returns false for undefined', async () => {
+		expect(await isMonitoredDialpadUser(env, undefined)).toBe(false);
 	});
 });
 
 describe('getRFUserIdByDialpadId', () => {
-	it('returns Joel RF user ID for Joel Dialpad ID', () => {
-		expect(getRFUserIdByDialpadId('8000000000000001')).toBe(900001);
+	it('returns Joel RF user ID for Joel Dialpad ID', async () => {
+		expect(await getRFUserIdByDialpadId(env, '8000000000000001')).toBe(900001);
 	});
 
-	it('returns Alice RF user ID for Alice Dialpad ID', () => {
-		expect(getRFUserIdByDialpadId('8000000000000002')).toBe(900002);
+	it('returns Alice RF user ID for Alice Dialpad ID', async () => {
+		expect(await getRFUserIdByDialpadId(env, '8000000000000002')).toBe(900002);
 	});
 
-	it('coerces numeric Dialpad IDs', () => {
-		expect(getRFUserIdByDialpadId(8000000000000001)).toBe(900001);
+	it('coerces numeric Dialpad IDs', async () => {
+		expect(await getRFUserIdByDialpadId(env, 8000000000000001)).toBe(900001);
 	});
 
-	it('returns null for unknown Dialpad ID', () => {
-		expect(getRFUserIdByDialpadId('1234567890')).toBeNull();
+	it('returns null for unknown Dialpad ID', async () => {
+		expect(await getRFUserIdByDialpadId(env, '1234567890')).toBeNull();
 	});
 
-	it('returns null for null/undefined', () => {
-		expect(getRFUserIdByDialpadId(null)).toBeNull();
-		expect(getRFUserIdByDialpadId(undefined)).toBeNull();
+	it('returns null for null/undefined', async () => {
+		expect(await getRFUserIdByDialpadId(env, null)).toBeNull();
+		expect(await getRFUserIdByDialpadId(env, undefined)).toBeNull();
 	});
 });
 
@@ -784,10 +791,9 @@ describe('findEligibleJob', () => {
     expect(result.userId).toBe(900001);
   });
 
-  it('uses the Joel RF user ID sourced from users.js, not a duplicate literal', async () => {
-    const { getUserByFirstName } = await import('../src/users.js');
-    const joel = getUserByFirstName('Joel');
-    // findEligibleJob's userId field must equal Joel's rfUserId from the registry
+  it('uses Joel RF user ID (900001) in userId field', () => {
+    // JOEL_RF_USER_ID is hardcoded in rf-client.js (900001) — same value as
+    // migrations/0002_seed_users.sql so tests and production agree.
     const result = findEligibleJob({
       jobs: [{
         job_id: 1,
@@ -796,7 +802,7 @@ describe('findEligibleJob', () => {
         stages: [{ id: 100, name: 'Call Booked' }],
       }],
     });
-    expect(result.userId).toBe(joel.rfUserId);
+    expect(result.userId).toBe(900001);
   });
 });
 

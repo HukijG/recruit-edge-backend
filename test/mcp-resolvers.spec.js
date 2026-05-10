@@ -1,6 +1,8 @@
 import { env } from 'cloudflare:test';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { applyMigration } from './helpers/d1-migrate.js';
+import { applyUsersMigration } from './helpers/users-migrate.js';
+import { _resetCacheForTests } from '../src/users.js';
 import { resetSnapshot } from '../src/mcp/snapshot.js';
 import {
   resolveCandidate,
@@ -48,6 +50,8 @@ const setSyncStateVersion = async (v) => {
 
 beforeEach(async () => {
   await applyMigration(env);
+  await applyUsersMigration(env);
+  _resetCacheForTests();
   resetSnapshot();
   await setSyncStateVersion(new Date().toISOString());
 });

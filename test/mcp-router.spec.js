@@ -1,9 +1,15 @@
 import { env, createExecutionContext } from 'cloudflare:test';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { applyMigration } from './helpers/d1-migrate.js';
+import { applyUsersMigration } from './helpers/users-migrate.js';
+import { _resetCacheForTests } from '../src/users.js';
 import worker from '../src';
 
-beforeEach(async () => { await applyMigration(env); });
+beforeEach(async () => {
+  await applyMigration(env);
+  await applyUsersMigration(env);
+  _resetCacheForTests();
+});
 
 async function call(path, body, headers = {}) {
   const r = new Request('http://x' + path, {

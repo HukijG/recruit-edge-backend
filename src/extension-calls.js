@@ -41,7 +41,7 @@ export async function processExtensionCallEvent(payload, env) {
     return { processed: false, reason: 'no-callid-in-payload', eventState };
   }
 
-  const user = getUserByDialpadId(targetId);
+  const user = await getUserByDialpadId(env, targetId);
   if (!user) {
     return { processed: false, reason: 'unmonitored-target', targetId, eventState, eventCallId };
   }

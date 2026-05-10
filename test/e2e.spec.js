@@ -11,7 +11,14 @@
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { SignJWT } from 'jose';
+import { applyUsersMigration } from './helpers/users-migrate.js';
+import { _resetCacheForTests } from '../src/users.js';
 import worker from '../src';
+
+beforeEach(async () => {
+	await applyUsersMigration(env);
+	_resetCacheForTests();
+});
 
 // ---------------------------------------------------------------------------
 // Helpers

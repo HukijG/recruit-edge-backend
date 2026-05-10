@@ -12,6 +12,8 @@
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { SignJWT } from 'jose';
+import { applyUsersMigration } from './helpers/users-migrate.js';
+import { _resetCacheForTests } from '../src/users.js';
 import worker from '../src';
 
 const originalFetch = globalThis.fetch;
@@ -70,6 +72,11 @@ async function seedDO(callId) {
 async function readDO() {
   return await getDOStub().getCallId();
 }
+
+beforeEach(async () => {
+  await applyUsersMigration(env);
+  _resetCacheForTests();
+});
 
 // ---------------------------------------------------------------------------
 // /dialpad-call no longer writes call-state (the calling webhook does)

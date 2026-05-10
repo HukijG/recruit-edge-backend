@@ -2,7 +2,6 @@
  * RecruiterFlow API Client
  */
 
-import { getUserByFirstName } from './users.js';
 import {
   getCachedConsultantForJobLink, cacheConsultantForJobLink,
   cacheCandidateDetails, getCachedCandidateDetails,
@@ -398,7 +397,10 @@ export async function createRFCustomActivity(activityData, env) {
  */
 const CALL_BOOKED_ELIGIBLE_STAGES = ['Sourced', 'Replied', 'Replied (Cold)'];
 const CALL_BOOKED_TARGET = 'Call Booked';
-const JOEL_RF_USER_ID = getUserByFirstName('Joel').rfUserId;
+// Joel's RF user id — sourced from migrations/0002_seed_users.sql.
+// Hardcoded here because findEligibleJob() is sync (no env available at call
+// site) and team membership changes require a deployment anyway.
+const JOEL_RF_USER_ID = 900001;
 
 /**
  * Find the most-recently-moved job on a candidate and check if it's

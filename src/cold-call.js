@@ -273,7 +273,7 @@ export async function processCallEvent(payload, env) {
 
   // --- Pre-LLM filters ---
 
-  if (!isMonitoredDialpadUser(payload.target?.id)) {
+  if (!await isMonitoredDialpadUser(env, payload.target?.id)) {
     console.log({ message: `[ColdCall] skipped: not a monitored target user (target=${payload.target?.id})`, source: 'cold-call', step: 'filter', callId });
     return { processed: false, isColdCall: false, outcome: null, reason: 'not target user' };
   }
@@ -400,7 +400,7 @@ export async function processCallEvent(payload, env) {
     }
   }
 
-  const activityUserId = getRFUserIdByDialpadId(payload.target?.id);
+  const activityUserId = await getRFUserIdByDialpadId(env, payload.target?.id);
   // RF's activity_text only honours <br> for line breaks; bare \n collapses
   // to a space at render time. Convert just before sending.
   const formattedActivityText = addHtmlLineBreaks(activityText);

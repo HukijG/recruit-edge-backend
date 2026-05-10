@@ -1,6 +1,8 @@
 import { env, createExecutionContext } from 'cloudflare:test';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { applyMigration } from './helpers/d1-migrate.js';
+import { applyUsersMigration } from './helpers/users-migrate.js';
+import { _resetCacheForTests } from '../src/users.js';
 import { resetSnapshot } from '../src/mcp/snapshot.js';
 import worker from '../src';
 
@@ -14,6 +16,8 @@ async function call(body) {
 
 beforeEach(async () => {
   await applyMigration(env);
+  await applyUsersMigration(env);
+  _resetCacheForTests();
   await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
   resetSnapshot();
   await env.RF_MCP_CACHE.prepare(

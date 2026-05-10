@@ -338,7 +338,7 @@ export async function resolveOwner(env, input) {
     return { ok: true, value: { id: coerced.value } };
   }
 
-  const fast = getUserByFirstName(coerced.value);
+  const fast = await getUserByFirstName(env, coerced.value);
   if (fast) {
     return { ok: true, value: { id: fast.rfUserId, name: fast.firstName } };
   }

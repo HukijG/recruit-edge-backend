@@ -7,8 +7,15 @@
  */
 
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { applyUsersMigration } from './helpers/users-migrate.js';
+import { _resetCacheForTests } from '../src/users.js';
 import worker from '../src';
+
+beforeEach(async () => {
+  await applyUsersMigration(env);
+  _resetCacheForTests();
+});
 
 const originalFetch = globalThis.fetch;
 

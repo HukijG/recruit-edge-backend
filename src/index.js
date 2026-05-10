@@ -1401,7 +1401,7 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
     }
 
     const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
-    const consultantRfUserId = resolveRFUserId(consultantFirstName);
+    const consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
     if (consultantFirstName && consultantRfUserId === null) {
       console.warn({
         message: `[Candidates] unknown consultantFirstName="${consultantFirstName}", attribution will be skipped`,
@@ -1531,7 +1531,7 @@ async function handleAddToJobEndpoint(request, env, ctx, corsHeaders) {
     }
 
     const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
-    const consultantRfUserId = resolveRFUserId(consultantFirstName);
+    const consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
     if (consultantFirstName && consultantRfUserId === null) {
       console.warn({
         message: `[AddToJob] unknown consultantFirstName="${consultantFirstName}", consultant_id will not be written`,
@@ -1718,7 +1718,7 @@ async function handleCandidateDetailsEndpoint(request, env, ctx, corsHeaders) {
       });
     }
 
-    const consultantRfUserId = resolveRFUserId(consultantFirstName);
+    const consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
 
     // Resolve rfId — KV linkedin index first, RF search fallback.
     let rfId = await lookupByLinkedIn(profileUrl, env);
@@ -1973,7 +1973,7 @@ async function handleDialpadUserContextEndpoint(request, env, corsHeaders) {
       });
     }
 
-    const user = getUserByFirstName(consultantFirstName);
+    const user = await getUserByFirstName(env, consultantFirstName);
     if (!user) {
       console.warn({
         message: `[DialpadUserContext] unknown consultantFirstName="${consultantFirstName}"`,
@@ -2044,7 +2044,7 @@ async function handleDialpadCallEndpoint(request, env, corsHeaders) {
       });
     }
 
-    const user = getUserByFirstName(consultantFirstName);
+    const user = await getUserByFirstName(env, consultantFirstName);
     if (!user) {
       return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
         status: 403, headers: responseHeaders,
@@ -2187,7 +2187,7 @@ async function handleDialpadSmsEndpoint(request, env, corsHeaders) {
       });
     }
 
-    const user = getUserByFirstName(consultantFirstName);
+    const user = await getUserByFirstName(env, consultantFirstName);
     if (!user) {
       return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
         status: 403, headers: responseHeaders,
@@ -2297,7 +2297,7 @@ async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
       });
     }
 
-    const user = getUserByFirstName(consultantFirstName);
+    const user = await getUserByFirstName(env, consultantFirstName);
     if (!user) {
       return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
         status: 403, headers: responseHeaders,
@@ -2396,7 +2396,7 @@ async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
       });
     }
 
-    const user = getUserByFirstName(consultantFirstName);
+    const user = await getUserByFirstName(env, consultantFirstName);
     if (!user) {
       return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
         status: 403, headers: responseHeaders,
@@ -2546,7 +2546,7 @@ async function handleMySourcingJobsEndpoint(request, env, corsHeaders) {
       });
     }
 
-    const consultantRfUserId = resolveRFUserId(consultantFirstName);
+    const consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
     if (!consultantRfUserId) {
       return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
         status: 403, headers: responseHeaders,
@@ -2629,7 +2629,7 @@ async function handleJobPipelineEndpoint(request, env, corsHeaders) {
       });
     }
 
-    const consultantRfUserId = resolveRFUserId(consultantFirstName);
+    const consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
     if (!consultantRfUserId) {
       return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
         status: 403, headers: responseHeaders,
@@ -2740,7 +2740,7 @@ async function handleCallStatsEndpoint(request, env, corsHeaders) {
       });
     }
 
-    const user = getUserByFirstName(consultantFirstName);
+    const user = await getUserByFirstName(env, consultantFirstName);
     if (!user) {
       return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
         status: 403, headers: responseHeaders,
