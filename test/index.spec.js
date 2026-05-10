@@ -20,6 +20,11 @@ beforeEach(async () => {
 	_resetCacheForTests();
 });
 
+// Joel's RF user id from the seed migration. Tests pass this as a parameter
+// to the now-pure findEligibleJob / isJoelCandidate helpers (parameter-injected
+// rather than module-hardcoded — see src/rf-client.js / src/enrichment.js).
+const JOEL_RF_USER_ID = 900001;
+
 describe('RF-Dialpad Sync Worker', () => {
 	it('/health returns 200 with status message', async () => {
 		const request = new Request('http://example.com/health');
@@ -681,20 +686,20 @@ describe('findEligibleJob', () => {
 
   it('returns null when candidate has no jobs', () => {
     const candidate = buildCandidate([]);
-    expect(findEligibleJob(candidate)).toBeNull();
+    expect(findEligibleJob(candidate, JOEL_RF_USER_ID)).toBeNull();
   });
 
   it('returns null for null candidate', () => {
-    expect(findEligibleJob(null)).toBeNull();
+    expect(findEligibleJob(null, JOEL_RF_USER_ID)).toBeNull();
   });
 
   it('returns null for candidate with undefined jobs', () => {
-    expect(findEligibleJob({ id: 1 })).toBeNull();
+    expect(findEligibleJob({ id: 1 }, JOEL_RF_USER_ID)).toBeNull();
   });
 
   it('returns the job when candidate is in Sourced', () => {
     const candidate = buildCandidate([buildJob({ stage_name: 'Sourced' })]);
-    const result = findEligibleJob(candidate);
+    const result = findEligibleJob(candidate, JOEL_RF_USER_ID);
     expect(result).not.toBeNull();
     expect(result.job_id).toBe(977);
     expect(result.targetStage.name).toBe('Call Booked');
@@ -702,29 +707,29 @@ describe('findEligibleJob', () => {
 
   it('returns the job when candidate is in Replied', () => {
     const candidate = buildCandidate([buildJob({ stage_name: 'Replied' })]);
-    const result = findEligibleJob(candidate);
+    const result = findEligibleJob(candidate, JOEL_RF_USER_ID);
     expect(result).not.toBeNull();
   });
 
   it('returns the job when candidate is in Replied (Cold)', () => {
     const candidate = buildCandidate([buildJob({ stage_name: 'Replied (Cold)' })]);
-    const result = findEligibleJob(candidate);
+    const result = findEligibleJob(candidate, JOEL_RF_USER_ID);
     expect(result).not.toBeNull();
   });
 
   it('returns null when candidate is already in Call Booked', () => {
     const candidate = buildCandidate([buildJob({ stage_name: 'Call Booked' })]);
-    expect(findEligibleJob(candidate)).toBeNull();
+    expect(findEligibleJob(candidate, JOEL_RF_USER_ID)).toBeNull();
   });
 
   it('returns null when candidate is in Shortlist (past Call Booked)', () => {
     const candidate = buildCandidate([buildJob({ stage_name: 'Shortlist' })]);
-    expect(findEligibleJob(candidate)).toBeNull();
+    expect(findEligibleJob(candidate, JOEL_RF_USER_ID)).toBeNull();
   });
 
   it('returns null when candidate is in 1st Interview', () => {
     const candidate = buildCandidate([buildJob({ stage_name: '1st Interview' })]);
-    expect(findEligibleJob(candidate)).toBeNull();
+    expect(findEligibleJob(candidate, JOEL_RF_USER_ID)).toBeNull();
   });
 
   it('picks the job with the most recent stage_moved when multiple jobs exist', () => {
@@ -747,7 +752,7 @@ describe('findEligibleJob', () => {
       ],
     });
     const candidate = buildCandidate([oldJob, recentJob]);
-    const result = findEligibleJob(candidate);
+    const result = findEligibleJob(candidate, JOEL_RF_USER_ID);
     expect(result).not.toBeNull();
     expect(result.job_id).toBe(200);
     expect(result.targetStage.id).toBe(60002);
@@ -765,7 +770,7 @@ describe('findEligibleJob', () => {
       stage_moved: '2026-03-24T17:10:16+0000',
     });
     const candidate = buildCandidate([eligibleOldJob, ineligibleRecentJob]);
-    expect(findEligibleJob(candidate)).toBeNull();
+    expect(findEligibleJob(candidate, JOEL_RF_USER_ID)).toBeNull();
   });
 
   it('returns null when job has no Call Booked stage in stages array', () => {
@@ -777,23 +782,26 @@ describe('findEligibleJob', () => {
       ],
     });
     const candidate = buildCandidate([job]);
-    expect(findEligibleJob(candidate)).toBeNull();
+    expect(findEligibleJob(candidate, JOEL_RF_USER_ID)).toBeNull();
   });
 
-  it('falls back to Joel user ID (900001) when added_to_job_by is missing', () => {
+  it('still returns eligible result when added_to_job_by is missing', () => {
+    // The userId field is independent of added_to_job_by — caller passes
+    // Joel's id in regardless, since added_to_job_by may be missing on
+    // candidates not added via the LinkedIn extension.
     const job = buildJob({
       stage_name: 'Sourced',
       added_to_job_by: null,
     });
     const candidate = buildCandidate([job]);
-    const result = findEligibleJob(candidate);
+    const result = findEligibleJob(candidate, JOEL_RF_USER_ID);
     expect(result).not.toBeNull();
-    expect(result.userId).toBe(900001);
+    expect(result.userId).toBe(JOEL_RF_USER_ID);
   });
 
-  it('uses Joel RF user ID (900001) in userId field', () => {
-    // JOEL_RF_USER_ID is hardcoded in rf-client.js (900001) — same value as
-    // migrations/0002_seed_users.sql so tests and production agree.
+  it('passes joelRfUserId through to result.userId', () => {
+    // findEligibleJob is a pure helper — caller resolves Joel from D1 and
+    // passes the id in. This test just verifies the parameter round-trips.
     const result = findEligibleJob({
       jobs: [{
         job_id: 1,
@@ -801,8 +809,8 @@ describe('findEligibleJob', () => {
         stage_moved: '2026-03-30T15:08:04+0000',
         stages: [{ id: 100, name: 'Call Booked' }],
       }],
-    });
-    expect(result.userId).toBe(900001);
+    }, JOEL_RF_USER_ID);
+    expect(result.userId).toBe(JOEL_RF_USER_ID);
   });
 });
 
@@ -1370,7 +1378,7 @@ describe('isJoelCandidate', () => {
 			id: 100,
 			jobs: [{ job_id: 1, added_to_job_by: { id: 900001, name: 'Joel Haines' } }],
 		};
-		expect(isJoelCandidate(candidate)).toBe(true);
+		expect(isJoelCandidate(candidate, JOEL_RF_USER_ID)).toBe(true);
 	});
 
 	it('returns false when jobs added by someone else', () => {
@@ -1378,7 +1386,7 @@ describe('isJoelCandidate', () => {
 			id: 101,
 			jobs: [{ job_id: 1, added_to_job_by: { id: 900003, name: 'Bob Smith' } }],
 		};
-		expect(isJoelCandidate(candidate)).toBe(false);
+		expect(isJoelCandidate(candidate, JOEL_RF_USER_ID)).toBe(false);
 	});
 
 	it('returns true when ANY job (not just first) is Joel\'s', () => {
@@ -1389,17 +1397,17 @@ describe('isJoelCandidate', () => {
 				{ job_id: 2, added_to_job_by: { id: 900001, name: 'Joel Haines' } },
 			],
 		};
-		expect(isJoelCandidate(candidate)).toBe(true);
+		expect(isJoelCandidate(candidate, JOEL_RF_USER_ID)).toBe(true);
 	});
 
 	it('returns false for empty jobs array', () => {
 		const candidate = { id: 103, jobs: [] };
-		expect(isJoelCandidate(candidate)).toBe(false);
+		expect(isJoelCandidate(candidate, JOEL_RF_USER_ID)).toBe(false);
 	});
 
 	it('returns false when jobs is undefined', () => {
 		const candidate = { id: 104 };
-		expect(isJoelCandidate(candidate)).toBe(false);
+		expect(isJoelCandidate(candidate, JOEL_RF_USER_ID)).toBe(false);
 	});
 
 	it('handles null added_to_job_by', () => {
@@ -1407,7 +1415,7 @@ describe('isJoelCandidate', () => {
 			id: 105,
 			jobs: [{ job_id: 1, added_to_job_by: null }],
 		};
-		expect(isJoelCandidate(candidate)).toBe(false);
+		expect(isJoelCandidate(candidate, JOEL_RF_USER_ID)).toBe(false);
 	});
 });
 

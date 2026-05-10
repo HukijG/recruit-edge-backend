@@ -8,10 +8,6 @@
 import { enrichPerson, searchPeople, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from './apollo-client.js';
 import { updateRFCandidate, addRFCandidateNote } from './rf-client.js';
 import { patchDialpadContact } from './dialpad-client.js';
-// Joel's RF user id — sourced from migrations/0002_seed_users.sql.
-// Hardcoded here because isJoelCandidate() is sync (no env available at call
-// site) and team membership changes require a deployment anyway.
-const JOEL_RF_USER_ID = 900001;
 
 function log(data) {
 	console.log({ source: 'enrichment', ...data });
@@ -24,13 +20,18 @@ function logError(data) {
 /**
  * Check if any job on the candidate was added by Joel.
  *
+ * Joel's RF user id is passed in by the caller (resolved from the D1
+ * users table, the source of truth) — this keeps the function pure / sync
+ * and avoids duplicating the constant in source code.
+ *
  * @param {Object} fullCandidate - Full candidate object from GET /candidate/get (includes jobs array)
+ * @param {number} joelRfUserId - Joel's RF user id, looked up via getUserByFirstName(env, 'Joel')
  * @returns {boolean}
  */
-export function isJoelCandidate(fullCandidate) {
+export function isJoelCandidate(fullCandidate, joelRfUserId) {
 	const jobs = fullCandidate?.jobs;
 	if (!Array.isArray(jobs) || jobs.length === 0) return false;
-	return jobs.some(job => job.added_to_job_by?.id === JOEL_RF_USER_ID);
+	return jobs.some(job => job.added_to_job_by?.id === joelRfUserId);
 }
 
 /**

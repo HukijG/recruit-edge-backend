@@ -7,6 +7,7 @@ import {
   cacheCandidateDetails, getCachedCandidateDetails,
   cacheCandidateActivities, getCachedCandidateActivities,
 } from './cache.js';
+import { getUserByFirstName } from './users.js';
 
 /**
  * Extract RF candidate ID from Dialpad contact ID
@@ -397,19 +398,19 @@ export async function createRFCustomActivity(activityData, env) {
  */
 const CALL_BOOKED_ELIGIBLE_STAGES = ['Sourced', 'Replied', 'Replied (Cold)'];
 const CALL_BOOKED_TARGET = 'Call Booked';
-// Joel's RF user id — sourced from migrations/0002_seed_users.sql.
-// Hardcoded here because findEligibleJob() is sync (no env available at call
-// site) and team membership changes require a deployment anyway.
-const JOEL_RF_USER_ID = 900001;
 
 /**
  * Find the most-recently-moved job on a candidate and check if it's
  * eligible for stage movement to "Call Booked".
  *
+ * Joel's RF user id is passed in by the caller (resolved from the D1
+ * users table, the source of truth) — this keeps the function pure / sync.
+ *
  * @param {object} candidate - Full candidate object from GET /candidate/get (must include jobs array)
+ * @param {number} joelRfUserId - Joel's RF user id, looked up via getUserByFirstName(env, 'Joel')
  * @returns {{ job_id: number, targetStage: { id: number, name: string }, userId: number } | null}
  */
-export function findEligibleJob(candidate) {
+export function findEligibleJob(candidate, joelRfUserId) {
   const jobs = candidate?.jobs;
   if (!Array.isArray(jobs) || jobs.length === 0) return null;
 
@@ -432,7 +433,7 @@ export function findEligibleJob(candidate) {
   return {
     job_id: mostRecent.job_id,
     targetStage: { id: targetStage.id, name: targetStage.name },
-    userId: JOEL_RF_USER_ID,
+    userId: joelRfUserId,
   };
 }
 
@@ -446,7 +447,11 @@ export function findEligibleJob(candidate) {
  * @returns {{ moved: boolean, jobId?: number, reason?: string }}
  */
 export async function moveToCallBooked(candidateId, candidateData, env) {
-  const eligible = findEligibleJob(candidateData);
+  const joel = await getUserByFirstName(env, 'Joel');
+  if (!joel) {
+    throw new Error('moveToCallBooked: Joel not found in users table — cannot resolve userId for stage move');
+  }
+  const eligible = findEligibleJob(candidateData, joel.rfUserId);
 
   if (!eligible) {
     return { moved: false, reason: 'not eligible (no jobs, wrong stage, or no Call Booked stage)' };

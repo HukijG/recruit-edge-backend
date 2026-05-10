@@ -261,7 +261,8 @@ async function handleRecruiterflowWebhook(request, env) {
       if (eventType === 'Created') {
         try {
           const fullCandidate = await getRFCandidate(candidate.id, env);
-          if (isJoelCandidate(fullCandidate)) {
+          const joel = await getUserByFirstName(env, 'Joel');
+          if (joel && isJoelCandidate(fullCandidate, joel.rfUserId)) {
             const enrichResult = await enrichCandidate(candidate, fullCandidate, env);
             console.log({
               message: `[RF] enrichment: ${enrichResult.enriched ? 'done' : `skipped (${enrichResult.reason})`}`,
