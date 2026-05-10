@@ -84,17 +84,71 @@ describe('getUserByRFUserId / resolveRFUserId / isMonitoredDialpadUser', () => {
 });
 
 describe('cache behavior', () => {
-  it('reads D1 once across multiple lookups (after _resetCacheForTests is NOT called)', async () => {
+  it('reads D1 once across multiple sequential lookups', async () => {
     let queryCount = 0;
     const originalPrepare = env.USERS_DB.prepare.bind(env.USERS_DB);
     env.USERS_DB.prepare = (sql) => { queryCount++; return originalPrepare(sql); };
+    try {
+      await getUserByEmail(env, 'joel@test.local');
+      await getUserByDialpadId(env, '8000000000000001');
+      await getUserByFirstName(env, 'Alice');
+      expect(queryCount).toBe(1); // single warm-up read; subsequent calls hit cache
+    } finally {
+      env.USERS_DB.prepare = originalPrepare;
+    }
+  });
 
-    await getUserByEmail(env, 'joel@test.local');
-    await getUserByDialpadId(env, '8000000000000001');
-    await getUserByFirstName(env, 'Alice');
+  it('collapses concurrent cold-start callers to a single D1 read', async () => {
+    let queryCount = 0;
+    const originalPrepare = env.USERS_DB.prepare.bind(env.USERS_DB);
+    env.USERS_DB.prepare = (sql) => { queryCount++; return originalPrepare(sql); };
+    try {
+      // All three fire from a clean cache; in-flight Promise memoization
+      // should collapse them to one read.
+      await Promise.all([
+        getUserByEmail(env, 'joel@test.local'),
+        getUserByDialpadId(env, '8000000000000001'),
+        getUserByFirstName(env, 'Alice'),
+      ]);
+      expect(queryCount).toBe(1);
+    } finally {
+      env.USERS_DB.prepare = originalPrepare;
+    }
+  });
 
-    expect(queryCount).toBe(1); // single warm-up read; subsequent calls hit cache
+  it('retries after a rejected first load (does not poison the cache)', async () => {
+    const originalPrepare = env.USERS_DB.prepare.bind(env.USERS_DB);
+    let attempt = 0;
+    env.USERS_DB.prepare = (sql) => {
+      attempt++;
+      if (attempt === 1) {
+        return { all: async () => { throw new Error('transient D1 error'); } };
+      }
+      return originalPrepare(sql);
+    };
+    try {
+      await expect(getUserByEmail(env, 'joel@test.local')).rejects.toThrow(/transient D1 error/);
+      // Second call should retry cleanly (cache stays null, inflight cleared).
+      const u = await getUserByEmail(env, 'joel@test.local');
+      expect(u).toMatchObject({ firstName: 'Joel' });
+      expect(attempt).toBe(2);
+    } finally {
+      env.USERS_DB.prepare = originalPrepare;
+    }
+  });
+});
 
-    env.USERS_DB.prepare = originalPrepare;
+describe('byFirstName collision semantics', () => {
+  it('a primary firstName wins over a colliding alias on another record', async () => {
+    // Inject a deliberate collision: a teammate primary-named "Bobby" alongside
+    // Bob who has alias ["Bobby"]. Primary should win.
+    await env.USERS_DB.prepare(
+      "INSERT INTO users (email, rf_user_id, dialpad_id, first_name) VALUES ('user6@test.local', 9999, '9999999999999999', 'Bobby')"
+    ).run();
+    _resetCacheForTests();
+
+    const u = await getUserByFirstName(env, 'Bobby');
+    expect(u).toMatchObject({ email: 'user6@test.local', rfUserId: 9999 });
+    expect(u.firstName).toBe('Bobby');
   });
 });

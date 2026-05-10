@@ -1,9 +1,20 @@
 /**
  * Team registry — D1-backed lookups, async.
  *
- * Identity records live in `env.USERS_DB.users`, keyed by lowercase email.
- * Every public function takes `env` as its first argument and returns a
- * Promise (call sites must `await`).
+ * `env.USERS_DB.users` is the SOURCE OF TRUTH for the team registry; this
+ * module is a read-through cache over it. Per CLAUDE.md's "Single sources of
+ * truth" rule, all consultant lookups (cold-call attribution, calendar
+ * Joel-only logic, extension consultantFirstName resolution, MCP
+ * consultantEmail resolution) read from here.
+ *
+ * `USERS_DB` is owned by the MAIN worker — it is NOT the sync-worker's
+ * `RF_MCP_CACHE` D1 (which holds candidates/jobs and follows the "only the
+ * sync worker writes D1" invariant). USERS_DB writes happen through migrations
+ * applied by the operator; this module never writes.
+ *
+ * Identity records are keyed by lowercase email (the `email` PK column has a
+ * `CHECK (email = LOWER(email))` constraint). Every public function takes
+ * `env` as its first argument and returns a Promise (call sites must `await`).
  *
  * Caching:
  *   - Module-level cache populated on first call after Worker boot via a
@@ -35,6 +46,21 @@ function normalizeEmail(email) {
   return trimmed || null;
 }
 
+function parseAliases(raw, email) {
+  // Defensive: a malformed `aliases` JSON value should NOT take the entire
+  // module offline. Log it loudly (so the bad row is fixable) and treat the
+  // record as having no aliases. Schema doesn't validate JSON shape — only
+  // TEXT vs NULL — so a hand-edited row could legitimately end up here.
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch (err) {
+    console.error(`[users] malformed aliases JSON for ${email}: ${err.message}`);
+    return null;
+  }
+}
+
 function rowToRecord(row) {
   return {
     email: row.email,
@@ -42,7 +68,7 @@ function rowToRecord(row) {
     dialpadId: row.dialpad_id,
     firstName: row.first_name,
     calendarMode: row.calendar_mode,
-    aliases: row.aliases ? JSON.parse(row.aliases) : null,
+    aliases: parseAliases(row.aliases, row.email),
   };
 }
 
