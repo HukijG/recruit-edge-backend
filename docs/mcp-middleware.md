@@ -8,6 +8,105 @@ The `rf-mcp-remote` MCP worker (`mcp-worker/`) is the public Streamable-HTTP fro
 
 Claude never has ids — it has names. The middleware does ALL alias / fuzzy / acronym resolution server-side. The MCP worker is a transparent forwarder that injects the verified `consultantEmail` (from the Access JWT) and returns the JSON verbatim. **Do NOT add client-side normalisation on the consumer.** If a query is hard to resolve, expand the resolver, not the consumer.
 
+## Design conventions for new MCP tools
+
+Every new MCP tool / endpoint added to either worker follows these rules. They are not stylistic preferences — they exist for prompt-budget economy, single-round-trip UX, and mental-model coherence. **Read this section in full before designing or implementing any new tool.**
+
+### Re-use entity resolvers; never roll your own
+
+Candidate / job / stage / owner references go through `src/mcp/resolvers.js`. Use:
+
+- `resolveCandidate(env, input)` — numeric short-circuit OR fuzzy via the in-memory snapshot.
+- `resolveJob(env, input, { restrictTo, onlyOpen, validateNumeric })` — fuzzy against the `jobs` table, defaults to open-only; pass `restrictTo: nonDq` for candidate-scoped flows (move-stage / log-interview / add-note).
+- `resolveStage(input, stages)` — fuzzy against a job's `stages[]` array.
+- `resolveOwner(env, input)` — `users.js` fast path → `sync_state.users` fallback.
+
+Each resolver returns one of:
+- `{ok: true, value}` — unique match
+- `{ok: false, reason: 'ambiguous', kind, options, hint}` — too close to call
+- `{ok: false, reason: 'not_found', input}` — no match
+
+The ambiguity envelope shape is consistent across all four resolvers so handlers can pattern-match a single shape.
+
+**Do NOT add client-side normalisation on the consumer.** If a query is hard to resolve, expand the resolver. If a fuzzy field needs a new alias path (e.g. an acronym map), put it server-side in `fuzzy.js` / `resolvers.js`.
+
+### Lean tool definitions — `mcp-worker/src/tools.ts`
+
+For each `server.registerTool(...)` block:
+
+- Input schema is the minimum identifying fields. Use `ref = z.union([z.string(), z.number().int()])` for entity references that accept either fuzzy names or numeric ids.
+- `*_id` short-circuit fields are accepted by the middleware handler but are NOT advertised in the tool's input schema. Numeric short-circuit happens transparently because `resolveCandidate` / `resolveJob` detect digit-strings.
+- Write tools never expose an attribution-override field (`user`, `created_by`, `activity_user_id`, etc.). Attribution is always `consultant.rfUserId` resolved from the JWT — server-side, no surface.
+- Description prose says: what to use the tool for, what fuzzy resolution means in this context, what disambiguation looks like, what recoverable failures look like, and that attribution is JWT-locked. Read existing tool blocks for the canonical phrasing.
+
+### Lean responses — the contract
+
+Response shapes consume tokens in Claude's context. Every byte must justify itself by carrying information Claude does NOT already have.
+
+**Success on write tools** is literally "this happened" — no echoing back what Claude sent:
+
+| Tool | Success shape | Rationale |
+|---|---|---|
+| `rf_candidate_add_note` | `{ok: true}` | Claude has the candidate identity from the request; the RF note id is not used downstream. |
+| `rf_candidate_move_stage` | `{ok: true, moved: {candidate_id, candidate_name, job_id, job_name, from_stage, to_stage}}` | `moved` carries the resolved tuple when auto-narrow picked from several possibilities — information Claude does NOT have from the request alone. |
+| `rf_candidate_log_interview` | `{ok: true, activity: {id, candidate_id, kind}, next_step, outlook_url, gcal_hint?}` | Calendar handoff payload is the whole reason the tool exists. |
+
+Bias toward `{ok: true}` for write tools. Only include extra fields when Claude cannot reconstruct them from the request OR they are load-bearing for a follow-up action (like calendar handoffs).
+
+**Disambiguation envelope** at HTTP 200:
+
+```json
+{ "needs_disambiguation": true, "kind": "candidate"|"job"|"stage"|"owner", "options": [...], "hint": "..." }
+```
+
+`options[]` carries ONLY the minimum identifying fields per option (candidates → `{id, name, current_organization, current_title}`; jobs → `{id, name, client_company_name}`; etc.). Never put full record bodies in `options`. If consumers need richer context, they re-call with the chosen id against `rf_candidate_get`.
+
+**Recoverable failures** at HTTP 200:
+
+```json
+{ "ok": false, "kind": "...", "error": "...", "available_jobs"?: [...], "available_stages"?: [...] }
+```
+
+Short error string + recovery hints only where they would unblock the caller. Hints are themselves lean — names + ids, no full bodies.
+
+**Loud failures (4xx / 5xx)** are install / transport errors only. Never use these as a routing mechanism for user-facing recovery cases (those go through the `{ok: false, kind, error}` shape above).
+
+**No echo.** Never include in the response what Claude sent in the request. Claude already has it.
+
+### Handler shape — post-narrow
+
+New handlers follow the post-narrow shape of `src/mcp/candidate-log-interview.js` (or `candidate-add-note.js`):
+
+1. **ID short-circuit.** Coerce `*_id` body fields onto the fuzzy field (`body.candidate_id` → `body.candidate`).
+2. **Validation.** Required fields present (else 400 with exact short error string).
+3. **Candidate resolve.** `resolveCandidate(env, body.candidate)` → single / ambiguous (load top-K bodies via `getCandidateById`) / not_found.
+4. **Optional `job` filter.** Drop candidates without a non-DQ link to the requested job via `resolveJob(env, body.job, { restrictTo: nonDq })`.
+5. **0 survivors** → 400 with a precise error string.
+6. **>1 survivors** → standard `needs_disambiguation` envelope at HTTP 200.
+7. **1 survivor** → commit + return lean success.
+
+If a new tool genuinely does NOT fit this shape, justify it in the spec doc — do not silently diverge.
+
+### Internal helpers — expose for in-process reuse
+
+Every handler module exposes a "do the thing" function as a named export. The function accepts the already-resolved candidate (and consultant) and returns the same `{ok, ...}` envelope the HTTP handler emits. Example: `addNoteForCandidate({env, candidate, noteMd, consultant})` returning `{ok: true}` / `{ok: false, status, error}`.
+
+Future tools that orchestrate multiple write actions (e.g. a Dialpad-call-to-note tool that combines a Dialpad lookup with a note write) MUST call these helpers in-process — no service-binding round-trip back into `/mcp/*` for work that lives in the same worker.
+
+### Summary checklist
+
+When adding a new tool, the spec / plan / implementer must each be able to point to:
+
+- [ ] Resolver reuse (no client-side normalisation, no rolled-own fuzzy)
+- [ ] Lean input schema (no `*_id` advertised; no attribution override)
+- [ ] Lean success shape (`{ok: true}` unless extra fields are load-bearing — say why in the spec)
+- [ ] Standard disambiguation envelope (minimum identifying fields per option)
+- [ ] Standard recoverable-failure shape (`{ok: false, kind, error}` at HTTP 200)
+- [ ] Post-narrow handler shape (or justification for divergence)
+- [ ] Internal helper exposed for in-process reuse
+
+If you cannot tick all seven, the design is not ready to ship.
+
 ## The two-worker split
 
 | Worker | Role |
@@ -105,7 +204,7 @@ All under `/mcp/*`. Identity is the verified `consultantEmail` body field (forwa
 | `/mcp/candidate-get` | By id (D1 SELECT) or by `query` (fuzzy via snapshot, `needs_disambiguation` if top-2 within 0.08). |
 | `/mcp/candidate-move-stage` | Fuzzy-resolves candidate/job/stage, calls RF `/candidate/move-to-stage` attributed to consultant. |
 | `/mcp/candidate-log-interview` | Fuzzy-resolves candidate (+ optional job restricted to candidate's jobs); creates RF custom activity (interview activity-type id resolved dynamically from `sync_state.activity_types`); returns `outlook_url` (recruiter-only block — no candidate email on `to=`) and optional `gcal_hint` based on `consultant.calendarMode`. |
-| `/mcp/candidate-add-note` | Fuzzy-resolves candidate (+ optional job restricted to candidate's jobs); renders markdown body → HTML via `marked` (in `src/mcp/markdown.js`); calls RF `/candidate/notes/add` attributed to `consultant.rfUserId` from the JWT. No `mentions` resolution, no attribution override. Exposes an internal `addNoteForCandidate(...)` for in-process reuse. |
+| `/mcp/candidate-add-note` | Fuzzy-resolves candidate (+ optional job restricted to candidate's jobs); renders markdown body → HTML via `marked` (in `src/mcp/markdown.js`); calls RF `/candidate/notes/add` attributed to `consultant.rfUserId` from the JWT. No `mentions` resolution, no attribution override. Success returns `{ok: true}` only — no echo back (per the lean-response convention). Exposes an internal `addNoteForCandidate(...)` for in-process reuse. |
 | `/mcp/job-candidates-filter` | Fuzzy-resolves `job` (or `job_id` short-circuit). Reads active candidates from `job_pipelines.stage_candidates_json`; hydrates from `candidates`. `stage` filter (fuzzy against `summary_json`); `limit` (default 100, max 500); `truncated` flag when more matched than fit. |
 | `/mcp/job-pipeline` | Fuzzy-resolves `job` (or `job_id` short-circuit). Reads canonical pipeline from `job_pipelines.summary_json`; hydrates active candidates from `candidates`. Filters: `stage` (single, fuzzy), `from`/`to` (range, fuzzy against `summary[]`), `submitted: true` (exact match on 'CV Sent' → end of pipeline). Default: same as `submitted`. Disqualified excluded unless `include_disqualified: true`. Cold-cache returns 200 + warning. |
 
@@ -125,6 +224,8 @@ Notes:
 - LinkedIn returned as full URL (`https://www.linkedin.com/in/...`) regardless of D1 storage shape (bare slug).
 
 ### Adding a new endpoint
+
+**Before starting:** read [Design conventions for new MCP tools](#design-conventions-for-new-mcp-tools) — that section defines what input / output shapes are acceptable. This recipe is the mechanical wiring; the conventions are the contract.
 
 Recipe for a new `/mcp/<name>` endpoint:
 
