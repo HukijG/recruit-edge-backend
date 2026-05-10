@@ -1,11 +1,4 @@
-import { getUserByFirstName } from '../users.js';
-
-function timingSafeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
-  let r = 0;
-  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return r === 0;
-}
+import { getUserByEmail, getUserByFirstName } from '../users.js';
 
 export function jsonResponse(status, payload) {
   return new Response(JSON.stringify(payload), {
@@ -34,16 +27,24 @@ export async function routeMcp(request, env, ctx, handlers) {
   const url = new URL(request.url);
   const tool = url.pathname;
 
-  const token = request.headers.get('X-MCP-Token') ?? '';
-  if (!env.MCP_EXTENSION_SECRET || !timingSafeEqual(token, env.MCP_EXTENSION_SECRET)) {
-    return logged(tool, t0, jsonResponse(401, { ok: false, error: 'auth' }));
-  }
+  // No X-MCP-Token check. The only caller is the rf-mcp-remote service binding
+  // (within the Cloudflare account boundary). Identity arrives as consultantEmail
+  // in the body, derived by the MCP worker from a verified Access JWT.
+
   let body = {};
   try { body = await request.json(); } catch {}
-  const consultant = await getUserByFirstName(env, body.consultantFirstName);
+
+  let consultant = null;
+  if (typeof body.consultantEmail === 'string') {
+    consultant = await getUserByEmail(env, body.consultantEmail);
+  } else if (typeof body.consultantFirstName === 'string') {
+    console.warn(`[mcp] legacy consultantFirstName fallback; tool=${tool}`);
+    consultant = await getUserByFirstName(env, body.consultantFirstName);
+  }
   if (!consultant) {
     return logged(tool, t0, jsonResponse(403, { ok: false, error: 'Unknown consultant' }));
   }
+
   const handler = handlers[url.pathname];
   if (!handler) {
     return logged(tool, t0, jsonResponse(404, { ok: false, error: 'not found' }), consultant.firstName);

@@ -21,20 +21,28 @@ async function call(path, body, headers = {}) {
 }
 
 describe('mcp router', () => {
-  it('returns 401 without X-MCP-Token', async () => {
-    const r = await call('/mcp/cache-status', { consultantFirstName: 'Joel' });
-    expect(r.status).toBe(401);
+  it('resolves consultant from consultantEmail (no token required on binding path)', async () => {
+    const r = await call('/mcp/cache-status', { consultantEmail: 'joel@test.local' });
+    expect(r.status).toBe(200);
   });
-  it('returns 401 with wrong token', async () => {
-    const r = await call('/mcp/cache-status', { consultantFirstName: 'Joel' }, { 'X-MCP-Token': 'nope' });
-    expect(r.status).toBe(401);
-  });
-  it('returns 403 for unknown consultant (right token)', async () => {
-    const r = await call('/mcp/cache-status', { consultantFirstName: 'Nobody' }, { 'X-MCP-Token': 'test-mcp-extension-secret' });
+
+  it('returns 403 for unknown consultantEmail', async () => {
+    const r = await call('/mcp/cache-status', { consultantEmail: 'nobody@test.local' });
     expect(r.status).toBe(403);
   });
-  it('returns 404 for unknown /mcp/* path (right token + known consultant)', async () => {
-    const r = await call('/mcp/does-not-exist', { consultantFirstName: 'Joel' }, { 'X-MCP-Token': 'test-mcp-extension-secret' });
+
+  it('falls back to consultantFirstName during transition', async () => {
+    const r = await call('/mcp/cache-status', { consultantFirstName: 'Joel' });
+    expect(r.status).toBe(200);
+  });
+
+  it('returns 403 when neither consultantEmail nor consultantFirstName resolves', async () => {
+    const r = await call('/mcp/cache-status', {});
+    expect(r.status).toBe(403);
+  });
+
+  it('returns 404 for unknown /mcp/* path (with valid consultant)', async () => {
+    const r = await call('/mcp/does-not-exist', { consultantEmail: 'joel@test.local' });
     expect(r.status).toBe(404);
   });
 });
