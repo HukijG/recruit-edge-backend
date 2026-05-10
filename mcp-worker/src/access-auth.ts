@@ -17,6 +17,17 @@ type JwksGetter =
 let jwks: JwksGetter | null = null;
 
 /**
+ * Module-id sentinel asserted by `mcp-worker/test/access-auth.spec.ts` to guard
+ * against vite's relative-path resolver silently falling back to the main
+ * worker's `src/access-auth.js` (one directory up from `mcp-worker/`) if this
+ * file is ever absent or moved. Without this guard, deleting / renaming this
+ * file leaves the test suite green while exercising a different module — a
+ * silent regression vector that becomes load-bearing once T9+ diverges this
+ * file's API from the main worker's. See T8 review.
+ */
+export const _MODULE_ID = "mcp-worker/access-auth";
+
+/**
  * verifyAccessJwt — validate a Cloudflare Access-issued JWT.
  *
  * Reads `Cf-Access-Jwt-Assertion` header (set by Access edge) first; falls

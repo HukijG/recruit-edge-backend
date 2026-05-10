@@ -1,12 +1,17 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { env } from "cloudflare:test";
 import { generateKeyPair, exportJWK, SignJWT, type JWK } from "jose";
-import { verifyAccessJwt, _setJwksForTests } from "../src/access-auth.js";
+import { verifyAccessJwt, _setJwksForTests, _MODULE_ID } from "../src/access-auth.js";
 
 let privateKey: CryptoKey;
 let publicJwk: JWK;
 
 beforeAll(async () => {
+  // Phantom-resolution guard: vite's resolver will silently fall back to the
+  // main worker's `src/access-auth.js` (one dir up) if this file disappears.
+  // Asserting the sentinel makes that failure mode loud instead of silent.
+  expect(_MODULE_ID).toBe("mcp-worker/access-auth");
+
   const kp = await generateKeyPair("RS256", { extractable: true });
   privateKey = kp.privateKey;
   publicJwk = await exportJWK(kp.publicKey);
