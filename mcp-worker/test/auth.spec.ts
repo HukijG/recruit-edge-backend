@@ -1,34 +1,16 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { env } from "cloudflare:test";
-import { generateKeyPair, exportJWK, SignJWT, type JWK } from "jose";
-import { _setJwksForTests } from "../src/access-auth.js";
 import worker from "../src/index.js";
+import { setupJwtFixture } from "./jwt-fixture.js";
 
-let privateKey: CryptoKey;
-let publicJwk: JWK;
 const EMPTY_CTX = {} as ExecutionContext;
 type ErrorBody = { ok: boolean; error: string };
-type JwtClaims = Record<string, unknown>;
+
+let makeJwt: Awaited<ReturnType<typeof setupJwtFixture>>["makeJwt"];
 
 beforeAll(async () => {
-  const kp = await generateKeyPair("RS256", { extractable: true });
-  privateKey = kp.privateKey;
-  publicJwk = await exportJWK(kp.publicKey);
-  publicJwk.kid = "test-key";
-  publicJwk.alg = "RS256";
-  publicJwk.use = "sig";
-  _setJwksForTests({ keys: [publicJwk] });
+  ({ makeJwt } = await setupJwtFixture());
 });
-
-async function makeJwt(claims: JwtClaims, aud = env.ACCESS_AUD_MCP): Promise<string> {
-  return new SignJWT(claims)
-    .setProtectedHeader({ alg: "RS256", kid: "test-key" })
-    .setIssuer(env.ACCESS_TEAM_DOMAIN)
-    .setAudience(aud)
-    .setIssuedAt()
-    .setExpirationTime("5m")
-    .sign(privateKey);
-}
 
 function makeRequest(headers: Record<string, string>, method = "POST", path = "/mcp"): Request {
   return new Request(`http://localhost${path}`, {
@@ -57,7 +39,7 @@ describe("auth gate (Access JWT)", () => {
   });
 
   it("returns 401 for JWT with wrong audience", async () => {
-    const jwt = await makeJwt({ email: "joel@test.local", sub: "user-1" }, "wrong-aud");
+    const jwt = await makeJwt({ email: "joel@test.local", sub: "user-1" }, { aud: "wrong-aud" });
     const res = await worker.fetch(
       makeRequest({ "Cf-Access-Jwt-Assertion": jwt }),
       env,

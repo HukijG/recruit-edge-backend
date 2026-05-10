@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { env } from "cloudflare:test";
-import { generateKeyPair, exportJWK, SignJWT, type JWK } from "jose";
+import type { JWK } from "jose";
 import { verifyAccessJwt, _setJwksForTests, _MODULE_ID } from "../src/access-auth.js";
+import { setupJwtFixture } from "./jwt-fixture.js";
 
-let privateKey: CryptoKey;
+let makeJwt: Awaited<ReturnType<typeof setupJwtFixture>>["makeJwt"];
 let publicJwk: JWK;
 
 beforeAll(async () => {
@@ -12,28 +13,8 @@ beforeAll(async () => {
   // Asserting the sentinel makes that failure mode loud instead of silent.
   expect(_MODULE_ID).toBe("mcp-worker/access-auth");
 
-  const kp = await generateKeyPair("RS256", { extractable: true });
-  privateKey = kp.privateKey;
-  publicJwk = await exportJWK(kp.publicKey);
-  publicJwk.kid = "test-key";
-  publicJwk.alg = "RS256";
-  publicJwk.use = "sig";
-  // Stub the helper's JWKS source so it returns our test key.
-  _setJwksForTests({ keys: [publicJwk] });
+  ({ makeJwt, publicJwk } = await setupJwtFixture());
 });
-
-type JwtClaims = Record<string, unknown>;
-type JwtOpts = { aud?: string; iss?: string };
-
-async function makeJwt(claims: JwtClaims, opts: JwtOpts = {}): Promise<string> {
-  return new SignJWT(claims)
-    .setProtectedHeader({ alg: "RS256", kid: "test-key" })
-    .setIssuer(opts.iss ?? env.ACCESS_TEAM_DOMAIN)
-    .setAudience(opts.aud ?? env.ACCESS_AUD_MCP)
-    .setIssuedAt()
-    .setExpirationTime("5m")
-    .sign(privateKey);
-}
 
 function reqWith(headers: Record<string, string>): Request {
   return new Request("http://x/mcp", { method: "POST", headers });
