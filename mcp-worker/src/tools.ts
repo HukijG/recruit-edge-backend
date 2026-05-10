@@ -115,7 +115,7 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
             "Additive over defaults. No fixed allow-list — pass any reasonable English name matching what you want; real fields resolve, anything else silently drops. Stay lean (only what serves the user's intent); don't constrain to a predetermined set.",
           ),
         filters: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .optional()
           .describe(
             "Long-tail filter bag for fields not yet first-class. Try anything reasonable — unknown keys silently drop.",
@@ -279,7 +279,7 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
         stage: ref.optional(),
         fields: z.array(z.string()).optional(),
         limit: z.number().int().min(1).max(500).optional(),
-        filters: z.record(z.unknown()).optional(),
+        filters: z.record(z.string(), z.unknown()).optional(),
       },
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
@@ -326,7 +326,7 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
           .optional()
           .describe("Default false; pass true to include DQ'd candidates."),
         fields: z.array(z.string()).optional(),
-        filters: z.record(z.unknown()).optional(),
+        filters: z.record(z.string(), z.unknown()).optional(),
       },
       annotations: { readOnlyHint: true, destructiveHint: false },
       _meta: { "anthropic/alwaysLoad": true },
