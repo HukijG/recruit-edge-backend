@@ -53,12 +53,7 @@ describe('/mcp/candidate-add-note', () => {
 
     expect(r.status).toBe(200);
     const b = await r.json();
-    expect(b.ok).toBe(true);
-    expect(b.note).toMatchObject({
-      id: 555,
-      candidate_id: 42,
-      candidate_name: 'Test Candidate',
-    });
+    expect(b).toEqual({ ok: true });
 
     expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     const [calledUrl, calledOpts] = globalThis.fetch.mock.calls[0];
@@ -131,8 +126,10 @@ describe('/mcp/candidate-add-note', () => {
     });
     expect(r.status).toBe(200);
     const b = await r.json();
-    expect(b.ok).toBe(true);
-    expect(b.note.candidate_id).toBe(42);
+    expect(b).toEqual({ ok: true });
+    // Confirm the auto-narrow picked candidate 42 by inspecting the RF payload.
+    const sent = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    expect(sent.id).toBe(42);
     expect(globalThis.fetch).toHaveBeenCalledTimes(1);
   });
 
@@ -224,8 +221,10 @@ describe('/mcp/candidate-add-note', () => {
     });
     expect(r.status).toBe(200);
     const b = await r.json();
-    expect(b.ok).toBe(true);
-    expect(b.note.candidate_id).toBe(42);
+    expect(b).toEqual({ ok: true });
+    // Confirm the auto-narrow picked the Eon-SE Jordan (id 42) by inspecting the RF payload.
+    const sent = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    expect(sent.id).toBe(42);
     expect(globalThis.fetch).toHaveBeenCalledTimes(1);
   });
 
@@ -292,9 +291,10 @@ describe('/mcp/candidate-add-note', () => {
     });
     expect(r.status).toBe(200);
     const b = await r.json();
-    expect(b.ok).toBe(true);
-    expect(b.note.id).toBe(111);
-    expect(b.note.candidate_id).toBe(42);
+    expect(b).toEqual({ ok: true });
+    // Confirm the short-circuit committed to candidate 42 by inspecting the RF payload.
+    const sent = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    expect(sent.id).toBe(42);
   });
 
   it('RF non-2xx response → 502', async () => {

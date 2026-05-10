@@ -24,28 +24,25 @@ import { addRFCandidateNote } from '../rf-client.js';
 /**
  * In-process primitive. Caller has already resolved the candidate and
  * brought the consultant record from the router. Returns the same
- * {ok, note} envelope the HTTP handler emits.
+ * lean envelope the HTTP handler emits: `{ok: true}` on success, or
+ * `{ok: false, status, error}` on a recoverable failure.
+ *
+ * No echo of the candidate or RF note id — every response byte costs
+ * Claude context tokens, and Claude already has the candidate identity
+ * from the request. The RF note id is not used downstream.
  */
 export async function addNoteForCandidate({ env, candidate, noteMd, consultant }) {
   if (!String(noteMd ?? '').trim()) {
     return { ok: false, status: 400, error: 'note is required' };
   }
   const html = mdToHtml(noteMd);
-  let result;
   try {
-    result = await addRFCandidateNote(candidate.id, html, consultant.rfUserId, env);
+    await addRFCandidateNote(candidate.id, html, consultant.rfUserId, env);
   } catch (err) {
     console.error('add-note RF call failed:', err);
     return { ok: false, status: 502, error: 'RF notes/add failed' };
   }
-  return {
-    ok: true,
-    note: {
-      id: result?.id ?? null,
-      candidate_id: candidate.id,
-      candidate_name: candidate.name,
-    },
-  };
+  return { ok: true };
 }
 
 export async function handleCandidateAddNote({ env, body, consultant }) {
@@ -128,5 +125,5 @@ export async function handleCandidateAddNote({ env, body, consultant }) {
   if (!res.ok) {
     return jsonResponse(res.status ?? 502, { error: res.error });
   }
-  return jsonResponse(200, { ok: true, note: res.note });
+  return jsonResponse(200, { ok: true });
 }
