@@ -33,8 +33,10 @@ Pipeline data lives in the `job_pipelines` D1 table, populated by `PipelineRebui
 
 ## Auth secrets
 
-- `MCP_EXTENSION_SECRET` — shared, in `X-MCP-Token` header for `/mcp/*`
+- `MCP_EXTENSION_SECRET` — shared, in `X-MCP-Token` header for `/mcp/*`. Same secret used by `rf-mcp-remote` (the remote MCP worker in `mcp-worker/`) on its outbound service-binding call to `/mcp/*` — so a rotation has to land on both workers together.
 - `ADMIN_SECRET` — sync worker only, in `X-Admin-Token` header for `POST /admin/full-rebuild`
+
+> **The header-based shared-secret model is mid-rework.** claude.ai's custom-connector UI requires OAuth, and Joel intends to put the LinkedIn extension behind OAuth as well. When OAuth lands, `MCP_EXTENSION_SECRET` (and very likely `X-Extension-Token` + `consultantFirstName`-in-body) gets replaced with per-user issued credentials — and `users.js` likely retires too. Nothing has been designed yet; see `docs/oauth-current-state.md` for the open questions and the shape of the work.
 
 ## Entity-reference resolvers
 

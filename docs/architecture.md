@@ -332,6 +332,8 @@ Dialpad call event (call_transcription or transcription state)
 
 Every request body includes `consultantFirstName: string`, resolved through `src/users.js:resolveRFUserId` to an RF user ID for attribution.
 
+> **Auth model is mid-rework.** The `X-Extension-Token` + `consultantFirstName`-in-body shape (and the `users.js`-as-registry pattern) is likely to be replaced with OAuth-issued per-user credentials in a sweep that also covers the remote MCP worker (`rf-mcp-remote`). Nothing is designed yet — see `docs/oauth-current-state.md` for current state, requirements, and open questions.
+
 ### `POST /candidates` — batch upsert
 
 ```
