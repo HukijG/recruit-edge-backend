@@ -190,9 +190,6 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
         candidate: ref,
         stage: ref,
         job: ref.optional(),
-        user: ref
-          .optional()
-          .describe("Attribution override. Defaults to the consultant configured for this MCP installation."),
       },
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
@@ -243,9 +240,6 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
           .describe(
             "Extra detail rendered under the title, one line per \\n. Leave empty unless the user explicitly gave context.",
           ),
-        user: ref
-          .optional()
-          .describe("Attribution override. Defaults to the consultant configured for this MCP installation."),
       },
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
