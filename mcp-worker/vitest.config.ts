@@ -1,6 +1,26 @@
-import { defineWorkersConfig } from "@cloudflare/vitest-pool-workers/config";
+import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { defineConfig } from "vitest/config";
 
-export default defineWorkersConfig({
+export default defineConfig({
+  plugins: [
+    cloudflareTest({
+      wrangler: { configPath: "./wrangler.mcp.jsonc" },
+      miniflare: {
+        // Override the MIDDLEWARE service binding with a no-op stub for tests.
+        // Real binding only matters in deploy/dev; tests inject per-call mocks.
+        serviceBindings: {
+          MIDDLEWARE: () =>
+            new Response(
+              JSON.stringify({ ok: false, error: "test-stub: override env.MIDDLEWARE per test" }),
+              { status: 503, headers: { "Content-Type": "application/json" } },
+            ),
+        },
+        bindings: {
+          MCP_EXTENSION_SECRET: "test-mcp-secret",
+        },
+      },
+    }),
+  ],
   test: {
     // The MCP SDK pulls in ajv (CJS, requires JSON) which the Workers
     // module-fallback loader can't handle directly. Pre-bundle via Vite SSR
@@ -12,25 +32,6 @@ export default defineWorkersConfig({
         ssr: {
           enabled: true,
           include: ["ajv", "ajv-formats"],
-        },
-      },
-    },
-    poolOptions: {
-      workers: {
-        wrangler: { configPath: "./wrangler.mcp.jsonc" },
-        miniflare: {
-          // Override the MIDDLEWARE service binding with a no-op stub for tests.
-          // Real binding only matters in deploy/dev; tests inject per-call mocks.
-          serviceBindings: {
-            MIDDLEWARE: () =>
-              new Response(
-                JSON.stringify({ ok: false, error: "test-stub: override env.MIDDLEWARE per test" }),
-                { status: 503, headers: { "Content-Type": "application/json" } },
-              ),
-          },
-          bindings: {
-            MCP_EXTENSION_SECRET: "test-mcp-secret",
-          },
         },
       },
     },
