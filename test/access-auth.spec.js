@@ -95,4 +95,38 @@ describe('verifyAccessJwt', () => {
     );
     expect(claims).toBeNull();
   });
+
+  it('rejects empty-string email or sub even though typeof passes', async () => {
+    // Empty strings satisfy `typeof === 'string'` but are not real claims.
+    // Defense matches the D1 schema's `CHECK (email LIKE '%@%.%')` constraint.
+    const jwtEmptyEmail = await makeJwt({ email: '', sub: 'user-1' });
+    expect(
+      await verifyAccessJwt(reqWith({ 'Cf-Access-Jwt-Assertion': jwtEmptyEmail }), env, env.ACCESS_AUD_MCP),
+    ).toBeNull();
+
+    const jwtEmptySub = await makeJwt({ email: 'joel@test.local', sub: '' });
+    expect(
+      await verifyAccessJwt(reqWith({ 'Cf-Access-Jwt-Assertion': jwtEmptySub }), env, env.ACCESS_AUD_MCP),
+    ).toBeNull();
+  });
+
+  it('_setJwksForTests(null) resets to remote source', async () => {
+    // After resetting, the next call falls through to createRemoteJWKSet(URL),
+    // which on the test domain (https://test.cloudflareaccess.com) will fail
+    // to fetch keys. The token validation will throw inside jose; the helper
+    // catches and returns null. This proves the reset path took effect — if
+    // the local JWKS were still wired, a malformed token would also return
+    // null but for a different reason. The behavioral signal is that the
+    // helper rebuilds rather than crashing on null jwks.
+    _setJwksForTests(null);
+    const jwt = await makeJwt({ email: 'joel@test.local', sub: 'user-1' });
+    const claims = await verifyAccessJwt(
+      reqWith({ 'Cf-Access-Jwt-Assertion': jwt }),
+      env,
+      env.ACCESS_AUD_MCP,
+    );
+    expect(claims).toBeNull();
+    // Restore the test JWKS so any tests that run after this one still work.
+    _setJwksForTests({ keys: [publicJwk] });
+  });
 });
