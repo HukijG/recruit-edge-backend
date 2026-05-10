@@ -1,38 +1,49 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeAll } from "vitest";
 import { env } from "cloudflare:test";
 import worker from "../src/index.js";
+import { setupJwtFixture } from "./jwt-fixture.js";
 
-const MCP_SECRET = "test-mcp-secret";
 const EMPTY_CTX = {} as ExecutionContext;
+const TEST_EMAIL = "joel@test.local";
+
+let makeJwt: Awaited<ReturnType<typeof setupJwtFixture>>["makeJwt"];
+
+beforeAll(async () => {
+  ({ makeJwt } = await setupJwtFixture());
+});
 
 function rpc(method: string, params: Record<string, unknown> = {}) {
   return JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
 }
 
-function authedRequest(body: string) {
+async function authedRequest(body: string): Promise<Request> {
+  const jwt = await makeJwt({ email: TEST_EMAIL, sub: "user-1" });
   return new Request("http://localhost/mcp", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
-      "X-MCP-Token": MCP_SECRET,
-      "X-RF-Consultant": "Joel",
+      "Cf-Access-Jwt-Assertion": jwt,
     },
     body,
   });
 }
 
-async function parseRpcResponse(res: Response): Promise<{ result?: any; error?: any }> {
+async function parseRpcResponse(res: Response): Promise<{ result?: unknown; error?: unknown }> {
   const text = await res.text();
   const dataLines = text.split("\n").filter(l => l.startsWith("data: "));
   const lastJson = dataLines.length > 0 ? dataLines[dataLines.length - 1].slice(6) : text;
   return JSON.parse(lastJson);
 }
 
-async function callTool(testEnv: typeof env, toolName: string, args: Record<string, unknown> = {}) {
+async function callTool(
+  testEnv: typeof env,
+  toolName: string,
+  args: Record<string, unknown> = {},
+) {
   // MCP requires initialize before tools/call.
   await worker.fetch(
-    authedRequest(rpc("initialize", {
+    await authedRequest(rpc("initialize", {
       protocolVersion: "2025-03-26",
       capabilities: {},
       clientInfo: { name: "vitest", version: "0.0.0" },
@@ -41,14 +52,14 @@ async function callTool(testEnv: typeof env, toolName: string, args: Record<stri
     EMPTY_CTX,
   );
   return worker.fetch(
-    authedRequest(rpc("tools/call", { name: toolName, arguments: args })),
+    await authedRequest(rpc("tools/call", { name: toolName, arguments: args })),
     testEnv,
     EMPTY_CTX,
   );
 }
 
 describe("tool dispatch", () => {
-  it("rf_cache_status calls /mcp/cache-status with consultantFirstName in body", async () => {
+  it("rf_cache_status calls /mcp/cache-status with consultantEmail in body", async () => {
     const middlewareFetch = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: true, candidates: 0, last_sync_at: null }), {
         status: 200,
@@ -64,17 +75,23 @@ describe("tool dispatch", () => {
     const [calledUrl, calledInit] = middlewareFetch.mock.calls.at(-1)!;
     expect(String(calledUrl)).toBe("https://internal/mcp/cache-status");
     expect(calledInit.method).toBe("POST");
-    expect(calledInit.headers["X-MCP-Token"]).toBe(MCP_SECRET);
+
+    // Service-binding traffic no longer carries X-MCP-Token.
+    expect(calledInit.headers["X-MCP-Token"]).toBeUndefined();
+
     const sentBody = JSON.parse(calledInit.body as string);
-    expect(sentBody.consultantFirstName).toBe("Joel");
+    // Email is extracted from the Access JWT claims.
+    expect(sentBody.consultantEmail).toBe(TEST_EMAIL);
+    // Old field must not be present.
+    expect(sentBody.consultantFirstName).toBeUndefined();
 
     // Verify the worker's response body actually carries the middleware payload
     // back through respond() to the caller. The MCP transport may emit SSE-framed
     // (data: ...) lines or plain JSON depending on the Accept header negotiation.
     const payload = await parseRpcResponse(res);
-    const innerText = payload.result?.content?.[0]?.text;
+    const innerText = (payload.result as { content?: Array<{ text?: string }> })?.content?.[0]?.text;
     expect(innerText).toBeDefined();
-    expect(JSON.parse(innerText)).toEqual({ ok: true, candidates: 0, last_sync_at: null });
+    expect(JSON.parse(innerText!)).toEqual({ ok: true, candidates: 0, last_sync_at: null });
   });
 
   it("MwClientError from middleware surfaces as isError tool result with status snippet", async () => {
@@ -94,7 +111,7 @@ describe("tool dispatch", () => {
     expect(res.status).toBe(200);
 
     const payload = await parseRpcResponse(res);
-    const result = payload.result;
+    const result = payload.result as { isError?: boolean; content?: Array<{ text?: string }> };
     expect(result?.isError).toBe(true);
     const errorText = result?.content?.[0]?.text;
     expect(errorText).toMatch(/Middleware error \(HTTP 500\)/);
@@ -106,7 +123,7 @@ describe("tool dispatch", () => {
     const testEnv = { ...env, MIDDLEWARE: { fetch: middlewareFetch } as unknown as Fetcher };
 
     await worker.fetch(
-      authedRequest(rpc("initialize", {
+      await authedRequest(rpc("initialize", {
         protocolVersion: "2025-03-26",
         capabilities: {},
         clientInfo: { name: "vitest", version: "0.0.0" },
@@ -115,7 +132,7 @@ describe("tool dispatch", () => {
       EMPTY_CTX,
     );
     const res = await worker.fetch(
-      authedRequest(rpc("tools/list")),
+      await authedRequest(rpc("tools/list")),
       testEnv,
       EMPTY_CTX,
     );
@@ -123,7 +140,9 @@ describe("tool dispatch", () => {
 
     // Streamable HTTP responses can be SSE-framed; parse the data line(s).
     const payload = await parseRpcResponse(res);
-    const toolNames = (payload.result?.tools ?? []).map((t: { name: string }) => t.name);
+    const toolNames = (
+      (payload.result as { tools?: Array<{ name: string }> })?.tools ?? []
+    ).map((t) => t.name);
 
     expect(toolNames.sort()).toEqual([
       "rf_cache_status",

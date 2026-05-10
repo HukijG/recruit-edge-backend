@@ -5,8 +5,9 @@
  *   - 4xx / 5xx → throws MwClientError (loud, install-shaped failures).
  *   - HTTP 200 with { ok: false, ... } body → passes through verbatim
  *     (recoverable conditions: needs_disambiguation, unknown stage, etc.).
- *   - Auth-derived consultantFirstName always overrides any caller-supplied
- *     value in `body` — the auth gate is the source of truth for identity.
+ *   - Auth-derived consultantEmail always overrides any caller-supplied
+ *     value in `body` — the Access JWT is the source of truth for identity.
+ *   - No X-MCP-Token header: service-binding traffic is trust-local.
  */
 import type { RequestCtx } from "./index.js";
 
@@ -28,13 +29,12 @@ export async function mwFetch<T = unknown>(
 ): Promise<T> {
   // Service bindings dispatch by binding, not DNS — the hostname is conventional only.
   const url = "https://internal" + path;
-  const payload = { ...body, consultantFirstName: ctx.consultantFirstName };
+  const payload = { ...body, consultantEmail: ctx.consultantEmail };
 
   const res = await ctx.env.MIDDLEWARE.fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-MCP-Token": ctx.env.MCP_EXTENSION_SECRET,
       Accept: "application/json",
     },
     body: JSON.stringify(payload),
