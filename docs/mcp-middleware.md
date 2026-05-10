@@ -57,6 +57,7 @@ Every endpoint that accepts a `candidate` / `job` / `stage` / `owner` reference 
 | `/mcp/candidate-search` | `job_id`, `owner_id` |
 | `/mcp/candidate-move-stage` | `candidate_id`, `job_id`, `stage_id` — when ALL THREE present, fast-path direct commit |
 | `/mcp/candidate-log-interview` | `candidate_id`, `job_id` |
+| `/mcp/candidate-add-note` | `candidate_id`, `job_id` |
 | `/mcp/job-pipeline` | `job_id` |
 | `/mcp/job-candidates-filter` | `job_id` |
 
@@ -104,6 +105,7 @@ All under `/mcp/*`. Identity is the verified `consultantEmail` body field (forwa
 | `/mcp/candidate-get` | By id (D1 SELECT) or by `query` (fuzzy via snapshot, `needs_disambiguation` if top-2 within 0.08). |
 | `/mcp/candidate-move-stage` | Fuzzy-resolves candidate/job/stage, calls RF `/candidate/move-to-stage` attributed to consultant. |
 | `/mcp/candidate-log-interview` | Fuzzy-resolves candidate (+ optional job restricted to candidate's jobs); creates RF custom activity (interview activity-type id resolved dynamically from `sync_state.activity_types`); returns `outlook_url` (recruiter-only block — no candidate email on `to=`) and optional `gcal_hint` based on `consultant.calendarMode`. |
+| `/mcp/candidate-add-note` | Fuzzy-resolves candidate (+ optional job restricted to candidate's jobs); renders markdown body → HTML via `marked` (in `src/mcp/markdown.js`); calls RF `/candidate/notes/add` attributed to `consultant.rfUserId` from the JWT. No `mentions` resolution, no attribution override. Exposes an internal `addNoteForCandidate(...)` for in-process reuse. |
 | `/mcp/job-candidates-filter` | Fuzzy-resolves `job` (or `job_id` short-circuit). Reads active candidates from `job_pipelines.stage_candidates_json`; hydrates from `candidates`. `stage` filter (fuzzy against `summary_json`); `limit` (default 100, max 500); `truncated` flag when more matched than fit. |
 | `/mcp/job-pipeline` | Fuzzy-resolves `job` (or `job_id` short-circuit). Reads canonical pipeline from `job_pipelines.summary_json`; hydrates active candidates from `candidates`. Filters: `stage` (single, fuzzy), `from`/`to` (range, fuzzy against `summary[]`), `submitted: true` (exact match on 'CV Sent' → end of pipeline). Default: same as `submitted`. Disqualified excluded unless `include_disqualified: true`. Cold-cache returns 200 + warning. |
 
