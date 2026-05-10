@@ -71,4 +71,52 @@ describe('/mcp/candidate-add-note', () => {
     // marked wraps plain prose in <p>
     expect(sent.value).toMatch(/^<p>/);
   });
+
+  it('rejects when note is missing (400)', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 42,
+    });
+    expect(r.status).toBe(400);
+    const b = await r.json();
+    expect(b.error).toBe('note is required');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects when note is whitespace-only (400)', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 42,
+      note: '   \n  ',
+    });
+    expect(r.status).toBe(400);
+    const b = await r.json();
+    expect(b.error).toBe('note is required');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects when candidate is missing (400)', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({
+      consultantFirstName: 'Joel',
+      note: 'a perfectly valid note body',
+    });
+    expect(r.status).toBe(400);
+    const b = await r.json();
+    expect(b.error).toBe('candidate is required');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('returns 404 for an unknown candidate id', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 9999,
+      note: 'whatever',
+    });
+    expect(r.status).toBe(404);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
 });
