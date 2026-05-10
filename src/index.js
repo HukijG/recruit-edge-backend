@@ -27,7 +27,6 @@ import {
   getPrewarmState, setPrewarmState,
   getDailyCallCount,
 } from './cache.js';
-import { formatKrispNotesAsHtml, extractCandidateEmail } from './krisp.js';
 import { processCallEvent, parseColdCallActivity, mergeTag } from './cold-call.js';
 import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enrichment.js';
 import { enrichPerson } from './apollo-client.js';
@@ -851,7 +850,7 @@ async function processKrispMeetingNotes(meeting, _content, _env) {
     source: 'krisp',
     meetingId: meeting?.id ?? null,
   });
-  return false;
+  return false; // false = no dedup-key write; keeps the namespace clean for the eventual real impl
 }
 
 async function handleDialpadCallWebhook(request, env) {

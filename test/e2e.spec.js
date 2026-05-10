@@ -933,8 +933,7 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 		expect(dedup).toBe('true');
 	});
 
-	// SKIPPED 2026-05-10: processKrispMeetingNotes is stubbed pending attribution decision.
-	it.skip('skips duplicate meeting (dedup flag already set)', async () => {
+	it('skips duplicate meeting (dedup flag already set)', async () => {
 		const calls = mockFetch([]);
 
 		// Pre-seed dedup flag
