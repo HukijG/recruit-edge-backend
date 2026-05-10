@@ -6,7 +6,7 @@
  */
 
 import { enrichPerson, searchPeople, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from './apollo-client.js';
-import { updateRFCandidate, addRFCandidateNote } from './rf-client.js';
+import { updateRFCandidate } from './rf-client.js';
 import { patchDialpadContact } from './dialpad-client.js';
 
 function log(data) {
@@ -306,16 +306,16 @@ async function fallbackSearch(candidate, fullCandidate, rfId, env) {
 }
 
 /**
- * Safely add a failure note to an RF candidate. Swallows errors.
+ * STUBBED 2026-05-10. The underlying `addRFCandidateNote` RF client helper
+ * was repurposed for the new MCP write-tool surface, which requires explicit
+ * `createdBy` attribution. The Apollo-enrichment-failure note path historically
+ * inherited a hardcoded Joel attribution, which is the wrong long-term answer
+ * (probably should be the candidate's lead owner). Apollo enrichment failures
+ * are rare; the callers below still invoke this stub so the flow continues
+ * without crashing, but no note is posted.
+ *
+ * TODO: refactor with proper attribution, or remove the call sites entirely.
  */
 async function safeAddNote(rfId, env) {
-	try {
-		await addRFCandidateNote(
-			rfId,
-			'<p>Apollo enrichment failed — LinkedIn profile likely incorrect. Manual review needed.</p>',
-			env
-		);
-	} catch (err) {
-		logError({ message: `[enrich] failed to add RF note: ${err.message}`, rfId });
-	}
+	logError({ message: `[enrich] safeAddNote STUBBED — would have posted Apollo failure note`, rfId });
 }
