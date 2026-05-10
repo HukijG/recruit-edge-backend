@@ -8,6 +8,7 @@ export const SERVER_INSTRUCTIONS = [
   "  - rf_candidate_search      — RANKED LIST / multi-match. Filter composition (company, owner, technology, stage [paired with job], role, segment, date windows) and/or fuzzy name. 'Jerry at Acme' goes here, not get.",
   "  - rf_candidate_move_stage  — move a candidate to a pipeline stage",
   "  - rf_candidate_log_interview — write an Interview activity (calendar handoff via response)",
+  "  - rf_candidate_add_note    — write a note on a candidate's RF timeline (markdown body, server renders to HTML)",
   "  - rf_job_pipeline          — JOB PIPELINE VIEW: candidates grouped by stage. Use for ANY pipeline / stage-progress / 'submitted' / 'in <stage>' query.",
   "  - rf_job_candidates_filter — flat (non-grouped) job-side list. ONLY when pipeline grouping isn't wanted — custom field projections / analytics-style filters. NOT the right tool for pipeline prompts.",
   "  - rf_cache_status          — diagnostic only, when the user asks about data freshness",
