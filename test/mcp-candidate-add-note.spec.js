@@ -119,4 +119,65 @@ describe('/mcp/candidate-add-note', () => {
     expect(r.status).toBe(404);
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
+
+  it('fuzzy candidate name resolves uniquely → commits the note', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 777 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 'Test Candidate',
+      note: 'fuzzy single match',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.ok).toBe(true);
+    expect(b.note.candidate_id).toBe(42);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('numeric candidate id as string still works', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 555 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: '42',
+      note: 'string id path',
+    });
+    expect(r.status).toBe(200);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('ambiguous fuzzy candidate name → needs_disambiguation kind=candidate, no RF call', async () => {
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(
+      42, JSON.stringify({ id: 42, name: 'Jordan Chen' }),
+      'Jordan Chen', 'Acme', 'AE', new Date().toISOString()
+    ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(
+      43, JSON.stringify({ id: 43, name: 'Jordan Patel' }),
+      'Jordan Patel', 'Globex', 'CSM', new Date().toISOString()
+    ).run();
+    resetSnapshot();
+    globalThis.fetch = vi.fn();
+    const r = await call({
+      consultantFirstName: 'Joel',
+      candidate: 'Jordan',
+      note: 'should disambiguate',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.needs_disambiguation).toBe(true);
+    expect(b.kind).toBe('candidate');
+    expect(b.options).toHaveLength(2);
+    expect(b.options.map((o) => o.id).sort()).toEqual([42, 43]);
+    expect(b.options.every((o) => 'current_organization' in o)).toBe(true);
+    expect(b.options.every((o) => 'current_title' in o)).toBe(true);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
 });
