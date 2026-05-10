@@ -6,6 +6,12 @@ import { SERVER_INSTRUCTIONS } from "./instructions.js";
 export interface Env {
   MIDDLEWARE: Fetcher;
   MCP_EXTENSION_SECRET: string;
+  // Cloudflare Access — verified via verifyAccessJwt in src/access-auth.ts.
+  // ACCESS_TEAM_DOMAIN is the team domain URL (e.g. https://acme.cloudflareaccess.com);
+  // ACCESS_AUD_MCP is the 64-char hex Application Audience (AUD) tag from the
+  // Access dashboard for the rf-mcp-remote app.
+  ACCESS_TEAM_DOMAIN: string;
+  ACCESS_AUD_MCP: string;
 }
 
 export interface RequestCtx {
