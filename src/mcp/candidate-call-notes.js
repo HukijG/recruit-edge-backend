@@ -18,8 +18,10 @@ import { jsonResponse } from './router.js';
 import { resolveCandidate, disambiguationPayload } from './resolvers.js';
 import { resolveTimeWindow } from './call-notes-time.js';
 import { CALL_NOTES_GUIDANCE } from './call-notes-guidance.js';
-import { listDialpadCalls, DialpadHttpError } from '../dialpad-client.js';
+import { listDialpadCalls, getDialpadCall, DialpadHttpError } from '../dialpad-client.js';
 import { extractRFIdFromDialpadContact } from '../rf-client.js';
+import { getCandidateById } from './d1-read.js';
+import { fetchCallTranscript } from '../cold-call.js';
 
 export const MIN_TOTAL_DURATION_MS = 120_000;
 export const MAX_LIST_PAGES = 20;
@@ -179,11 +181,136 @@ async function handleListCalls({ env, body, consultant }) {
   return jsonResponse(200, out);
 }
 
-export async function handleCandidateCallNotes({ env, body, consultant }) {
-  if (body?.step === 'list_calls') {
-    return handleListCalls({ env, body, consultant });
+/**
+ * Step 2 of the three-stage flow: fetch one call, verify the consultant owns
+ * it (target.id match), resolve the linked RF candidate, then fetch and format
+ * the transcript.
+ *
+ * Order of operations matters for per-record authorization:
+ *
+ *   1. `consultant.dialpadId` missing → ok:false, kind:'no_dialpad_id'.
+ *   2. `body.call_id` missing → 400.
+ *   3. GET /call/{id} — 429 → rate_limited; 4xx → call_not_found; 5xx → 502.
+ *   4. `call.target.id !== consultant.dialpadId` → ok:false, kind:'not_your_call'.
+ *      MUST run before the transcript fetch — knowing a call_id should not be
+ *      enough to read any teammate's transcript.
+ *   5. `extractRFIdFromDialpadContact` on `call.contact.id` — null → no_rf_candidate.
+ *   6. `getCandidateById` from D1 — null → no_candidate (cache miss).
+ *   7. `fetchCallTranscript` — DialpadHttpError 404 → no_transcript; other non-2xx → 502.
+ *   8. `formatTranscript` produces empty string (moments-only transcript) → no_transcript.
+ *   9. Success: candidate id+name, lean call summary, formatted transcript text,
+ *      and the CALL_NOTES_GUIDANCE markdown brief Claude uses to structure notes.
+ */
+async function handleGetTranscript({ env, body, consultant }) {
+  if (!consultant.dialpadId) {
+    return jsonResponse(200, {
+      ok: false,
+      kind: 'no_dialpad_id',
+      error: 'Your consultant record has no Dialpad user id; ask Joel to update the team registry.',
+    });
   }
-  // Other step handlers wired in Tasks 6–7. Until then, every other step
-  // returns the canonical "unknown step" 400.
+  const callId = body.call_id;
+  if (typeof callId !== 'string' || !callId) {
+    return jsonResponse(400, { error: 'call_id is required for step=get_transcript' });
+  }
+
+  let call;
+  try {
+    call = await getDialpadCall(callId, env);
+  } catch (err) {
+    if (err instanceof DialpadHttpError) {
+      if (err.status === 429) {
+        return jsonResponse(200, {
+          ok: false,
+          kind: 'rate_limited',
+          error: 'Dialpad rate-limit — try again in a moment.',
+        });
+      }
+      if (err.status >= 400 && err.status < 500) {
+        return jsonResponse(200, {
+          ok: false,
+          kind: 'call_not_found',
+          error: 'Call not found on Dialpad.',
+        });
+      }
+      return jsonResponse(502, { error: `Dialpad get-call failed: ${err.status}` });
+    }
+    throw err;
+  }
+
+  // Per-record authorization: only the user whose Dialpad line is on `target`
+  // may read this call's transcript. Runs BEFORE the transcript fetch so a
+  // stolen call_id can't leak a teammate's transcript.
+  if (String(call?.target?.id ?? '') !== String(consultant.dialpadId)) {
+    return jsonResponse(200, {
+      ok: false,
+      kind: 'not_your_call',
+      error: 'This call is not on your Dialpad line.',
+    });
+  }
+
+  const rfId = extractRFIdFromDialpadContact(call?.contact?.id);
+  if (rfId == null) {
+    return jsonResponse(200, {
+      ok: false,
+      kind: 'no_rf_candidate',
+      error: 'This call is not linked to an RF candidate.',
+    });
+  }
+
+  const candidate = await getCandidateById(env, Number(rfId));
+  if (!candidate) {
+    return jsonResponse(200, {
+      ok: false,
+      kind: 'no_candidate',
+      error: 'Linked RF candidate not in the cache; ask the sync worker to rebuild.',
+    });
+  }
+
+  let transcript;
+  try {
+    transcript = await fetchCallTranscript(callId, env);
+  } catch (err) {
+    // fetchCallTranscript throws DialpadHttpError on non-2xx — branch on the
+    // status code, no string-matching.
+    if (err instanceof DialpadHttpError && err.status === 404) {
+      return jsonResponse(200, {
+        ok: false,
+        kind: 'no_transcript',
+        error: 'No transcript exists yet for this call. Dialpad usually publishes transcripts within a few minutes of hangup.',
+      });
+    }
+    const status = err instanceof DialpadHttpError ? err.status : '?';
+    return jsonResponse(502, { error: `Dialpad transcript fetch failed: ${status}` });
+  }
+
+  const text = formatTranscript(transcript?.lines);
+  if (!text) {
+    return jsonResponse(200, {
+      ok: false,
+      kind: 'no_transcript',
+      error: 'Transcript exists but contains no spoken lines (moments only).',
+    });
+  }
+
+  return jsonResponse(200, {
+    ok: true,
+    candidate: { id: candidate.id, name: candidate.name },
+    call: {
+      call_id: String(call.call_id),
+      started_at: isoFromMs(call.date_started),
+      duration_minutes: Math.round(Number(call.total_duration ?? 0) / 60_000),
+      direction: call.direction,
+    },
+    transcript: text,
+    guidance: CALL_NOTES_GUIDANCE,
+  });
+}
+
+export async function handleCandidateCallNotes({ env, body, consultant }) {
+  if (body?.step === 'list_calls') return handleListCalls({ env, body, consultant });
+  if (body?.step === 'get_transcript') return handleGetTranscript({ env, body, consultant });
+  // submit_notes wired in Task 7. Until then, every other step returns the
+  // canonical "unknown step" 400.
   return jsonResponse(400, { error: 'step must be one of list_calls, get_transcript, submit_notes' });
 }

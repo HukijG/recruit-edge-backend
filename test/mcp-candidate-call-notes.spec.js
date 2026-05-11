@@ -375,3 +375,138 @@ describe('/mcp/candidate-call-notes step=list_calls', () => {
     ]));
   });
 });
+
+describe('/mcp/candidate-call-notes step=get_transcript', () => {
+  const happyCall = {
+    call_id: '5000000000000001',
+    contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF50976', name: 'Priya Sharma', phone: '+1', type: 'shared' },
+    target: { id: '8000000000000001', type: 'user', email: 'joel@…', name: 'Joel Haines' },
+    date_started: '1747000000000',
+    direction: 'outbound',
+    duration: 0,
+    total_duration: 1_440_000,
+    state: 'hangup',
+  };
+  const happyTranscript = {
+    call_id: '5000000000000001',
+    lines: [
+      { type: 'moment', name: 'X', content: 'voicemail', time: '...' },
+      { type: 'transcript', name: 'Sarah', content: 'Hi Joel, thanks for setting this up.', time: '...' },
+      { type: 'moment', name: 'X', content: 'call_purpose_category' },
+      { type: 'transcript', name: 'Joel', content: 'Of course — start by telling me a bit about your role.' },
+      { type: 'transcript', name: 'Sarah', content: 'Sure, I lead the platform team at Globex…' },
+    ],
+  };
+
+  function mockTwo(callBody, transcriptBody) {
+    globalThis.fetch = vi.fn().mockImplementation((url) => {
+      const u = String(url);
+      if (u.includes('/call/')) {
+        return Promise.resolve(new Response(JSON.stringify(callBody), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      }
+      if (u.includes('/transcripts/')) {
+        return Promise.resolve(new Response(JSON.stringify(transcriptBody), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      }
+      return Promise.resolve(new Response('unexpected', { status: 500 }));
+    });
+  }
+
+  it('happy path: ownership ok, transcript filtered + formatted, guidance returned', async () => {
+    mockTwo(happyCall, happyTranscript);
+    const r = await call({
+      consultantFirstName: 'Joel',
+      step: 'get_transcript',
+      call_id: '5000000000000001',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.ok).toBe(true);
+    expect(b.candidate).toEqual({ id: 50976, name: 'Priya Sharma' });
+    expect(b.call.call_id).toBe('5000000000000001');
+    expect(b.call.duration_minutes).toBe(24);
+    expect(b.call.direction).toBe('outbound');
+    expect(b.transcript).toBe(
+      'Sarah: Hi Joel, thanks for setting this up.\n'
+      + 'Joel: Of course — start by telling me a bit about your role.\n'
+      + 'Sarah: Sure, I lead the platform team at Globex…',
+    );
+    expect(typeof b.guidance).toBe('string');
+    expect(b.guidance.length).toBeGreaterThan(50);
+  });
+
+  it('call_id missing → 400', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({ consultantFirstName: 'Joel', step: 'get_transcript' });
+    expect(r.status).toBe(400);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('Dialpad get-call 429 → rate_limited', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('', { status: 429 }));
+    const r = await call({ consultantFirstName: 'Joel', step: 'get_transcript', call_id: '1' });
+    const b = await r.json();
+    expect(b.ok).toBe(false);
+    expect(b.kind).toBe('rate_limited');
+  });
+
+  it('Dialpad get-call 404 → call_not_found', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('', { status: 404 }));
+    const r = await call({ consultantFirstName: 'Joel', step: 'get_transcript', call_id: '1' });
+    const b = await r.json();
+    expect(b.ok).toBe(false);
+    expect(b.kind).toBe('call_not_found');
+  });
+
+  it('Dialpad get-call 500 → 502', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('boom', { status: 500 }));
+    const r = await call({ consultantFirstName: 'Joel', step: 'get_transcript', call_id: '1' });
+    expect(r.status).toBe(502);
+  });
+
+  it('target.id mismatch → not_your_call', async () => {
+    mockTwo({ ...happyCall, target: { ...happyCall.target, id: '9999999999999999' } }, happyTranscript);
+    const r = await call({ consultantFirstName: 'Joel', step: 'get_transcript', call_id: '1' });
+    const b = await r.json();
+    expect(b.ok).toBe(false);
+    expect(b.kind).toBe('not_your_call');
+    const calls = globalThis.fetch.mock.calls.map(([u]) => String(u));
+    expect(calls.every((u) => !u.includes('/transcripts/'))).toBe(true);
+  });
+
+  it('contact has no RF id → no_rf_candidate', async () => {
+    mockTwo({ ...happyCall, contact: { id: '5000000000000002', name: '(415) 555-0184', type: 'local' } }, happyTranscript);
+    const r = await call({ consultantFirstName: 'Joel', step: 'get_transcript', call_id: '1' });
+    const b = await r.json();
+    expect(b.ok).toBe(false);
+    expect(b.kind).toBe('no_rf_candidate');
+  });
+
+  it('RF id present but candidate missing in D1 → no_candidate', async () => {
+    mockTwo({ ...happyCall, contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF77777' } }, happyTranscript);
+    const r = await call({ consultantFirstName: 'Joel', step: 'get_transcript', call_id: '1' });
+    const b = await r.json();
+    expect(b.ok).toBe(false);
+    expect(b.kind).toBe('no_candidate');
+  });
+
+  it('transcript 404 → no_transcript', async () => {
+    globalThis.fetch = vi.fn().mockImplementation((url) => {
+      const u = String(url);
+      if (u.includes('/call/')) return Promise.resolve(new Response(JSON.stringify(happyCall), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      if (u.includes('/transcripts/')) return Promise.resolve(new Response('', { status: 404 }));
+      return Promise.resolve(new Response('?', { status: 500 }));
+    });
+    const r = await call({ consultantFirstName: 'Joel', step: 'get_transcript', call_id: '1' });
+    const b = await r.json();
+    expect(b.ok).toBe(false);
+    expect(b.kind).toBe('no_transcript');
+  });
+
+  it('transcript with only moments → no_transcript', async () => {
+    mockTwo(happyCall, { call_id: '1', lines: [{ type: 'moment', name: 'X', content: 'voicemail' }] });
+    const r = await call({ consultantFirstName: 'Joel', step: 'get_transcript', call_id: '1' });
+    const b = await r.json();
+    expect(b.ok).toBe(false);
+    expect(b.kind).toBe('no_transcript');
+  });
+});
