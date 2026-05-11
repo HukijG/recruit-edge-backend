@@ -9,6 +9,7 @@
 import { extractRFIdFromDialpadContact, updateRFCandidate, createRFCustomActivity, getRFCandidate, moveJobsToStage } from './rf-client.js';
 import { isMonitoredDialpadUser, getRFUserIdByDialpadId } from './users.js';
 import { DialpadHttpError } from './dialpad-client.js';
+import { runAI } from './lib/ai-instrument.js';
 
 // --- Constants ---
 
@@ -127,7 +128,7 @@ export async function extractActionItems(transcriptText, env) {
   if (!tail) return null;
 
   try {
-    const response = await env.AI.run(ACTION_ITEMS_MODEL, {
+    const response = await runAI(env, ACTION_ITEMS_MODEL, {
       messages: [
         { role: 'system', content: ACTION_ITEMS_PROMPT },
         { role: 'user', content: tail }
@@ -150,7 +151,7 @@ export async function extractNegativeCallNotes(transcriptText, env) {
   if (!tail) return null;
 
   try {
-    const response = await env.AI.run(ACTION_ITEMS_MODEL, {
+    const response = await runAI(env, ACTION_ITEMS_MODEL, {
       messages: [
         { role: 'system', content: NEGATIVE_NOTES_PROMPT },
         { role: 'user', content: tail }
@@ -215,7 +216,7 @@ export async function classifyColdCall(transcriptText, env, callState) {
     ? `Call type: Voicemail\n\nTranscript:\n\n${truncated}`
     : `Transcript:\n\n${truncated}`;
 
-  const response = await env.AI.run(AI_MODEL, {
+  const response = await runAI(env, AI_MODEL, {
     messages: [
       { role: 'system', content: COLD_CALL_SYSTEM_PROMPT },
       { role: 'user', content: userMessage }
