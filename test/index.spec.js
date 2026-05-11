@@ -1570,10 +1570,16 @@ describe('setJobCandidateConsultantId', () => {
 		});
 	});
 
-	it('throws on non-2xx response', async () => {
-		const { setJobCandidateConsultantId } = await import('../src/rf-client.js');
-		globalThis.fetch = async () => new Response('boom', { status: 500 });
-		await expect(setJobCandidateConsultantId(50000, 999, 900001, testEnv)).rejects.toThrow(/RF API error: 500/);
+	it('throws RFTransientError on 500 (write — no retry)', async () => {
+		const { setJobCandidateConsultantId, RFTransientError } = await import('../src/rf-client.js');
+		let calls = 0;
+		globalThis.fetch = async () => { calls++; return new Response('boom', { status: 500 }); };
+		const err = await setJobCandidateConsultantId(50000, 999, 900001, testEnv).catch(e => e);
+		expect(err).toBeInstanceOf(RFTransientError);
+		expect(err.status).toBe(500);
+		expect(err.message).toMatch(/RF transient error: 500/);
+		// Write path — no retry.
+		expect(calls).toBe(1);
 	});
 });
 
@@ -1646,10 +1652,15 @@ describe('getJobCandidateConsultantId', () => {
 		expect(await getJobCandidateConsultantId(50000, 999, testEnv)).toBeNull();
 	});
 
-	it('throws on non-2xx response', async () => {
-		const { getJobCandidateConsultantId } = await import('../src/rf-client.js');
-		globalThis.fetch = async () => new Response('boom', { status: 500 });
-		await expect(getJobCandidateConsultantId(50000, 999, testEnv)).rejects.toThrow(/RF API error: 500/);
+	it('throws RFTransientError on 500 after one retry (read — retries once)', async () => {
+		const { getJobCandidateConsultantId, RFTransientError } = await import('../src/rf-client.js');
+		let calls = 0;
+		globalThis.fetch = async () => { calls++; return new Response('boom', { status: 500 }); };
+		const err = await getJobCandidateConsultantId(50000, 999, testEnv).catch(e => e);
+		expect(err).toBeInstanceOf(RFTransientError);
+		expect(err.status).toBe(500);
+		expect(err.message).toMatch(/RF transient error: 500/);
+		expect(calls).toBe(2);
 	});
 });
 
@@ -1734,11 +1745,16 @@ describe('listCandidateActivities', () => {
 		expect(await listCandidateActivities(50615, testEnv)).toEqual([]);
 	});
 
-	it('throws on non-2xx', async () => {
-		const { listCandidateActivities } = await import('../src/rf-client.js');
-		globalThis.fetch = async () => new Response('nope', { status: 500 });
+	it('throws RFTransientError on 500 after one retry', async () => {
+		const { listCandidateActivities, RFTransientError } = await import('../src/rf-client.js');
+		let calls = 0;
+		globalThis.fetch = async () => { calls++; return new Response('nope', { status: 500 }); };
 		const testEnv = { ...env, RF_API_KEY: 'test-rf-key' };
-		await expect(listCandidateActivities(50615, testEnv)).rejects.toThrow(/RF API error: 500/);
+		const err = await listCandidateActivities(50615, testEnv).catch(e => e);
+		expect(err).toBeInstanceOf(RFTransientError);
+		expect(err.status).toBe(500);
+		expect(err.message).toMatch(/RF transient error: 500/);
+		expect(calls).toBe(2);
 	});
 });
 

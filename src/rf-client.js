@@ -10,6 +10,111 @@ import {
 import { getUserByFirstName } from './users.js';
 
 /**
+ * Typed errors thrown by RF helpers so callers (MCP handlers) can distinguish
+ * rate limits / transient failures / hard failures and react appropriately.
+ *
+ * Network failures (fetch() itself throwing) are NOT wrapped — the original
+ * TypeError / AbortError / etc. propagates so the generic handler catch can
+ * report it as "rf_unavailable".
+ */
+export class RFError extends Error {
+  constructor(message, { status, body, retryAfterMs } = {}) {
+    super(message);
+    this.name = 'RFError';
+    this.status = status;        // number | undefined
+    this.body = body;            // raw response text or null
+    this.retryAfterMs = retryAfterMs; // number | undefined
+  }
+}
+
+export class RFRateLimitedError extends RFError {
+  constructor(message, opts) {
+    super(message, opts);
+    this.name = 'RFRateLimitedError';
+  }
+}
+
+export class RFTransientError extends RFError {
+  constructor(message, opts) {
+    super(message, opts);
+    this.name = 'RFTransientError';
+  }
+}
+
+/**
+ * Maximum Retry-After we will surface to callers. RFC 7231 allows seconds or
+ * an HTTP-date; anything beyond 60s is almost certainly a server-side bug, so
+ * we cap to avoid asking callers to back off indefinitely.
+ */
+const RETRY_AFTER_CAP_MS = 60_000;
+
+/**
+ * Parse a `Retry-After` header value into milliseconds.
+ *
+ * Accepts:
+ *   - Integer seconds (`"5"` → 5000)
+ *   - HTTP-date (`"Wed, 21 Oct 2026 07:28:00 GMT"` → diff vs now in ms)
+ *
+ * Returns `undefined` for missing / invalid / negative values. Result is
+ * always capped at RETRY_AFTER_CAP_MS so callers can't be asked to wait
+ * absurd amounts of time.
+ *
+ * @param {string|null|undefined} headerValue
+ * @returns {number|undefined}
+ */
+export function parseRetryAfter(headerValue) {
+  if (headerValue === null || headerValue === undefined) return undefined;
+  const raw = String(headerValue).trim();
+  if (!raw) return undefined;
+
+  // Integer-seconds form. `/^\d+$/` rejects negatives and decimals (RFC 7231
+  // says delta-seconds is a non-negative integer).
+  if (/^\d+$/.test(raw)) {
+    const seconds = parseInt(raw, 10);
+    if (!Number.isFinite(seconds) || seconds < 0) return undefined;
+    const ms = seconds * 1000;
+    return Math.min(ms, RETRY_AFTER_CAP_MS);
+  }
+
+  // HTTP-date form per RFC 7231 — always contains an alphabetic month name
+  // (Jan…Dec) and / or weekday (Mon…Sun). Requiring at least one ASCII letter
+  // rules out edge-cases where `Date.parse` mis-interprets a bare number like
+  // `-5` (which V8 treats as a sparse year format).
+  if (!/[A-Za-z]/.test(raw)) return undefined;
+  const parsedTs = Date.parse(raw);
+  if (Number.isNaN(parsedTs)) return undefined;
+  const diffMs = parsedTs - Date.now();
+  if (diffMs <= 0) return 0;
+  return Math.min(diffMs, RETRY_AFTER_CAP_MS);
+}
+
+/**
+ * Classify a non-2xx RF response into the appropriate typed error.
+ *
+ *   - 429                 → RFRateLimitedError (with parsed Retry-After)
+ *   - 5xx (>=500, <=599)  → RFTransientError
+ *   - everything else     → RFError
+ *
+ * @param {Response} res
+ * @param {string|null} body
+ * @returns {RFError}
+ */
+export function classifyRFResponse(res, body) {
+  const status = res.status;
+  if (status === 429) {
+    return new RFRateLimitedError('RF rate limited (429)', {
+      status,
+      body,
+      retryAfterMs: parseRetryAfter(res.headers.get('Retry-After')),
+    });
+  }
+  if (status >= 500 && status <= 599) {
+    return new RFTransientError(`RF transient error: ${status}`, { status, body });
+  }
+  return new RFError(`RF API error: ${status} - ${body}`, { status, body });
+}
+
+/**
  * Extract RF candidate ID from Dialpad contact ID
  * @param {string} dialpadContactId - e.g. "shared_contact_pool_Company:xxx_uid_RFxxxxx"
  * @returns {string|null}
@@ -63,7 +168,7 @@ export async function updateRFCandidate(candidateId, updateData, env) {
   });
 
   if (!response.ok) {
-    throw new Error(`RF API error: ${response.status} - ${responseText}`);
+    throw classifyRFResponse(response, responseText);
   }
 
   return JSON.parse(responseText);
@@ -92,7 +197,7 @@ export async function addRFCandidate(candidateData, env) {
   if (!response.ok) {
     const errorText = await response.text();
     console.error(`RF add candidate error: ${response.status}`, errorText);
-    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    throw classifyRFResponse(response, errorText);
   }
 
   return await response.json();
@@ -148,9 +253,11 @@ export function extractLinkedInSlug(input) {
 /**
  * Fetch full candidate data from RF.
  *
- * Retries once on 502 — RF's edge occasionally returns transient 502s and
- * the cost of a single retry is far cheaper than failing the whole
- * /candidate-details response and forcing the user to refresh.
+ * Retries once on any 5xx (transient) — RF's edge occasionally returns
+ * transient failures and the cost of a single retry is far cheaper than
+ * failing the whole /candidate-details response and forcing the user to
+ * refresh. Does NOT retry on 429 (rate limit): propagate immediately so the
+ * caller can respect Retry-After.
  */
 export async function getRFCandidate(candidateId, env) {
   const rfApiKey = env.RF_API_KEY;
@@ -174,10 +281,11 @@ export async function getRFCandidate(candidateId, env) {
     }
 
     const errorText = await response.text();
+    const err = classifyRFResponse(response, errorText);
 
-    if (response.status === 502 && attempt === 1) {
+    if (err instanceof RFTransientError && attempt === 1) {
       console.warn({
-        message: `[RF get] 502 for candidate=${candidateId}, retrying once`,
+        message: `[RF get] ${response.status} for candidate=${candidateId}, retrying once`,
         source: 'rf-get',
         candidateId,
       });
@@ -185,11 +293,11 @@ export async function getRFCandidate(candidateId, env) {
     }
 
     console.error(`RF get error: ${response.status}`, errorText);
-    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    throw err;
   }
 
   // Unreachable — the loop either returns or throws on every iteration
-  throw new Error('RF API error: unreachable');
+  throw new RFError('RF API error: unreachable');
 }
 
 /**
@@ -204,8 +312,9 @@ export async function getRFCandidate(candidateId, env) {
  * `stages[].time` `to` is their current stage. No documented pagination at
  * this scale (largest job's `detail[]` is "a few hundred").
  *
- * One-shot 502 retry per the existing `getRFCandidate` pattern — RF's edge
- * produces transient 502s on read paths.
+ * One-shot retry on any 5xx (transient) — RF's edge produces transient 5xx
+ * on read paths. Does NOT retry on 429: propagate immediately so callers
+ * can respect Retry-After.
  */
 export async function fetchRFJobPipeline(env, jobId) {
   const rfApiKey = env.RF_API_KEY;
@@ -216,9 +325,10 @@ export async function fetchRFJobPipeline(env, jobId) {
     const response = await fetch(url, { method: 'GET', headers: { 'RF-Api-Key': rfApiKey } });
     if (response.ok) return response.json();
     const errorText = await response.text();
-    if (response.status === 502 && attempt === 1) {
+    const err = classifyRFResponse(response, errorText);
+    if (err instanceof RFTransientError && attempt === 1) {
       console.warn({
-        message: `[RF pipeline] 502 for job=${jobId}, retrying once`,
+        message: `[RF pipeline] ${response.status} for job=${jobId}, retrying once`,
         source: 'rf-job-pipeline',
         jobId,
       });
@@ -229,10 +339,58 @@ export async function fetchRFJobPipeline(env, jobId) {
       source: 'rf-job-pipeline',
       jobId,
     });
-    throw new Error(`RF /job/pipeline ${response.status}: ${errorText}`);
+    throw err;
   }
   // Unreachable — the loop either returns or throws on every iteration
-  throw new Error('RF /job/pipeline unreachable');
+  throw new RFError('RF /job/pipeline unreachable');
+}
+
+/**
+ * GET /candidate/custom-field/list — full custom-field schema for the RF
+ * account. Used by `src/mcp/custom-fields.js` to build a name→id map so
+ * MCP `technology` / `segment` / `role` filters can be routed through RF as
+ * the canonical `custom_field.<id>` filter shape (per spec rev 5 RF-7).
+ *
+ * Response shape: `{data: [{id, name, type, options: [...]}, ...]}` per the
+ * RF API contract. Each entry carries the numeric `id` and a `name` we match
+ * case-insensitively, plus an enumerated `options` list for single-select /
+ * multi-select fields (empty for text fields).
+ *
+ * One-shot retry on any 5xx (transient); does NOT retry on 429 (caller
+ * respects Retry-After via the typed RFRateLimitedError).
+ */
+export async function fetchRFCustomFieldList(env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+  if (!rfApiKey) throw new Error('RF_API_KEY environment variable is required');
+  const url = `${rfBaseUrl}/candidate/custom-field/list`;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const response = await fetch(url, { method: 'GET', headers: { 'RF-Api-Key': rfApiKey } });
+    if (response.ok) {
+      const result = await response.json();
+      // Tolerate {data:[...]}, {fields:[...]}, or a bare array.
+      if (Array.isArray(result?.data)) return result.data;
+      if (Array.isArray(result?.fields)) return result.fields;
+      if (Array.isArray(result)) return result;
+      return [];
+    }
+    const errorText = await response.text();
+    const err = classifyRFResponse(response, errorText);
+    if (err instanceof RFTransientError && attempt === 1) {
+      console.warn({
+        message: `[RF custom-field/list] ${response.status}, retrying once`,
+        source: 'rf-custom-field-list',
+      });
+      continue;
+    }
+    console.error({
+      message: `RF /candidate/custom-field/list error status=${response.status} body=${errorText}`,
+      source: 'rf-custom-field-list',
+    });
+    throw err;
+  }
+  // Unreachable — the loop either returns or throws on every iteration
+  throw new RFError('RF /candidate/custom-field/list unreachable');
 }
 
 /**
@@ -372,7 +530,7 @@ export async function addRFCandidateNote(candidateId, htmlContent, createdBy, en
   if (!response.ok) {
     const errorText = await response.text();
     console.error(`RF add note error: ${response.status}`, errorText);
-    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    throw classifyRFResponse(response, errorText);
   }
 
   return await response.json();
@@ -431,7 +589,7 @@ export async function createRFCustomActivity(activityData, env) {
   if (!response.ok) {
     const errorText = await response.text();
     console.error(`RF custom activity error: ${response.status}`, errorText);
-    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    throw classifyRFResponse(response, errorText);
   }
 
   return await response.json();
@@ -530,7 +688,7 @@ export async function moveToCallBooked(candidateId, candidateData, env) {
   if (!response.ok) {
     const errorText = await response.text();
     console.error(`RF move-to-stage error: ${response.status}`, errorText);
-    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    throw classifyRFResponse(response, errorText);
   }
 
   return { moved: true, jobId: eligible.job_id };
@@ -651,7 +809,7 @@ export async function moveJobsToStage(candidateId, candidateData, options, env) 
     if (!response.ok) {
       const errorText = await response.text();
       console.error({ message: `RF move-to-stage error candidate=${candidateId} job=${job.job_id} status=${response.status} body=${errorText}`, source: 'rf-move-stage' });
-      throw new Error(`RF API error: ${response.status} - ${errorText}`);
+      throw classifyRFResponse(response, errorText);
     }
 
     movedJobIds.push(job.job_id);
@@ -678,18 +836,32 @@ export async function listOpenJobs(env) {
 
   while (true) {
     const url = `${rfBaseUrl}/job/list?only_open=1&items_per_page=${perPage}&current_page=${page}`;
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: { 'RF-Api-Key': rfApiKey },
-    });
+    let jobs = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { 'RF-Api-Key': rfApiKey },
+      });
 
-    if (!response.ok) {
+      if (response.ok) {
+        jobs = await response.json();
+        break;
+      }
+
       const errorText = await response.text();
+      const err = classifyRFResponse(response, errorText);
+      if (err instanceof RFTransientError && attempt === 1) {
+        console.warn({
+          message: `[RF job/list] ${response.status} on page=${page}, retrying once`,
+          source: 'rf-job-list',
+          page,
+        });
+        continue;
+      }
       console.error(`RF job/list error: ${response.status}`, errorText);
-      throw new Error(`RF API error: ${response.status} - ${errorText}`);
+      throw err;
     }
 
-    const jobs = await response.json();
     if (!Array.isArray(jobs) || jobs.length === 0) break;
 
     for (const job of jobs) {
@@ -794,6 +966,10 @@ export async function searchCandidatesByPredicateOnly({ predicateFilters, maxPag
  * the supplied filter array. Page size 100; loops until a short page or
  * `maxPages` reached. Used by both `searchCandidatesByIdsAndPredicate` and
  * `searchCandidatesByPredicateOnly`.
+ *
+ * Per-page one-shot 5xx retry (mirrors `getRFCandidate` + `fetchRFJobPipeline`).
+ * Does NOT retry on 429: propagate immediately so callers can respect
+ * Retry-After.
  */
 async function searchCandidatesByFilters({ filters, maxPages = 10 }, env) {
   const rfApiKey = env.RF_API_KEY;
@@ -815,24 +991,39 @@ async function searchCandidatesByFilters({ filters, maxPages = 10 }, env) {
       include_count: true,
     };
 
-    const response = await fetch(`${rfBaseUrl}/candidate/search`, {
-      method: 'POST',
-      headers: { 'RF-Api-Key': rfApiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify(requestBody),
-    });
+    let result = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const response = await fetch(`${rfBaseUrl}/candidate/search`, {
+        method: 'POST',
+        headers: { 'RF-Api-Key': rfApiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      });
 
-    if (!response.ok) {
+      if (response.ok) {
+        result = await response.json();
+        break;
+      }
+
       const errorText = await response.text();
+      const err = classifyRFResponse(response, errorText);
+      if (err instanceof RFTransientError && attempt === 1) {
+        console.warn({
+          message: `[RF candidate/search] ${response.status} on page=${page}, retrying once`,
+          source: 'rf-search',
+          page,
+          filterKeys: filters.map(f => f.key),
+        });
+        continue;
+      }
       console.error({
         message: `RF candidate/search error status=${response.status} body=${errorText}`,
         source: 'rf-search',
         page,
         filterKeys: filters.map(f => f.key),
       });
-      throw new Error(`RF API error: ${response.status} - ${errorText}`);
+      throw err;
     }
 
-    const result = await response.json();
     const candidates = Array.isArray(result?.data)
       ? result.data
       : Array.isArray(result?.candidates)
@@ -879,7 +1070,7 @@ export async function setJobCandidateConsultantId(candidateId, jobId, consultant
   if (!response.ok) {
     const errorText = await response.text();
     console.error(`RF set-consultant-field error candidate=${candidateId} job=${jobId} status=${response.status}`, errorText);
-    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    throw classifyRFResponse(response, errorText);
   }
 
   return await response.json();
@@ -888,6 +1079,8 @@ export async function setJobCandidateConsultantId(candidateId, jobId, consultant
 /**
  * Read the consultant_id custom field for a job-candidate link.
  * Returns the numeric value (an RF user_id) or null if the field is unset.
+ *
+ * One-shot 5xx retry; 429 propagates immediately as RFRateLimitedError.
  */
 export async function getJobCandidateConsultantId(candidateId, jobId, env) {
   const rfApiKey = env.RF_API_KEY;
@@ -898,18 +1091,33 @@ export async function getJobCandidateConsultantId(candidateId, jobId, env) {
   }
 
   const url = `${rfBaseUrl}/job-candidate/custom-field/value/list?candidate_id=${candidateId}&job_id=${jobId}`;
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: { 'RF-Api-Key': rfApiKey, 'Accept': 'application/json' },
-  });
+  let result = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { 'RF-Api-Key': rfApiKey, 'Accept': 'application/json' },
+    });
 
-  if (!response.ok) {
+    if (response.ok) {
+      result = await response.json();
+      break;
+    }
+
     const errorText = await response.text();
+    const err = classifyRFResponse(response, errorText);
+    if (err instanceof RFTransientError && attempt === 1) {
+      console.warn({
+        message: `[RF get-consultant-field] ${response.status} candidate=${candidateId} job=${jobId}, retrying once`,
+        source: 'rf-get-consultant-field',
+        candidateId,
+        jobId,
+      });
+      continue;
+    }
     console.error(`RF get-consultant-field error candidate=${candidateId} job=${jobId} status=${response.status}`, errorText);
-    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    throw err;
   }
 
-  const result = await response.json();
   const fields = Array.isArray(result?.data) ? result.data : [];
   const entry = fields.find(f => f.id === JOB_CANDIDATE_CONSULTANT_FIELD_ID);
   if (!entry || entry.value === null || entry.value === undefined) return null;
@@ -943,7 +1151,7 @@ export async function addCandidateToJob(candidateId, jobId, env) {
   if (!response.ok) {
     const errorText = await response.text();
     console.error(`RF add-to-job error: ${response.status}`, errorText);
-    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    throw classifyRFResponse(response, errorText);
   }
 
   return await response.json();
@@ -999,6 +1207,8 @@ export async function resolveJobConsultantId(candidateId, jobId, env) {
 /**
  * GET /candidate/activity/list — full activity feed for a candidate.
  * First page only (50 entries). Returns the data array (empty if none).
+ *
+ * One-shot 5xx retry; 429 propagates immediately as RFRateLimitedError.
  */
 export async function listCandidateActivities(candidateId, env) {
   const rfApiKey = env.RF_API_KEY;
@@ -1009,18 +1219,31 @@ export async function listCandidateActivities(candidateId, env) {
   }
 
   const url = `${rfBaseUrl}/candidate/activity/list?id=${candidateId}&items_per_page=50&current_page=1&include_count=true`;
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: { 'RF-Api-Key': rfApiKey, 'Accept': 'application/json' },
-  });
+  let result = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { 'RF-Api-Key': rfApiKey, 'Accept': 'application/json' },
+    });
 
-  if (!response.ok) {
+    if (response.ok) {
+      result = await response.json();
+      break;
+    }
+
     const errorText = await response.text();
+    const err = classifyRFResponse(response, errorText);
+    if (err instanceof RFTransientError && attempt === 1) {
+      console.warn({
+        message: `[RF activity-list] ${response.status} candidate=${candidateId}, retrying once`,
+        source: 'rf-activity-list',
+        candidateId,
+      });
+      continue;
+    }
     console.error(`RF activity-list error candidate=${candidateId} status=${response.status}`, errorText);
-    throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    throw err;
   }
-
-  const result = await response.json();
   return Array.isArray(result?.data) ? result.data : [];
 }
 
