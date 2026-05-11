@@ -293,10 +293,9 @@ async function handleGetTranscript({ env, body, consultant }) {
  *
  *   - Fallback path (candidate_fallback fuzzy string): delegates the whole
  *     candidate-resolution flow to `handleCandidateAddNote` verbatim. The
- *     sibling's behavior — needs_disambiguation envelope, HTTP 404 +
- *     `{error: 'candidate not found'}` on resolver miss — flows through
- *     unchanged. Dialect divergence vs. the fast path's HTTP-200 envelope is
- *     deliberate: see spec § "Note on the candidate_id-not-in-D1 dialect".
+ *     sibling returns the unified lean envelope on resolver miss (HTTP 200 +
+ *     `{ok:false, kind:'no_candidate'}`) — identical shape to the fast path.
+ *     Ambiguous fuzzy resolves still surface a `needs_disambiguation` envelope.
  *
  * Attribution is always `consultant.rfUserId` (resolved server-side from the
  * Access JWT). Both paths funnel the inbound `note` straight to
@@ -358,13 +357,9 @@ async function handleSubmitNotes({ env, body, consultant }) {
   }
 
   // Fallback path: delegate to /mcp/candidate-add-note's handler verbatim so
-  // disambiguation / not-found behave identically to the sibling tool.
-  //
-  // Dialect note: the sibling returns HTTP 404 + {error: 'candidate not found'}
-  // on resolver not_found, whereas the fast path above returns HTTP 200 + the
-  // {ok: false, kind: 'no_candidate'} envelope. The asymmetry is deliberate —
-  // see spec § "Note on the candidate_id-not-in-D1 dialect". Preserving the
-  // sibling's shape on this path means the fallback is a true passthrough.
+  // disambiguation / not-found behave identically to the sibling tool. Both
+  // paths now return the unified lean envelope (HTTP 200 + {ok:false,
+  // kind:'no_candidate'}) on resolver not_found — no dialect drift.
   return handleCandidateAddNote({
     env,
     body: { candidate: body.candidate_fallback, note },

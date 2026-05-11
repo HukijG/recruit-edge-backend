@@ -25,8 +25,10 @@ export async function handleCandidateGet({ env, body }) {
     if (candRes.reason === 'ambiguous') {
       return jsonResponse(200, disambiguationPayload(candRes));
     }
-    // not_found — keep the legacy 404 status so existing callers don't break.
-    return jsonResponse(404, { error: 'No match' });
+    // Lean envelope: HTTP 200 + {ok:false, kind:'no_candidate'} — consistent
+    // with the RF-unavailable / rate-limited branches below and with the rest
+    // of the system. Consumer apologises + asks for a better-narrowed query.
+    return jsonResponse(200, { ok: false, kind: 'no_candidate', error: 'No match' });
   }
 
   const candidateId = candRes.value.id;

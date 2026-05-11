@@ -88,7 +88,7 @@ describe('/mcp/candidate-log-interview', () => {
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
-  it('returns 404 for unknown candidate id', async () => {
+  it('returns lean no_candidate envelope for unknown candidate id', async () => {
     globalThis.fetch = vi.fn();
     const r = await call({
       consultantFirstName: 'Joel',
@@ -96,7 +96,9 @@ describe('/mcp/candidate-log-interview', () => {
       kind: '1st Interview',
       start_time: '2026-05-08T10:00:00+01:00',
     });
-    expect(r.status).toBe(404);
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b).toMatchObject({ ok: false, kind: 'no_candidate' });
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 

@@ -591,13 +591,15 @@ describe('/mcp/candidate-call-notes step=submit_notes', () => {
     expect(sent.id).toBe(50976);
   });
 
-  it('fallback path: candidate_fallback not found → 404', async () => {
+  it('fallback path: candidate_fallback not found → lean no_candidate envelope', async () => {
     globalThis.fetch = vi.fn();
     const r = await call({
       consultantFirstName: 'Joel', step: 'submit_notes',
       candidate_fallback: 'Nobody-McNoFace-1234567', note: 'x',
     });
-    expect(r.status).toBe(404);
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b).toMatchObject({ ok: false, kind: 'no_candidate' });
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 });

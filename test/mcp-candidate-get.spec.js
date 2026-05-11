@@ -79,10 +79,12 @@ describe('/mcp/candidate-get', () => {
     expect(body.candidate.jobs[0].stage_name).toBe('Sourced');
   });
 
-  it('returns 404 for missing id', async () => {
+  it('returns lean no_candidate envelope for missing id', async () => {
     // No RF mock needed — the thin-cache check fails before RF is called.
     const r = await call({ consultantFirstName: 'Joel', id: 999 });
-    expect(r.status).toBe(404);
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b).toMatchObject({ ok: false, kind: 'no_candidate' });
   });
 
   it('honours fields[] projection with aliases', async () => {
@@ -135,9 +137,11 @@ describe('/mcp/candidate-get', () => {
     }
   });
 
-  it('fuzzy query with no matches returns 404', async () => {
+  it('fuzzy query with no matches returns lean no_candidate envelope', async () => {
     const r = await call({ consultantFirstName: 'Joel', query: 'zzzzzzzzzz' });
-    expect(r.status).toBe(404);
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b).toMatchObject({ ok: false, kind: 'no_candidate' });
   });
 
   it('returns LinkedIn as a full URL', async () => {
@@ -186,14 +190,17 @@ describe('/mcp/candidate-get', () => {
     expect(body.candidate.current_title).toBe('Staff Engineer');
   });
 
-  it('candidate id not in thin cache → returns 404 (no RF call)', async () => {
-    // Post-migration, resolveCandidateThin queries candidates_v2 directly
-    // and returns not_found on miss. candidate-get maps that to legacy 404.
+  it('candidate id not in thin cache → returns lean no_candidate envelope (no RF call)', async () => {
+    // Post-migration, resolveCandidateThin queries candidates_v2 directly and
+    // returns not_found on miss. candidate-get maps that to the lean envelope
+    // (HTTP 200, kind:'no_candidate') — consistent with the rest of the system.
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2 WHERE id = 42');
     globalThis.fetch = vi.fn(); // Should never be called.
 
     const r = await call({ consultantFirstName: 'Joel', id: 42 });
-    expect(r.status).toBe(404);
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b).toMatchObject({ ok: false, kind: 'no_candidate' });
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 

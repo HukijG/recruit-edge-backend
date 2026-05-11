@@ -151,10 +151,12 @@ describe('/mcp/candidate-move-stage', () => {
     expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/candidate/move-to-stage'))).toBe(false);
   });
 
-  it('returns 404 for unknown candidate id', async () => {
+  it('returns lean no_candidate envelope for unknown candidate id', async () => {
     globalThis.fetch = vi.fn();
     const r = await call({ consultantFirstName: 'Joel', candidate: 999, stage: 'Replied' });
-    expect(r.status).toBe(404);
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b).toMatchObject({ ok: false, kind: 'no_candidate' });
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
@@ -370,24 +372,30 @@ describe('/mcp/candidate-move-stage', () => {
     expect(body.moved.to_stage).toBe('Replied');
   });
 
-  it('candidate_id with non-existent id returns 404', async () => {
+  it('candidate_id with non-existent id returns lean no_candidate envelope', async () => {
     // No candidates_v2 row for 99999 → thin sanity check fails before RF.
     globalThis.fetch = vi.fn();
     const r = await call({ consultantFirstName: 'Joel', candidate_id: 99999, job_id: 100, stage_id: 2 });
-    expect(r.status).toBe(404);
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b).toMatchObject({ ok: false, kind: 'no_candidate' });
   });
 
-  it('candidate_id + wrong job_id returns 404', async () => {
+  it('candidate_id + wrong job_id returns lean not_on_job envelope', async () => {
     const fetchMock = mockMoveStage(new Map([[42, JERRY_42_BODY]]));
     globalThis.fetch = fetchMock;
     const r = await call({ consultantFirstName: 'Joel', candidate_id: 42, job_id: 999, stage_id: 2 });
-    expect(r.status).toBe(404);
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b).toMatchObject({ ok: false, kind: 'not_on_job' });
   });
 
-  it('candidate_id + job_id + bad stage_id returns 404', async () => {
+  it('candidate_id + job_id + bad stage_id returns lean no_stage envelope', async () => {
     const fetchMock = mockMoveStage(new Map([[42, JERRY_42_BODY]]));
     globalThis.fetch = fetchMock;
     const r = await call({ consultantFirstName: 'Joel', candidate_id: 42, job_id: 100, stage_id: 9999 });
-    expect(r.status).toBe(404);
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b).toMatchObject({ ok: false, kind: 'no_stage' });
   });
 });

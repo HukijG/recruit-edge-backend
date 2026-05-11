@@ -152,12 +152,17 @@ export async function handleCandidateMoveStage({ env, body, consultant }) {
         error: err?.message ?? String(err),
       });
     }
-    if (!candRes.ok) return jsonResponse(404, { error: 'candidate not found', candidate_id: body.candidate_id });
+    // Lean envelope: HTTP 200 + {ok:false, kind:'no_candidate'} for missing
+    // candidate. Consumer apologises + asks for a better-narrowed reference.
+    if (!candRes.ok) return jsonResponse(200, { ok: false, kind: 'no_candidate', error: 'candidate not found', candidate_id: body.candidate_id });
     const candidate = candRes.value;
     const link = (candidate.jobs ?? []).find((j) => Number(j.job_id) === Number(body.job_id));
-    if (!link) return jsonResponse(404, { error: 'candidate is not on that job', candidate_id: body.candidate_id, job_id: body.job_id });
+    // Lean envelope: candidate-job linkage missing — recoverable, consumer
+    // re-asks the user with a different (candidate, job) pairing.
+    if (!link) return jsonResponse(200, { ok: false, kind: 'not_on_job', error: 'candidate is not on that job', candidate_id: body.candidate_id, job_id: body.job_id });
     const stage = (link.stages ?? []).find((s) => Number(s.id) === Number(body.stage_id));
-    if (!stage) return jsonResponse(404, { error: 'stage not found on this job', stage_id: body.stage_id });
+    // Lean envelope: stage missing on this job's pipeline.
+    if (!stage) return jsonResponse(200, { ok: false, kind: 'no_stage', error: 'stage not found on this job', stage_id: body.stage_id });
 
     try {
       await callRfMoveStage(env, {
@@ -227,7 +232,9 @@ export async function handleCandidateMoveStage({ env, body, consultant }) {
     );
     candidateOptions = bodies.filter((r) => r.ok).map((r) => r.value);
   } else {
-    return jsonResponse(404, { error: 'candidate not found' });
+    // Lean envelope: HTTP 200 + {ok:false, kind:'no_candidate'} — consistent
+    // with the rest of the system.
+    return jsonResponse(200, { ok: false, kind: 'no_candidate', error: 'candidate not found' });
   }
 
   // 2. Enumerate every (candidate, job, stage) tuple. The flattening lets a

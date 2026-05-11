@@ -115,14 +115,16 @@ describe('/mcp/candidate-add-note', () => {
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
-  it('returns 404 for an unknown candidate id', async () => {
+  it('returns lean no_candidate envelope for an unknown candidate id', async () => {
     globalThis.fetch = vi.fn();
     const r = await call({
       consultantFirstName: 'Joel',
       candidate: 9999,
       note: 'whatever',
     });
-    expect(r.status).toBe(404);
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b).toMatchObject({ ok: false, kind: 'no_candidate' });
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
