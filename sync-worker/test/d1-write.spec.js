@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:test';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { applyMigration } from './helpers/migrate.js';
-import { writeCandidatesAndLinks, writeJobs, writeJobPipeline } from '../src/d1-write.js';
+import { writeCandidatesAndLinks, writeJobs, writeJobPipeline, writeCandidatesThin, writeJobsThin, writeCalls } from '../src/d1-write.js';
 
 beforeEach(async () => {
   await applyMigration(env.RF_MCP_CACHE);
@@ -192,5 +192,113 @@ describe('writeJobPipeline', () => {
       .all();
     expect(results.length).toBe(1);
     expect(JSON.parse(results[0].summary_json)).toEqual([{ id: 1, name: 'B', count: 0 }]);
+  });
+});
+
+describe('writeCandidatesThin', () => {
+  const candidate = {
+    id: 1,
+    name: 'Jane Doe',
+    linkedin_profile: 'jane-doe',
+    added_time: '2024-06-01T12:00:00+0000',
+    current_title: 'CTO',
+    current_organization: 'Acme',
+  };
+
+  it('inserts a new candidate', async () => {
+    await writeCandidatesThin(env, [candidate]);
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT id, name, linkedin_profile FROM candidates_v2 WHERE id = ?')
+      .bind(1).all();
+    expect(results).toEqual([{ id: 1, name: 'Jane Doe', linkedin_profile: 'jane-doe' }]);
+  });
+
+  it('is idempotent on PK collision (INSERT-OR-IGNORE)', async () => {
+    await writeCandidatesThin(env, [candidate]);
+    const updated = { ...candidate, name: 'CHANGED — should NOT overwrite' };
+    await writeCandidatesThin(env, [updated]);
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT name FROM candidates_v2 WHERE id = 1').all();
+    expect(results[0].name).toBe('Jane Doe');
+  });
+
+  it('handles >100 rows by chunking', async () => {
+    const many = Array.from({ length: 250 }, (_, i) => ({
+      id: i + 1,
+      name: `c${i}`,
+      added_time: '2024-06-01T12:00:00+0000',
+    }));
+    await writeCandidatesThin(env, many);
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT COUNT(*) AS n FROM candidates_v2').all();
+    expect(results[0].n).toBe(250);
+  });
+
+  it('no-op on empty array', async () => {
+    await writeCandidatesThin(env, []);
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT COUNT(*) AS n FROM candidates_v2').all();
+    expect(results[0].n).toBe(0);
+  });
+});
+
+describe('writeJobsThin', () => {
+  const job = {
+    id: 42,
+    name: 'Senior SWE',
+    company: { name: 'Acme' },
+    created_time: '2024-01-15T09:00:00+0000',
+  };
+
+  it('inserts a new job', async () => {
+    await writeJobsThin(env, [job]);
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT id, name, client_company_name FROM jobs_v2 WHERE id = 42').all();
+    expect(results[0]).toMatchObject({ id: 42, name: 'Senior SWE', client_company_name: 'Acme' });
+  });
+
+  it('writes canonical_pipeline_json when provided as second arg map', async () => {
+    const pipelineByJobId = new Map([[42, [{ id: 1, name: 'Sourced' }, { id: 2, name: 'Hired' }]]]);
+    await writeJobsThin(env, [job], { pipelineByJobId });
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT canonical_pipeline_json FROM jobs_v2 WHERE id = 42').all();
+    expect(JSON.parse(results[0].canonical_pipeline_json)).toEqual([
+      { id: 1, name: 'Sourced' }, { id: 2, name: 'Hired' },
+    ]);
+  });
+
+  it('is idempotent on PK collision', async () => {
+    await writeJobsThin(env, [job]);
+    await writeJobsThin(env, [{ ...job, name: 'CHANGED' }]);
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT name FROM jobs_v2 WHERE id = 42').all();
+    expect(results[0].name).toBe('Senior SWE');
+  });
+});
+
+describe('writeCalls', () => {
+  const call = {
+    call_id: 'c-1',
+    target: { id: '8000000000000001' },
+    contact: { id: 'shared_contact_pool_Company:X_uid_RF555' },
+    date_started: 1717248000000,
+    total_duration: 180000,
+    direction: 'outbound',
+  };
+
+  it('inserts a new call', async () => {
+    await writeCalls(env, [call]);
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT call_id, rf_candidate_id, duration_ms FROM calls WHERE call_id = ?')
+      .bind('c-1').all();
+    expect(results[0]).toEqual({ call_id: 'c-1', rf_candidate_id: 555, duration_ms: 180000 });
+  });
+
+  it('is idempotent on PK collision', async () => {
+    await writeCalls(env, [call]);
+    await writeCalls(env, [{ ...call, total_duration: 999 }]);
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT duration_ms FROM calls WHERE call_id = ?').bind('c-1').all();
+    expect(results[0].duration_ms).toBe(180000); // first write wins (INSERT-OR-IGNORE)
   });
 });

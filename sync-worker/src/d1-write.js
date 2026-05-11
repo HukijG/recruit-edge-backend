@@ -18,7 +18,13 @@
  * surface that as a thrown error rather than silently splitting.
  */
 
-import { toCandidateRow, toCandidateJobRows } from './normalize.js';
+import {
+  toCandidateRow,
+  toCandidateJobRows,
+  toCandidateThinRow,
+  toJobThinRow,
+  toCallRow,
+} from './normalize.js';
 
 const CAND_COLS = [
   'id', 'body', 'name', 'primary_email', 'linkedin_profile',
@@ -157,4 +163,96 @@ export async function writeJobPipeline(env, jobId, summary, stageCandidates) {
     .prepare(JP_INSERT_SQL)
     .bind(jobId, JSON.stringify(summary ?? []), JSON.stringify(stageCandidates ?? {}), now)
     .run();
+}
+
+// ---------------------------------------------------------------------------
+// THIN-IMMUTABLE writers — INSERT OR IGNORE (first write wins).
+// These target candidates_v2, jobs_v2, and calls from migration 0003.
+// ---------------------------------------------------------------------------
+
+const CAND_V2_COLS = [
+  'id', 'name', 'linkedin_profile', 'added_time_ms',
+  'current_title_at_cache_time', 'current_company_at_cache_time', 'cached_at_ms',
+];
+const JOBS_V2_COLS = [
+  'id', 'name', 'client_company_name', 'added_time_ms',
+  'canonical_pipeline_json', 'cached_at_ms',
+];
+const CALLS_COLS = [
+  'call_id', 'target_dialpad_id', 'dialpad_contact_id', 'rf_candidate_id',
+  'date_started_ms', 'duration_ms', 'direction', 'cached_at_ms',
+];
+
+const candV2Placeholders = CAND_V2_COLS.map(() => '?').join(', ');
+const jobsV2Placeholders = JOBS_V2_COLS.map(() => '?').join(', ');
+const callsPlaceholders  = CALLS_COLS.map(() => '?').join(', ');
+
+const CAND_V2_SQL = `INSERT OR IGNORE INTO candidates_v2 (${CAND_V2_COLS.join(', ')}) VALUES (${candV2Placeholders})`;
+const JOBS_V2_SQL = `INSERT OR IGNORE INTO jobs_v2 (${JOBS_V2_COLS.join(', ')}) VALUES (${jobsV2Placeholders})`;
+const CALLS_SQL   = `INSERT OR IGNORE INTO calls (${CALLS_COLS.join(', ')}) VALUES (${callsPlaceholders})`;
+
+/**
+ * Batch-insert rows using INSERT OR IGNORE into the given table.
+ * On PK collision the existing row is preserved (first write wins).
+ * Chunks at D1_BATCH_CAP (100) — no atomicity requirement here since each row
+ * is self-contained.
+ *
+ * @param {object} env
+ * @param {string} sql - prepared INSERT OR IGNORE SQL
+ * @param {Array<object>} rows - already-normalised row objects
+ * @param {string[]} cols - ordered column names matching SQL placeholders
+ */
+async function batchInsert(env, sql, rows, cols) {
+  if (!rows?.length) return;
+  const stmts = rows.map(row =>
+    env.RF_MCP_CACHE.prepare(sql).bind(...cols.map(c => row[c] ?? null))
+  );
+  for (let i = 0; i < stmts.length; i += D1_BATCH_CAP) {
+    await env.RF_MCP_CACHE.batch(stmts.slice(i, i + D1_BATCH_CAP));
+  }
+}
+
+/**
+ * INSERT OR IGNORE candidates into candidates_v2.
+ * Re-running with the same RF candidates is safe — existing rows are not
+ * overwritten (immutable-cache contract).
+ *
+ * @param {object} env - Worker env with `RF_MCP_CACHE` D1 binding
+ * @param {Array<object>} rfCandidates - RF candidate-shaped objects
+ */
+export async function writeCandidatesThin(env, rfCandidates) {
+  const rows = rfCandidates.map(toCandidateThinRow);
+  await batchInsert(env, CAND_V2_SQL, rows, CAND_V2_COLS);
+}
+
+/**
+ * INSERT OR IGNORE jobs into jobs_v2.
+ * If `opts.pipelineByJobId` (Map<id, stage[]>) is provided, the
+ * `canonical_pipeline_json` column is populated for matching job ids.
+ *
+ * @param {object} env
+ * @param {Array<object>} rfJobs - RF job-shaped objects
+ * @param {{ pipelineByJobId?: Map<number, Array> }} [opts]
+ */
+export async function writeJobsThin(env, rfJobs, opts = {}) {
+  const pipelineByJobId = opts.pipelineByJobId ?? new Map();
+  const rows = rfJobs.map(j => {
+    const row = toJobThinRow(j);
+    const summary = pipelineByJobId.get(j.id);
+    if (summary) row.canonical_pipeline_json = JSON.stringify(summary);
+    return row;
+  });
+  await batchInsert(env, JOBS_V2_SQL, rows, JOBS_V2_COLS);
+}
+
+/**
+ * INSERT OR IGNORE Dialpad calls into the `calls` table.
+ * Accepts Dialpad /v2/call list items or hangup webhook payloads.
+ *
+ * @param {object} env
+ * @param {Array<object>} dialpadCalls
+ */
+export async function writeCalls(env, dialpadCalls) {
+  const rows = dialpadCalls.map(toCallRow);
+  await batchInsert(env, CALLS_SQL, rows, CALLS_COLS);
 }
