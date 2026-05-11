@@ -138,14 +138,14 @@ If you're unsure whether a new endpoint needs Access:
 
 The sync-worker cron trigger remains commented out in `sync-worker/wrangler.sync.jsonc` as of this branch (the `"triggers"` block is present but commented). Re-enable is cutover step 2 (operator-driven, after migration `0003_v2_tables.sql` is applied and the new sync-worker code is deployed).
 
-**Two paths run side-by-side during the dual-write phase:**
+**Two paths exist side-by-side during the dual-write phase, both gated by env vars on sync-worker:**
 
-- **Legacy `tailSync`** — always fires once cron is re-enabled. Writes to the legacy `candidates`, `candidate_jobs`, `jobs`, `job_pipelines` tables (REPLACE-everything semantics, same as before).
-- **New `tailSyncThin`** — fires only when `CRON_THIN_ENABLED='true'` (or `'1'`) is set as a Worker secret/var on sync-worker. Additive-only INSERT-OR-IGNORE into `candidates_v2`, `jobs_v2`, `calls`. Default is `"false"` — the new path is off until the operator explicitly enables it.
+- **Legacy `tailSync`** — fires only when `CRON_LEGACY_ENABLED='true'` (or `'1'`) is set as a Worker secret/var on sync-worker. Default `'false'`. Writes to the legacy `candidates`, `candidate_jobs`, `jobs`, `job_pipelines` tables (REPLACE-everything semantics, same as before). Intentionally inert during the dual-write window because it drives the ~1M D1 writes/day storm the redesign exists to fix — only set to `'true'` if the operator needs to fall back to legacy writes during a cutover emergency.
+- **New `tailSyncThin`** — fires only when `CRON_THIN_ENABLED='true'` (or `'1'`) is set as a Worker secret/var on sync-worker. Default `'false'`. Additive-only INSERT-OR-IGNORE into `candidates_v2`, `jobs_v2`, `calls`. Operator sets this to `'true'` at cutover step 5, after verifying the new tables were seeded by `/admin/cache-rebuild` and the main worker is reading from the thin tables without errors.
 
-The `CRON_THIN_ENABLED` gate is defense-in-depth for the dual-write phase: re-enabling cron does not automatically activate the new write path. The operator sets the flag explicitly after verifying the new tables were created by the migration.
+Both gates default to `'false'` so re-enabling the cron trigger at step 2 does not automatically activate either write path. The operator opts in explicitly — `CRON_THIN_ENABLED='true'` at step 5; `CRON_LEGACY_ENABLED` stays `'false'` throughout normal cutover (the legacy path is functionally gone from step 2 onward).
 
-Both paths write to disjoint table sets until cutover step 6 drops the legacy tables. The cron bypasses Access entirely — it writes nothing through user-facing routes.
+Both paths write to disjoint table sets until cutover step 6 drops the legacy tables. After step 6, the legacy `tailSync` function is removed and both env-var gates become redundant (they're removed alongside the dual-path cleanup). The cron bypasses Access entirely — it writes nothing through user-facing routes.
 
 Not auth-related per se, but tracked here so re-enabling cron during auth work doesn't surface as unexpected unauthenticated traffic.
 
@@ -153,7 +153,7 @@ Not auth-related per se, but tracked here so re-enabling cron during auth work d
 
 ### D1 PITR rollback plan
 
-Cutover step 6 drops the legacy tables (`candidates`, `candidate_jobs`, `jobs`, `job_pipelines`) via `migrations/0004_drop_legacy.sql`. This is irreversible via the migration tool — once applied, recovery requires a D1 export/restore.
+Cutover step 6 drops the legacy tables (`candidates`, `candidate_jobs`, `jobs`, `job_pipelines`) via `0004_drop_legacy.sql`. The migration file is staged in `sync-worker/migrations-pending/` during the dual-write phase so `wrangler d1 migrations apply` does NOT pick it up alongside `0003` at cutover step 1. At step 6, `git mv` it back into `sync-worker/migrations/` and then run `wrangler d1 migrations apply --remote`. This is irreversible via the migration tool — once applied, recovery requires a D1 export/restore.
 
 **Before applying `0004_drop_legacy.sql`**, take a fresh D1 export:
 

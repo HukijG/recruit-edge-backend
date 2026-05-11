@@ -2,7 +2,7 @@
 
 > **Status note (2026-05-11):** Auth migration Phase 1 has shipped — the MCP path (claude.ai connector) is now fronted by Cloudflare Access OAuth (Spec A). The extension API still sits behind the legacy `X-Extension-Token` header until Spec B lands; new user-facing endpoints must NOT add new shared-secret headers (see `docs/security.md`).
 >
-> **Thin-immutable cache redesign (Tasks 1–19, 2026-05-11):** `RF_MCP_CACHE` is being migrated to a thin-immutable schema. New tables `candidates_v2`, `jobs_v2`, and `calls` are live; the legacy `candidates`, `candidate_jobs`, `jobs`, and `job_pipelines` tables coexist during dual-write cutover (steps 2–5). Pipeline reads are now live RF pass-through — the `job_pipelines` table is no longer the source of truth. The new `tailSyncThin` cron path writes only INSERT-OR-IGNORE (no rewrites of unchanged rows); it is gated by `CRON_THIN_ENABLED=true` until cutover completes. The legacy cron path remains OFF (commit `b40dcac`, 2026-05-10) — the full rebuild and cache-seed Workflows are callable on demand. Webhook-driven cache writes for the `calls` table are live via the hangup webhook → service-binding → sync-worker path.
+> **Thin-immutable cache redesign (Tasks 1–19, 2026-05-11):** `RF_MCP_CACHE` is being migrated to a thin-immutable schema. New tables `candidates_v2`, `jobs_v2`, and `calls` are live; the legacy `candidates`, `candidate_jobs`, `jobs`, and `job_pipelines` tables coexist during dual-write cutover (steps 2–5). Pipeline reads are now live RF pass-through — the `job_pipelines` table is no longer the source of truth. The new `tailSyncThin` cron path writes only INSERT-OR-IGNORE (no rewrites of unchanged rows); it is gated by `CRON_THIN_ENABLED='true'` (default `'false'`) until cutover completes. The legacy `tailSync` call is gated behind `CRON_LEGACY_ENABLED='false'` (default) and is intentionally inert during the dual-write window; only `tailSyncThin` runs when `CRON_THIN_ENABLED='true'`. The full rebuild and cache-seed Workflows remain callable on demand. Webhook-driven cache writes for the `calls` table are live via the hangup webhook → service-binding → sync-worker path.
 >
 > Call-state architecture has settled on **webhook-driven Durable Object** storage. Per-user `ExtCallState` DO holds the active Dialpad `call_id` with strong consistency. The Dialpad `calling`+`hangup` webhook (`/webhook/dialpad/extension-calls`) is the only writer; `/dialpad-call`, `/dialpad-hangup`, and `/extension-call-status` are read-only.
 
@@ -11,7 +11,7 @@
 Three Cloudflare Workers cooperating around a small set of D1 + KV bindings:
 
 - **`rf-dialpad-sync-dev`** (main worker, this repo's root) — the integration hub. Receives webhooks from RecruiterFlow (RF), Dialpad, Google Calendar, Krisp, and the LinkedIn extension; writes to RF + Dialpad APIs; serves the extension and PWA routes; also serves the internal `/mcp/*` API consumed only over a service binding from the MCP worker. Owns `USERS_DB` (D1) and `SYNC_STATE` (KV) writes; reads `RF_MCP_CACHE` (D1).
-- **`rf-mcp-cache-sync`** (sync worker, `sync-worker/` subtree) — the **sole writer** of `RF_MCP_CACHE` (D1). Runs a 15-min cron with two parallel paths: the legacy `tailSync` (currently always-on during dual-write phase) and the new additive-only `tailSyncThin` (gated by `CRON_THIN_ENABLED`). On-demand Workflows: `FullRebuildWorkflow` (legacy repopulation), `PipelineRebuildWorkflow` (legacy per-job pipeline refresh), and `CacheSeedWorkflow` (per-table thin-schema seed). Also accepts `POST /admin/cache-rebuild?table=` for the new seed path and `POST /internal/calls/upsert` (service-binding-only, from main worker) for live call-cache writes.
+- **`rf-mcp-cache-sync`** (sync worker, `sync-worker/` subtree) — the **sole writer** of `RF_MCP_CACHE` (D1). Runs a 15-min cron with two parallel paths: the legacy `tailSync` (gated behind `CRON_LEGACY_ENABLED='false'` default; intentionally inert during the dual-write window — see `sync-worker/src/sync-worker.js` § `getCacheCronLegacyFlag`) and the new additive-only `tailSyncThin` (gated by `CRON_THIN_ENABLED='false'` default). On-demand Workflows: `FullRebuildWorkflow` (legacy repopulation), `CacheSeedWorkflow` (per-table thin-schema seed); `PipelineRebuildWorkflow` (legacy per-job pipeline refresh) still exists in `sync-worker/src/pipeline-workflow.js` but is no longer instantiated from `scheduled()`. Also accepts `POST /admin/cache-rebuild?table=` for the new seed path and `POST /internal/calls/upsert` (service-binding-only, from main worker) for live call-cache writes.
 - **`rf-mcp-remote`** (MCP worker, `mcp-worker/` subtree) — the public Streamable-HTTP MCP server consumed by claude.ai. Stateless TypeScript Worker; validates the Cloudflare Access JWT, then service-binds into the main worker's `/mcp/*` surface. Owns no storage; never reads RF directly.
 
 RF is the source of truth for candidate records. The KV `SYNC_STATE` cache provides fast lookups for integrations that don't have an RF candidate ID, and short-TTL snapshot caches make the extension's sidepanel responsive when recruiters walk through bulk-added candidate queues.
@@ -149,7 +149,7 @@ This file does NOT duplicate that material. References below use the Access auth
 | `sync-worker/migrations/0001_init.sql` | Initial schema: legacy `candidates`, `candidate_jobs`, `jobs`, `sync_state`. |
 | `sync-worker/migrations/0002_job_pipelines.sql` | Legacy `job_pipelines` table. |
 | `sync-worker/migrations/0003_v2_tables.sql` | **Thin-immutable schema:** `candidates_v2`, `jobs_v2`, `calls`. Coexists with legacy tables during dual-write cutover. |
-| `sync-worker/migrations/0004_drop_legacy.sql` | **Applied at cutover step 6 only.** Drops `candidates`, `candidate_jobs`, `jobs`, `job_pipelines`. |
+| `sync-worker/migrations-pending/0004_drop_legacy.sql` | **Staged out of the migrations dir until cutover step 6.** Moved back to `sync-worker/migrations/` and applied at step 6 only. Drops `candidates`, `candidate_jobs`, `jobs`, `job_pipelines`. |
 | `sync-worker/wrangler.sync.jsonc` | Sync-worker config: RF_MCP_CACHE (rw) + USERS_DB (ro) D1 bindings, KV, Workflow bindings (`REBUILD_WORKFLOW`, `PIPELINE_REBUILD_WORKFLOW`, `CACHE_SEED_WORKFLOW`), `workers_dev: false` (closes public workers.dev subdomain), `CRON_THIN_ENABLED` env var (default `"false"` — flip to `"true"` to activate additive cron). Cron block currently commented out. |
 | `sync-worker/vitest.config.js` | Vitest config for sync-worker tests. |
 | `sync-worker/test/{admin,d1-write,normalize,pipeline-normalize,pipeline-workflow,rf-list-client,sync-state,tail-sync,workflow,internal-calls-upsert,sync-worker}.spec.js` | Sync-worker tests. `internal-calls-upsert.spec.js` covers the service-binding endpoint idempotency; `sync-worker.spec.js` covers cron e2e against mocked RF + Dialpad. |
@@ -234,7 +234,7 @@ The MCP worker validates the JWT, builds a fresh per-request `McpServer` (mandat
 | `/admin/cache-rebuild?table=<candidates\|jobs\|calls>&since=<iso>` | POST | `X-Admin-Token` (`ADMIN_SECRET`, timing-safe) | Kicks off `CacheSeedWorkflow` for the specified thin-schema table. `since` is optional (calls only — defaults to 2 years). Returns `{ ok, workflow_id }` HTTP 202. |
 | `/internal/calls/upsert` | POST | `X-Internal-Token` (`INTERNAL_SECRET`, timing-safe) | Service-binding-only endpoint. Accepts a Dialpad hangup payload and INSERT-OR-IGNORE into `calls`. Validates `call_id`, `target.id`, `date_started` fields. The workers.dev subdomain is disabled (`workers_dev: false`), so this is only reachable via service binding from the main worker. |
 
-The 15-min `scheduled()` handler runs `tailSync` (legacy, always on during dual-write) and `tailSyncThin` (new, gated by `CRON_THIN_ENABLED`). The cron block in `wrangler.sync.jsonc` is currently commented out — the cron was disabled 2026-05-10 to stop the INSERT-OR-REPLACE write-storm; re-enable after the legacy write paths are retired (cutover step 6).
+The 15-min `scheduled()` handler runs `tailSync` (legacy, gated behind `CRON_LEGACY_ENABLED='false'` default) and `tailSyncThin` (new, gated by `CRON_THIN_ENABLED='false'` default). Re-enable the cron block in `wrangler.sync.jsonc` at cutover step 2 (dual-write monitoring phase): both gates default `'false'` so cron runs but both paths no-op. At step 5 set `CRON_THIN_ENABLED='true'` to activate the additive write path. At step 6, drop the legacy `tailSync` function + both env-var gates entirely.
 
 ---
 
@@ -817,9 +817,18 @@ rf-dialpad-sync-dev /mcp/* router (src/mcp/router.js)
 src/mcp/<name>.js
    │ resolvers (resolveCandidate / resolveJob / resolveStage / resolveOwner)
    │   - candidate fuzzy: in-memory snapshot of candidates_v2 (id, name, linkedin_profile, added_time_ms)
-   │   - id resolve: D1 SELECT from candidates_v2 or live RF /candidate/get
+   │   - candidate id resolve: D1 SELECT from candidates_v2 (`getThinCandidateById`) — used by
+   │     `/mcp/candidate-get` as a sanity check before the live `/candidate/get` fetch.
+   │   - candidate ambiguity hydration (organisation + title for top-K options): still reads
+   │     `current_organization` / `current_title` from the legacy `candidates` table (`SELECT
+   │     id, current_organization, current_title FROM candidates WHERE id IN (?)`) until cutover
+   │     step 6 (`0004_drop_legacy.sql`) drops `candidates`. After step 6 this hydration moves
+   │     to a live RF `/candidate/search` batch.
+   │   - job resolve: D1 SELECT from the legacy `jobs` table (`SELECT id, name,
+   │     client_company_name FROM jobs WHERE …`); `jobs_v2` exists and is dual-written but
+   │     `resolveJob` / `loadJobMeta` / `loadJobs` migrate to it at cutover step 6.
    │ For mutable data: live RF call (/candidate/get, /candidate/search, /job/pipeline)
-   │ For call history: D1 SELECT from calls table
+   │ For call history: D1 SELECT from `calls` table (`getCallsForCandidate`)
    │ NEVER writes D1 — that's the sync worker's exclusive responsibility
    ▼
 JSON response → mwFetch → tool body → MCP stream → claude.ai
@@ -851,8 +860,8 @@ Sole writer of `RF_MCP_CACHE` (D1). Deployed independently from the same monorep
 ### What it does
 
 - **Scheduled cron (`*/15 * * * *`, cron block currently commented out in `wrangler.sync.jsonc`):** `scheduled()` runs two parallel paths inside `ctx.waitUntil`:
-  1. **Legacy `tailSync`** (always on during dual-write phase) — `INSERT-OR-REPLACE`s into the legacy `candidates`, `candidate_jobs`, `jobs` tables using `fetchCandidatesUpdatedSince` + `writeCandidatesAndLinks` / `writeJobs`. Also creates a new `PipelineRebuildWorkflow` instance.
-  2. **New `tailSyncThin`** (gated by `CRON_THIN_ENABLED=true` env var) — three parallel INSERT-OR-IGNORE subtasks via `Promise.allSettled` (one failure doesn't block others):
+  1. **Legacy `tailSync`** (gated behind `CRON_LEGACY_ENABLED='false'` default; intentionally inert during dual-write — `getCacheCronLegacyFlag(env)` in `sync-worker/src/sync-worker.js` short-circuits with a structured `op:'skip_legacy_tail_sync'` log when the gate is OFF) — when re-enabled, `INSERT-OR-REPLACE`s into the legacy `candidates`, `candidate_jobs`, `jobs` tables using `fetchCandidatesUpdatedSince` + `writeCandidatesAndLinks` / `writeJobs`. No longer instantiates `PipelineRebuildWorkflow` (the class still exists in `sync-worker/src/pipeline-workflow.js` but is not invoked from cron).
+  2. **New `tailSyncThin`** (gated by `CRON_THIN_ENABLED='true'` env var; default `'false'` during dual-write monitoring) — three parallel INSERT-OR-IGNORE subtasks via `Promise.allSettled` (one failure doesn't block others):
      - `tailSyncCandidatesThin`: RF `/candidate/search` with `added_on` date filter → `writeCandidatesThin` → `candidates_v2`. Cursor stored as `last_candidates_added_cursor`. Cap-aware: capped → MIN `added_time` across batch; not-capped → MAX `added_time`.
      - `tailSyncJobsThin`: full re-scan of RF `/job/list` → `writeJobsThin` → `jobs_v2`. For each newly-seen job id, fetches `/job/pipeline` once to seed `canonical_pipeline_json`. (~100 jobs total; one full re-scan per tick.)
      - `tailSyncCallsThin`: per-consultant fan-out via `listConsultants(env)` (reads `USERS_DB.users`); for each consultant queries `MAX(date_started_ms) - 6h` as the `started_after` window → `fetchCallsForConsultant` → `writeCalls` → `calls`. 6-hour overlap absorbs the strict-`>` semantics of `started_after` (DP-2 verified).
@@ -865,13 +874,15 @@ Sole writer of `RF_MCP_CACHE` (D1). Deployed independently from the same monorep
 
 - **`FullRebuildWorkflow`** (`sync-worker/src/workflow.js`): legacy full repopulation — candidates page-walk, jobs, users, activity_types, custom_fields, per-job pipeline rebuild. In-flight token claim/release wraps the run.
 
-- **`PipelineRebuildWorkflow`** (`sync-worker/src/pipeline-workflow.js`): legacy per-job pipeline snapshot refresh. One `step.do` per open job; per-step retries (3 attempts, exponential backoff).
+- **`PipelineRebuildWorkflow`** (`sync-worker/src/pipeline-workflow.js`): legacy per-job pipeline snapshot refresh. Class still present in the file but no longer cron-instantiated (the spawn from `scheduled()` was removed during the thin-cache cutover). One `step.do` per open job; per-step retries (3 attempts, exponential backoff). Retained on disk pending step-6 cleanup.
 
 - **`CacheSeedWorkflow`** (`sync-worker/src/workflow.js`): new per-table thin-schema seed. Uses `step.do` + retry semantics. Batches 200 rows per `RF_MCP_CACHE.batch(...)`. Resumable on partial failure.
 
 ### Why the cron block is commented out
 
-The legacy `tailSync` path (`INSERT-OR-REPLACE`-everything semantics) was driving ~1M D1 writes/day with zero active consumers. The new `tailSyncThin` path eliminates the write-storm by using INSERT-OR-IGNORE-on-PK and an `added_on` cursor that only processes new candidates. Re-enable the cron block after cutover step 6 removes the legacy path and confirms the thin path's write volume is acceptable.
+The legacy `tailSync` path (`INSERT-OR-REPLACE`-everything semantics) was driving ~1M D1 writes/day with zero active consumers. The new `tailSyncThin` path eliminates the write-storm by using INSERT-OR-IGNORE-on-PK and an `added_on` cursor that only processes new candidates.
+
+**Re-enable the cron block at cutover step 2** (the dual-write monitoring phase). The legacy `tailSync` path is now inert during dual-write — gated behind `CRON_LEGACY_ENABLED='false'` default; only `tailSyncThin` runs once `CRON_THIN_ENABLED='true'` is set at step 5. After cutover step 6 drops the legacy tables, the `CRON_LEGACY_ENABLED` gate (and the legacy `tailSync` function itself) is removed; `CRON_THIN_ENABLED` likewise becomes redundant and is removed alongside it.
 
 ### Additive tail-sync cursor semantics (`fetchCandidatesAddedSince`)
 
@@ -966,7 +977,21 @@ Example: `https://www.LinkedIn.com/in/John-Smith/?utm_source=share` → `linkedi
 
 Shared between the sync worker (writer) and the main worker (reader). Schema in `sync-worker/migrations/`:
 
-**Current state (dual-write phase, cutover steps 2–5):** both legacy and thin-immutable tables coexist. The thin tables are the active read path for MCP queries; legacy tables remain until cutover step 6 (`0004_drop_legacy.sql`).
+**Current state (dual-write phase, cutover steps 2–5):** both legacy and thin-immutable tables coexist. MCP read paths split across the two table sets — some have migrated to thin, others still consume legacy until cutover step 6 drops them (`0004_drop_legacy.sql`, staged in `sync-worker/migrations-pending/` and moved back into `sync-worker/migrations/` at step 6).
+
+**Thin (already on `candidates_v2` / `jobs_v2` / `calls`):**
+- `src/mcp/snapshot.js` — in-memory fuzzy snapshot reads `candidates_v2` (`SELECT id, name, linkedin_profile, added_time_ms FROM candidates_v2`).
+- `src/mcp/candidate-get.js` — `getThinCandidateById` cache sanity check against `candidates_v2`, then live `/candidate/get` to RF.
+- `src/mcp/job-pipeline.js` + `src/mcp/job-candidates-filter.js` — default thin-field hydration via `getCandidatesByIds` (batched `SELECT … FROM candidates_v2 WHERE id IN (…)`); expanded-field requests fan out to live RF `/candidate/get`. Pipeline data itself is always live RF (`/job/pipeline?job_id=<id>`), never cached.
+- `src/mcp/candidate-call-notes.js` step 1 — `getCallsForCandidate` reads the thin `calls` table (per-record auth via `target_dialpad_id` in the WHERE clause).
+
+**Legacy (still reads `candidates` / `candidate_jobs` / `jobs`; migrates at step 6 or in the post-cutover cleanup follow-ups):**
+- `src/mcp/resolvers.js` — candidate ambiguity hydration (`SELECT id, current_organization, current_title FROM candidates WHERE id IN (…)`); job fuzzy + numeric resolution (`SELECT id, name, client_company_name FROM jobs …`).
+- `src/mcp/job-pipeline.js` `loadJobMeta` and `src/mcp/job-candidates-filter.js` job-id meta lookup — `SELECT id, name, client_company_name FROM jobs WHERE id = ?`.
+- `src/mcp/candidate-search.js` — `getCustomFieldOptions` (technology / segment / role universe via SQLite JSON1 `json_each` against `candidates.body`); `stage_name` distinct values via `SELECT DISTINCT stage_name FROM candidate_jobs WHERE job_id = ?`; `projectMatches` body hydration for results that don't already carry a body via `SELECT id, body FROM candidates WHERE id IN (…)`.
+- `src/mcp/d1-read.js` `getCandidateById` / `getCandidateByEmail` / `getCandidateByLinkedIn` — full-body reads from `candidates`. Not currently consumed by any of the migrated handlers above; retained for callers still on the legacy fast path and removed alongside step 6.
+
+After cutover step 6 + the follow-up cleanups noted in the merge handover § 5, the resolvers + `loadJobMeta` migrate to `jobs_v2`, candidate ambiguity hydration moves to a live RF `/candidate/search` batch (or a dedicated thin column set), the custom-field universe migrates to a dedicated lookup table or live `/candidate/custom-field/list`, and the full-body lookup in `projectMatches` is dropped — every code path that needs a full body goes live to RF.
 
 | Table | Phase | Purpose | Key columns |
 |-------|-------|---------|-------------|

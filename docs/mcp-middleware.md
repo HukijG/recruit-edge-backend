@@ -1,6 +1,6 @@
 # MCP Middleware
 
-Server side of the MCP layer. A thin router (`src/mcp/router.js`) under `/mcp/*` resolves the consultant from a verified Access JWT (`consultantEmail` body field, forwarded over the service binding from `rf-mcp-remote` — see `docs/security.md`), then dispatches to per-tool middleware handlers in `src/mcp/`. Read-only against a shared D1 cache (`RF_MCP_CACHE`). Pipeline data is **not cached** — every `job-pipeline` / `job-candidates-filter` read goes live to RF (see § Pipeline reads below). Cron is currently OFF; see `docs/architecture.md` § Sync worker.
+Server side of the MCP layer. A thin router (`src/mcp/router.js`) under `/mcp/*` resolves the consultant from a verified Access JWT (`consultantEmail` body field, forwarded over the service binding from `rf-mcp-remote` — see `docs/security.md`), then dispatches to per-tool middleware handlers in `src/mcp/`. Read-only against a shared D1 cache (`RF_MCP_CACHE`). Pipeline data is **not cached** — every `job-pipeline` / `job-candidates-filter` read goes live to RF (see § Pipeline reads below). Cron is gated behind two env vars (`CRON_THIN_ENABLED` and `CRON_LEGACY_ENABLED`), both default `'false'`. The new thin path activates at cutover step 5; the legacy path remains inert until step 6 drops it entirely. See `docs/architecture.md` § Sync worker.
 
 The `rf-mcp-remote` MCP worker (`mcp-worker/`) is the public Streamable-HTTP front; it validates the Access JWT, then service-binds into this `/mcp/*` surface. Architecture overview in `docs/architecture.md`. Auth shape in `docs/security.md`.
 
@@ -120,9 +120,10 @@ If you cannot tick all seven, the design is not ready to ship.
 
 **D1 binding** `RF_MCP_CACHE` is shared between both workers (sync writes, main reads). Schema across migrations in `sync-worker/migrations/`:
 - `candidates`, `candidate_jobs`, `jobs`, `sync_state` — `0001_init.sql`
-- `candidates_v2`, `calls` — `0003_v2_tables.sql` (thin schema; additive-only writes)
+- `job_pipelines` — `0002_job_pipelines.sql` (per-job pipeline snapshot, legacy; no longer consulted by any MCP handler — scheduled for removal at cutover step 6)
+- `candidates_v2`, `jobs_v2`, `calls` — `0003_v2_tables.sql` (thin schema; additive-only writes; INSERT-OR-IGNORE on PK only)
 
-`candidates_v2` stores thin rows `{id, name, linkedin_profile, added_time_ms, current_title_at_cache_time, current_company_at_cache_time}` — the source for the in-memory snapshot and D1 batch hydration. The old `mcp:pipeline:{jobId}` and `mcp:job-candidates:{jobId}` KV keys are gone; the `job_pipelines` D1 table is gone — pipeline reads go live to RF.
+`candidates_v2` stores thin rows `{id, name, linkedin_profile, added_time_ms, current_title_at_cache_time, current_company_at_cache_time, cached_at_ms}` — the source for the in-memory snapshot and D1 batch hydration. The old `mcp:pipeline:{jobId}` and `mcp:job-candidates:{jobId}` KV keys are gone; the `job_pipelines` D1 table is scheduled for removal at cutover step 6 (`0004_drop_legacy.sql` in `sync-worker/migrations-pending/`); MCP pipeline reads no longer consult it — they go live to RF.
 
 Tail sync inserts newly-added candidates into `candidates_v2` and `calls` via INSERT-OR-IGNORE (additive only; no UPDATEs). Version key `last_candidates_added_cursor` in `sync_state` gates snapshot refreshes (falls back to `last_tail_sync_at` during the dual-write transition window).
 
@@ -191,11 +192,12 @@ Ambiguity returns the standard envelope; not_found on the read-side endpoints fa
 
 ### Custom-field filter resolution
 
-`technology` (multi-select), `segment`, and `role` filters on `candidate-search` are fuzzy-resolved against the live universe of distinct values from the legacy `candidates.body` JSON corpus. Worker globals memoise the universe with `last_tail_sync_at` version-checking.
+`technology` (multi-select), `segment`, and `role` filters on `candidate-search` resolve against the canonical option universe from RF's `/candidate/custom-field/list` endpoint. The map is fetched lazily and cached in worker globals for 5 min (`src/mcp/custom-fields.js`).
 
-- Case-insensitivity ("kubernetes" → "Kubernetes") and prefix matching ("ent" → "Enterprise") work out of the box
-- **Synonym mapping (e.g. "k8s" → "Kubernetes") is NOT covered** — for that, add the alias to a future explicit alias dictionary, don't push normalisation onto the consumer
-- **Custom-field RF routing is currently deferred.** After fuzzy-resolving the value, these filters are dropped server-side (no `custom_field.<id>` mapping table exists yet). The response carries `warning: 'custom_field_unverified'` and `_meta.unverifiedFilters: ['technology'|'segment'|'role']` so Claude can surface the gap. Wiring them through RF is a tracked followup task (needs a `custom_field.<id>` mapping env var or D1 lookup of `/candidate/custom-field/list`).
+- Case-insensitivity ("kubernetes" → "Kubernetes") and prefix matching ("ent" → "Enterprise") work out of the box.
+- **Synonym mapping (e.g. "k8s" → "Kubernetes") is NOT covered** — for that, add the alias to a future explicit alias dictionary, don't push normalisation onto the consumer.
+- After resolving the canonical option name, the filter goes to RF as `{key: 'custom_field.<id>', conjunction: 'in', values: [<name>]}` — same single round-trip pattern as the other mutable filters.
+- If RF's `/candidate/custom-field/list` is unreachable (network / 5xx after retry / 429), the response carries `warning: 'custom_field_map_unavailable'` and the offending filter is dropped (the rest of the search still runs). Never silent — every dropped filter generates an observable warning.
 
 ## Endpoints
 
@@ -317,9 +319,9 @@ On RF failure: `{ok: false, recoverable: true, kind: 'pipeline_unavailable', job
 | `company` / `current_organization` | RF `current_company` text | Mutable; RF key is `current_company` |
 | `current_title` | RF `current_title` text | Mutable |
 | `owner` / `lead_owner_id` | RF `lead_owner` multi-select-by-ID | Mutable; numeric id resolved via `resolveOwner` |
-| `stage` (with `job`) | RF `stage` multi-select-by-name + `job` multi-select-by-ID | Mutable; stage fuzzy-resolved against `candidate_jobs` distinct names |
-| `disqualified: true` | RF `stage='Disqualified'` | No boolean DQ filter in RF (RF-7 verified) |
-| `technology` / `segment` / `role` | Currently dropped | Custom-field id mapping not yet wired; surfaced as `warning: 'custom_field_unverified'` + `_meta.unverifiedFilters` |
+| `stage` (with `job`) | RF `stage` multi-select-by-name + `job` multi-select-by-ID | Mutable; stage fuzzy-resolved against union of `jobs_v2.canonical_pipeline_json` stage names (5-min in-memory cache) |
+| `disqualified: true` | RF `stage='Disqualified'` | No boolean DQ filter in RF |
+| `technology` / `segment` / `role` | RF `custom_field.<id>` multi-select | Mutable; canonical option name + numeric id resolved via cached `/candidate/custom-field/list`. Map fetch failure surfaces `warning: 'custom_field_map_unavailable'`. |
 
 ### Per-job pipelines, not a global canonical list
 
@@ -337,7 +339,8 @@ Changes landed in `mcp-worker/src/tools.ts` alongside the middleware refactor:
 - `include_disqualified` renamed to `disqualified`. Semantics changed: `true` returns ONLY disqualified candidates (not additive). Default omitted/false: non-DQ'd only.
 - `updated_after` / `updated_before` removed (mutable, not load-bearing; silently dropped in prior version).
 - `warning: 'filter_unverified'` documented in description — RF was unreachable, results are tier-1 only.
-- `warning: 'custom_field_unverified'` documented — `technology`/`segment`/`role` accepted by tool but warn-and-drop server-side.
+- `warning: 'custom_field_map_unavailable'` documented — `/candidate/custom-field/list` was unreachable; offending `technology`/`segment`/`role` filter dropped (search still runs).
+- Success envelopes carry `ok: true`. RF rate limit surfaces as `{ok: false, kind: 'rate_limited', recoverable: false, retry_after_ms}` at HTTP 200.
 
 **`rf_job_pipeline`:**
 - Stale "cold cache" hint removed (pipeline cache is gone; the tool is now always live to RF).
