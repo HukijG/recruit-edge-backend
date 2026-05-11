@@ -1,3 +1,12 @@
+import { env as workerEnv } from 'cloudflare:workers';
+import { installBodyCapture } from './lib/body-capture.js';
+import { installLogsBridge } from './lib/logs-bridge.js';
+
+installBodyCapture();
+installLogsBridge('rf-cf-metrics-poller');
+
+import { instrument } from '@microlabs/otel-cf-workers';
+import { resolveOtelConfig } from './lib/otel-config.js';
 import { trace } from '@opentelemetry/api';
 import { fetchCFMetrics } from './cf-graphql.js';
 import { pushOTelMetrics } from './otlp-metrics.js';
@@ -11,8 +20,8 @@ interface Env {
   LD_OTLP_METRICS_URL: string;
 }
 
-export default {
-  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext) {
+const handler = {
+  async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext) {
     trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.CRON_METRICS_TICK);
     console.log({ source: 'metrics-poller', message: 'tick start' });
     const t0 = Date.now();
@@ -32,3 +41,12 @@ export default {
     }
   },
 };
+
+// `instrument()` is the production wiring. In environments where `LD_SDK_KEY` is
+// absent (e.g. the vitest harness), we export the raw handler so the cron path
+// never touches the OTLP exporters. The lib `installLogsBridge` already
+// self-skips on missing key; this mirrors that semantic at the handler layer.
+// Same pattern as main + sync + mcp workers.
+export default (workerEnv as unknown as { LD_SDK_KEY?: string }).LD_SDK_KEY
+  ? instrument(handler, resolveOtelConfig)
+  : handler;
