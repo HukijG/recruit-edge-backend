@@ -108,4 +108,17 @@ describe('logs-bridge', () => {
     installLogsBridge('test-service');
     expect(setProviderMock).not.toHaveBeenCalled();
   });
+
+  it('OTEL_DISABLED=1 short-circuits before registering or wrapping console.*', async () => {
+    vi.resetModules();
+    vi.doMock('cloudflare:workers', () => ({ env: { LD_SDK_KEY: 'test-sdk-key', OTEL_DISABLED: '1' } }));
+    setProviderMock.mockClear();
+    emitMock.mockClear();
+    const mod = await import('../../src/lib/logs-bridge.js');
+    mod.installLogsBridge('test-service');
+    expect(setProviderMock).not.toHaveBeenCalled();
+    console.log('would normally emit');
+    console.error('would normally emit error');
+    expect(emitMock).not.toHaveBeenCalled();
+  });
 });

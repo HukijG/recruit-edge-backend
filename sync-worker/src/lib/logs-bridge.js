@@ -9,6 +9,9 @@ const DEFAULT_LD_OTLP_LOGS_URL = 'https://otel.observability.app.launchdarkly.co
 let installed = false;
 
 export function installLogsBridge(serviceName) {
+  // Emergency kill switch — wholesale disables the console.* wrap so no OTel log records are emitted.
+  // Independent of LD_SDK_KEY (which controls whether export is even possible).
+  if (env && env.OTEL_DISABLED === '1') return;
   if (installed) return;
   installed = true;
 

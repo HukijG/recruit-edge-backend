@@ -8,6 +8,9 @@ export function instrumentedStep(step, tracerName, instanceId) {
       const fn = hasConfig ? maybeFn : configOrFn;
       const config = hasConfig ? configOrFn : undefined;
 
+      // Per-attempt span: each retry re-enters this closure and creates a fresh
+      // child span, so retries are visible separately under the outer Workflow span.
+      // The wrapper is pure observability; step idempotency is preserved.
       const wrappedFn = async () => {
         return await tracer.startActiveSpan(
           `step.do:${name}`,

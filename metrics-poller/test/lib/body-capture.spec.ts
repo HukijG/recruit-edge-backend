@@ -75,6 +75,54 @@ describe('body-capture', () => {
     expect(reqCall![1]).toMatch(/…\[truncated, original \d+ bytes\]$/);
   });
 
+  it('captures outbound request body when called as fetch(Request, undefined)', async () => {
+    installBodyCapture();
+    const req = new Request('https://example.com/api', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Joel', candidate_id: 9876 }),
+    });
+    await fetch(req);
+    const reqCall = setAttributeMock.mock.calls.find(([k]: any) => k === 'http.request.body');
+    expect(reqCall, 'request body must be captured from the Request object when init is undefined').toBeDefined();
+    expect(reqCall![1]).toContain('"name":"Joel"');
+    expect(reqCall![1]).toContain('"candidate_id":9876');
+  });
+
+  it('streams oversized responses without materialising the full body', async () => {
+    const CHUNK_BYTES = 8 * 1024;
+    const TOTAL_BYTES = 80 * 1024;
+    let chunksProduced = 0;
+    const stream = new ReadableStream({
+      pull(controller) {
+        if (chunksProduced * CHUNK_BYTES >= TOTAL_BYTES) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(new TextEncoder().encode('a'.repeat(CHUNK_BYTES)));
+        chunksProduced++;
+      },
+    });
+    const streamingResponse = new Response(stream, {
+      headers: { 'content-type': 'text/plain' },
+    });
+    globalThis.fetch = vi.fn(async () => streamingResponse) as any;
+    installBodyCapture();
+
+    // In production the caller always consumes the response (body-capture clones it).
+    // Read+discard the original here so the underlying tee can drain in Node-style runtimes.
+    const response = await fetch('https://example.com/big');
+    try { await response.text(); } catch { /* ignore */ }
+
+    const respCall = setAttributeMock.mock.calls.find(([k]: any) => k === 'http.response.body');
+    expect(respCall).toBeDefined();
+    expect(respCall![1]).toMatch(/…\[truncated, original >\d+ bytes\]$/);
+    // The captured body must not contain the full 80KB — strictly bounded by the truncation budget.
+    // (We don't assert chunksProduced<TOTAL/CHUNK because Node's tee semantics keep pulling for the
+    // sibling branch even after cancel(); the budget bound on the captured string is the contract.)
+    expect(respCall![1].length).toBeLessThan(TOTAL_BYTES);
+  });
+
   it('skips non-text content types', async () => {
     installBodyCapture();
     await fetch('https://example.com/image.png', {
@@ -96,6 +144,22 @@ describe('body-capture', () => {
     expect(urlCall![1]).toContain('token=%5BREDACTED%5D');
   });
 
+  it('redacts PII-shaped URL query params (email, phone, linkedin, attendee_email, attendee_phone)', async () => {
+    installBodyCapture();
+    await fetch('https://example.com/api?email=joel%40example.com&phone=%2B15551234567&linkedin=https%3A%2F%2Flinkedin.com%2Fin%2Fjoel&attendee_email=guest%40example.com&attendee_phone=%2B15559999999&user=joel');
+    const urlCall = setAttributeMock.mock.calls.find(([k]: any) => k === 'url.full.redacted');
+    expect(urlCall).toBeDefined();
+    expect(urlCall![1]).toContain('email=%5BREDACTED%5D');
+    expect(urlCall![1]).toContain('phone=%5BREDACTED%5D');
+    expect(urlCall![1]).toContain('linkedin=%5BREDACTED%5D');
+    expect(urlCall![1]).toContain('attendee_email=%5BREDACTED%5D');
+    expect(urlCall![1]).toContain('attendee_phone=%5BREDACTED%5D');
+    expect(urlCall![1]).toContain('user=joel');
+    expect(urlCall![1]).not.toContain('joel%40example.com');
+    expect(urlCall![1]).not.toContain('15551234567');
+    expect(urlCall![1]).not.toContain('linkedin.com%2Fin%2Fjoel');
+  });
+
   it('is idempotent', async () => {
     installBodyCapture();
     const after = globalThis.fetch;
@@ -115,5 +179,21 @@ describe('body-capture', () => {
       body: JSON.stringify({ name: 'Joel' }),
     });
     expect(setAttributeMock).not.toHaveBeenCalledWith('http.request.body', expect.any(String));
+  });
+
+  it('OTEL_DISABLED=1 skips the fetch wrapper entirely', async () => {
+    vi.resetModules();
+    vi.doMock('cloudflare:workers', () => ({ env: { OTEL_DISABLED: '1' } }));
+    setAttributeMock.mockClear();
+    const beforeFetch = globalThis.fetch;
+    const mod = await import('../../src/lib/body-capture.js');
+    mod.installBodyCapture();
+    expect(globalThis.fetch).toBe(beforeFetch);
+    await fetch('https://example.com/api', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Joel' }),
+    });
+    expect(setAttributeMock).not.toHaveBeenCalled();
   });
 });
