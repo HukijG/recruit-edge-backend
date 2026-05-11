@@ -57,3 +57,95 @@ export async function countTable(env, table) {
     .first();
   return row?.n ?? 0;
 }
+
+// ---------------------------------------------------------------------------
+// Thin-schema readers (Task 12) — candidates_v2 and calls tables.
+// ---------------------------------------------------------------------------
+
+// SQLite expression-tree depth limit is ~999 placeholders in production; the
+// D1 Sessions API and miniflare's local D1 shim enforce a tighter internal
+// limit (~480 parameters per statement).  100 per chunk keeps us well inside
+// both limits, and for the typical pipeline page (≤200 candidates) results
+// in just two roundtrips.
+const SQLITE_PARAMS_PER_CHUNK = 100;
+
+/**
+ * Fetch a single thin candidate row by RF id.
+ * Returns {id, name, linkedin_profile, added_time_ms} or null if not found.
+ */
+export async function getThinCandidateById(env, id) {
+  const row = await env.RF_MCP_CACHE
+    .prepare('SELECT id, name, linkedin_profile, added_time_ms FROM candidates_v2 WHERE id = ?')
+    .bind(Number(id))
+    .first();
+  return row ?? null;
+}
+
+/**
+ * Batch fetch thin candidate rows by id-list, preserving the input order.
+ * Chunks the id-list to stay under SQLite's expression depth.
+ *
+ * Returns full thin row including current_title_at_cache_time and
+ * current_company_at_cache_time.  Ids absent from the cache are silently
+ * omitted (no error).
+ *
+ * Used by pipeline tools (Tasks 15/16) for thin-only hydration of an
+ * RF /job/pipeline response.
+ *
+ * @param {object} env
+ * @param {number[]} ids - RF candidate ids to fetch
+ * @returns {Promise<object[]>}
+ */
+export async function getCandidatesByIds(env, ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return [];
+  const numericIds = ids.map(Number).filter(Number.isFinite);
+
+  const byId = new Map();
+  for (let i = 0; i < numericIds.length; i += SQLITE_PARAMS_PER_CHUNK) {
+    const chunk = numericIds.slice(i, i + SQLITE_PARAMS_PER_CHUNK);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const { results } = await env.RF_MCP_CACHE
+      .prepare(`SELECT id, name, linkedin_profile, added_time_ms,
+                       current_title_at_cache_time, current_company_at_cache_time
+                FROM candidates_v2 WHERE id IN (${placeholders})`)
+      .bind(...chunk)
+      .all();
+    for (const row of results) byId.set(row.id, row);
+  }
+  return numericIds.map(id => byId.get(id)).filter(Boolean);
+}
+
+/**
+ * Step-1 read for /mcp/candidate-call-notes. Per-record auth via
+ * target_dialpad_id — only rows belonging to the requesting consultant's
+ * Dialpad user id are returned.
+ *
+ * @param {object} env
+ * @param {string} targetDialpadId   Consultant's Dialpad user id (from JWT)
+ * @param {number} rfCandidateId     RF candidate id
+ * @param {object} [opts]
+ * @param {number} [opts.minDurationMs=120000]         Default 2 min
+ * @param {number} [opts.startedAfterMs=0]
+ * @param {number} [opts.startedBeforeMs=Date.now()]
+ * @param {number} [opts.limit=20]
+ * @returns {Promise<{call_id: string, date_started_ms: number, duration_ms: number, direction: string}[]>}
+ */
+export async function getCallsForCandidate(env, targetDialpadId, rfCandidateId, opts = {}) {
+  const minDurationMs   = opts.minDurationMs   ?? 120_000;
+  const startedAfterMs  = opts.startedAfterMs  ?? 0;
+  const startedBeforeMs = opts.startedBeforeMs ?? Date.now();
+  const limit           = opts.limit ?? 20;
+
+  const { results } = await env.RF_MCP_CACHE
+    .prepare(`SELECT call_id, date_started_ms, duration_ms, direction
+              FROM calls
+              WHERE target_dialpad_id = ?
+                AND rf_candidate_id   = ?
+                AND duration_ms       >= ?
+                AND date_started_ms BETWEEN ? AND ?
+              ORDER BY date_started_ms DESC
+              LIMIT ?`)
+    .bind(String(targetDialpadId), Number(rfCandidateId), minDurationMs, startedAfterMs, startedBeforeMs, limit)
+    .all();
+  return results;
+}
