@@ -1,8 +1,8 @@
 /**
  * /mcp/candidate-search — single-call tier-2 fuzzy + filter search.
  *
- * Per spec rev 5 ("thin-immutable-cache-design.md") this handler now follows
- * the **single round-trip** design instead of a per-id fan-out:
+ * Per spec rev 5 ("thin-immutable-cache-design.md") this handler follows the
+ * **single round-trip** design, never the per-id fan-out:
  *
  * 1. **Tier 1: cache fuzzy** — `query` (if any) → in-memory snapshot scan →
  *    candidate id list. Pure-name match, recency-boosted via `added_time_ms`.
@@ -11,7 +11,7 @@
  *        → resolved against the local cache; no RF round-trip.
  *      - **Mutable** (`email`, `company`/`current_organization`, `current_title`,
  *        `owner` / `lead_owner_id`, `stage`+`job`, `disqualified`,
- *        `custom_field.<id>`, …) → routed to RF.
+ *        `technology` / `segment` / `role` → `custom_field.<id>`) → routed to RF.
  * 3. **Tier 2: RF `/candidate/search` (single call)** when any mutable filter
  *    is present. Composes `candidate_id IN (tier-1 ids)` + the predicate
  *    filters server-side via `conjunction: 'match-all'`. No fan-out.
@@ -19,102 +19,121 @@
  *    directly (no RF call).
  * 5. **Empty tier-1 + mutable filter** — return empty without RF call.
  * 6. **RF failure during tier-2** — degrade to tier-1 results with
- *    `warning: 'filter_unverified'`.
+ *    `warning: 'filter_unverified'` (transient) or `rate_limited` envelope (429).
  *
- * NB: the legacy `last_updated` / `last_activity` range filters are DROPPED
- * per spec rev 5 (mutable, not load-bearing). The legacy `last_updated DESC`
- * ordering for filter-only queries is replaced by RF's result order.
+ * Custom-field routing (rev 5 RF-7): the `getCustomFieldMap` helper pulls
+ * RF's `/candidate/custom-field/list` once per 5 min into a name→id map.
+ * `technology[]` / `segment` / `role` filters resolve to canonical option
+ * names AND emit `custom_field.<id>` filters server-side — no
+ * `unverifiedFilters` drop. If the map can't be fetched (RF unavailable),
+ * the response surfaces `warning: 'custom_field_map_unavailable'` rather
+ * than silently dropping the filter.
  *
- * The fuzzy resolvers for `job` / `owner` / `stage` / `technology` / `segment`
- * / `role` still run client-side first (so Claude's natural-language input
- * lands as canonical RF values). The `disqualified=true` shorthand expands to
- * `{key: 'stage', values: ['Disqualified']}` — RF has no boolean DQ filter.
+ * Stage universe: RF `/job/pipeline` exposes per-job stage names, but the
+ * fuzzy resolver for the `stage` filter needs an in-memory universe so
+ * lowercase / abbreviation inputs resolve before going to RF. We build that
+ * universe from `jobs_v2.canonical_pipeline_json` — the snapshot-only stage
+ * list per job (rev 5 schema). Cached for 5 min in module scope.
+ *
+ * NB: the legacy `last_updated` / `last_activity` range filters are dropped
+ * per spec rev 5 (mutable, not load-bearing).
  */
 
 import { jsonResponse } from './router.js';
-import { session } from './d1-read.js';
+import { session, getCandidatesByIds } from './d1-read.js';
 import { resolveFieldsWithDefaults } from './projection.js';
 import { projectWithLinkedIn } from './linkedin.js';
 import { getSnapshot } from './snapshot.js';
 import { scoreString, recencyBoost, normalize } from './fuzzy.js';
-import { resolveJob, resolveOwner, resolveStage, disambiguationPayload } from './resolvers.js';
+import {
+  resolveJob, resolveOwner, resolveStage, disambiguationPayload,
+} from './resolvers.js';
 import {
   searchCandidatesByIdsAndPredicate,
   searchCandidatesByPredicateOnly,
+  getRFCandidate,
+  extractLinkedInSlug,
+  RFRateLimitedError,
 } from '../rf-client.js';
+import { getCustomFieldMap, lookupField } from './custom-fields.js';
+import { pMapLimit } from './concurrency.js';
 
 const DEFAULT_FIELDS = ['id', 'name', 'current_title', 'linkedin_profile'];
 const FUZZY_THRESHOLD = 0.35;
 const TIER1_FUZZY_LIMIT = 200;  // tier-1 pool size before tier-2 narrowing
+const HYDRATION_CONCURRENCY = 8;
 
-// In-memory custom-field option universes, version-checked against the
-// `last_tail_sync_at` sync_state stamp (same pattern as snapshot.js). Survives
-// across requests within an isolate; refreshed automatically when the sync
-// worker advances the cursor.
-const CF_OPTS_KEY = '__rfMcpCustomFieldOptions';
+// ─── In-memory caches ─────────────────────────────────────────────────────
 
-async function readSyncVersion(env) {
-  const row = await env.RF_MCP_CACHE
-    .prepare("SELECT value FROM sync_state WHERE key = 'last_tail_sync_at'")
-    .first();
-  return row?.value ?? null;
-}
+const STAGE_UNIVERSE_KEY = '__rfMcpStageUniverse';
+const STAGE_UNIVERSE_TTL_MS = 5 * 60_000;
 
 /**
- * Pull the universe of distinct values for a single custom field by walking
- * every candidate's `custom_fields` JSON. Cached in worker globals + version-
- * checked. Returns [] if the field doesn't exist in the corpus — caller falls
- * back to literal exact-match behaviour in that case.
+ * Read the union of all stage names across `jobs_v2.canonical_pipeline_json`.
+ * Cached in module scope for 5 min. Used by the `stage` fuzzy resolver so a
+ * user-typed "sourced" lands as "Sourced" before being sent to RF.
  *
- * `multiSelect=true` walks the inner array (Technology stores `value: [...]`).
- * `multiSelect=false` reads the single string `value` (Segment, Role).
+ * Returns the canonical names verbatim (preserves case) so the RF filter
+ * receives the same casing RF uses in its pipeline.
  *
- * NB: this still reads the legacy `candidates.body` JSON during the dual-
- * write phase. When the legacy table drops (Task 30+), this helper either
- * dies with `technology`/`segment`/`role` filter support or migrates to a
- * dedicated lookup table — out-of-scope for Task 13.
+ * @param {object} env
+ * @returns {Promise<string[]>}
  */
-async function getCustomFieldOptions(env, fieldName, multiSelect) {
+export async function getKnownStageNames(env) {
   const G = globalThis;
-  G[CF_OPTS_KEY] = G[CF_OPTS_KEY] ?? {};
-  const cacheKey = `${fieldName.toLowerCase()}:${multiSelect ? 'm' : 's'}`;
-  const version = await readSyncVersion(env);
-  const cached = G[CF_OPTS_KEY][cacheKey];
-  if (cached && cached.dataVersion === version) return cached.options;
-
-  const sql = multiSelect
-    ? `SELECT DISTINCT tv.value AS v
-         FROM candidates c, json_each(c.body, '$.custom_fields') AS cf,
-              json_each(json_extract(cf.value, '$.value')) AS tv
-        WHERE LOWER(json_extract(cf.value, '$.name')) = ?
-          AND tv.value IS NOT NULL`
-    : `SELECT DISTINCT json_extract(cf.value, '$.value') AS v
-         FROM candidates c, json_each(c.body, '$.custom_fields') AS cf
-        WHERE LOWER(json_extract(cf.value, '$.name')) = ?
-          AND json_extract(cf.value, '$.value') IS NOT NULL`;
+  const cached = G[STAGE_UNIVERSE_KEY];
+  const now = Date.now();
+  if (cached && now - cached.fetchedAtMs < STAGE_UNIVERSE_TTL_MS) {
+    return cached.stages;
+  }
   const { results } = await session(env)
-    .prepare(sql)
-    .bind(fieldName.toLowerCase())
+    .prepare('SELECT canonical_pipeline_json FROM jobs_v2 WHERE canonical_pipeline_json IS NOT NULL')
     .all();
-  const options = (results ?? [])
-    .map((r) => r.v)
-    .filter((v) => typeof v === 'string' && v.length > 0);
-  G[CF_OPTS_KEY][cacheKey] = { options, dataVersion: version };
-  return options;
+  const seen = new Set();
+  for (const row of results ?? []) {
+    try {
+      const parsed = JSON.parse(row.canonical_pipeline_json);
+      const stages = Array.isArray(parsed?.stages)
+        ? parsed.stages
+        : Array.isArray(parsed) ? parsed : [];
+      for (const s of stages) {
+        const name = typeof s === 'string' ? s : s?.name;
+        if (typeof name === 'string' && name.length > 0) seen.add(name);
+      }
+    } catch {
+      // Tolerate corrupt JSON — skip the row.
+    }
+  }
+  const stages = [...seen];
+  G[STAGE_UNIVERSE_KEY] = { stages, fetchedAtMs: now };
+  return stages;
 }
 
 /**
- * Resolve a custom-field user-input string against the universe via the same
- * primitive `resolveStage` uses (case-insensitive exact, then fuzzy + UNIQUE_GAP).
- * Returns the standard discriminated union: `{ ok, value }` / `{ ok:false, reason:'ambiguous', ... }`.
- * On not_found the caller is expected to fall through to literal exact-match
- * behaviour — preserves zero-regression on canonical inputs and on inputs that
- * fuzzy genuinely can't disambiguate.
+ * Test-only reset for the stage-universe cache.
  */
-async function fuzzyResolveCustomFieldValue(env, fieldName, input, multiSelect) {
-  const options = await getCustomFieldOptions(env, fieldName, multiSelect);
+export function _resetStageUniverseForTests() {
+  delete globalThis[STAGE_UNIVERSE_KEY];
+}
+
+// ─── Custom-field filter routing ──────────────────────────────────────────
+
+/**
+ * Fuzzy-resolve a user-typed custom-field value against the canonical
+ * `options[]` enumeration from RF's `/candidate/custom-field/list`.
+ *
+ * `cfMeta` is the entry from `getCustomFieldMap` ({id, name, options}); if
+ * the field has no enumerated options (text custom field) the input passes
+ * through verbatim.
+ *
+ * Returns the standard discriminated union from `resolveStage`:
+ *   { ok: true, value: {id, name} } | { ok: false, reason: 'ambiguous', ... }
+ *   | { ok: false, reason: 'not_found', ... }
+ */
+function fuzzyResolveCustomFieldOption(cfMeta, input) {
+  const options = cfMeta?.options ?? [];
   if (options.length === 0) {
-    return { ok: true, value: { id: input, name: input } };  // schema empty → pass through
+    return { ok: true, value: { id: input, name: input } };
   }
   const resolvable = options.map((name) => ({ id: name, name }));
   return resolveStage(input, resolvable);
@@ -132,15 +151,17 @@ async function fuzzyResolveCustomFieldValue(env, fieldName, input, multiSelect) 
  *     the caller appends them to the RF request only when a call is already being
  *     made due to a mutable filter. This preserves the cache-only path for
  *     pure-immutable queries.
- *   - `unverifiedFilters`  — list of filter keys that were DROPPED (custom-field
- *     filters not yet wired to `custom_field.<id>`). Empty when all filters routed.
+ *   - `cfWarnings`         — warnings emitted when the custom-field map is
+ *     unavailable or a filter's field name doesn't exist in RF's schema.
  *
  * Inputs are read from BOTH the top-level body fields (existing wire contract)
  * AND the optional `filters` long-tail bag (forward-compat per the MCP tool
  * descriptor in `mcp-worker/src/tools.ts`).
  *
- * `resolved.{jobId,ownerId,stage}` carry post-fuzzy-resolver canonical values
- * so this builder doesn't have to know about fuzzy resolution.
+ * `resolved.{jobId,ownerId,stageName}` carry post-fuzzy-resolver canonical
+ * values. `resolved.customFieldFilters` carries pre-built `custom_field.<id>`
+ * RF filter objects (technology / segment / role); the caller resolves the
+ * map + canonical option names upstream.
  *
  * Filter-key map (spec rev 5 RF-7):
  *   `email`              → RF `email`            (text — substring; MUTABLE)
@@ -157,19 +178,13 @@ async function fuzzyResolveCustomFieldValue(env, fieldName, input, multiSelect) 
  *     `added_before`     → rfImmutableFilters `added_on` (date;
  *                          ALSO snapshot predicate in buildImmutableSnapshotFilter)
  *   `technology` /
- *     `segment` / `role` → custom_field.<id>     (NOT wired; surfaced as
- *                          `unverifiedFilters` in the response)
- *
- * Custom-field filters (`technology`, `segment`, `role`) are currently dropped —
- * the project doesn't yet expose a custom-field-id mapping table. They are
- * returned in `unverifiedFilters` so the caller can surface the gap to Claude.
- * Once a mapping is wired (env var or D1 lookup of `/candidate/custom-field/list`),
- * translate to `{key: 'custom_field.<id>', conjunction: 'in', values: [...]}`.
+ *     `segment` / `role` → RF `custom_field.<id>` — emitted by the upstream
+ *                          custom-field resolver (passed in as
+ *                          `resolved.customFieldFilters`).
  */
 function buildRFPredicateFilters(body, resolved = {}) {
   const out = [];          // mutable — drives hasMutableFilters
   const immutable = [];    // immutable RF filters — appended to RF calls when already made
-  const unverifiedFilters = [];
   // Merge top-level body keys with the optional `filters` long-tail bag.
   // Top-level keys take precedence (existing wire contract).
   const longTail = (body && typeof body.filters === 'object' && body.filters !== null)
@@ -196,8 +211,16 @@ function buildRFPredicateFilters(body, resolved = {}) {
   // ─── owner / lead_owner → RF `lead_owner` (by ID) ──────────────
   // Use the post-resolver numeric id when present; fall through to a numeric
   // top-level value (preserves the `owner_id` direct-id wire shape).
-  const ownerNumeric = resolved.ownerId
-    ?? (typeof tf.lead_owner_id === 'number' ? tf.lead_owner_id : undefined);
+  // `lead_owner_id` accepts numbers AND numeric-strings ("123") to match
+  // Claude's habit of JSON-stringifying ids.
+  let ownerNumeric = resolved.ownerId;
+  if (typeof ownerNumeric !== 'number') {
+    if (typeof tf.lead_owner_id === 'number' && Number.isFinite(tf.lead_owner_id)) {
+      ownerNumeric = tf.lead_owner_id;
+    } else if (typeof tf.lead_owner_id === 'string' && /^\d+$/.test(tf.lead_owner_id.trim())) {
+      ownerNumeric = Number(tf.lead_owner_id.trim());
+    }
+  }
   if (typeof ownerNumeric === 'number' && Number.isFinite(ownerNumeric)) {
     out.push({ conjunction: 'in', values: [ownerNumeric], key: 'lead_owner' });
   }
@@ -220,10 +243,15 @@ function buildRFPredicateFilters(body, resolved = {}) {
   // already pushed above is the canonical post-fuzzy-resolved one; appending
   // a second `stage` filter ANDs them and would return zero rows. Skip the
   // DQ expansion if a stage is already set — the user's explicit stage wins.
-  // For DQ-from-a-specific-job, RF has `disqualified_from` (per RF-7 wrinkle)
-  // but the current wire contract doesn't surface that knob.
   if (tf.disqualified === true && !resolved.stageName) {
     out.push({ conjunction: 'in', values: ['Disqualified'], key: 'stage' });
+  }
+
+  // ─── custom_field.<id> (technology / segment / role) ───────────
+  // Resolved upstream against RF's /candidate/custom-field/list; emit any
+  // pre-built filter objects here.
+  if (Array.isArray(resolved.customFieldFilters)) {
+    out.push(...resolved.customFieldFilters);
   }
 
   // ─── linkedin_profile → rfImmutableFilters (substring per RF-7) ──
@@ -237,11 +265,6 @@ function buildRFPredicateFilters(body, resolved = {}) {
   }
 
   // ─── added_after / added_before → rfImmutableFilters `added_on` ──
-  // Per spec rev 5 RF-7, `added_on` is a system field for candidate creation
-  // time. These are immutable (also honored by buildImmutableSnapshotFilter for
-  // tier-1 paths); we route them to RF as well when an RF call is made for a
-  // mutable filter, so both sources agree. Does NOT go into `out` — does not
-  // trigger an RF call on its own.
   if (tf.added_after) {
     immutable.push({
       type: 'date',
@@ -261,29 +284,11 @@ function buildRFPredicateFilters(body, resolved = {}) {
     });
   }
 
-  // ─── technology / role / segment → custom_field.<id> (NOT wired) ──
-  // Spec rev 5 routes these through RF as `custom_field.<id>` filters, but
-  // the project doesn't expose a custom-field-id mapping table yet. Collect
-  // the dropped keys and return them so the caller can surface a warning.
-  // TODO(future): map to `{key: 'custom_field.<id>', conjunction: 'in', values: [...]}`
-  // once a custom-field id table is exposed (env var or D1 lookup of
-  // `/candidate/custom-field/list`).
-  if (Array.isArray(tf.technology) && tf.technology.length > 0) unverifiedFilters.push('technology');
-  if (tf.segment != null && tf.segment !== '') unverifiedFilters.push('segment');
-  if (tf.role != null && tf.role !== '') unverifiedFilters.push('role');
-  if (unverifiedFilters.length > 0) {
-    console.warn({
-      message: '[mcp/candidate-search] custom-field filters not yet wired to RF custom_field.<id> — ignored',
-      source: 'mcp-candidate-search',
-      ignoredFilters: unverifiedFilters,
-    });
-  }
-
   // ─── Dropped per spec rev 5 ────────────────────────────────────
   // `last_updated` / `last_activity_at` ranges (`updated_after`/`updated_before`)
   // — mutable, not load-bearing. Silently dropped.
 
-  return { rfFilters: out, rfImmutableFilters: immutable, unverifiedFilters };
+  return { rfFilters: out, rfImmutableFilters: immutable };
 }
 
 /**
@@ -297,13 +302,15 @@ function buildRFPredicateFilters(body, resolved = {}) {
  * Immutable per spec rev 5: `added_time` range, `linkedin_profile`.
  *
  * `linkedin_profile` is dual-handled:
- *   - Here (tier-1 paths): exact slug match against the snapshot row.
+ *   - Here (tier-1 paths): exact slug match against the snapshot row after
+ *     normalising user input via `extractLinkedInSlug` (so a full URL like
+ *     "https://www.linkedin.com/in/Jane-Doe/" still matches the lowercased
+ *     slug "jane-doe" we store).
  *   - In buildRFPredicateFilters (tier-2 paths): RF substring search.
- * Both predicates fire when both paths are active; they are AND'd.
+ *   Both predicates fire when both paths are active; they are AND'd.
  */
 function buildImmutableSnapshotFilter(body) {
   const preds = [];
-  // Merge long-tail bag so both sources are checked (mirrors buildRFPredicateFilters).
   const longTail = (body && typeof body.filters === 'object' && body.filters !== null)
     ? body.filters
     : {};
@@ -317,11 +324,15 @@ function buildImmutableSnapshotFilter(body) {
     const ms = Date.parse(tf.added_before);
     if (Number.isFinite(ms)) preds.push((r) => r.added_time_ms <= ms);
   }
-  // linkedin_profile: exact slug match on the snapshot row (tier-1 path).
-  // RF substring match is handled separately in buildRFPredicateFilters.
+  // linkedin_profile: normalise via extractLinkedInSlug so the caller can
+  // pass a full URL ("https://www.linkedin.com/in/Jane-Doe/"), a bare slug
+  // ("Jane-Doe"), or any of the formats the LinkedIn extension might use.
+  // Snapshot stores the lowercased slug; we lowercase the input slug too.
   if (typeof tf.linkedin_profile === 'string' && tf.linkedin_profile) {
-    const slug = tf.linkedin_profile;
-    preds.push((r) => r.linkedin_profile === slug);
+    const slug = extractLinkedInSlug(tf.linkedin_profile);
+    if (slug) {
+      preds.push((r) => r.linkedin_profile === slug);
+    }
   }
   if (preds.length === 0) return null;
   return (r) => preds.every((p) => p(r));
@@ -333,15 +344,9 @@ function buildImmutableSnapshotFilter(body) {
  * snapshot is cached in memory and version-checked against the cron cursor
  * stamp.
  *
- * `limit` defaults to TIER1_FUZZY_LIMIT (200) for the tier-2 funnel; the
- * pure-fuzzy short-circuit overrides this with the user's requested limit.
- *
- * Optional `immutablePredicate` further narrows in JS before returning.
- *
- * Returns rows shaped as `{id, name, score, _thinRow}` — `_thinRow` carries
- * the snapshot's thin fields (id, name, linkedin_profile, added_time_ms) so
- * projection can synthesize a body without re-fetching from D1 when the
- * legacy `candidates.body` cache is empty.
+ * Returns rows shaped as `{id, name, score, _thinRow}` where `_thinRow`
+ * carries the snapshot's thin fields (id, name, linkedin_profile,
+ * added_time_ms).
  */
 async function tier1Fuzzy(env, query, limit, immutablePredicate = null) {
   const snap = await getSnapshot(env);
@@ -360,13 +365,12 @@ async function tier1Fuzzy(env, query, limit, immutablePredicate = null) {
 }
 
 /**
- * Synthesize a candidate-shaped body from a snapshot thin row, used when the
- * legacy `candidates.body` blob is missing (post-Task 30 / new-thin-cache
- * inserts that didn't dual-write). Carries id, name, linkedin_profile,
- * and added_time (ISO string from added_time_ms). Other fields default to
+ * Synthesize a candidate-shaped body from a snapshot thin row. Used for the
+ * pure-fuzzy / immutable-only paths where no full body is available — the
+ * snapshot's quasi-immutable fields are all we have. Other fields default to
  * undefined and projection drops them silently.
  */
-function thinRowToBody(row) {
+function thinSnapRowToBody(row) {
   return {
     id: row.id,
     name: row.name,
@@ -378,52 +382,59 @@ function thinRowToBody(row) {
 }
 
 /**
- * Project a list of `{id, name, ...}` matches (either tier-1 fuzzy hits or
- * RF candidate bodies) into the standard MCP response shape.
+ * Synthesize a candidate-shaped body from a thin candidates_v2 row. Used
+ * for the tier-2 path to project hydrated matched ids without fanning out
+ * to RF when the requested fields are all thin.
+ */
+function thinDbRowToBody(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    linkedin_profile: row.linkedin_profile,
+    added_time: row.added_time_ms != null
+      ? new Date(row.added_time_ms).toISOString()
+      : null,
+    current_title: row.current_title_at_cache_time ?? null,
+    current_organization: row.current_company_at_cache_time ?? null,
+  };
+}
+
+/**
+ * Project a list of `{id, name, ...}` matches into the standard MCP response
+ * shape.
  *
  * Body source by precedence (per match):
  *   1. `m._body` — set by tier-2 RF match (full RF candidate body, JSON
  *      string). Used directly.
- *   2. Legacy `candidates.body` D1 read — single batched IN-list SELECT for
- *      every tier-1 match. Populated during the dual-write phase; absent
- *      post-Task 30. Caller pays at most one D1 read per call.
- *   3. `m._thinRow` — snapshot row, synthesized into a minimal candidate
- *      body. Final fallback so the post-thin-cache pure-fuzzy / immutable-
- *      filter paths still project sensibly.
+ *   2. `m._thinRow` — synthesised from the snapshot row (pure-fuzzy /
+ *      immutable-only paths). Carries the quasi-immutable fields only.
+ *
+ * For tier-2 we always have `_body` from RF (since RF returned the matched
+ * candidate); thin hydration via `getCandidatesByIds` is used only when the
+ * caller requests fields outside the thin set AND wants to avoid the RF
+ * fan-out — handled separately in the tier-2 branch.
  *
  * `userFields` is the caller-supplied `fields[]` — additive over defaults.
  */
-async function projectMatches(env, matches, userFields) {
-  // Single batched legacy-body lookup for everything missing a `_body`.
-  // RF results already carry it; pure-fuzzy / tier-1 results don't.
-  const idsNeedingBody = matches.filter((m) => !m._body).map((m) => m.id);
-  let bodyById = new Map();
-  if (idsNeedingBody.length) {
-    const placeholders = idsNeedingBody.map(() => '?').join(', ');
-    const { results } = await session(env)
-      .prepare(`SELECT id, body FROM candidates WHERE id IN (${placeholders})`)
-      .bind(...idsNeedingBody)
-      .all();
-    bodyById = new Map((results ?? []).map((r) => [r.id, r.body]));
-  }
-
+function projectMatches(matches, userFields) {
   return matches.map((m) => {
+    // Body source precedence:
+    //   1. `_body` (set by tier-2 RF result) — full RF body.
+    //   2. `_thinDbRow` (set by pure-fuzzy / immutable-only enrichment) —
+    //      v2 row carries current_title_at_cache_time + current_company_at_cache_time.
+    //   3. `_thinRow` (snapshot-only) — fewer fields than the DB row.
     let c;
-    const bodyJson = m._body ?? bodyById.get(m.id);
-    if (bodyJson) {
-      c = JSON.parse(bodyJson);
+    if (m._body) {
+      c = JSON.parse(m._body);
+    } else if (m._thinDbRow) {
+      c = thinDbRowToBody(m._thinDbRow);
     } else if (m._thinRow) {
-      c = thinRowToBody(m._thinRow);
+      c = thinSnapRowToBody(m._thinRow);
     } else {
-      // Last-resort minimal shape — handler shouldn't reach here, but
-      // guarantees `id`/`name` are populated even if both lookup + thin
-      // row are absent.
       c = { id: m.id, name: m.name };
     }
     const { paths } = resolveFieldsWithDefaults(userFields, DEFAULT_FIELDS, c, c);
     const projected = projectWithLinkedIn(c, paths);
-    // Preserve `score` when present (tier-1 fuzzy hits carry it; pure-RF
-    // matches don't).
     return m.score != null ? { ...projected, score: m.score } : projected;
   });
 }
@@ -437,7 +448,7 @@ export async function handleCandidateSearch({ env, body }) {
   let jobId = null;
   if (body.job_id != null) {
     const id = Number(body.job_id);
-    if (!Number.isFinite(id)) return jsonResponse(400, { error: 'job_id must be numeric' });
+    if (!Number.isFinite(id)) return jsonResponse(400, { ok: false, kind: 'invalid_input', error: 'job_id must be numeric' });
     jobId = id;
   } else if (body.job != null) {
     const r = await resolveJob(env, body.job, { validateNumeric: false });
@@ -445,14 +456,14 @@ export async function handleCandidateSearch({ env, body }) {
       if (r.reason === 'ambiguous') {
         return jsonResponse(200, disambiguationPayload(r));
       }
-      return jsonResponse(400, { error: `job not found: ${JSON.stringify(body.job)}` });
+      return jsonResponse(400, { ok: false, kind: 'invalid_input', error: `job not found: ${JSON.stringify(body.job)}` });
     }
     jobId = r.value.id;
   }
   let ownerId = null;
   if (body.owner_id != null) {
     const id = Number(body.owner_id);
-    if (!Number.isFinite(id)) return jsonResponse(400, { error: 'owner_id must be numeric' });
+    if (!Number.isFinite(id)) return jsonResponse(400, { ok: false, kind: 'invalid_input', error: 'owner_id must be numeric' });
     ownerId = id;
   } else if (body.owner != null) {
     const r = await resolveOwner(env, body.owner);
@@ -460,65 +471,99 @@ export async function handleCandidateSearch({ env, body }) {
       if (r.reason === 'ambiguous') {
         return jsonResponse(200, disambiguationPayload(r));
       }
-      return jsonResponse(400, { error: `owner not found: ${JSON.stringify(body.owner)}` });
+      return jsonResponse(400, { ok: false, kind: 'invalid_input', error: `owner not found: ${JSON.stringify(body.owner)}` });
     }
     ownerId = r.value.id;
   }
 
-  // ─── Custom-field fuzzy resolve (technology / segment / role) ──
-  // Each input is matched against the corpus's distinct values via the
-  // version-cached option universe; canonical case is substituted before
-  // routing. Ambiguity returns the standard envelope; not_found falls
-  // through (unknowns still return empty matches like they did
-  // pre-resolver). NB: even though `buildRFPredicateFilters` currently
-  // *drops* these (until `custom_field.<id>` mapping is wired), we still
-  // resolve here so:
-  //   (a) ambiguity surfaces as a disambiguation envelope (the contract
-  //       Claude depends on), and
-  //   (b) when the mapping eventually ships, only the `buildRFPredicateFilters`
-  //       gap closes — no other code change.
-  if (Array.isArray(body.technology) && body.technology.length) {
-    const resolved = [];
-    for (const v of body.technology) {
-      const r = await fuzzyResolveCustomFieldValue(env, 'technology', v, true);
-      if (!r.ok && r.reason === 'ambiguous') {
-        return jsonResponse(200, disambiguationPayload(r));
+  // ─── Custom-field resolve (technology / segment / role) ────────
+  // Pull the name→id map from RF; resolve each user input against the
+  // canonical option list; emit `custom_field.<id>` filter objects.
+  // On RF unavailable we surface `custom_field_map_unavailable` rather than
+  // silently dropping the filter — no warn-and-drop block.
+  const customFieldFilters = [];
+  let cfMapWarning = null;
+  const hasCfInput = (Array.isArray(body.technology) && body.technology.length)
+    || (body.segment != null && body.segment !== '')
+    || (body.role != null && body.role !== '');
+
+  let cfMap = null;
+  if (hasCfInput) {
+    try {
+      cfMap = await getCustomFieldMap(env);
+    } catch (e) {
+      if (e instanceof RFRateLimitedError) {
+        return jsonResponse(200, {
+          ok: false,
+          kind: 'rate_limited',
+          recoverable: false,
+          retry_after_ms: e.retryAfterMs ?? null,
+          error: 'RF rate limited fetching custom-field schema',
+        });
       }
-      resolved.push(r.ok ? r.value.name : v);
+      // Transient or other → surface as warning, continue with no CF filter.
+      cfMapWarning = 'custom_field_map_unavailable';
+      cfMap = null;
     }
-    body = { ...body, technology: resolved };
   }
-  if (body.segment) {
-    const r = await fuzzyResolveCustomFieldValue(env, 'segment', body.segment, false);
-    if (!r.ok && r.reason === 'ambiguous') {
-      return jsonResponse(200, disambiguationPayload(r));
+
+  /**
+   * Resolve one custom-field input against the schema. Returns either a
+   * pushable filter object, or surfaces an ambiguity envelope to the caller
+   * by returning `{ ambiguity: <disambiguationPayload> }`.
+   * `multi` controls whether the resolved canonical name lands in `values`
+   * as `[name]` for single-select or a flat list for multi-select.
+   */
+  async function resolveOneCfFilter(fieldName, input, isMulti) {
+    if (!cfMap) return null;
+    const meta = lookupField(cfMap, fieldName);
+    if (!meta) return null; // field doesn't exist on this account — silently skip
+    if (Array.isArray(input)) {
+      const values = [];
+      for (const v of input) {
+        const r = fuzzyResolveCustomFieldOption(meta, v);
+        if (!r.ok && r.reason === 'ambiguous') {
+          return { ambiguity: disambiguationPayload(r) };
+        }
+        values.push(r.ok ? r.value.name : v);
+      }
+      if (values.length === 0) return null;
+      return { conjunction: 'in', values, key: `custom_field.${meta.id}` };
     }
-    if (r.ok) body = { ...body, segment: r.value.name };
+    const r = fuzzyResolveCustomFieldOption(meta, input);
+    if (!r.ok && r.reason === 'ambiguous') {
+      return { ambiguity: disambiguationPayload(r) };
+    }
+    const name = r.ok ? r.value.name : input;
+    return { conjunction: 'in', values: [name], key: `custom_field.${meta.id}` };
   }
-  if (body.role) {
-    const r = await fuzzyResolveCustomFieldValue(env, 'role', body.role, false);
-    if (!r.ok && r.reason === 'ambiguous') {
-      return jsonResponse(200, disambiguationPayload(r));
-    }
-    if (r.ok) body = { ...body, role: r.value.name };
+
+  if (Array.isArray(body.technology) && body.technology.length) {
+    const fr = await resolveOneCfFilter('technology', body.technology, true);
+    if (fr?.ambiguity) return jsonResponse(200, fr.ambiguity);
+    if (fr) customFieldFilters.push(fr);
+  }
+  if (body.segment != null && body.segment !== '') {
+    const fr = await resolveOneCfFilter('segment', body.segment, false);
+    if (fr?.ambiguity) return jsonResponse(200, fr.ambiguity);
+    if (fr) customFieldFilters.push(fr);
+  }
+  if (body.role != null && body.role !== '') {
+    const fr = await resolveOneCfFilter('role', body.role, false);
+    if (fr?.ambiguity) return jsonResponse(200, fr.ambiguity);
+    if (fr) customFieldFilters.push(fr);
   }
 
   // ─── Stage fuzzy resolve (only with job context) ───────────────
-  // Resolve against the distinct stage names recorded for that job in
-  // candidate_jobs (legacy cache during the dual-write phase). Ambiguity
-  // returns the standard envelope; not_found falls through and the
-  // unresolved name is sent verbatim to RF (which will return zero rows
-  // for an unknown stage — same observable behaviour as the pre-rev-5
-  // fall-through-to-empty pattern).
+  // Universe is the union of stage names across `jobs_v2.canonical_pipeline_json`.
+  // Ambiguity returns the standard envelope; not_found falls through and the
+  // unresolved name is sent verbatim to RF (which returns zero rows for an
+  // unknown stage — same observable behaviour as the pre-rev-5 fall-through).
   let stageName = null;
   if (body.stage && jobId != null) {
-    const { results: stageRows } = await session(env)
-      .prepare('SELECT DISTINCT stage_name FROM candidate_jobs WHERE job_id = ? AND stage_name IS NOT NULL')
-      .bind(jobId)
-      .all();
-    const distinct = (stageRows ?? []).map((r) => r.stage_name).filter(Boolean);
-    if (distinct.length > 0) {
-      const resolvable = distinct.map((name) => ({ id: name, name }));
+    const knownStages = await getKnownStageNames(env);
+    if (knownStages.length > 0) {
+      const resolvable = knownStages.map((name) => ({ id: name, name }));
       const r = resolveStage(body.stage, resolvable);
       if (!r.ok && r.reason === 'ambiguous') {
         return jsonResponse(200, disambiguationPayload(r));
@@ -526,26 +571,17 @@ export async function handleCandidateSearch({ env, body }) {
       if (r.ok) {
         stageName = r.value.name;
       } else {
-        // Not found in the local distinct list — pass through verbatim.
-        // RF treats unknown stage names as "no match" → empty result.
         stageName = String(body.stage);
       }
     } else {
-      // No distinct stages cached yet (cold cache, edge case) — pass through.
       stageName = String(body.stage);
     }
   }
 
   // ─── Build the RF filter envelope ──────────────────────────────
-  const { rfFilters, rfImmutableFilters, unverifiedFilters } = buildRFPredicateFilters(body, {
-    jobId,
-    ownerId,
-    stageName,
+  const { rfFilters, rfImmutableFilters } = buildRFPredicateFilters(body, {
+    jobId, ownerId, stageName, customFieldFilters,
   });
-  // Combined predicate filters for RF calls: mutable + immutable (date / linkedin).
-  // The immutable filters are appended only when an RF call is already being made
-  // (driven by rfFilters.length > 0), so they don't drag pure-immutable queries
-  // into RF unnecessarily.
   const allRFFilters = [...rfFilters, ...rfImmutableFilters];
 
   const immutablePredicate = buildImmutableSnapshotFilter(body);
@@ -555,43 +591,52 @@ export async function handleCandidateSearch({ env, body }) {
 
   // Must have something to narrow on — query, mutable filter, OR immutable.
   if (!hasQuery && !hasMutableFilters && !hasImmutableFilters) {
-    return jsonResponse(400, { error: 'must provide query or at least one filter' });
+    return jsonResponse(400, { ok: false, kind: 'invalid_input', error: 'must provide query or at least one filter' });
+  }
+
+  /**
+   * Attach metadata + the `ok: true` flag to a success response. Centralised
+   * so every success branch stays in sync.
+   */
+  function successResponse(projected, extras = {}) {
+    const resp = { ok: true, count: projected.length, matches: projected, ...extras };
+    if (cfMapWarning) {
+      resp.warning = cfMapWarning;
+      resp._meta = { ...(resp._meta ?? {}), warning: cfMapWarning };
+    }
+    return resp;
   }
 
   // ─── Pure-fuzzy short-circuit (no mutable filter) ──────────────
-  // Either query+immutable or query alone. No RF round-trip.
+  // Enriches each match with the v2 snapshot columns (current_title /
+  // current_organization at cache time) via a single D1 batch so the
+  // default-field projection works without an RF round-trip. The cost is
+  // one extra D1 read for the top-N matches; negligible at our scale.
   if (hasQuery && !hasMutableFilters) {
     const tier1 = await tier1Fuzzy(env, body.query, limit, immutablePredicate);
-    const projected = await projectMatches(env, tier1, body.fields);
-    const resp = { count: projected.length, matches: projected };
-    if (unverifiedFilters.length > 0) {
-      resp.warning = 'custom_field_unverified';
-      resp._meta = { unverifiedFilters };
-    }
-    return jsonResponse(200, resp);
+    const dbRows = tier1.length ? await getCandidatesByIds(env, tier1.map((m) => m.id)) : [];
+    const dbById = new Map(dbRows.map((r) => [r.id, r]));
+    const enriched = tier1.map((m) => ({ ...m, _thinDbRow: dbById.get(m.id) ?? null }));
+    const projected = projectMatches(enriched, body.fields);
+    return jsonResponse(200, successResponse(projected));
   }
 
   // ─── Immutable-only filter (no query, no mutable) ──────────────
-  // Cache-side narrow over the snapshot. No fuzzy ranking; recency-DESC.
   if (!hasQuery && !hasMutableFilters && hasImmutableFilters) {
     const snap = await getSnapshot(env);
     const matches = snap.rows
       .filter(immutablePredicate)
       .sort((a, b) => (b.added_time_ms ?? 0) - (a.added_time_ms ?? 0))
       .slice(0, limit)
-      .map((r) => ({ id: r.id, name: r.name }));
-    const projected = await projectMatches(env, matches, body.fields);
-    const resp = { count: projected.length, matches: projected };
-    if (unverifiedFilters.length > 0) {
-      resp.warning = 'custom_field_unverified';
-      resp._meta = { unverifiedFilters };
-    }
-    return jsonResponse(200, resp);
+      .map((r) => ({ id: r.id, name: r.name, _thinRow: r }));
+    const dbRows = matches.length ? await getCandidatesByIds(env, matches.map((m) => m.id)) : [];
+    const dbById = new Map(dbRows.map((r) => [r.id, r]));
+    const enriched = matches.map((m) => ({ ...m, _thinDbRow: dbById.get(m.id) ?? null }));
+    const projected = projectMatches(enriched, body.fields);
+    return jsonResponse(200, successResponse(projected));
   }
 
   // ─── Tier-2: mutable filter present, route through RF ──────────
-  // 1. If there's a query, run tier-1 to narrow the id-pool first.
-  // 2. Otherwise, predicate-only RF search (no id-list).
   let rfResult;
   let tier1ForFallback = [];
 
@@ -600,7 +645,7 @@ export async function handleCandidateSearch({ env, body }) {
     tier1ForFallback = tier1;
     if (tier1.length === 0) {
       // Tier-1 returned nothing — return empty without bothering RF.
-      return jsonResponse(200, { count: 0, matches: [] });
+      return jsonResponse(200, successResponse([]));
     }
     try {
       rfResult = await searchCandidatesByIdsAndPredicate(
@@ -608,55 +653,61 @@ export async function handleCandidateSearch({ env, body }) {
         env,
       );
     } catch (err) {
+      if (err instanceof RFRateLimitedError) {
+        return jsonResponse(200, {
+          ok: false,
+          kind: 'rate_limited',
+          recoverable: false,
+          retry_after_ms: err.retryAfterMs ?? null,
+          error: 'RF rate limited',
+        });
+      }
       console.warn({
         message: `[mcp/candidate-search] RF search failed; degrading to tier-1: ${err.message}`,
         source: 'mcp-candidate-search',
         droppedFilters: Object.keys(body).filter((k) => !['query', 'limit', 'fields', 'filters'].includes(k)),
         query: body.query,
       });
-      const projected = await projectMatches(env, tier1.slice(0, limit), body.fields);
-      return jsonResponse(200, {
-        count: projected.length,
-        matches: projected,
-        warning: 'filter_unverified',
-      });
+      const projected = projectMatches(tier1.slice(0, limit), body.fields);
+      const resp = { ok: true, count: projected.length, matches: projected, warning: 'filter_unverified' };
+      if (cfMapWarning) resp._meta = { warning: cfMapWarning };
+      return jsonResponse(200, resp);
     }
   } else {
-    // No query → predicate-only RF search.
     try {
       rfResult = await searchCandidatesByPredicateOnly(
         { predicateFilters: allRFFilters },
         env,
       );
     } catch (err) {
+      if (err instanceof RFRateLimitedError) {
+        return jsonResponse(200, {
+          ok: false,
+          kind: 'rate_limited',
+          recoverable: false,
+          retry_after_ms: err.retryAfterMs ?? null,
+          error: 'RF rate limited',
+        });
+      }
       console.warn({
         message: `[mcp/candidate-search] RF predicate-only search failed: ${err.message}`,
         source: 'mcp-candidate-search',
         droppedFilters: Object.keys(body).filter((k) => !['query', 'limit', 'fields', 'filters'].includes(k)),
       });
-      // Without a tier-1 pool, we have nothing to degrade to. Return an
-      // empty response with the filter_unverified warning so the caller
-      // knows the filter wasn't applied.
-      return jsonResponse(200, {
-        count: 0,
-        matches: [],
-        warning: 'filter_unverified',
-      });
+      return jsonResponse(200, { ok: true, count: 0, matches: [], warning: 'filter_unverified' });
     }
   }
 
   // ─── Project RF results ────────────────────────────────────────
-  // RF returns full candidate bodies; preserve them as `_body` so
-  // projectMatches doesn't re-fetch from D1.
+  // RF returns full candidate bodies; preserve them as `_body` so projection
+  // can read them without an extra fetch.
   let rfMatches = (rfResult.candidates ?? []).map((c) => ({
     id: c.id,
     name: c.name,
     _body: JSON.stringify(c),
   }));
 
-  // If we ran tier-1, preserve its score-ordering on the RF result set:
-  // RF intersects the id-list but doesn't preserve our recency-boosted
-  // fuzzy ordering. Reorder by tier-1 score, then trim to limit.
+  // If we ran tier-1, preserve its score-ordering on the RF result set.
   if (hasQuery && tier1ForFallback.length > 0) {
     const scoreById = new Map(tier1ForFallback.map((r) => [r.id, r.score]));
     rfMatches = rfMatches
@@ -665,11 +716,6 @@ export async function handleCandidateSearch({ env, body }) {
   }
 
   const trimmed = rfMatches.slice(0, limit);
-  const projected = await projectMatches(env, trimmed, body.fields);
-  const resp = { count: projected.length, matches: projected };
-  if (unverifiedFilters.length > 0) {
-    resp.warning = 'custom_field_unverified';
-    resp._meta = { unverifiedFilters };
-  }
-  return jsonResponse(200, resp);
+  const projected = projectMatches(trimmed, body.fields);
+  return jsonResponse(200, successResponse(projected));
 }

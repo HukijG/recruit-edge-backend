@@ -4,6 +4,8 @@ import { applyMigration } from './helpers/d1-migrate.js';
 import { applyUsersMigration } from './helpers/users-migrate.js';
 import { _resetCacheForTests } from '../src/users.js';
 import { resetSnapshot } from '../src/mcp/snapshot.js';
+import { _resetStageUniverseForTests } from '../src/mcp/candidate-search.js';
+import { _resetCustomFieldMapForTests } from '../src/mcp/custom-fields.js';
 import worker from '../src';
 
 const originalFetch = globalThis.fetch;
@@ -47,22 +49,47 @@ const insert = async (id, name, opts = {}) => {
       new Date().toISOString(),
     )
     .run();
-  // Also seed candidates_v2 so the snapshot (which now reads candidates_v2) can find this candidate.
+  // Also seed candidates_v2 with snapshot columns mirroring the seeded body
+  // so thin-cache reads (current_title/current_organization aliases) work.
   const addedMs = opts.last_activity_at ? Date.parse(opts.last_activity_at) : Date.now();
   const linkedin = opts.body?.linkedin_profile ?? null;
+  const currentTitle = opts.body?.current_title ?? null;
+  const currentOrg = opts.body?.current_organization ?? null;
   await env.RF_MCP_CACHE.prepare(
-    `INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)`,
+    `INSERT OR IGNORE INTO candidates_v2
+       (id, name, linkedin_profile, added_time_ms,
+        current_title_at_cache_time, current_company_at_cache_time, cached_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(id, name, linkedin, addedMs, Date.now())
+    .bind(id, name, linkedin, addedMs, currentTitle, currentOrg, Date.now())
     .run();
 };
+
+/**
+ * Seed a `jobs_v2` row with an optional canonical_pipeline_json so the stage
+ * resolver universe (read by getKnownStageNames) is populated. Tests that
+ * exercise the stage filter pass `stages: ['Sourced', 'Replied', ...]`.
+ */
+async function insertJobV2(id, name, client, opts = {}) {
+  const stages = Array.isArray(opts.stages) ? opts.stages : null;
+  const canon = stages ? JSON.stringify({ stages }) : null;
+  await env.RF_MCP_CACHE.prepare(
+    `INSERT OR IGNORE INTO jobs_v2 (id, name, client_company_name, added_time_ms, canonical_pipeline_json, cached_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).bind(id, name, client, Date.now(), canon, Date.now()).run();
+}
 
 beforeEach(async () => {
   await applyMigration(env);
   await applyUsersMigration(env);
   _resetCacheForTests();
+  _resetStageUniverseForTests();
+  _resetCustomFieldMapForTests();
   await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+  await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
   await env.RF_MCP_CACHE.exec('DELETE FROM candidate_jobs');
+  await env.RF_MCP_CACHE.exec('DELETE FROM jobs');
+  await env.RF_MCP_CACHE.exec('DELETE FROM jobs_v2');
   resetSnapshot();
   await env.RF_MCP_CACHE
     .prepare("INSERT INTO sync_state (key, value) VALUES ('last_tail_sync_at', ?)")
@@ -171,13 +198,7 @@ describe('/mcp/candidate-search', () => {
   });
 
   it('job filter routes through RF as job-by-id', async () => {
-    await env.RF_MCP_CACHE
-      .prepare(
-        `INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(100, JSON.stringify({}), 'Enterprise AE', 'Nominal', 1, new Date().toISOString())
-      .run();
+    await insertJobV2(100, 'Enterprise AE', 'Nominal');
     await insert(1, 'Alice');
     globalThis.fetch = mockRf([{ id: 1, name: 'Alice' }]);
     const r = await call({ consultantFirstName: 'Joel', job: 'Enterprise AE' });
@@ -191,17 +212,8 @@ describe('/mcp/candidate-search', () => {
   });
 
   it('lowercase stage with job filter resolves to canonical and passes to RF', async () => {
-    await env.RF_MCP_CACHE
-      .prepare(
-        `INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(100, JSON.stringify({}), 'Enterprise AE', 'Nominal', 1, new Date().toISOString())
-      .run();
+    await insertJobV2(100, 'Enterprise AE', 'Nominal', { stages: ['Sourced'] });
     await insert(1, 'Alice');
-    await env.RF_MCP_CACHE.prepare(
-      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (1, 100, 'Sourced', 0)`,
-    ).run();
     globalThis.fetch = mockRf([{ id: 1, name: 'Alice' }]);
     const r = await call({ consultantFirstName: 'Joel', job: 100, stage: 'sourced' });
     expect(r.status).toBe(200);
@@ -216,22 +228,9 @@ describe('/mcp/candidate-search', () => {
   });
 
   it('ambiguous stage with job filter → 200 needs_disambiguation kind=stage (no RF call)', async () => {
-    await env.RF_MCP_CACHE
-      .prepare(
-        `INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(100, JSON.stringify({}), 'Enterprise AE', 'Nominal', 1, new Date().toISOString())
-      .run();
-    await env.RF_MCP_CACHE.prepare(
-      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (1, 100, '1st Interview', 0)`,
-    ).run();
-    await env.RF_MCP_CACHE.prepare(
-      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (2, 100, '2nd Interview', 0)`,
-    ).run();
-    await env.RF_MCP_CACHE.prepare(
-      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (3, 100, 'Final Interview', 0)`,
-    ).run();
+    await insertJobV2(100, 'Enterprise AE', 'Nominal', {
+      stages: ['1st Interview', '2nd Interview', 'Final Interview'],
+    });
     const fetchMock = vi.fn();
     globalThis.fetch = fetchMock;
     const r = await call({ consultantFirstName: 'Joel', job: 100, stage: 'interview' });
@@ -244,16 +243,7 @@ describe('/mcp/candidate-search', () => {
   });
 
   it('unknown stage with job filter falls through to RF (returns RF empty result)', async () => {
-    await env.RF_MCP_CACHE
-      .prepare(
-        `INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(100, JSON.stringify({}), 'Enterprise AE', 'Nominal', 1, new Date().toISOString())
-      .run();
-    await env.RF_MCP_CACHE.prepare(
-      `INSERT INTO candidate_jobs (candidate_id, job_id, stage_name, disqualified) VALUES (1, 100, 'Sourced', 0)`,
-    ).run();
+    await insertJobV2(100, 'Enterprise AE', 'Nominal', { stages: ['Sourced'] });
     globalThis.fetch = mockRf([]);  // RF returns empty for unknown stage.
     const r = await call({ consultantFirstName: 'Joel', job: 100, stage: 'totally-not-a-real-stage' });
     expect(r.status).toBe(200);
@@ -299,6 +289,9 @@ describe('/mcp/candidate-search', () => {
   });
 
   it('default fields are id, name, current_title, linkedin_profile only', async () => {
+    // Pure-fuzzy path enriches tier-1 matches with the v2 snapshot row so
+    // current_title (mapped from current_title_at_cache_time) projects in
+    // the default set. insert() mirrors body.current_title onto the v2 col.
     await insert(1, 'A', { body: { current_title: 'CTO', linkedin_profile: 'a-slug', primary_email: 'a@x.com' } });
     const r = await call({ consultantFirstName: 'Joel', query: 'A' });
     const body = await r.json();
@@ -353,6 +346,30 @@ describe('/mcp/candidate-search', () => {
     ]));
   });
 
+  it('lead_owner_id as a numeric-string ("123") still routes through RF as a number', async () => {
+    await insert(1, 'A');
+    globalThis.fetch = mockRf([{ id: 1, name: 'A' }]);
+    // Use the long-tail filters bag so the test exercises the lead_owner_id
+    // string-coercion path (top-level body knobs are owner / owner_id).
+    const r = await call({
+      consultantFirstName: 'Joel',
+      filters: { lead_owner_id: '123' },
+    });
+    expect(r.status).toBe(200);
+    const sentBody = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    expect(sentBody.filters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'lead_owner', values: [123] }),
+    ]));
+  });
+
+  it('success envelope carries ok: true', async () => {
+    await insert(1, 'A');
+    const r = await call({ consultantFirstName: 'Joel', query: 'A' });
+    const body = await r.json();
+    expect(body.ok).toBe(true);
+    expect(Array.isArray(body.matches)).toBe(true);
+  });
+
   it('_meta omitted on clean calls', async () => {
     await insert(1, 'A');
     const r = await call({ consultantFirstName: 'Joel', query: 'A' });
@@ -362,41 +379,78 @@ describe('/mcp/candidate-search', () => {
 
   // ─── Custom-field filters (technology / segment / role) ─────────
   // Per spec rev 5, these are MUTABLE and route through RF as
-  // `custom_field.<id>`; until the id-mapping table lands, they're logged-
-  // and-ignored. Verify the resolver still handles ambiguity (so Claude's
-  // disambiguation contract holds) and the request returns gracefully.
-  it('lowercase technology resolves to canonical case (resolver still runs)', async () => {
-    // Resolver needs the option universe — seed two candidates with technology values.
-    await insert(1, 'Alice', {
-      body: { custom_fields: [{ name: 'Technology', value: ['Kubernetes', 'Go'] }] },
+  // `custom_field.<id>` via the `getCustomFieldMap` resolver. Lowercase
+  // input canonicalises against RF's option list.
+  it('lowercase technology resolves to canonical via RF custom-field map', async () => {
+    await insert(1, 'Alice');
+    const fetchMock = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/custom-field/list')) {
+        return new Response(JSON.stringify({
+          data: [{ id: 7, name: 'Technology', options: ['Kubernetes', 'Go'] }],
+        }), { status: 200 });
+      }
+      if (u.includes('/candidate/search')) {
+        return new Response(JSON.stringify({ data: [{ id: 1, name: 'Alice' }] }), { status: 200 });
+      }
+      throw new Error('unexpected: ' + u);
     });
-    await insert(2, 'Bob', {
-      body: { custom_fields: [{ name: 'Technology', value: ['Postgres'] }] },
-    });
-    // No fuzzy query → tier-1 doesn't fire. With only the (currently-dropped)
-    // technology filter, no mutable filters reach RF, so nothing to predicate
-    // on — handler 400s for "no filter provided".
-    // The resolver runs successfully (no ambiguity envelope, no 500).
+    globalThis.fetch = fetchMock;
     const r = await call({ consultantFirstName: 'Joel', technology: ['kubernetes'] });
-    expect(r.status).toBe(400);
+    expect(r.status).toBe(200);
+    const searchCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/candidate/search'));
+    const sent = JSON.parse(searchCall[1].body);
+    expect(sent.filters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'custom_field.7', values: ['Kubernetes'] }),
+    ]));
   });
 
-  it('lowercase segment resolves to canonical case (resolver still runs)', async () => {
-    await insert(1, 'Alice', {
-      body: { custom_fields: [{ name: 'Segment', value: 'Enterprise' }] },
+  it('lowercase segment resolves to canonical via RF custom-field map', async () => {
+    await insert(1, 'Alice');
+    const fetchMock = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/custom-field/list')) {
+        return new Response(JSON.stringify({
+          data: [{ id: 12, name: 'Segment', options: ['Enterprise', 'Mid-Market'] }],
+        }), { status: 200 });
+      }
+      if (u.includes('/candidate/search')) {
+        return new Response(JSON.stringify({ data: [{ id: 1, name: 'Alice' }] }), { status: 200 });
+      }
+      throw new Error('unexpected: ' + u);
     });
+    globalThis.fetch = fetchMock;
     const r = await call({ consultantFirstName: 'Joel', segment: 'enterprise' });
-    // Same as technology — no mutable filter routed since custom_field.<id>
-    // mapping isn't wired; resolver passed (no ambiguity envelope).
-    expect(r.status).toBe(400);
+    expect(r.status).toBe(200);
+    const searchCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/candidate/search'));
+    const sent = JSON.parse(searchCall[1].body);
+    expect(sent.filters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'custom_field.12', values: ['Enterprise'] }),
+    ]));
   });
 
-  it('lowercase role resolves to canonical case (resolver still runs)', async () => {
-    await insert(1, 'Alice', {
-      body: { custom_fields: [{ name: 'Role', value: 'AE' }] },
+  it('lowercase role resolves to canonical via RF custom-field map', async () => {
+    await insert(1, 'Alice');
+    const fetchMock = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/custom-field/list')) {
+        return new Response(JSON.stringify({
+          data: [{ id: 9, name: 'Role', options: ['AE', 'CSM'] }],
+        }), { status: 200 });
+      }
+      if (u.includes('/candidate/search')) {
+        return new Response(JSON.stringify({ data: [{ id: 1, name: 'Alice' }] }), { status: 200 });
+      }
+      throw new Error('unexpected: ' + u);
     });
+    globalThis.fetch = fetchMock;
     const r = await call({ consultantFirstName: 'Joel', role: 'ae' });
-    expect(r.status).toBe(400);
+    expect(r.status).toBe(200);
+    const searchCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/candidate/search'));
+    const sent = JSON.parse(searchCall[1].body);
+    expect(sent.filters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'custom_field.9', values: ['AE'] }),
+    ]));
   });
 
   // ─── Immutable-only filter path (no RF call) ────────────────────
@@ -588,6 +642,23 @@ describe('rf_candidate_search — tier-1+RF-search single round-trip', () => {
     expect(res.matches.map((m) => m.id)).toEqual([1]);
   });
 
+  it('linkedin_profile full URL with mixed case still matches normalised slug', async () => {
+    await seedThin([
+      { id: 1, name: 'Jane Doe', linkedin_profile: 'jane-doe', added_time_ms: 1 },
+      { id: 2, name: 'Jane Smith', linkedin_profile: 'jane-smith', added_time_ms: 2 },
+    ]);
+    const rfFetch = vi.fn();
+    globalThis.fetch = rfFetch;
+    const r = await call({
+      consultantFirstName: 'Joel',
+      query: 'jane',
+      linkedin_profile: 'https://www.linkedin.com/in/Jane-Doe/',
+    });
+    const res = await r.json();
+    expect(rfFetch).not.toHaveBeenCalled();
+    expect(res.matches.map((m) => m.id)).toEqual([1]);
+  });
+
   it('linkedin_profile substring filter reaches RF on tier-2 path (mutable filter present)', async () => {
     await seedThin([
       { id: 1, name: 'Jane Doe',   linkedin_profile: 'jane-doe',   added_time_ms: 1 },
@@ -604,15 +675,104 @@ describe('rf_candidate_search — tier-1+RF-search single round-trip', () => {
     ]));
   });
 
-  // ─── Fix 5: custom-field warning surfaces ─────────────────────────
-  it('drops technology filter with warning surfaced to caller', async () => {
+  // ─── Custom-field filters now route to RF as custom_field.<id> ─────
+  it('routes technology filter through RF as custom_field.<id> (no unverified warning)', async () => {
     await seedThin([{ id: 1, name: 'Jane', added_time_ms: 1 }]);
-    const rfFetch = vi.fn();
+    const rfFetch = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/custom-field/list')) {
+        return new Response(JSON.stringify({
+          data: [
+            { id: 7, name: 'Technology', options: [{ name: 'Kubernetes' }, { name: 'Python' }] },
+          ],
+        }), { status: 200 });
+      }
+      if (u.includes('/candidate/search')) {
+        return new Response(JSON.stringify({ data: [{ id: 1, name: 'Jane' }] }), { status: 200 });
+      }
+      throw new Error('unexpected: ' + u);
+    });
     globalThis.fetch = rfFetch;
     const r = await call({ consultantFirstName: 'Joel', query: 'jane', technology: ['Kubernetes'] });
     const res = await r.json();
-    // warning should be present since technology was dropped
-    expect(res.warning ?? res._meta?.warning).toMatch(/custom_field/i);
-    expect(res._meta?.unverifiedFilters).toContain('technology');
+    expect(res.ok).toBe(true);
+    // No warn-and-drop warning anymore.
+    expect(res.warning).toBeUndefined();
+    // The search call carried a custom_field.7 filter.
+    const searchCall = rfFetch.mock.calls.find(([u]) => String(u).includes('/candidate/search'));
+    const sent = JSON.parse(searchCall[1].body);
+    expect(sent.filters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'custom_field.7', values: ['Kubernetes'] }),
+    ]));
+  });
+
+  it('lowercase technology canonicalises via the custom-field map (Kubernetes ← kubernetes)', async () => {
+    await seedThin([{ id: 1, name: 'Jane', added_time_ms: 1 }]);
+    const rfFetch = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/custom-field/list')) {
+        return new Response(JSON.stringify({
+          data: [
+            { id: 7, name: 'Technology', options: ['Kubernetes', 'Python'] },
+          ],
+        }), { status: 200 });
+      }
+      if (u.includes('/candidate/search')) {
+        return new Response(JSON.stringify({ data: [{ id: 1, name: 'Jane' }] }), { status: 200 });
+      }
+      throw new Error('unexpected: ' + u);
+    });
+    globalThis.fetch = rfFetch;
+    await call({ consultantFirstName: 'Joel', query: 'jane', technology: ['kubernetes'] });
+    const searchCall = rfFetch.mock.calls.find(([u]) => String(u).includes('/candidate/search'));
+    const sent = JSON.parse(searchCall[1].body);
+    expect(sent.filters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'custom_field.7', values: ['Kubernetes'] }),
+    ]));
+  });
+
+  it('custom-field map fetch failure surfaces a warning instead of silently dropping', async () => {
+    await seedThin([{ id: 1, name: 'Jane', added_time_ms: 1 }]);
+    const rfFetch = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/custom-field/list')) {
+        return new Response('boom', { status: 500 });
+      }
+      if (u.includes('/candidate/search')) {
+        return new Response(JSON.stringify({ data: [{ id: 1, name: 'Jane' }] }), { status: 200 });
+      }
+      throw new Error('unexpected: ' + u);
+    });
+    globalThis.fetch = rfFetch;
+    const r = await call({ consultantFirstName: 'Joel', query: 'jane', technology: ['Kubernetes'] });
+    const res = await r.json();
+    expect(res.warning).toMatch(/custom_field_map_unavailable/);
+    // No custom_field.<id> filter on the search call since the map fetch failed.
+    const searchCall = rfFetch.mock.calls.find(([u]) => String(u).includes('/candidate/search'));
+    if (searchCall) {
+      const sent = JSON.parse(searchCall[1].body);
+      expect(sent.filters.find((f) => String(f.key).startsWith('custom_field.'))).toBeUndefined();
+    }
+  });
+
+  it('uses the cached custom-field map on subsequent calls (no second /candidate/custom-field/list fetch)', async () => {
+    await seedThin([{ id: 1, name: 'Jane', added_time_ms: 1 }]);
+    const rfFetch = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/custom-field/list')) {
+        return new Response(JSON.stringify({
+          data: [{ id: 7, name: 'Technology', options: ['Kubernetes'] }],
+        }), { status: 200 });
+      }
+      if (u.includes('/candidate/search')) {
+        return new Response(JSON.stringify({ data: [{ id: 1, name: 'Jane' }] }), { status: 200 });
+      }
+      throw new Error('unexpected: ' + u);
+    });
+    globalThis.fetch = rfFetch;
+    await call({ consultantFirstName: 'Joel', query: 'jane', technology: ['Kubernetes'] });
+    await call({ consultantFirstName: 'Joel', query: 'jane', technology: ['Kubernetes'] });
+    const listCalls = rfFetch.mock.calls.filter(([u]) => String(u).includes('/candidate/custom-field/list'));
+    expect(listCalls.length).toBe(1);
   });
 });

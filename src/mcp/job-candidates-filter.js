@@ -45,12 +45,17 @@
  */
 
 import { jsonResponse } from './router.js';
-import { resolveFieldsWithDefaults } from './projection.js';
+import { resolveFieldsWithDefaults, resolveFieldName } from './projection.js';
 import { projectWithLinkedIn } from './linkedin.js';
 import { resolveJob, resolveStage, disambiguationPayload } from './resolvers.js';
 import { session, getCandidatesByIds } from './d1-read.js';
-import { fetchRFJobPipeline, getRFCandidate } from '../rf-client.js';
+import {
+  fetchRFJobPipeline,
+  getRFCandidate,
+  RFRateLimitedError,
+} from '../rf-client.js';
 import { pMapLimit } from './concurrency.js';
+import { indexPipelineDetail } from './pipeline-index.js';
 
 const DEFAULT_FIELDS = ['id', 'name', 'linkedin_profile'];
 const DEFAULT_LIMIT = 100;
@@ -61,6 +66,12 @@ const HYDRATION_CONCURRENCY = 8;
  * Field names served entirely by the thin candidates_v2 D1 row. Anything
  * outside this set forces the expanded-hydration fan-out.
  *
+ * Resolved via the projection layer's alias map so user-typed aliases
+ * (`title` → `current_title`) collapse to the canonical thin column.
+ * `current_title` / `current_organization` map to the snapshot columns
+ * (at-cache-time; never live) — trade-off documented on the
+ * `rf_job_candidates_filter` descriptor.
+ *
  * Keep in sync with `candidates_v2` columns in
  * `sync-worker/migrations/0003_v2_tables.sql`.
  */
@@ -69,53 +80,46 @@ const THIN_FIELDS = new Set([
   'name',
   'linkedin_profile',
   'added_time_ms',
+  'current_title_at_cache_time',
+  'current_company_at_cache_time',
+  'current_title',
+  'current_organization',
 ]);
+
+function canonicalFieldKey(field) {
+  if (typeof field !== 'string' || !field) return field;
+  const r = resolveFieldName(field, [...THIN_FIELDS]);
+  return r?.path ?? field;
+}
 
 function isThinOnly(fields) {
   if (!Array.isArray(fields) || fields.length === 0) return true;
-  return fields.every((f) => THIN_FIELDS.has(f));
+  return fields.every((f) => THIN_FIELDS.has(canonicalFieldKey(f)));
 }
 
 /**
- * RF `/job/pipeline` `detail[]` → `{stageName: candidateId[]}` map.
- *
- * Keeps Disqualified candidates in a separate bucket so the read-time
- * `include_disqualified` flag can opt them in without re-fetching. The
- * "current stage" is the `to` field of the entry with the latest `time`.
- *
- * Returns `{active: {stageName: id[]}, disqualified: id[]}`.
+ * Project a thin candidates_v2 row into a candidate-shaped body so the
+ * shared projection / LinkedIn URL normalisation works the same way it does
+ * for full RF bodies. Aliases the snapshot columns to user-facing names.
  */
-function indexPipelineDetail(detail) {
-  const active = {};
-  const disqualified = [];
-  if (!Array.isArray(detail)) return { active, disqualified };
-  for (const entry of detail) {
-    const id = entry?.candidate?.id;
-    if (id == null) continue;
-    const stages = Array.isArray(entry.stages) ? entry.stages : [];
-    if (stages.length === 0) continue;
-    let latest = stages[0];
-    for (let i = 1; i < stages.length; i++) {
-      if (Date.parse(stages[i].time) > Date.parse(latest.time)) latest = stages[i];
-    }
-    const current = latest?.to;
-    if (!current) continue;
-    if (current === 'Disqualified') {
-      disqualified.push(id);
-    } else {
-      (active[current] ??= []).push(id);
-    }
-  }
-  return { active, disqualified };
+function thinRowToBody(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    linkedin_profile: row.linkedin_profile,
+    added_time_ms: row.added_time_ms,
+    current_title: row.current_title_at_cache_time ?? null,
+    current_organization: row.current_company_at_cache_time ?? null,
+  };
 }
 
 /**
  * Look up `{id, name, client_company_name}` for a numeric job id from the
- * `jobs` cache table. Returns null on miss.
+ * thin `jobs_v2` cache. Returns null on miss.
  */
 async function loadJobMeta(env, jobId) {
   return session(env)
-    .prepare('SELECT id, name, client_company_name FROM jobs WHERE id = ?')
+    .prepare('SELECT id, name, client_company_name FROM jobs_v2 WHERE id = ?')
     .bind(jobId)
     .first();
 }
@@ -188,6 +192,16 @@ export async function handleJobCandidatesFilter({ env, body }) {
   try {
     pipeline = await fetchRFJobPipeline(env, jobMeta.id);
   } catch (err) {
+    if (err instanceof RFRateLimitedError) {
+      return jsonResponse(200, {
+        ok: false,
+        recoverable: false,
+        kind: 'rate_limited',
+        job: jobMeta,
+        retry_after_ms: err.retryAfterMs ?? null,
+        error: err.message,
+      });
+    }
     return jsonResponse(200, {
       ok: false,
       recoverable: true,
@@ -236,12 +250,15 @@ export async function handleJobCandidatesFilter({ env, body }) {
   let hydration_errors = [];
 
   if (useThinPath) {
-    // Thin path: one D1 batch over candidates_v2.
+    // Thin path: one D1 batch over candidates_v2; project rows into
+    // candidate-shape so current_title / current_organization aliases work.
     const ids = sliced.map((x) => x.id);
     const rows = ids.length ? await getCandidatesByIds(env, ids) : [];
-    bodyById = new Map(rows.map((r) => [r.id, r]));
+    bodyById = new Map(rows.map((r) => [r.id, thinRowToBody(r)]));
   } else {
     // Expanded path: parallel /candidate/get fan-out at concurrency 8.
+    // Per-id failures carry the underlying typed error's status when
+    // available (lets observability filter on 429 vs 5xx vs other).
     bodyById = new Map();
     const ids = sliced.map((x) => x.id);
     if (ids.length) {
@@ -254,7 +271,10 @@ export async function handleJobCandidatesFilter({ env, body }) {
         if (r.ok) {
           bodyById.set(id, r.value);
         } else {
-          hydration_errors.push({ id, reason: r.error?.message ?? String(r.error) });
+          const e = r.error;
+          const entry = { id, reason: e?.message ?? String(e) };
+          if (typeof e?.status === 'number') entry.status = e.status;
+          hydration_errors.push(entry);
         }
       }
     }

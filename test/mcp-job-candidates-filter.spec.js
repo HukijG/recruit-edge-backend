@@ -13,6 +13,12 @@ const insertJob = async (id, name = 'Job ' + id, client = 'Acme') => {
               VALUES (?, ?, ?, ?, 1, ?)`)
     .bind(id, JSON.stringify({ id, name }), name, client, new Date().toISOString())
     .run();
+  // Dual-write the thin cache — pipeline tools now read from jobs_v2.
+  await env.RF_MCP_CACHE
+    .prepare(`INSERT OR IGNORE INTO jobs_v2 (id, name, client_company_name, added_time_ms, cached_at_ms)
+              VALUES (?, ?, ?, ?, ?)`)
+    .bind(id, name, client, Date.now(), Date.now())
+    .run();
 };
 
 /**
@@ -117,6 +123,7 @@ beforeEach(async () => {
   await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
   await env.RF_MCP_CACHE.exec('DELETE FROM candidate_jobs');
   await env.RF_MCP_CACHE.exec('DELETE FROM jobs');
+  await env.RF_MCP_CACHE.exec('DELETE FROM jobs_v2');
   await env.RF_MCP_CACHE.exec('DELETE FROM job_pipelines');
 });
 
@@ -372,23 +379,39 @@ describe('/mcp/job-candidates-filter', () => {
           const idMatch = u.match(/[?&]id=(\d+)/);
           const id = idMatch ? Number(idMatch[1]) : 0;
           return fakeJsonResponse({
-            candidate: { id, name: `C${id}`, current_title: 'Director' },
+            candidate: { id, name: `C${id}`, primary_email: `c${id}@x.com` },
           });
         }
         throw new Error(`unexpected fetch: ${u}`);
       });
 
-      const r = await call({ job: 100, fields: ['id', 'name', 'current_title'] });
+      // primary_email forces the expanded path (current_title now stays
+      // thin — see THIN_FIELDS docs for the at-cache-time trade-off).
+      const r = await call({ job: 100, fields: ['id', 'name', 'primary_email'] });
       const body = await r.json();
       expect(pipelineFetched).toBe(1);
       expect(candidateFetched).toBe(30);
       // Hard cap at 8.
       expect(observedMaxConcurrency).toBeLessThanOrEqual(8);
       expect(body.matched).toHaveLength(30);
-      expect(body.matched.every((c) => c.current_title === 'Director')).toBe(true);
+      expect(body.matched.every((c) => c.primary_email?.startsWith('c'))).toBe(true);
     });
 
-    it('per-id /candidate/get failure during hydration returns partial result + hydration_errors', async () => {
+    it('current_title field stays on the thin path (no /candidate/get fan-out — at-cache-time snapshot)', async () => {
+      await insertJob(100);
+      await insertCandidate(1, 'A', { current_title: 'Engineer' });
+      const fetches = [];
+      globalThis.fetch = vi.fn(async (url) => {
+        fetches.push(String(url));
+        return fakeJsonResponse(buildPipelinePayload(STANDARD_SUMMARY, { Sourced: [1] }));
+      });
+      const r = await call({ job: 100, fields: ['id', 'name', 'current_title'] });
+      const body = await r.json();
+      expect(fetches.filter((u) => u.includes('/candidate/get'))).toHaveLength(0);
+      expect(body.matched[0].current_title).toBe('Engineer');
+    });
+
+    it('per-id /candidate/get failure during hydration returns partial result + hydration_errors with status', async () => {
       await insertJob(100);
       await insertCandidate(1, 'A');
       await insertCandidate(2, 'B');
@@ -402,37 +425,30 @@ describe('/mcp/job-candidates-filter', () => {
           const id = idMatch ? Number(idMatch[1]) : 0;
           if (id === 1) {
             return fakeJsonResponse({
-              candidate: { id: 1, name: 'A', current_title: 'PM' },
+              candidate: { id: 1, name: 'A', primary_email: 'a@x.com' },
             });
           }
-          // 502 retry-once fires, second attempt also 502 → upstream throws.
-          // Handler captures as hydration_errors[] entry.
           return fakeErrorResponse({ status: 502, body: 'service error' });
         }
         throw new Error(`unexpected fetch: ${u}`);
       });
 
-      const r = await call({ job: 100, fields: ['id', 'name', 'current_title'] });
+      const r = await call({ job: 100, fields: ['id', 'name', 'primary_email'] });
       const body = await r.json();
       expect(body.hydration_errors).toEqual([
-        { id: 2, reason: expect.stringContaining('502') },
+        { id: 2, reason: expect.stringContaining('502'), status: 502 },
       ]);
-      // Partial success: candidate 1 in matched, candidate 2 dropped.
       expect(body.matched).toHaveLength(1);
       expect(body.matched[0].id).toBe(1);
-      expect(body.matched[0].current_title).toBe('PM');
+      expect(body.matched[0].primary_email).toBe('a@x.com');
     });
 
-    it('fields extends defaults — id, name, linkedin_profile always present', async () => {
+    it('fields extends defaults — id, name, linkedin_profile always present (thin path)', async () => {
+      // `current_title` now stays on the thin path (snapshot column); no
+      // /candidate/get fan-out fires.
       await insertJob(100);
-      await insertCandidate(1, 'A', { linkedin_profile: 'a' });
-      mockRFPipeline(
-        buildPipelinePayload(STANDARD_SUMMARY, { Sourced: [1] }),
-        {
-          onCandidateGet: () =>
-            fakeJsonResponse({ candidate: { id: 1, name: 'A', linkedin_profile: 'a', current_title: 'CTO' } }),
-        },
-      );
+      await insertCandidate(1, 'A', { linkedin_profile: 'a', current_title: 'CTO' });
+      mockRFPipeline(buildPipelinePayload(STANDARD_SUMMARY, { Sourced: [1] }));
       const r = await call({ job: 100, fields: ['current_title'] });
       const body = await r.json();
       const m = body.matched[0];

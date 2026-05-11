@@ -13,6 +13,12 @@ const insertJob = async (id, name = 'Job ' + id, client = 'Acme') => {
               VALUES (?, ?, ?, ?, 1, ?)`)
     .bind(id, JSON.stringify({ id, name }), name, client, new Date().toISOString())
     .run();
+  // Dual-write the thin cache — pipeline tools now read from jobs_v2.
+  await env.RF_MCP_CACHE
+    .prepare(`INSERT OR IGNORE INTO jobs_v2 (id, name, client_company_name, added_time_ms, cached_at_ms)
+              VALUES (?, ?, ?, ?, ?)`)
+    .bind(id, name, client, Date.now(), Date.now())
+    .run();
 };
 
 /**
@@ -122,6 +128,7 @@ beforeEach(async () => {
   await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
   await env.RF_MCP_CACHE.exec('DELETE FROM candidate_jobs');
   await env.RF_MCP_CACHE.exec('DELETE FROM jobs');
+  await env.RF_MCP_CACHE.exec('DELETE FROM jobs_v2');
   await env.RF_MCP_CACHE.exec('DELETE FROM job_pipelines');
 });
 
@@ -275,22 +282,16 @@ describe('/mcp/job-pipeline', () => {
   });
 
   describe('fields param', () => {
-    it('extends defaults — does not replace them (expanded path: per-id /candidate/get)', async () => {
+    it('extends defaults — does not replace them (thin path: current_title from cache)', async () => {
+      // `title` resolves to current_title alias, which now comes from the
+      // v2 snapshot column → thin path, no /candidate/get fan-out.
       await insertJob(984);
       await insertCandidate(7, 'X', {
         linkedin_profile: 'x',
         current_organization: 'Acme',
         current_title: 'CTO',
       });
-      mockRFPipeline(
-        buildPipelinePayload(STANDARD_SUMMARY, { 'CV Sent': [7] }),
-        {
-          onCandidateGet: () =>
-            fakeJsonResponse({
-              candidate: { id: 7, name: 'X', linkedin_profile: 'x', current_title: 'CTO' },
-            }),
-        },
-      );
+      mockRFPipeline(buildPipelinePayload(STANDARD_SUMMARY, { 'CV Sent': [7] }));
       const r = await call({ job: 984, fields: ['title'] });
       const body = await r.json();
       const c = body.stages['CV Sent'][0];
@@ -313,6 +314,11 @@ describe('/mcp/job-pipeline', () => {
             fakeJsonResponse({ candidate: { id: 7, name: 'X' } }),
         },
       );
+      // Use a key the resolver can't map to a thin column so the expanded
+      // path fires. (Bare unknown like 'totally_unknown_xyz' silently
+      // resolves to nothing AND stays on the thin path because it's not in
+      // THIN_FIELDS — but isThinOnly returns false for it, forcing fan-out
+      // even when projection drops it.)
       const r = await call({ job: 984, fields: ['totally_unknown_xyz'] });
       const body = await r.json();
       expect(body._meta).toBeUndefined();
@@ -394,23 +400,48 @@ describe('/mcp/job-pipeline', () => {
           const idMatch = u.match(/[?&]id=(\d+)/);
           const id = idMatch ? Number(idMatch[1]) : 0;
           return fakeJsonResponse({
-            candidate: { id, name: `C${id}`, current_title: 'CTO' },
+            candidate: { id, name: `C${id}`, primary_email: `c${id}@x.com` },
           });
         }
         throw new Error(`unexpected fetch: ${u}`);
       });
 
-      const r = await call({ job: 984, fields: ['id', 'name', 'current_title'] });
+      // primary_email is OUTSIDE the thin set so it forces the expanded
+      // hydration path (current_title now stays thin — see THIN_FIELDS docs).
+      const r = await call({ job: 984, fields: ['id', 'name', 'primary_email'] });
       const body = await r.json();
       expect(pipelineFetched).toBe(1);
       expect(candidateFetched).toBe(30);
       // Hard cap at 8 — defensive against accidental concurrency-bound bumps.
       expect(observedMaxConcurrency).toBeLessThanOrEqual(8);
       expect(body.stages['CV Sent']).toHaveLength(30);
-      expect(body.stages['CV Sent'].every((c) => c.current_title === 'CTO')).toBe(true);
+      expect(body.stages['CV Sent'].every((c) => c.primary_email?.startsWith('c'))).toBe(true);
     });
 
-    it('per-id /candidate/get failure during hydration returns partial result + hydration_errors', async () => {
+    it('current_title field stays on the thin path (no /candidate/get fan-out — at-cache-time snapshot)', async () => {
+      // Spec rev 5 lines 173-175: current_title_at_cache_time is cached on
+      // candidates_v2; requesting `current_title` returns that snapshot
+      // verbatim and skips the live /candidate/get fan-out. Trade-off
+      // documented on the rf_job_pipeline descriptor.
+      await insertJob(984);
+      await insertCandidate(7, 'X', {
+        linkedin_profile: 'x-slug',
+        current_title: 'Engineer',
+      });
+      const fetches = [];
+      globalThis.fetch = vi.fn(async (url) => {
+        fetches.push(String(url));
+        return fakeJsonResponse(buildPipelinePayload(STANDARD_SUMMARY, { 'CV Sent': [7] }));
+      });
+      const r = await call({ job: 984, fields: ['id', 'name', 'current_title'] });
+      const body = await r.json();
+      expect(fetches.filter((u) => u.includes('/candidate/get'))).toHaveLength(0);
+      const c = body.stages['CV Sent'][0];
+      expect(c.id).toBe(7);
+      expect(c.current_title).toBe('Engineer');
+    });
+
+    it('per-id /candidate/get failure during hydration returns partial result + hydration_errors with status', async () => {
       await insertJob(984);
       await insertCandidate(1, 'A');
       await insertCandidate(2, 'B');
@@ -426,27 +457,27 @@ describe('/mcp/job-pipeline', () => {
           const id = idMatch ? Number(idMatch[1]) : 0;
           if (id === 1) {
             return fakeJsonResponse({
-              candidate: { id: 1, name: 'A', current_title: 'CTO' },
+              candidate: { id: 1, name: 'A', primary_email: 'a@x.com' },
             });
           }
-          // 502 retry-once will fire, then we return the same 502 on attempt 2
-          // → upstream throws "RF API error: 502 - boom". The handler captures
-          // it as a hydration_errors[] entry instead of throwing.
+          // 502 retry-once fires, then second attempt also 502 → upstream
+          // throws RFTransientError. Handler captures as hydration_errors[]
+          // entry instead of bubbling.
           return fakeErrorResponse({ status: 502, body: 'boom' });
         }
         throw new Error(`unexpected fetch: ${u}`);
       });
 
-      const r = await call({ job: 984, fields: ['id', 'name', 'current_title'] });
+      // primary_email forces fan-out (current_title would stay thin).
+      const r = await call({ job: 984, fields: ['id', 'name', 'primary_email'] });
       const body = await r.json();
       expect(body.hydration_errors).toEqual([
-        { id: 2, reason: expect.stringContaining('502') },
+        { id: 2, reason: expect.stringContaining('502'), status: 502 },
       ]);
-      // Partial success: candidate 1 still surfaces in CV Sent, candidate 2 is
-      // dropped (not present in stages array, but its id is in hydration_errors).
+      // Partial success: candidate 1 surfaces in CV Sent, candidate 2 dropped.
       expect(body.stages['CV Sent']).toHaveLength(1);
       expect(body.stages['CV Sent'][0].id).toBe(1);
-      expect(body.stages['CV Sent'][0].current_title).toBe('CTO');
+      expect(body.stages['CV Sent'][0].primary_email).toBe('a@x.com');
     });
 
     it('RF /job/pipeline failure → recoverable pipeline_unavailable envelope', async () => {
