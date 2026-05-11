@@ -18,14 +18,13 @@ import { jsonResponse } from './router.js';
 import { resolveCandidate, disambiguationPayload } from './resolvers.js';
 import { resolveTimeWindow } from './call-notes-time.js';
 import { CALL_NOTES_GUIDANCE } from './call-notes-guidance.js';
-import { listDialpadCalls, getDialpadCall, DialpadHttpError } from '../dialpad-client.js';
+import { getDialpadCall, DialpadHttpError } from '../dialpad-client.js';
 import { extractRFIdFromDialpadContact } from '../rf-client.js';
-import { getCandidateById } from './d1-read.js';
+import { getCandidateById, getCallsForCandidate } from './d1-read.js';
 import { fetchCallTranscript } from '../cold-call.js';
 import { addNoteForCandidate, handleCandidateAddNote } from './candidate-add-note.js';
 
 export const MIN_TOTAL_DURATION_MS = 120_000;
-export const MAX_LIST_PAGES = 20;
 
 /**
  * Pure function: take Dialpad's transcript.lines[] array and render only the
@@ -56,17 +55,16 @@ function isoFromMs(ms) {
  * candidate inside a time window, filtered to ≥ 2-minute calls.
  *
  * Order of operations (identity guard first, then input validation, then
- * candidate resolution, then Dialpad call):
+ * candidate resolution, then D1 SELECT):
  *
  *   1. `consultant.dialpadId` missing → ok:false, kind:'no_dialpad_id'.
  *   2. `body.candidate` missing → 400.
  *   3. `resolveCandidate` ambiguous → needs_disambiguation envelope.
  *      `resolveCandidate` not_found → ok:false, kind:'no_candidate'.
- *   4. Paginate /api/v2/call until cursor is null OR MAX_LIST_PAGES.
- *   5. Filter by RF candidate id extracted from `contact.id` AND
- *      `total_duration >= MIN_TOTAL_DURATION_MS`.
- *   6. Sort DESC by `date_started`, project to {call_id, started_at,
- *      duration_minutes, direction}.
+ *   4. SELECT from local `calls` table via `getCallsForCandidate` — per-record
+ *      auth enforced by `target_dialpad_id = consultant.dialpadId` in the WHERE
+ *      clause; duration filter and time window applied in-query. ~5-10ms.
+ *   5. Project rows to {call_id, started_at, duration_minutes, direction}.
  *
  * `window` is OMITTED on success when `tw.source === 'iso'` (Claude already
  * has the bounds — no point echoing them). On `no_long_calls` the window is
@@ -99,71 +97,28 @@ async function handleListCalls({ env, body, consultant }) {
 
   const tw = resolveTimeWindow(body);
 
-  // Paginate Dialpad calls. Bail at MAX_LIST_PAGES with a warning so a too-wide
-  // window doesn't keep us in here forever — Claude can narrow and retry.
-  const items = [];
-  let cursor = null;
-  let pages = 0;
-  const warnings = [...tw.warnings];
-  try {
-    while (true) {
-      const page = await listDialpadCalls({
-        targetId: consultant.dialpadId,
-        targetType: 'user',
-        startedAfterMs: tw.startedAfterMs,
-        startedBeforeMs: tw.startedBeforeMs,
-        cursor,
-      }, env);
-      pages += 1;
-      items.push(...page.items);
-      cursor = page.cursor || null;
-      if (!cursor) break;
-      if (pages >= MAX_LIST_PAGES) {
-        warnings.push(`hit pagination cap (${MAX_LIST_PAGES} pages); narrow the time range`);
-        break;
-      }
-    }
-  } catch (err) {
-    if (err instanceof DialpadHttpError) {
-      return jsonResponse(502, { error: `Dialpad list-calls failed: ${err.status}` });
-    }
-    throw err;
-  }
-
-  // Filter: matching candidate (RF id parsed from shared-pool contact id) and
-  // total_duration ≥ 2 min. Live Dialpad payloads emit fractional ms for
-  // total_duration (e.g. 68286.025) — Number coercion handles it cleanly.
-  const candIdStr = String(candidate.id);
-  const surviving = items.filter((c) => {
-    const rfId = extractRFIdFromDialpadContact(c?.contact?.id);
-    if (rfId == null || String(rfId) !== candIdStr) return false;
-    const td = Number(c?.total_duration ?? 0);
-    return Number.isFinite(td) && td >= MIN_TOTAL_DURATION_MS;
+  const rows = await getCallsForCandidate(env, consultant.dialpadId, candidate.id, {
+    minDurationMs: MIN_TOTAL_DURATION_MS,
+    startedAfterMs: tw.startedAfterMs,
+    startedBeforeMs: tw.startedBeforeMs,
+    limit: 20,
   });
 
-  // Sort newest-first by date_started (also string-typed in live payloads).
-  surviving.sort((a, b) => Number(b.date_started) - Number(a.date_started));
-
-  const window = {
-    started_after: isoFromMs(tw.startedAfterMs),
-    started_before: isoFromMs(tw.startedBeforeMs),
-  };
-
-  if (surviving.length === 0) {
+  if (rows.length === 0) {
     const out = {
       ok: false,
       kind: 'no_long_calls',
       error: `No calls of 2+ minutes found for ${candidate.name} in this window. Try widening the time range.`,
-      window,
+      window: { started_after: isoFromMs(tw.startedAfterMs), started_before: isoFromMs(tw.startedBeforeMs) },
     };
-    if (warnings.length) out._meta = { warnings };
+    if (tw.warnings.length) out._meta = { warnings: tw.warnings };
     return jsonResponse(200, out);
   }
 
-  const calls = surviving.map((c) => ({
+  const calls = rows.map((c) => ({
     call_id: String(c.call_id),
-    started_at: isoFromMs(c.date_started),
-    duration_minutes: Math.round(Number(c.total_duration) / 60_000),
+    started_at: isoFromMs(c.date_started_ms),
+    duration_minutes: Math.round(c.duration_ms / 60_000),
     direction: c.direction,
   }));
 
@@ -176,9 +131,9 @@ async function handleListCalls({ env, body, consultant }) {
   // no point echoing them back. Included otherwise so Claude can surface
   // "searched X → Y" to the user.
   if (tw.source !== 'iso') {
-    out.window = window;
+    out.window = { started_after: isoFromMs(tw.startedAfterMs), started_before: isoFromMs(tw.startedBeforeMs) };
   }
-  if (warnings.length) out._meta = { warnings };
+  if (tw.warnings.length) out._meta = { warnings: tw.warnings };
   console.log({
     message: `[mcp] candidate-call-notes step=list_calls candidate_id=${candidate.id} calls=${calls.length}`,
     source: 'mcp-candidate-call-notes',

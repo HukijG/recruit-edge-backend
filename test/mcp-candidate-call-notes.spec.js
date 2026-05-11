@@ -85,66 +85,32 @@ describe('formatTranscript', () => {
   });
 });
 
+// Helper: insert a call row into the calls table.
+// target_dialpad_id defaults to Joel's Dialpad ID (per seed).
+// date_started_ms defaults to "2 days ago" so calls land within any reasonable window query.
+async function seedCall(env, { call_id, rf_candidate_id = 50976, date_started_ms, duration_ms, direction = 'outbound', target_dialpad_id = '8000000000000001' }) {
+  const ts = date_started_ms ?? (Date.now() - 2 * 24 * 60 * 60 * 1000); // 2 days ago
+  await env.RF_MCP_CACHE.prepare(
+    'INSERT INTO calls (call_id, target_dialpad_id, rf_candidate_id, date_started_ms, duration_ms, direction, cached_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  ).bind(call_id, target_dialpad_id, rf_candidate_id, ts, duration_ms, direction, Date.now()).run();
+  return ts;
+}
+
 describe('/mcp/candidate-call-notes step=list_calls', () => {
-  it('happy path: time_query, two paginated pages, mix of <2min and matching/non-matching contacts', async () => {
-    const page1 = {
-      items: [
-        // Long matching call → keep
-        {
-          call_id: 'A',
-          contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF50976', name: 'Priya Sharma', phone: '+1', type: 'shared' },
-          target: { id: '8000000000000001', type: 'user' },
-          date_started: '1747000000000',
-          direction: 'outbound',
-          duration: 0,
-          total_duration: 1440000.0,
-        },
-        // Short matching call → drop (under 120000 ms)
-        {
-          call_id: 'B',
-          contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF50976', name: 'Priya Sharma', phone: '+1', type: 'shared' },
-          target: { id: '8000000000000001', type: 'user' },
-          date_started: '1747100000000',
-          direction: 'outbound',
-          duration: 0,
-          total_duration: 60_000,
-        },
-        // Long non-matching call → drop
-        {
-          call_id: 'C',
-          contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF99999', name: 'Other', phone: '+1', type: 'shared' },
-          target: { id: '8000000000000001', type: 'user' },
-          date_started: '1747200000000',
-          direction: 'outbound',
-          duration: 0,
-          total_duration: 600_000,
-        },
-      ],
-      cursor: 'PAGE2',
-    };
-    const page2 = {
-      items: [
-        // Long matching call on page 2 → keep
-        {
-          call_id: 'D',
-          contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF50976', name: 'Priya Sharma', phone: '+1', type: 'shared' },
-          target: { id: '8000000000000001', type: 'user' },
-          date_started: '1746900000000',
-          direction: 'inbound',
-          duration: 0,
-          total_duration: 480_000,
-        },
-      ],
-      cursor: null,
-    };
-    let n = 0;
-    globalThis.fetch = vi.fn().mockImplementation(() => {
-      n += 1;
-      return Promise.resolve(new Response(
-        JSON.stringify(n === 1 ? page1 : page2),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
-      ));
-    });
+  it('happy path: time_query, multiple D1 rows, mix of <2min and matching/non-matching', async () => {
+    const now = Date.now();
+    // Call A: long matching call → keep (24 min) — newer
+    const tsA = now - 1 * 24 * 60 * 60 * 1000; // 1 day ago
+    await seedCall(env, { call_id: 'A', date_started_ms: tsA, duration_ms: 1440000, direction: 'outbound' });
+    // Call B: short matching call → dropped by WHERE duration_ms >= 120000
+    await seedCall(env, { call_id: 'B', date_started_ms: tsA - 1000, duration_ms: 60000, direction: 'outbound' });
+    // Call C: long but belongs to OTHER candidate (rf_candidate_id = 99999) → not returned by D1 per-record auth
+    await seedCall(env, { call_id: 'C', rf_candidate_id: 99999, date_started_ms: tsA - 2000, duration_ms: 600000, direction: 'outbound' });
+    // Call D: long matching call → keep (8 min), older
+    const tsD = now - 2 * 24 * 60 * 60 * 1000; // 2 days ago
+    await seedCall(env, { call_id: 'D', date_started_ms: tsD, duration_ms: 480000, direction: 'inbound' });
+
+    globalThis.fetch = vi.fn(); // must NOT be called for step=list_calls
 
     const r = await call({
       consultantFirstName: 'Joel',
@@ -159,43 +125,40 @@ describe('/mcp/candidate-call-notes step=list_calls', () => {
     expect(b.candidate).toEqual({ id: 50976, name: 'Priya Sharma' });
     expect(b.window?.started_after).toMatch(/T/);
     expect(b.window?.started_before).toMatch(/T/);
+    // D1 returns newest-first (ORDER BY date_started_ms DESC). A > D.
+    // isoFromMs strips sub-second precision and uses +00:00 suffix.
+    function isoFromMs(ms) { return new Date(Number(ms)).toISOString().replace(/\.\d{3}Z$/, '+00:00'); }
     expect(b.calls).toEqual([
-      { call_id: 'A', started_at: new Date(1747000000000).toISOString().replace('.000Z', '+00:00'), duration_minutes: 24, direction: 'outbound' },
-      { call_id: 'D', started_at: new Date(1746900000000).toISOString().replace('.000Z', '+00:00'), duration_minutes: 8, direction: 'inbound' },
+      { call_id: 'A', started_at: isoFromMs(tsA), duration_minutes: 24, direction: 'outbound' },
+      { call_id: 'D', started_at: isoFromMs(tsD), duration_minutes: 8, direction: 'inbound' },
     ]);
-    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
-    const page2Url = new URL(String(globalThis.fetch.mock.calls[1][0]));
-    expect(page2Url.searchParams.get('cursor')).toBe('PAGE2');
+    // Step 1 must NOT hit Dialpad live.
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
   it('ISO inputs → window OMITTED on success', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(new Response(
-      JSON.stringify({
-        items: [{
-          call_id: 'A', contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF50976' },
-          target: { id: '8000000000000001', type: 'user' }, date_started: '1747000000000',
-          direction: 'outbound', duration: 0, total_duration: 1_440_000,
-        }],
-        cursor: null,
-      }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } },
-    ));
+    // Use ISO bounds that bracket "now" — seed the call inside that window.
+    const now = Date.now();
+    const tsA = now - 1 * 24 * 60 * 60 * 1000; // 1 day ago
+    await seedCall(env, { call_id: 'A', date_started_ms: tsA, duration_ms: 1440000, direction: 'outbound' });
+    const startedAfter = new Date(now - 3 * 24 * 60 * 60 * 1000).toISOString();
+    const startedBefore = new Date(now + 60_000).toISOString(); // just ahead of now
+    globalThis.fetch = vi.fn();
     const r = await call({
       consultantFirstName: 'Joel',
       step: 'list_calls', candidate: 50976,
-      started_after: '2026-05-03T00:00:00Z',
-      started_before: '2026-05-10T00:00:00Z',
+      started_after: startedAfter,
+      started_before: startedBefore,
     });
     const b = await r.json();
     expect(b.ok).toBe(true);
     expect(b.window).toBeUndefined();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
-  it('zero long calls → kind=no_long_calls with window included', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(new Response(
-      JSON.stringify({ items: [], cursor: null }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } },
-    ));
+  it('zero long calls → kind=no_long_calls with window included (no Dialpad fetch)', async () => {
+    // Calls table is empty for this candidate — no seedCall needed.
+    globalThis.fetch = vi.fn();
     const r = await call({
       consultantFirstName: 'Joel',
       step: 'list_calls', candidate: 50976, time_query: 'today',
@@ -205,9 +168,25 @@ describe('/mcp/candidate-call-notes step=list_calls', () => {
     expect(b.kind).toBe('no_long_calls');
     expect(b.window?.started_after).toBeTruthy();
     expect(b.window?.started_before).toBeTruthy();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
-  it('consultant with no dialpadId → kind=no_dialpad_id', async () => {
+  it('per-record auth: rows for OTHER consultant (different target_dialpad_id) must NOT leak', async () => {
+    // Seed a call owned by a different Dialpad user.
+    await seedCall(env, { call_id: 'OTHER', date_started_ms: 1747000000000, duration_ms: 1440000, direction: 'outbound', target_dialpad_id: '9999999999999999' });
+    globalThis.fetch = vi.fn();
+    const r = await call({
+      consultantFirstName: 'Joel',
+      step: 'list_calls', candidate: 50976, time_query: 'last 7 days',
+    });
+    const b = await r.json();
+    // Joel's query must return no rows since the row belongs to another Dialpad user.
+    expect(b.ok).toBe(false);
+    expect(b.kind).toBe('no_long_calls');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('consultant with no dialpadId → kind=no_dialpad_id (no D1 query)', async () => {
     await env.USERS_DB.prepare(
       "UPDATE users SET dialpad_id = '' WHERE first_name = 'Joel'",
     ).run();
@@ -262,51 +241,26 @@ describe('/mcp/candidate-call-notes step=list_calls', () => {
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
-  it('Dialpad list returns 500 → 502', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
-      new Response('boom', { status: 500 }),
-    );
-    const r = await call({
-      consultantFirstName: 'Joel', step: 'list_calls', candidate: 50976, time_query: 'today',
-    });
-    expect(r.status).toBe(502);
-  });
-
-  it('boundary: total_duration of exactly 119_999.5 dropped; 120_000.025 kept (fractional ms per live payloads)', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(new Response(
-      JSON.stringify({
-        items: [
-          { call_id: 'X', contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF50976' },
-            target: { id: '8000000000000001', type: 'user' }, date_started: '1747000000000',
-            direction: 'outbound', duration: 0, total_duration: 119_999.5 },
-          { call_id: 'Y', contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF50976' },
-            target: { id: '8000000000000001', type: 'user' }, date_started: '1747100000000',
-            direction: 'outbound', duration: 0, total_duration: 120_000.025 },
-        ],
-        cursor: null,
-      }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } },
-    ));
+  it('boundary: duration_ms of exactly 119_999 dropped; 120_000 kept (D1 integer filter)', async () => {
+    const now = Date.now();
+    const ts = now - 60 * 60 * 1000; // 1 hour ago — within today's window
+    await seedCall(env, { call_id: 'X', date_started_ms: ts - 1000, duration_ms: 119999, direction: 'outbound' });
+    await seedCall(env, { call_id: 'Y', date_started_ms: ts, duration_ms: 120000, direction: 'outbound' });
+    globalThis.fetch = vi.fn();
     const r = await call({
       consultantFirstName: 'Joel', step: 'list_calls', candidate: 50976, time_query: 'today',
     });
     const b = await r.json();
     expect(b.ok).toBe(true);
     expect(b.calls.map((c) => c.call_id)).toEqual(['Y']);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
   it('ISO + time_query both set → window OMITTED, warning includes drop', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(new Response(
-      JSON.stringify({
-        items: [{
-          call_id: 'A', contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF50976' },
-          target: { id: '8000000000000001', type: 'user' }, date_started: '1747000000000',
-          direction: 'outbound', duration: 0, total_duration: 1_440_000,
-        }],
-        cursor: null,
-      }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } },
-    ));
+    const now = Date.now();
+    const ts = now - 1 * 24 * 60 * 60 * 1000; // 1 day ago
+    await seedCall(env, { call_id: 'A', date_started_ms: ts, duration_ms: 1440000, direction: 'outbound' });
+    globalThis.fetch = vi.fn();
     const r = await call({
       consultantFirstName: 'Joel', step: 'list_calls', candidate: 50976,
       started_after: '2026-05-03T00:00:00Z',
@@ -318,13 +272,12 @@ describe('/mcp/candidate-call-notes step=list_calls', () => {
     expect(b._meta?.warnings ?? []).toEqual(expect.arrayContaining([
       expect.stringMatching(/dropped time_query/i),
     ]));
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
-  it('garbage time_query → 7d default window + warning propagated to _meta', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(new Response(
-      JSON.stringify({ items: [], cursor: null }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } },
-    ));
+  it('garbage time_query → 7d default window + warning propagated to _meta (no Dialpad fetch)', async () => {
+    // No calls seeded — D1 returns empty for the default 7d window.
+    globalThis.fetch = vi.fn();
     const r = await call({
       consultantFirstName: 'Joel', step: 'list_calls', candidate: 50976,
       time_query: 'around 3pm last fortnight',
@@ -335,50 +288,20 @@ describe('/mcp/candidate-call-notes step=list_calls', () => {
     ]));
     expect(b.ok).toBe(false);
     expect(b.kind).toBe('no_long_calls');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
-  it('non-RF contact (numeric local id, no uid_RF substring) is dropped', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(new Response(
-      JSON.stringify({
-        items: [
-          { call_id: 'L', contact: { id: '5000000000000002', name: '(415) 555-0184', type: 'local' },
-            target: { id: '8000000000000001', type: 'user' }, date_started: '1747000000000',
-            direction: 'outbound', duration: 0, total_duration: 600_000 },
-        ],
-        cursor: null,
-      }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } },
-    ));
+  it('time-window filter: call outside window is excluded', async () => {
+    // Seed a call far in the past (year 2020) — should be excluded by a "last 7 days" window.
+    await seedCall(env, { call_id: 'OLD', date_started_ms: 1580000000000, duration_ms: 600000, direction: 'outbound' });
+    globalThis.fetch = vi.fn();
     const r = await call({
-      consultantFirstName: 'Joel', step: 'list_calls', candidate: 50976, time_query: 'today',
+      consultantFirstName: 'Joel', step: 'list_calls', candidate: 50976, time_query: 'last 7 days',
     });
     const b = await r.json();
     expect(b.ok).toBe(false);
     expect(b.kind).toBe('no_long_calls');
-  });
-
-  it('pagination cap (MAX_LIST_PAGES = 20) → first 20 pages returned, warning emitted', async () => {
-    globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(new Response(
-      JSON.stringify({
-        items: [{
-          call_id: 'A', contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF50976' },
-          target: { id: '8000000000000001', type: 'user' }, date_started: '1747000000000',
-          direction: 'outbound', duration: 0, total_duration: 600_000,
-        }],
-        cursor: 'NEXT',
-      }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } },
-    )));
-    const r = await call({
-      consultantFirstName: 'Joel', step: 'list_calls', candidate: 50976, time_query: 'today',
-    });
-    const b = await r.json();
-    expect(b.ok).toBe(true);
-    expect(b.calls.length).toBe(20);
-    expect(globalThis.fetch).toHaveBeenCalledTimes(20);
-    expect(b._meta?.warnings ?? []).toEqual(expect.arrayContaining([
-      expect.stringMatching(/pagination cap/i),
-    ]));
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 });
 
