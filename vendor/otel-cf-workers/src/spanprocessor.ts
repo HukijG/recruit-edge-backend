@@ -73,8 +73,17 @@ class TraceState {
 
 	private async exportSpans(spans: ReadableSpan[]): Promise<void> {
 		await scheduler.wait(1)
+		// Apply the user-supplied postProcessor (e.g. resource enrichment) before
+		// forwarding spans to the exporter. Upstream v1.0.0-rc.52 declares this
+		// hook in the TraceConfig types + README + parseConfig but never invokes
+		// it anywhere in the published build; patched here so `config.postProcessor`
+		// actually runs as documented. Falls back to passing spans through when no
+		// config is on the active context (defensive — the standard call chain
+		// always has one set via setConfig in createHandlerProxy).
+		const config = getActiveConfig()
+		const processed = config?.postProcessor ? config.postProcessor(spans) : spans
 		const promise = new Promise<void>((resolve, reject) => {
-			this.exporter.export(spans, (result) => {
+			this.exporter.export(processed, (result) => {
 				if (result.code === ExportResultCode.SUCCESS) {
 					resolve()
 				} else {

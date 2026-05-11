@@ -223,8 +223,10 @@ var TraceState = class {
   }
   async exportSpans(spans) {
     await scheduler.wait(1);
+    const config = getActiveConfig();
+    const processed = config?.postProcessor ? config.postProcessor(spans) : spans;
     const promise = new Promise((resolve, reject) => {
-      this.exporter.export(spans, (result) => {
+      this.exporter.export(processed, (result) => {
         if (result.code === ExportResultCode2.SUCCESS) {
           resolve();
         } else {
