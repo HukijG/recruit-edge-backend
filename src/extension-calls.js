@@ -17,6 +17,7 @@
 
 import { getUserByDialpadId } from './users.js';
 import { incrementDailyCallCount } from './cache.js';
+import { forwardHangupToSyncWorker } from './webhook/dialpad-hangup-forwarder.js';
 
 const ACTIVE_TRIGGER_STATES = new Set(['calling']);
 const TERMINAL_STATES = new Set(['hangup']);
@@ -61,6 +62,11 @@ export async function processExtensionCallEvent(payload, env) {
   }
 
   if (TERMINAL_STATES.has(eventState)) {
+    // Fire-and-forget forward to sync-worker for the calls cache.
+    // Failures are logged in the forwarder; cron backfill (tailSyncCallsThin)
+    // catches dropped messages within 15 min.
+    void forwardHangupToSyncWorker(payload, env);
+
     // Bump the daily call counter for every monitored outbound hangup,
     // regardless of whether the DO has a matching call_id. We want this to
     // catch calls placed via the Dialpad app (no calling event for the DO,

@@ -10,10 +10,11 @@
  */
 
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
-import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { SignJWT } from 'jose';
 import { applyUsersMigration } from './helpers/users-migrate.js';
 import { _resetCacheForTests } from '../src/users.js';
+import { processExtensionCallEvent } from '../src/extension-calls.js';
 import worker from '../src';
 
 const originalFetch = globalThis.fetch;
@@ -576,5 +577,105 @@ describe('/dialpad-hangup', () => {
 
     expect(response.status).toBe(502);
     expect(await readDO()).toBe('99999');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// processExtensionCallEvent — hangup forwards to sync-worker
+// ---------------------------------------------------------------------------
+
+describe('processExtensionCallEvent — hangup forwards to sync-worker', () => {
+  // Use the real cloudflare:test env (has EXT_CALL_STATE DO, SYNC_STATE KV,
+  // USERS_DB D1) and augment it with a mocked SYNC_WORKER binding so we can
+  // assert on the POST without a real service binding.
+  let syncFetch;
+  let testEnv;
+
+  const JOEL_DIALPAD_ID_UNIT = '8000000000000001';
+
+  beforeEach(async () => {
+    await applyUsersMigration(env);
+    _resetCacheForTests();
+    await clearDO();
+    syncFetch = vi.fn().mockResolvedValue(new Response('{"ok":true}', { status: 200 }));
+    testEnv = {
+      ...env,
+      SYNC_WORKER: { fetch: syncFetch },
+      INTERNAL_SECRET: 'test-internal-secret',
+    };
+  });
+
+  afterEach(async () => {
+    await clearDO();
+    vi.restoreAllMocks();
+  });
+
+  it('fires SYNC_WORKER.fetch on outbound hangup with the full Dialpad payload + X-Internal-Token header', async () => {
+    // Seed DO so the handler can match call_id for the DO clear.
+    await seedDO('c-abc-123');
+    const payload = {
+      direction: 'outbound',
+      state: 'hangup',
+      call_id: 'c-abc-123',
+      target: { id: JOEL_DIALPAD_ID_UNIT },
+      contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF42' },
+      date_started: 1717248000000,
+      total_duration: 180000,
+    };
+    await processExtensionCallEvent(payload, testEnv);
+    expect(syncFetch).toHaveBeenCalledOnce();
+    const [url, opts] = syncFetch.mock.calls[0];
+    expect(String(url)).toContain('/internal/calls/upsert');
+    expect(opts.method).toBe('POST');
+    expect(opts.headers['X-Internal-Token']).toBe('test-internal-secret');
+    expect(opts.headers['Content-Type']).toBe('application/json');
+    const body = JSON.parse(opts.body);
+    expect(body).toMatchObject({
+      call_id: 'c-abc-123',
+      target: { id: JOEL_DIALPAD_ID_UNIT },
+      contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF42' },
+      date_started: 1717248000000,
+      total_duration: 180000,
+    });
+  });
+
+  it('does NOT fire on calling state (only hangup)', async () => {
+    await processExtensionCallEvent({
+      direction: 'outbound',
+      state: 'calling',
+      call_id: 'c-1',
+      target: { id: JOEL_DIALPAD_ID_UNIT },
+    }, testEnv);
+    expect(syncFetch).not.toHaveBeenCalled();
+  });
+
+  it('does NOT block the handler when SYNC_WORKER.fetch fails', async () => {
+    syncFetch.mockRejectedValueOnce(new Error('sync down'));
+    // Seed the DO so the hangup can clear and return processed:true.
+    await seedDO('c-1');
+    const result = await processExtensionCallEvent({
+      direction: 'outbound',
+      state: 'hangup',
+      call_id: 'c-1',
+      target: { id: JOEL_DIALPAD_ID_UNIT },
+      contact: { id: 'shared_contact_pool_Company:X_uid_RF1' },
+      date_started: 1,
+      total_duration: 1,
+    }, testEnv);
+    // processed:true — hangup DO clear still succeeded despite forward failure
+    expect(result.processed).toBe(true);
+  });
+
+  it('does NOT fire on inbound hangup (only outbound)', async () => {
+    await processExtensionCallEvent({
+      direction: 'inbound',
+      state: 'hangup',
+      call_id: 'c-1',
+      target: { id: JOEL_DIALPAD_ID_UNIT },
+      contact: { id: 'shared_contact_pool_Company:X_uid_RF1' },
+      date_started: 1,
+      total_duration: 1,
+    }, testEnv);
+    expect(syncFetch).not.toHaveBeenCalled();
   });
 });

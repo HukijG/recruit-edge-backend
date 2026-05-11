@@ -22,10 +22,18 @@ export default defineWorkersConfig({
 						APOLLO_WEBHOOK_SECRET: 'test-apollo-webhook-secret',
 						ACCESS_TEAM_DOMAIN: 'https://test.cloudflareaccess.com',
 						ACCESS_AUD_MCP: 'a'.repeat(64),  // 64-char hex shape matches production Access AUD format
+						INTERNAL_SECRET: 'test-internal-secret',
 					},
 					d1Databases: {
 						RF_MCP_CACHE: 'rf-mcp-cache-test',
 						USERS_DB: 'rf-users-test',
+					},
+					// Mock the SYNC_WORKER service binding so miniflare starts cleanly.
+					// Tests that need to assert on forwarded requests inject their own
+					// vi.fn() via a spread of env — this stub just prevents the runtime
+					// startup failure from an unresolved service name.
+					serviceBindings: {
+						SYNC_WORKER: async () => new Response('{"ok":true}', { status: 200 }),
 					},
 				},
 			},

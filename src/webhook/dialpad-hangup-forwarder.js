@@ -1,0 +1,43 @@
+/**
+ * Forward a Dialpad hangup webhook payload to sync-worker for calls-cache
+ * insertion. Failures are logged but never thrown — drop-and-rely-on-cron-
+ * backfill is the chosen design (per spec rev 5 "drop after one attempt,
+ * rely on cron").
+ *
+ * Sync-worker's /internal/calls/upsert is gated by X-Internal-Token (per
+ * spec rev 5 "Auth: Two-layer" — workers_dev=false + shared secret).
+ */
+export async function forwardHangupToSyncWorker(payload, env) {
+  if (!env.SYNC_WORKER?.fetch) {
+    console.warn({ message: '[hangup-forwarder] SYNC_WORKER binding missing — skipping', source: 'hangup-forwarder' });
+    return;
+  }
+  if (!env.INTERNAL_SECRET) {
+    console.warn({ message: '[hangup-forwarder] INTERNAL_SECRET not set — skipping forward', source: 'hangup-forwarder', callId: payload?.call_id });
+    return;
+  }
+  try {
+    const res = await env.SYNC_WORKER.fetch('http://internal/internal/calls/upsert', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Internal-Token': env.INTERNAL_SECRET,
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      console.warn({
+        message: `[hangup-forwarder] sync-worker rejected upsert status=${res.status} body=${body}`,
+        source: 'hangup-forwarder',
+        callId: payload?.call_id,
+      });
+    }
+  } catch (err) {
+    console.warn({
+      message: `[hangup-forwarder] forward failed: ${err.message}`,
+      source: 'hangup-forwarder',
+      callId: payload?.call_id,
+    });
+  }
+}
