@@ -1,6 +1,6 @@
 # MCP Middleware
 
-Server side of the MCP layer. A thin router (`src/mcp/router.js`) under `/mcp/*` resolves the consultant from a verified Access JWT (`consultantEmail` body field, forwarded over the service binding from `rf-mcp-remote` — see `docs/security.md`), then dispatches to per-tool middleware handlers in `src/mcp/`. Read-only against a shared D1 cache (`RF_MCP_CACHE`); pipeline data sourced from the `job_pipelines` table (rebuilt every 15 min by the sync worker — though the cron is currently OFF; see `docs/architecture.md` § Sync worker).
+Server side of the MCP layer. A thin router (`src/mcp/router.js`) under `/mcp/*` resolves the consultant from a verified Access JWT (`consultantEmail` body field, forwarded over the service binding from `rf-mcp-remote` — see `docs/security.md`), then dispatches to per-tool middleware handlers in `src/mcp/`. Read-only against a shared D1 cache (`RF_MCP_CACHE`). Pipeline data is **not cached** — every `job-pipeline` / `job-candidates-filter` read goes live to RF (see § Pipeline reads below). Cron is currently OFF; see `docs/architecture.md` § Sync worker.
 
 The `rf-mcp-remote` MCP worker (`mcp-worker/`) is the public Streamable-HTTP front; it validates the Access JWT, then service-binds into this `/mcp/*` surface. Architecture overview in `docs/architecture.md`. Auth shape in `docs/security.md`.
 
@@ -112,7 +112,7 @@ If you cannot tick all seven, the design is not ready to ship.
 | Worker | Role |
 |---|---|
 | **Main worker** (`rf-dialpad-sync-dev`) | Reader. Serves `/mcp/*`. Reads D1. **Never writes.** |
-| **Sync worker** (`sync-worker/`, isolated subtree, own `wrangler.jsonc`, deployed independently via GitHub build watch path) | Sole writer. Runs the cron tail-sync (every 15 min) and the admin-triggered full rebuild Workflow. Also runs `PipelineRebuildWorkflow` every 15 min. **Sole writer to D1.** |
+| **Sync worker** (`sync-worker/`, isolated subtree, own `wrangler.jsonc`, deployed independently via GitHub build watch path) | Sole writer. Runs the cron tail-sync (every 15 min) and the admin-triggered full rebuild Workflow. **Sole writer to D1.** |
 
 > **Discipline rule: no main-worker code path may write D1.** That invariant keeps the sync surface auditable and prevents schema drift between writers.
 
@@ -120,11 +120,11 @@ If you cannot tick all seven, the design is not ready to ship.
 
 **D1 binding** `RF_MCP_CACHE` is shared between both workers (sync writes, main reads). Schema across migrations in `sync-worker/migrations/`:
 - `candidates`, `candidate_jobs`, `jobs`, `sync_state` — `0001_init.sql`
-- `job_pipelines` — `0002_job_pipelines.sql`
+- `candidates_v2`, `calls` — `0003_v2_tables.sql` (thin schema; additive-only writes)
 
-Tail sync re-fetches `/job/list` every tick so new jobs and open-status flips surface within 15 min without waiting for a manual rebuild. Full rebuild bumps both `last_full_rebuild_at` and `last_tail_sync_at` so the main worker's snapshot version pin reloads.
+`candidates_v2` stores thin rows `{id, name, linkedin_profile, added_time_ms, current_title_at_cache_time, current_company_at_cache_time}` — the source for the in-memory snapshot and D1 batch hydration. The old `mcp:pipeline:{jobId}` and `mcp:job-candidates:{jobId}` KV keys are gone; the `job_pipelines` D1 table is gone — pipeline reads go live to RF.
 
-Pipeline data lives in the `job_pipelines` D1 table, populated by `PipelineRebuildWorkflow` every 15 min from RF `/job/pipeline`. The old `mcp:pipeline:{jobId}` and `mcp:job-candidates:{jobId}` KV keys are gone.
+Tail sync inserts newly-added candidates into `candidates_v2` and `calls` via INSERT-OR-IGNORE (additive only; no UPDATEs). Version key `last_candidates_added_cursor` in `sync_state` gates snapshot refreshes (falls back to `last_tail_sync_at` during the dual-write transition window).
 
 ## Auth
 
@@ -184,17 +184,18 @@ When a `*_id` field is present, the corresponding fuzzy-name field (`candidate`,
 
 `stage` is fuzzy on every endpoint that accepts it:
 - `candidate-move-stage` (against the target job's `stages[]`)
-- `candidate-search` (against `candidate_jobs.stage_name` for the resolved job)
-- `job-pipeline` and `job-candidates-filter` (against `summary_json`'s stage names for the resolved job)
+- `candidate-search` (against distinct `stage_name` values from `candidate_jobs` for the resolved job)
+- `job-pipeline` and `job-candidates-filter` (against the live `summary[]` returned by RF `/job/pipeline`)
 
 Ambiguity returns the standard envelope; not_found on the read-side endpoints falls through to literal exact-match (so unknowns still return empty results, never 404).
 
 ### Custom-field filter resolution
 
-`technology` (multi-select), `segment`, and `role` filters on `candidate-search` are also fuzzy-resolved against the live universe of distinct values from candidate bodies. Worker globals memoise the universe with `last_tail_sync_at` version-checking.
+`technology` (multi-select), `segment`, and `role` filters on `candidate-search` are fuzzy-resolved against the live universe of distinct values from the legacy `candidates.body` JSON corpus. Worker globals memoise the universe with `last_tail_sync_at` version-checking.
 
 - Case-insensitivity ("kubernetes" → "Kubernetes") and prefix matching ("ent" → "Enterprise") work out of the box
 - **Synonym mapping (e.g. "k8s" → "Kubernetes") is NOT covered** — for that, add the alias to a future explicit alias dictionary, don't push normalisation onto the consumer
+- **Custom-field RF routing is currently deferred.** After fuzzy-resolving the value, these filters are dropped server-side (no `custom_field.<id>` mapping table exists yet). The response carries `warning: 'custom_field_unverified'` and `_meta.unverifiedFilters: ['technology'|'segment'|'role']` so Claude can surface the gap. Wiring them through RF is a tracked followup task (needs a `custom_field.<id>` mapping env var or D1 lookup of `/candidate/custom-field/list`).
 
 ## Endpoints
 
@@ -203,22 +204,22 @@ All under `/mcp/*`. Identity is the verified `consultantEmail` body field (forwa
 | Endpoint | Purpose |
 |---|---|
 | `/mcp/cache-status` | Returns sync_state stamps + table counts; cheap health probe. |
-| `/mcp/candidate-search` | Filter (D1 SELECT with WHERE on indexed cols + JSON1 fanout for `technology`/`segment`/`role` + `candidate_jobs` JOIN for `job`/`stage`; `include_disqualified` flips the JOIN guard) and/or fuzzy (in-memory snapshot, top-K). `query` + filters → SQL narrow then fuzzy rank. `job` + `owner` accept names via the resolver. |
-| `/mcp/candidate-get` | By id (D1 SELECT) or by `query` (fuzzy via snapshot, `needs_disambiguation` if top-2 within 0.08). |
+| `/mcp/candidate-search` | Fuzzy name match (tier-1, in-memory snapshot) and/or mutable filter (tier-2, single RF `/candidate/search` call). See § Candidate search pattern below. `job` + `owner` accept names via the resolver. `disqualified: true` → RF `stage='Disqualified'` (no boolean DQ filter). |
+| `/mcp/candidate-get` | Fuzzy resolve (snapshot) → thin-cache sanity check → live RF `/candidate/get`. Returns full candidate body projected via `fields[]`. `needs_disambiguation` on ambiguous name; `ok: false, kind: 'rf_unavailable'` on RF failure. |
 | `/mcp/candidate-move-stage` | Fuzzy-resolves candidate/job/stage, calls RF `/candidate/move-to-stage` attributed to consultant. |
 | `/mcp/candidate-log-interview` | Fuzzy-resolves candidate (+ optional job restricted to candidate's jobs); creates RF custom activity (interview activity-type id resolved dynamically from `sync_state.activity_types`); returns `outlook_url` (recruiter-only block — no candidate email on `to=`) and optional `gcal_hint` based on `consultant.calendarMode`. |
 | `/mcp/candidate-add-note` | Fuzzy-resolves candidate (+ optional job restricted to candidate's jobs); renders markdown body → HTML via `marked` (in `src/mcp/markdown.js`); calls RF `/candidate/notes/add` attributed to `consultant.rfUserId` from the JWT. No `mentions` resolution, no attribution override. Success returns `{ok: true}` only — no echo back (per the lean-response convention). Exposes an internal `addNoteForCandidate(...)` for in-process reuse. |
-| `/mcp/candidate-call-notes` | Three-stage Dialpad-call → structured RF note. `step='list_calls'` fuzzy-resolves candidate + paginates `GET /api/v2/call` (target_id=consultant.dialpadId, target_type='user'), filters to ≥2 min `total_duration` matching the candidate's RF id (via `extractRFIdFromDialpadContact` on `call.contact.id`). `step='get_transcript'` checks `call.target.id == consultant.dialpadId`, derives candidate, fetches `/transcripts/{call_id}`, filters to `type='transcript'` lines, returns transcript + the call-notes rendering brief. `step='submit_notes'` delegates to `addNoteForCandidate` (fast path) or `handleCandidateAddNote` (fuzzy fallback). |
-| `/mcp/job-candidates-filter` | Fuzzy-resolves `job` (or `job_id` short-circuit). Reads active candidates from `job_pipelines.stage_candidates_json`; hydrates from `candidates`. `stage` filter (fuzzy against `summary_json`); `limit` (default 100, max 500); `truncated` flag when more matched than fit. |
-| `/mcp/job-pipeline` | Fuzzy-resolves `job` (or `job_id` short-circuit). Reads canonical pipeline from `job_pipelines.summary_json`; hydrates active candidates from `candidates`. Filters: `stage` (single, fuzzy), `from`/`to` (range, fuzzy against `summary[]`), `submitted: true` (exact match on 'CV Sent' → end of pipeline). Default: same as `submitted`. Disqualified excluded unless `include_disqualified: true`. Cold-cache returns 200 + warning. |
+| `/mcp/candidate-call-notes` | Three-stage Dialpad-call → structured RF note. `step='list_calls'` fuzzy-resolves candidate + reads from D1 `calls` table via `getCallsForCandidate` (~5-10ms; per-record auth enforced by `target_dialpad_id` in WHERE). `step='get_transcript'` checks `call.target.id == consultant.dialpadId`, fetches `/transcripts/{call_id}`, returns transcript + call-notes rendering brief. `step='submit_notes'` delegates to `addNoteForCandidate` (fast path) or `handleCandidateAddNote` (fuzzy fallback). |
+| `/mcp/job-candidates-filter` | Live RF `/job/pipeline` + conditional D1 or RF hydration. Flat (non-grouped) candidate list. `stage` filter (fuzzy against live `summary[]`); `include_disqualified` (default false); `limit` (default 100, max 500); `truncated: true` when total exceeds. On RF failure: `{ok: false, kind: 'pipeline_unavailable'}`. See § Pipeline reads below. |
+| `/mcp/job-pipeline` | Live RF `/job/pipeline` + conditional D1 or RF hydration. Stage-grouped pipeline view. Filters: `stage` (single, fuzzy), `from`/`to` (range, fuzzy against live `summary[]`), `submitted: true` (exact match on 'CV Sent' → end of pipeline). Default: same as `submitted`. Disqualified excluded unless `include_disqualified: true`. On RF failure: `{ok: false, kind: 'pipeline_unavailable'}`. See § Pipeline reads below. |
 
 ### Three-step Dialpad-call-to-note flow
 
 `/mcp/candidate-call-notes` is the only multi-stage endpoint on the MCP surface. It exists because Claude has to round-trip with the user between stages (which call → user picks one → notes drafted → user accepts → commit), so the natural shape is three separate API calls keyed by a `step` discriminator.
 
 Stages and their data flow:
-1. `list_calls`: candidate ref + time window → list of `{call_id, started_at, duration_minutes, direction}`. Candidate ambiguity returns the standard `needs_disambiguation` envelope; no Dialpad call is made.
-2. `get_transcript`: `call_id` → `{candidate, call, transcript, guidance}`. Per-record auth: `call.target.id == consultant.dialpadId` (rejected as `kind: 'not_your_call'` otherwise — Access JWT plus this per-record check is the layered authorization).
+1. `list_calls`: candidate ref + time window → list of `{call_id, started_at, duration_minutes, direction}`. Candidate ambiguity returns the standard `needs_disambiguation` envelope. Calls are read from the D1 `calls` table via `getCallsForCandidate(env, consultant.dialpadId, candidate.id, opts)` — ~5-10ms; no Dialpad live call. Per-record auth is enforced in the WHERE clause: `target_dialpad_id = consultant.dialpadId`. Filters applied in-query: `duration_ms >= 120000` (default), `date_started_ms BETWEEN startedAfterMs AND startedBeforeMs`, `LIMIT 20`.
+2. `get_transcript`: `call_id` → `{candidate, call, transcript, guidance}`. Per-record auth: `call.target.id == consultant.dialpadId` (rejected as `kind: 'not_your_call'` otherwise — Access JWT plus this per-record check is the layered authorization). Fetches live from Dialpad `/transcripts/{call_id}`; filters to `type='transcript'` lines.
 3. `submit_notes`: `candidate_id` (fast) OR `candidate_fallback` (fuzzy) plus markdown `note` → `{ok: true}`. The fuzzy path delegates to `handleCandidateAddNote` verbatim.
 
 Full design: the candidate-call-notes design (2026-05-10).
@@ -263,12 +264,87 @@ Recipe for a new `/mcp/<name>` endpoint:
 8. **Consumer surface.** Tool registrations + descriptions live in `mcp-worker/src/tools.ts` (`registerTools`). Add a `server.registerTool(...)` block there with the body params, response shape, and the default field set so the LLM client's tool list reflects the new endpoint. If the new tool is the read endpoint Claude should always have loaded, set `_meta: { "anthropic/alwaysLoad": true }`.
 9. **Endpoint table.** Add a row to the table above. If the endpoint adds a new `*_id` body field, add it to the ID short-circuit table too.
 
-If the new endpoint requires data NOT already in D1, that's a sync-worker change — extend the rebuild workflow, not the read path. Read paths must never call RF directly except for the four write endpoints (`move-stage`, `log-interview`, etc.) where it's intentional.
+If the new endpoint requires data NOT already in D1, that's a sync-worker change — extend the tail-sync writer, not the read path. Read paths must never call RF directly except for the write endpoints (`move-stage`, `log-interview`, etc.) and the pipeline tools (`job-pipeline`, `job-candidates-filter`, `candidate-get`) where it's intentional.
+
+### Candidate search pattern (tier-1 + single RF call)
+
+`/mcp/candidate-search` uses a two-tier pattern to combine fuzzy name matching with mutable RF filters in a single round-trip:
+
+**Filter classification.** Filters split into:
+- **Immutable** (`added_after` / `added_before`, `linkedin_profile`) — resolved against the in-memory snapshot or D1; no RF call.
+- **Mutable** (`email`, `company`/`current_organization`, `current_title`, `owner`/`lead_owner_id`, `stage`+`job`, `disqualified`, future `custom_field.<id>`) — routed to RF.
+
+**Decision tree:**
+1. **Pure fuzzy (no mutable filter)** — tier-1 snapshot scan only; recency-boosted by `added_time_ms`. No RF call.
+2. **Immutable filter only (no query, no mutable)** — snapshot scan with in-JS predicate. No RF call.
+3. **Fuzzy query + mutable filter** — tier-1 snapshot → id pool (up to 200 ids) → ONE RF `/candidate/search` call with `{candidate_id IN (ids), ...predicateFilters}` intersection server-side. RF failure degrades to tier-1 results with `warning: 'filter_unverified'`.
+4. **Mutable filter + no query** — predicate-only RF search (no id list). RF failure → empty result with `warning: 'filter_unverified'`.
+5. **Empty tier-1 + mutable filter** — return empty without calling RF.
+
+When both a fuzzy query and a mutable filter are present, tier-1 fuzzy score ordering is preserved on the RF intersection result (RF doesn't preserve fuzzy ordering; the handler re-ranks by score after the RF call).
+
+`disqualified: true` expands to RF `stage='Disqualified'` — RF has no boolean DQ filter. When a `stage` filter is also set, the user's explicit stage takes precedence.
+
+Immutable filters (`added_after`/`added_before`, `linkedin_profile`) are appended to RF calls when a mutable filter is already present (so both sources agree), but do NOT trigger an RF call on their own.
+
+### Pipeline reads (live RF + conditional hydration)
+
+`/mcp/job-pipeline` and `/mcp/job-candidates-filter` are fully live — no D1 pipeline cache.
+
+**Per-request flow:**
+1. ONE live RF `/job/pipeline?job_id=<id>` call (~300–800 ms baseline). Returns `{summary: [{id, name, count}], detail: [{candidate: {id, name}, stages: [...]}]}`. `summary[]` is the canonical ordered pipeline (per-job, includes 0-count stages and Disqualified). The "current stage" for each candidate is derived from the most-recent `stages[].to` in `detail[]`.
+2. Apply windowing (`stage`, `from`/`to`, `submitted: true`, or default CV-Sent → end). Fuzzy against the live `summary[]`.
+3. Conditional per-candidate hydration based on `fields[]`:
+   - **Thin (default `['id', 'name', 'linkedin_profile']` or any subset of `candidates_v2` columns)** — one D1 batch via `getCandidatesByIds` (~5-10ms). Columns: `id, name, linkedin_profile, added_time_ms, current_title_at_cache_time, current_company_at_cache_time`.
+   - **Expanded (any field requiring live data — `current_title`, `primary_email`, `phone_numbers`, custom fields, etc.)** — parallel `/candidate/get` fan-out at concurrency 8 via `pMapLimit`. Per-id failures captured as `hydration_errors[]` in the response — partial result returned, never a thrown error.
+
+**Latency profile:**
+- Thin (default) fields: ~300–810 ms (RF pipeline call + D1 hydration).
+- Expanded fields, N candidates in selected stages: ~300–800 ms + ceil(N/8) × ~150 ms.
+
+**Why no pipeline cache:** a cache must be invalidated on every move-stage, disqualification, owner reassignment, and new-candidate-on-job. The bust paths multiply faster than the read savings; 300–800 ms is the cost of correctness.
+
+On RF failure: `{ok: false, recoverable: true, kind: 'pipeline_unavailable', job, error}`.
+
+### Filter source-of-truth map
+
+| Filter | Source | Notes |
+|---|---|---|
+| `query` (fuzzy name) | Cache snapshot (`candidates_v2`) | Recency-boosted via `added_time_ms` |
+| `added_after` / `added_before` | Cache snapshot + RF (when mutable filter also present) | Immutable — snapshot predicate on tier-1, `added_on` date filter appended to RF calls |
+| `linkedin_profile` | Cache snapshot (exact slug) + RF substring (when mutable filter present) | Dual-handled; both predicates AND |
+| `email` | RF `email` text (substring match) | Mutable |
+| `company` / `current_organization` | RF `current_company` text | Mutable; RF key is `current_company` |
+| `current_title` | RF `current_title` text | Mutable |
+| `owner` / `lead_owner_id` | RF `lead_owner` multi-select-by-ID | Mutable; numeric id resolved via `resolveOwner` |
+| `stage` (with `job`) | RF `stage` multi-select-by-name + `job` multi-select-by-ID | Mutable; stage fuzzy-resolved against `candidate_jobs` distinct names |
+| `disqualified: true` | RF `stage='Disqualified'` | No boolean DQ filter in RF (RF-7 verified) |
+| `technology` / `segment` / `role` | Currently dropped | Custom-field id mapping not yet wired; surfaced as `warning: 'custom_field_unverified'` + `_meta.unverifiedFilters` |
 
 ### Per-job pipelines, not a global canonical list
 
 **There is NO global canonical stage list.** Each RF job defines its own pipeline (Phone Screen vs no Phone Screen, Take-home vs Onsite, Final Interview optional, etc).
 
-RF's `/job/pipeline?job_id=X` returns a canonical, ordered `summary[]` of stages (with aggregate counts, including 0-count stages). The sync-worker writes that array verbatim to `job_pipelines.summary_json` per open job, every 15 min via `PipelineRebuildWorkflow`. The main worker reads it; range filters and `submitted: true` resolve against this canonical list, NOT against derived stage names from candidate body fragments.
+RF's `/job/pipeline?job_id=X` returns a canonical, ordered `summary[]` of stages (with aggregate counts, including 0-count stages). This is fetched live on every pipeline request; range filters and `submitted: true` resolve against this live list, NOT against derived stage names from candidate body fragments.
 
 Landmark stages used by the defaults / submitted ("CV Sent", "Offer", "Hired") do exact-name lookup first, then fuzzy-resolve against the per-job list. When a landmark isn't present in the job's actual pipeline, `submitted: true` falls back to the full canonical list and emits a `_meta.warnings` entry.
+
+### Tool descriptor changes (Tasks 11-17)
+
+Changes landed in `mcp-worker/src/tools.ts` alongside the middleware refactor:
+
+**`rf_candidate_search`:**
+- `include_disqualified` renamed to `disqualified`. Semantics changed: `true` returns ONLY disqualified candidates (not additive). Default omitted/false: non-DQ'd only.
+- `updated_after` / `updated_before` removed (mutable, not load-bearing; silently dropped in prior version).
+- `warning: 'filter_unverified'` documented in description — RF was unreachable, results are tier-1 only.
+- `warning: 'custom_field_unverified'` documented — `technology`/`segment`/`role` accepted by tool but warn-and-drop server-side.
+
+**`rf_job_pipeline`:**
+- Stale "cold cache" hint removed (pipeline cache is gone; the tool is now always live to RF).
+- Orphan `filters: {...}` field removed from input schema.
+- Description updated to reflect live RF reads and `pipeline_unavailable` recoverable failure.
+
+**`rf_job_candidates_filter`:**
+- Orphan `filters: {...}` field removed from input schema.
+- `include_disqualified` added (was missing; `rf_job_pipeline` had it, filter didn't).
+- Description updated to document live RF reads, `hydration_errors[]`, and `truncated`.
