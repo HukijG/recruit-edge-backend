@@ -91,7 +91,13 @@ export async function addRFCandidate(candidateData, env) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    console.error(`RF add candidate error: ${response.status}`, errorText);
+    console.error({
+      source: 'rf',
+      op: 'add_candidate',
+      message: `RF add candidate error: ${response.status}`,
+      status: response.status,
+      body_preview: typeof errorText === 'string' ? errorText.slice(0, 4096) : String(errorText).slice(0, 4096),
+    });
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
@@ -328,7 +334,13 @@ export async function addRFCandidateNote(candidateId, htmlContent, createdBy, en
 
   if (!response.ok) {
     const errorText = await response.text();
-    console.error(`RF add note error: ${response.status}`, errorText);
+    console.error({
+      source: 'rf',
+      op: 'add_note',
+      message: `RF add note error: ${response.status}`,
+      status: response.status,
+      body_preview: typeof errorText === 'string' ? errorText.slice(0, 4096) : String(errorText).slice(0, 4096),
+    });
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
@@ -832,7 +844,13 @@ export async function addCandidateToJob(candidateId, jobId, env) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    console.error(`RF add-to-job error: ${response.status}`, errorText);
+    console.error({
+      source: 'rf',
+      op: 'add_to_job',
+      message: `RF add-to-job error: ${response.status}`,
+      status: response.status,
+      body_preview: typeof errorText === 'string' ? errorText.slice(0, 4096) : String(errorText).slice(0, 4096),
+    });
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
