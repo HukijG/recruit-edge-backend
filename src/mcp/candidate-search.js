@@ -125,9 +125,15 @@ async function fuzzyResolveCustomFieldValue(env, fieldName, input, multiSelect) 
  * filter objects per spec rev 5 RF-7 verification.
  *
  * Returns:
- *   - `rfFilters`        — array of RF filter objects (to pass under `filters[]`).
- *   - `mutableKeysHit`   — list of mutable-filter keys we routed to RF (for
- *     telemetry / degradation logging).
+ *   - `rfFilters`          — MUTABLE filter objects only (drives `hasMutableFilters`
+ *     / whether an RF round-trip is made). Does NOT include immutable filters.
+ *   - `rfImmutableFilters` — RF filter objects for immutable keys (`added_on`,
+ *     `linkedin_profile` substring). These do NOT drive the RF call decision;
+ *     the caller appends them to the RF request only when a call is already being
+ *     made due to a mutable filter. This preserves the cache-only path for
+ *     pure-immutable queries.
+ *   - `unverifiedFilters`  — list of filter keys that were DROPPED (custom-field
+ *     filters not yet wired to `custom_field.<id>`). Empty when all filters routed.
  *
  * Inputs are read from BOTH the top-level body fields (existing wire contract)
  * AND the optional `filters` long-tail bag (forward-compat per the MCP tool
@@ -137,27 +143,33 @@ async function fuzzyResolveCustomFieldValue(env, fieldName, input, multiSelect) 
  * so this builder doesn't have to know about fuzzy resolution.
  *
  * Filter-key map (spec rev 5 RF-7):
- *   `email`              → RF `email`            (text — substring)
+ *   `email`              → RF `email`            (text — substring; MUTABLE)
  *   `company` /
- *     `current_organization` → RF `current_company` (text)
- *   `current_title`      → RF `current_title`    (text)
- *   `owner` / `lead_owner_id` → RF `lead_owner`  (multi-select-by-ID; numeric)
- *   `stage` (with `job`) → RF `stage`            (multi-select-by-NAME)
- *   `job_id` / `job`     → RF `job`              (multi-select-by-ID; numeric)
- *   `disqualified=true`  → RF `{stage: 'Disqualified'}` (no boolean DQ filter)
- *   `linkedin_profile`   → RF `linkedin_profile` (text — substring)
+ *     `current_organization` → RF `current_company` (text; MUTABLE)
+ *   `current_title`      → RF `current_title`    (text; MUTABLE)
+ *   `owner` / `lead_owner_id` → RF `lead_owner`  (multi-select-by-ID; MUTABLE)
+ *   `stage` (with `job`) → RF `stage`            (multi-select-by-NAME; MUTABLE)
+ *   `job_id` / `job`     → RF `job`              (multi-select-by-ID; MUTABLE)
+ *   `disqualified=true`  → RF `{stage: 'Disqualified'}` (MUTABLE)
+ *   `linkedin_profile`   → rfImmutableFilters `linkedin_profile` (substring;
+ *                          ALSO exact-slug in buildImmutableSnapshotFilter)
+ *   `added_after` /
+ *     `added_before`     → rfImmutableFilters `added_on` (date;
+ *                          ALSO snapshot predicate in buildImmutableSnapshotFilter)
  *   `technology` /
- *     `segment` / `role` → custom_field.<id>     (TODO: id mapping not wired)
+ *     `segment` / `role` → custom_field.<id>     (NOT wired; surfaced as
+ *                          `unverifiedFilters` in the response)
  *
- * Custom-field filters (`technology`, `segment`, `role`) are currently logged
- * and ignored — the project doesn't yet expose a custom-field-id mapping table.
- * They remain mutable per the spec's filter-to-source map; once a mapping is
- * wired (env var or D1 lookup of `/candidate/custom-field/list`), translate to
- * `{key: 'custom_field.<id>', conjunction: 'in', values: [...]}`.
+ * Custom-field filters (`technology`, `segment`, `role`) are currently dropped —
+ * the project doesn't yet expose a custom-field-id mapping table. They are
+ * returned in `unverifiedFilters` so the caller can surface the gap to Claude.
+ * Once a mapping is wired (env var or D1 lookup of `/candidate/custom-field/list`),
+ * translate to `{key: 'custom_field.<id>', conjunction: 'in', values: [...]}`.
  */
 function buildRFPredicateFilters(body, resolved = {}) {
-  const out = [];
-  const mutableKeysHit = [];
+  const out = [];          // mutable — drives hasMutableFilters
+  const immutable = [];    // immutable RF filters — appended to RF calls when already made
+  const unverifiedFilters = [];
   // Merge top-level body keys with the optional `filters` long-tail bag.
   // Top-level keys take precedence (existing wire contract).
   const longTail = (body && typeof body.filters === 'object' && body.filters !== null)
@@ -168,20 +180,17 @@ function buildRFPredicateFilters(body, resolved = {}) {
   // ─── email (text — substring per RF-7) ─────────────────────────
   if (tf.email != null && tf.email !== '') {
     out.push({ conjunction: 'in', values: [String(tf.email)], key: 'email' });
-    mutableKeysHit.push('email');
   }
 
   // ─── company / current_organization → RF `current_company` ─────
   const company = tf.current_organization ?? tf.company;
   if (company != null && company !== '') {
     out.push({ conjunction: 'in', values: [String(company)], key: 'current_company' });
-    mutableKeysHit.push('current_company');
   }
 
   // ─── current_title (text) ──────────────────────────────────────
   if (tf.current_title != null && tf.current_title !== '') {
     out.push({ conjunction: 'in', values: [String(tf.current_title)], key: 'current_title' });
-    mutableKeysHit.push('current_title');
   }
 
   // ─── owner / lead_owner → RF `lead_owner` (by ID) ──────────────
@@ -191,13 +200,11 @@ function buildRFPredicateFilters(body, resolved = {}) {
     ?? (typeof tf.lead_owner_id === 'number' ? tf.lead_owner_id : undefined);
   if (typeof ownerNumeric === 'number' && Number.isFinite(ownerNumeric)) {
     out.push({ conjunction: 'in', values: [ownerNumeric], key: 'lead_owner' });
-    mutableKeysHit.push('lead_owner');
   }
 
   // ─── job → RF `job` (by ID) ────────────────────────────────────
   if (typeof resolved.jobId === 'number' && Number.isFinite(resolved.jobId)) {
     out.push({ conjunction: 'in', values: [resolved.jobId], key: 'job' });
-    mutableKeysHit.push('job');
   }
 
   // ─── stage (with job, by NAME) ─────────────────────────────────
@@ -206,7 +213,6 @@ function buildRFPredicateFilters(body, resolved = {}) {
   // ambiguous (each job has its own pipeline).
   if (resolved.stageName && typeof resolved.jobId === 'number') {
     out.push({ conjunction: 'in', values: [String(resolved.stageName)], key: 'stage' });
-    mutableKeysHit.push('stage');
   }
 
   // ─── disqualified=true → stage='Disqualified' (no boolean DQ filter) ──
@@ -218,75 +224,103 @@ function buildRFPredicateFilters(body, resolved = {}) {
   // but the current wire contract doesn't surface that knob.
   if (tf.disqualified === true && !resolved.stageName) {
     out.push({ conjunction: 'in', values: ['Disqualified'], key: 'stage' });
-    mutableKeysHit.push('stage_disqualified');
   }
 
-  // ─── linkedin_profile (text — substring per RF-7) ──────────────
-  // NB: linkedin_profile is QUASI-immutable; we still route it through RF as
-  // a substring search since RF treats it as a text filter. Callers wanting
-  // exact-slug match should use the cache-only path (filter handler).
+  // ─── linkedin_profile → rfImmutableFilters (substring per RF-7) ──
+  // Dual-handled: buildImmutableSnapshotFilter applies exact-slug match on the
+  // snapshot for tier-1 paths; here we route a substring search to RF for
+  // branches 4/5 (mutable filter already present). Both predicates AND.
+  // NB: this does NOT go into `out` — it doesn't trigger an RF call on its
+  // own (it stays cache-side on pure-immutable paths).
   if (tf.linkedin_profile != null && tf.linkedin_profile !== '') {
-    out.push({ conjunction: 'in', values: [String(tf.linkedin_profile)], key: 'linkedin_profile' });
-    mutableKeysHit.push('linkedin_profile');
+    immutable.push({ conjunction: 'in', values: [String(tf.linkedin_profile)], key: 'linkedin_profile' });
+  }
+
+  // ─── added_after / added_before → rfImmutableFilters `added_on` ──
+  // Per spec rev 5 RF-7, `added_on` is a system field for candidate creation
+  // time. These are immutable (also honored by buildImmutableSnapshotFilter for
+  // tier-1 paths); we route them to RF as well when an RF call is made for a
+  // mutable filter, so both sources agree. Does NOT go into `out` — does not
+  // trigger an RF call on its own.
+  if (tf.added_after) {
+    immutable.push({
+      type: 'date',
+      is_relative: false,
+      filter_type: 'after',
+      date: String(tf.added_after).slice(0, 10),
+      key: 'added_on',
+    });
+  }
+  if (tf.added_before) {
+    immutable.push({
+      type: 'date',
+      is_relative: false,
+      filter_type: 'before',
+      date: String(tf.added_before).slice(0, 10),
+      key: 'added_on',
+    });
   }
 
   // ─── technology / role / segment → custom_field.<id> (NOT wired) ──
   // Spec rev 5 routes these through RF as `custom_field.<id>` filters, but
-  // the project doesn't expose a custom-field-id mapping table yet. Log the
-  // dropped filter so we can spot drift in production telemetry; revisit
-  // when the id mapping ships.
-  const cfDropped = [];
-  if (Array.isArray(tf.technology) && tf.technology.length > 0) cfDropped.push('technology');
-  if (tf.segment != null && tf.segment !== '') cfDropped.push('segment');
-  if (tf.role != null && tf.role !== '') cfDropped.push('role');
-  if (cfDropped.length > 0) {
+  // the project doesn't expose a custom-field-id mapping table yet. Collect
+  // the dropped keys and return them so the caller can surface a warning.
+  // TODO(future): map to `{key: 'custom_field.<id>', conjunction: 'in', values: [...]}`
+  // once a custom-field id table is exposed (env var or D1 lookup of
+  // `/candidate/custom-field/list`).
+  if (Array.isArray(tf.technology) && tf.technology.length > 0) unverifiedFilters.push('technology');
+  if (tf.segment != null && tf.segment !== '') unverifiedFilters.push('segment');
+  if (tf.role != null && tf.role !== '') unverifiedFilters.push('role');
+  if (unverifiedFilters.length > 0) {
     console.warn({
       message: '[mcp/candidate-search] custom-field filters not yet wired to RF custom_field.<id> — ignored',
       source: 'mcp-candidate-search',
-      ignoredFilters: cfDropped,
+      ignoredFilters: unverifiedFilters,
     });
-    // TODO(future): map to `{key: 'custom_field.<id>', conjunction: 'in', values: [...]}`
-    // once a custom-field id table is exposed (env var or D1 lookup of
-    // `/candidate/custom-field/list`).
   }
 
   // ─── Dropped per spec rev 5 ────────────────────────────────────
   // `last_updated` / `last_activity_at` ranges (`updated_after`/`updated_before`)
-  // — mutable, not load-bearing. Silently dropped; no warning needed since the
-  // tool descriptor still lists them but they no longer route anywhere.
-  // `added_after` / `added_before` are IMMUTABLE and handled by the caller's
-  // immutable-filter path (cache-side), not here.
+  // — mutable, not load-bearing. Silently dropped.
 
-  return { rfFilters: out, mutableKeysHit };
+  return { rfFilters: out, rfImmutableFilters: immutable, unverifiedFilters };
 }
 
 /**
- * Detect whether the request includes any IMMUTABLE-only filter (i.e. a
- * filter that should narrow the tier-1 fuzzy result set in JS without
- * touching RF). Returns the predicate to apply to the snapshot row, or
- * `null` if no immutable filter is set.
+ * Detect whether the request includes any IMMUTABLE filter that should narrow
+ * the tier-1 fuzzy result set in JS. Returns a predicate to apply to each
+ * snapshot row, or `null` if no immutable filter is set.
  *
- * Immutable per spec rev 5: `added_time` range, `linkedin_profile` exact.
- * NB: `linkedin_profile` is also routed to RF as a substring search above —
- * here we additionally apply an exact slug match against the cache when the
- * user's input looks like a bare slug. Both paths can fire; the predicates
- * are conjunctive (AND).
+ * Reads from BOTH top-level body fields AND the optional `filters` long-tail
+ * bag — same merge strategy as buildRFPredicateFilters (top-level wins).
+ *
+ * Immutable per spec rev 5: `added_time` range, `linkedin_profile`.
+ *
+ * `linkedin_profile` is dual-handled:
+ *   - Here (tier-1 paths): exact slug match against the snapshot row.
+ *   - In buildRFPredicateFilters (tier-2 paths): RF substring search.
+ * Both predicates fire when both paths are active; they are AND'd.
  */
 function buildImmutableSnapshotFilter(body) {
   const preds = [];
-  if (body.added_after) {
-    const ms = Date.parse(body.added_after);
+  // Merge long-tail bag so both sources are checked (mirrors buildRFPredicateFilters).
+  const longTail = (body && typeof body.filters === 'object' && body.filters !== null)
+    ? body.filters
+    : {};
+  const tf = { ...longTail, ...body };
+
+  if (tf.added_after) {
+    const ms = Date.parse(tf.added_after);
     if (Number.isFinite(ms)) preds.push((r) => r.added_time_ms >= ms);
   }
-  if (body.added_before) {
-    const ms = Date.parse(body.added_before);
+  if (tf.added_before) {
+    const ms = Date.parse(tf.added_before);
     if (Number.isFinite(ms)) preds.push((r) => r.added_time_ms <= ms);
   }
-  // linkedin_profile exact slug match (cache-side); only when body says so
-  // explicitly via top-level (the long-tail `filters.linkedin_profile` is
-  // routed through RF as substring instead).
-  if (typeof body.linkedin_profile === 'string' && body.linkedin_profile) {
-    const slug = body.linkedin_profile;
+  // linkedin_profile: exact slug match on the snapshot row (tier-1 path).
+  // RF substring match is handled separately in buildRFPredicateFilters.
+  if (typeof tf.linkedin_profile === 'string' && tf.linkedin_profile) {
+    const slug = tf.linkedin_profile;
     preds.push((r) => r.linkedin_profile === slug);
   }
   if (preds.length === 0) return null;
@@ -503,11 +537,16 @@ export async function handleCandidateSearch({ env, body }) {
   }
 
   // ─── Build the RF filter envelope ──────────────────────────────
-  const { rfFilters, mutableKeysHit } = buildRFPredicateFilters(body, {
+  const { rfFilters, rfImmutableFilters, unverifiedFilters } = buildRFPredicateFilters(body, {
     jobId,
     ownerId,
     stageName,
   });
+  // Combined predicate filters for RF calls: mutable + immutable (date / linkedin).
+  // The immutable filters are appended only when an RF call is already being made
+  // (driven by rfFilters.length > 0), so they don't drag pure-immutable queries
+  // into RF unnecessarily.
+  const allRFFilters = [...rfFilters, ...rfImmutableFilters];
 
   const immutablePredicate = buildImmutableSnapshotFilter(body);
   const hasMutableFilters = rfFilters.length > 0;
@@ -524,7 +563,12 @@ export async function handleCandidateSearch({ env, body }) {
   if (hasQuery && !hasMutableFilters) {
     const tier1 = await tier1Fuzzy(env, body.query, limit, immutablePredicate);
     const projected = await projectMatches(env, tier1, body.fields);
-    return jsonResponse(200, { count: projected.length, matches: projected });
+    const resp = { count: projected.length, matches: projected };
+    if (unverifiedFilters.length > 0) {
+      resp.warning = 'custom_field_unverified';
+      resp._meta = { unverifiedFilters };
+    }
+    return jsonResponse(200, resp);
   }
 
   // ─── Immutable-only filter (no query, no mutable) ──────────────
@@ -537,7 +581,12 @@ export async function handleCandidateSearch({ env, body }) {
       .slice(0, limit)
       .map((r) => ({ id: r.id, name: r.name }));
     const projected = await projectMatches(env, matches, body.fields);
-    return jsonResponse(200, { count: projected.length, matches: projected });
+    const resp = { count: projected.length, matches: projected };
+    if (unverifiedFilters.length > 0) {
+      resp.warning = 'custom_field_unverified';
+      resp._meta = { unverifiedFilters };
+    }
+    return jsonResponse(200, resp);
   }
 
   // ─── Tier-2: mutable filter present, route through RF ──────────
@@ -555,14 +604,14 @@ export async function handleCandidateSearch({ env, body }) {
     }
     try {
       rfResult = await searchCandidatesByIdsAndPredicate(
-        { ids: tier1.map((r) => r.id), predicateFilters: rfFilters },
+        { ids: tier1.map((r) => r.id), predicateFilters: allRFFilters },
         env,
       );
     } catch (err) {
       console.warn({
         message: `[mcp/candidate-search] RF search failed; degrading to tier-1: ${err.message}`,
         source: 'mcp-candidate-search',
-        mutableKeysHit,
+        droppedFilters: Object.keys(body).filter((k) => !['query', 'limit', 'fields', 'filters'].includes(k)),
         query: body.query,
       });
       const projected = await projectMatches(env, tier1.slice(0, limit), body.fields);
@@ -576,14 +625,14 @@ export async function handleCandidateSearch({ env, body }) {
     // No query → predicate-only RF search.
     try {
       rfResult = await searchCandidatesByPredicateOnly(
-        { predicateFilters: rfFilters },
+        { predicateFilters: allRFFilters },
         env,
       );
     } catch (err) {
       console.warn({
         message: `[mcp/candidate-search] RF predicate-only search failed: ${err.message}`,
         source: 'mcp-candidate-search',
-        mutableKeysHit,
+        droppedFilters: Object.keys(body).filter((k) => !['query', 'limit', 'fields', 'filters'].includes(k)),
       });
       // Without a tier-1 pool, we have nothing to degrade to. Return an
       // empty response with the filter_unverified warning so the caller
@@ -617,5 +666,10 @@ export async function handleCandidateSearch({ env, body }) {
 
   const trimmed = rfMatches.slice(0, limit);
   const projected = await projectMatches(env, trimmed, body.fields);
-  return jsonResponse(200, { count: projected.length, matches: projected });
+  const resp = { count: projected.length, matches: projected };
+  if (unverifiedFilters.length > 0) {
+    resp.warning = 'custom_field_unverified';
+    resp._meta = { unverifiedFilters };
+  }
+  return jsonResponse(200, resp);
 }

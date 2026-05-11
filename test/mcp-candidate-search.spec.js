@@ -540,4 +540,79 @@ describe('rf_candidate_search — tier-1+RF-search single round-trip', () => {
       expect.objectContaining({ key: 'email', values: ['x@y.com'] }),
     ]));
   });
+
+  // ─── Fix 1: added_after + mutable filter routes both to RF ────────
+  it('routes added_after through RF when present alongside a mutable filter (no query)', async () => {
+    const rfFetch = vi.fn().mockResolvedValue({
+      ok: true, status: 200,
+      json: async () => ({ data: [] }),
+      text: async () => '',
+    });
+    globalThis.fetch = rfFetch;
+    await call({ consultantFirstName: 'Joel', email: 'x@y.com', added_after: '2026-04-08' });
+    expect(rfFetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(rfFetch.mock.calls[0][1].body);
+    expect(body.filters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'email' }),
+      expect.objectContaining({ key: 'added_on', filter_type: 'after', date: '2026-04-08' }),
+    ]));
+  });
+
+  it('routes added_before through RF alongside a mutable filter', async () => {
+    const rfFetch = vi.fn().mockResolvedValue({
+      ok: true, status: 200,
+      json: async () => ({ data: [] }),
+      text: async () => '',
+    });
+    globalThis.fetch = rfFetch;
+    await call({ consultantFirstName: 'Joel', email: 'x@y.com', added_before: '2026-04-30' });
+    expect(rfFetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(rfFetch.mock.calls[0][1].body);
+    expect(body.filters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'added_on', filter_type: 'before', date: '2026-04-30' }),
+    ]));
+  });
+
+  // ─── Fix 3: linkedin_profile dual-handled ─────────────────────────
+  it('linkedin_profile exact-slug filters tier-1 snapshot on pure-fuzzy path', async () => {
+    await seedThin([
+      { id: 1, name: 'Jane Doe',   linkedin_profile: 'jane-doe',   added_time_ms: 1 },
+      { id: 2, name: 'Jane Smith', linkedin_profile: 'jane-smith', added_time_ms: 2 },
+    ]);
+    const rfFetch = vi.fn();
+    globalThis.fetch = rfFetch;
+    // Pure-fuzzy path (no mutable filter): snapshot exact-slug match narrows.
+    const r = await call({ consultantFirstName: 'Joel', query: 'jane', linkedin_profile: 'jane-doe' });
+    const res = await r.json();
+    expect(rfFetch).not.toHaveBeenCalled();
+    expect(res.matches.map((m) => m.id)).toEqual([1]);
+  });
+
+  it('linkedin_profile substring filter reaches RF on tier-2 path (mutable filter present)', async () => {
+    await seedThin([
+      { id: 1, name: 'Jane Doe',   linkedin_profile: 'jane-doe',   added_time_ms: 1 },
+    ]);
+    const rfFetch = mockRf([{ id: 1, name: 'Jane Doe' }]);
+    globalThis.fetch = rfFetch;
+    // Mutable filter (email) triggers tier-2; linkedin_profile also goes to RF.
+    const r = await call({ consultantFirstName: 'Joel', email: 'jane@acme.com', linkedin_profile: 'jane-doe' });
+    const res = await r.json();
+    expect(rfFetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(rfFetch.mock.calls[0][1].body);
+    expect(body.filters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'linkedin_profile', values: ['jane-doe'] }),
+    ]));
+  });
+
+  // ─── Fix 5: custom-field warning surfaces ─────────────────────────
+  it('drops technology filter with warning surfaced to caller', async () => {
+    await seedThin([{ id: 1, name: 'Jane', added_time_ms: 1 }]);
+    const rfFetch = vi.fn();
+    globalThis.fetch = rfFetch;
+    const r = await call({ consultantFirstName: 'Joel', query: 'jane', technology: ['Kubernetes'] });
+    const res = await r.json();
+    // warning should be present since technology was dropped
+    expect(res.warning ?? res._meta?.warning).toMatch(/custom_field/i);
+    expect(res._meta?.unverifiedFilters).toContain('technology');
+  });
 });
