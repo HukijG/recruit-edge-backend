@@ -11,6 +11,7 @@
       "database_id": "00000000-0000-0000-0000-000000000001",
       "migrations_dir": "migrations"
     },
+    // USERS_DB is read-only here — main worker owns the schema (see ../CLAUDE.md "D1 ownership").
     {
       "binding": "USERS_DB",
       "database_name": "rf-users",

@@ -20,9 +20,7 @@ beforeAll(async () => {
   ).run();
 
   // Seed two test consultants in USERS_DB.
-  await env.USERS_DB.exec(
-    "DELETE FROM users WHERE email IN ('joel@test.local', 'user2@test.local')"
-  );
+  await env.USERS_DB.prepare("DELETE FROM users WHERE email IN ('joel@test.local', 'user2@test.local')").run();
   await env.USERS_DB
     .prepare(`INSERT INTO users (email, rf_user_id, dialpad_id, first_name)
               VALUES (?, ?, ?, ?), (?, ?, ?, ?)`)
@@ -39,6 +37,7 @@ describe('listConsultants', () => {
       { email: 'joel@test.local', dialpadId: '8000000000000001', rfUserId: 900001, firstName: 'Joel' },
       { email: 'user2@test.local', dialpadId: '8000000000000002', rfUserId: 900002, firstName: 'Alice' },
     ]));
+    expect(out).toHaveLength(2);
   });
 
   it('throws when USERS_DB binding is absent', async () => {
