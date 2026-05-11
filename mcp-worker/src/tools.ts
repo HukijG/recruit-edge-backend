@@ -71,7 +71,7 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
         "  • `technology[]` — multi-select OR; per-element fuzzy against the live custom-field universe",
         "  • `segment`, `role` — single-value custom fields, fuzzy-resolved",
         "  • `added_after / added_before / updated_after / updated_before` — ISO dates",
-        "  • `include_disqualified` — only matters with `job`; default excludes DQ'd",
+        "  • `disqualified` — when `true`, return ONLY disqualified candidates (default omitted/false: non-DQ'd only)",
         "At least one of `query` or any filter must be set (400 otherwise). Numeric (or numeric-string) ids bypass fuzzy on `job` / `owner`.",
         "",
         "Ordering depends on what's set:",
@@ -106,7 +106,7 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
         added_before: z.string().optional().describe("ISO date."),
         updated_after: z.string().optional().describe("ISO date."),
         updated_before: z.string().optional().describe("ISO date."),
-        include_disqualified: z.boolean().optional(),
+        disqualified: z.boolean().optional().describe("If true, return ONLY disqualified candidates. Default (omitted or false): returns non-disqualified candidates only."),
         limit: z.number().int().min(1).max(50).optional(),
         fields: z
           .array(z.string())
