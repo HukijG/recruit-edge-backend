@@ -1,3 +1,12 @@
+import { env as workerEnv } from 'cloudflare:workers';
+import { installBodyCapture } from './lib/body-capture.js';
+import { installLogsBridge } from './lib/logs-bridge.js';
+
+installBodyCapture();
+installLogsBridge('rf-dialpad-sync-dev');
+
+import { instrument } from '@microlabs/otel-cf-workers';
+import { resolveOtelConfig } from './lib/otel-config.js';
 import {
   createOrUpdateDialpadContact, patchDialpadContact, getDialpadContact,
   getUserCallerId, initiateCall, buildCallerIdsFromDialpad, sendSMS,
@@ -32,7 +41,7 @@ import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enric
 import { enrichPerson } from './apollo-client.js';
 import { resolveRFUserId, getUserByFirstName } from './users.js';
 
-export default {
+const handler = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
@@ -207,6 +216,14 @@ export default {
     }
   },
 };
+
+// `instrument()` is the production wiring. In environments where `LD_SDK_KEY` is
+// absent (e.g. the vitest harness — see vitest.config.js for why), we export the
+// raw handler so requests never touch the OTLP exporters. The lib `installLogsBridge`
+// already self-skips on missing key; this mirrors that semantic at the handler layer.
+export default workerEnv.LD_SDK_KEY
+  ? instrument(handler, resolveOtelConfig)
+  : handler;
 
 async function handleRecruiterflowWebhook(request, env) {
   try {
