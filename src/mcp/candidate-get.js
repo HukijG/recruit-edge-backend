@@ -57,5 +57,5 @@ export async function handleCandidateGet({ env, body }) {
   // 4. Apply Claude-requested fields[] projection (additive over defaults).
   const { paths } = resolveFieldsWithDefaults(body.fields, DEFAULT_FIELDS, full, full);
   const projected = projectWithLinkedIn(full, paths);
-  return jsonResponse(200, { candidate: projected });
+  return jsonResponse(200, { ok: true, candidate: projected });
 }
