@@ -7,6 +7,8 @@ installLogsBridge('rf-dialpad-sync-dev');
 
 import { instrument } from '@microlabs/otel-cf-workers';
 import { resolveOtelConfig } from './lib/otel-config.js';
+import { trace } from '@opentelemetry/api';
+import { FLOWS } from './lib/flow-names.js';
 import {
   createOrUpdateDialpadContact, patchDialpadContact, getDialpadContact,
   getUserCallerId, initiateCall, buildCallerIdsFromDialpad, sendSMS,
@@ -58,12 +60,14 @@ const handler = {
 
     try {
       if (url.pathname.startsWith('/mcp/')) {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.MCP_PROXY);
         const { routeMcp } = await import('./mcp/router.js');
         const { handlers } = await import('./mcp/handlers-registry.js');
         return routeMcp(request, env, ctx, handlers);
       }
 
       if (url.pathname === '/health') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.HEALTH);
         return new Response('RF-Dialpad Sync Middleware - OK', {
           status: 200,
           headers: corsHeaders
@@ -71,42 +75,52 @@ const handler = {
       }
 
       if (url.pathname === '/webhook/recruiterflow' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.WEBHOOK_RF);
         return await handleRecruiterflowWebhook(request, env);
       }
 
       if (url.pathname === '/webhook/dialpad' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.WEBHOOK_DIALPAD_GENERAL);
         return await handleDialpadWebhook(request, env);
       }
 
       if (url.pathname === '/webhook/calendar' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.WEBHOOK_CALENDAR);
         return await handleCalendarWebhook(request, env);
       }
 
       if (url.pathname === '/webhook/recruiterflow/manual' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.WEBHOOK_RF_MANUAL);
         return await handleManualRFWebhook(request, env, url);
       }
 
       if (url.pathname === '/webhook/krisp' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.WEBHOOK_KRISP);
         return await handleKrispWebhook(request, env);
       }
 
       if (url.pathname === '/webhook/dialpad/calls' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.WEBHOOK_DIALPAD_CALL);
         return await handleDialpadCallWebhook(request, env);
       }
 
       if (url.pathname === '/webhook/dialpad/extension-calls' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.WEBHOOK_DIALPAD_EXT_CALL);
         return await handleDialpadExtensionCallsWebhook(request, env);
       }
 
       if (url.pathname === '/webhook/apollo' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.WEBHOOK_APOLLO_ENRICHMENT);
         return await handleApolloWebhook(request, env, url);
       }
 
       if (url.pathname === '/test/coldcall' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.TEST_COLD_CALL);
         return await handleTestColdCall(request, env, url);
       }
 
       if (url.pathname === '/candidates' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_ADD_CANDIDATE);
         const extAuth = request.headers.get('X-Extension-Token');
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
@@ -115,6 +129,7 @@ const handler = {
       }
 
       if (url.pathname === '/candidates/add-to-job' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_ADD_TO_JOB);
         const extAuth = request.headers.get('X-Extension-Token');
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
@@ -123,6 +138,7 @@ const handler = {
       }
 
       if (url.pathname === '/candidate-mark-invalid' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_MARK_INVALID);
         const extAuth = request.headers.get('X-Extension-Token');
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
@@ -131,6 +147,7 @@ const handler = {
       }
 
       if (url.pathname === '/candidate-details' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_FETCH_DETAILS);
         const extAuth = request.headers.get('X-Extension-Token');
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
@@ -139,6 +156,7 @@ const handler = {
       }
 
       if (url.pathname === '/dialpad-user-context' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_DIALPAD_USER_CONTEXT);
         const extAuth = request.headers.get('X-Extension-Token');
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
@@ -147,6 +165,7 @@ const handler = {
       }
 
       if (url.pathname === '/dialpad-call' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_CALL_REQUEST);
         const extAuth = request.headers.get('X-Extension-Token');
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
@@ -155,6 +174,7 @@ const handler = {
       }
 
       if (url.pathname === '/dialpad-sms' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_DIALPAD_SMS);
         const extAuth = request.headers.get('X-Extension-Token');
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
