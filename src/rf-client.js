@@ -740,6 +740,123 @@ export async function searchCandidatesByJobAndStage({ jobId, stageName, maxPages
   return { candidates: allCandidates, totalItems };
 }
 
+/**
+ * Single-call tier-2 search: RF /candidate/search with `candidate_id IN (ids)`
+ * intersected with additional mutable predicate filters server-side via
+ * `conjunction: 'match-all'`.
+ *
+ * Per spec rev 5 RF-1 + RF-7 verification (thin-immutable cache design):
+ * `candidate_id` is a multi-select-by-ID filter (`{conjunction: 'in', values: [...], key: 'candidate_id'}`).
+ * It composes with any other filter object (`email`, `current_company`,
+ * `current_title`, `lead_owner`, `stage`, `job`, `custom_field.<id>`, etc.)
+ * in the same `filters[]` array — the top-level `match-all` ANDs them.
+ *
+ * Empty / invalid id-list short-circuits to `{candidates: [], totalItems: 0}`
+ * without hitting RF — saves the round-trip.
+ *
+ * @param {Object} args
+ * @param {Array<number>} args.ids               id-list to intersect with predicate
+ * @param {Array<Object>} args.predicateFilters  RF filter objects to AND with the id-list
+ * @param {number} [args.maxPages=10]
+ * @param {Object} env
+ * @returns {Promise<{candidates: Array, totalItems: number|null}>}
+ */
+export async function searchCandidatesByIdsAndPredicate({ ids, predicateFilters, maxPages = 10 }, env) {
+  const numericIds = (Array.isArray(ids) ? ids : [])
+    .map(Number)
+    .filter(Number.isFinite);
+  if (numericIds.length === 0) {
+    return { candidates: [], totalItems: 0 };
+  }
+  const filters = [
+    { conjunction: 'in', values: numericIds, key: 'candidate_id' },
+    ...(Array.isArray(predicateFilters) ? predicateFilters : []),
+  ];
+  return searchCandidatesByFilters({ filters, maxPages }, env);
+}
+
+/**
+ * Predicate-only candidate search — no id-list intersection. Used by the
+ * mutable-filter-only path (no fuzzy `query`) where the caller wants RF to
+ * narrow purely on predicate.
+ *
+ * @param {Object} args
+ * @param {Array<Object>} args.predicateFilters  RF filter objects to AND together
+ * @param {number} [args.maxPages=10]
+ * @param {Object} env
+ * @returns {Promise<{candidates: Array, totalItems: number|null}>}
+ */
+export async function searchCandidatesByPredicateOnly({ predicateFilters, maxPages = 10 }, env) {
+  const filters = Array.isArray(predicateFilters) ? predicateFilters.slice() : [];
+  if (filters.length === 0) {
+    // Defensive — caller should never reach here with no filters; bail before
+    // RF returns the entire account.
+    return { candidates: [], totalItems: 0 };
+  }
+  return searchCandidatesByFilters({ filters, maxPages }, env);
+}
+
+/**
+ * Internal — paginated `/candidate/search` with `conjunction: 'match-all'` over
+ * the supplied filter array. Page size 100; loops until a short page or
+ * `maxPages` reached. Used by both `searchCandidatesByIdsAndPredicate` and
+ * `searchCandidatesByPredicateOnly`.
+ */
+async function searchCandidatesByFilters({ filters, maxPages = 10 }, env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const perPage = 100;
+  const allCandidates = [];
+  let totalItems = null;
+
+  for (let page = 1; page <= maxPages; page++) {
+    const requestBody = {
+      items_per_page: perPage,
+      current_page: page,
+      conjunction: 'match-all',
+      filters,
+      include_count: true,
+    };
+
+    const response = await fetch(`${rfBaseUrl}/candidate/search`, {
+      method: 'POST',
+      headers: { 'RF-Api-Key': rfApiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error({
+        message: `RF candidate/search error status=${response.status} body=${errorText}`,
+        source: 'rf-search',
+        page,
+        filterKeys: filters.map(f => f.key),
+      });
+      throw new Error(`RF API error: ${response.status} - ${errorText}`);
+    }
+
+    const result = await response.json();
+    const candidates = Array.isArray(result?.data)
+      ? result.data
+      : Array.isArray(result?.candidates)
+        ? result.candidates
+        : Array.isArray(result)
+          ? result
+          : [];
+    if (typeof result?.total_items === 'number') totalItems = result.total_items;
+
+    allCandidates.push(...candidates);
+
+    if (candidates.length < perPage) break;
+  }
+
+  return { candidates: allCandidates, totalItems };
+}
+
 const JOB_CANDIDATE_CONSULTANT_FIELD_ID = 16;
 
 /**
