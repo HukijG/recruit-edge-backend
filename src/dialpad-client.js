@@ -402,6 +402,99 @@ function countryFromE164(number) {
 }
 
 /**
+ * Error thrown by the new list/get helpers on Dialpad non-2xx responses.
+ * Lets handlers branch on status (e.g. 429 → rate_limited envelope) without
+ * parsing message strings. Existing helpers in this module continue to throw
+ * plain `Error` — this class is additive, not a refactor.
+ *
+ * `body` shape:
+ *   - parsed JSON object when the response carries Content-Type: application/json
+ *   - raw string text otherwise
+ *   - null when the response had no body
+ */
+export class DialpadHttpError extends Error {
+  constructor(status, body, message) {
+    super(message);
+    this.name = 'DialpadHttpError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
+async function readDialpadBody(response) {
+  const text = await response.text();
+  if (!text) return null;
+  const ct = response.headers.get('content-type') || '';
+  if (ct.includes('application/json')) {
+    try { return JSON.parse(text); } catch { return text; }
+  }
+  return text;
+}
+
+/**
+ * GET /api/v2/call — list calls for a target (user/group/office) within a
+ * timestamp window. Single-page; the handler paginates by re-calling with
+ * cursor until cursor is null.
+ *
+ * @param {Object} args
+ * @param {string|number} args.targetId
+ * @param {string} args.targetType  — 'user' for our recruiter-scoped flow
+ * @param {number} args.startedAfterMs
+ * @param {number} args.startedBeforeMs
+ * @param {string|null} [args.cursor]
+ * @param {Object} env
+ * @returns {Promise<{items: Array, cursor: string|null}>}
+ */
+export async function listDialpadCalls({ targetId, targetType, startedAfterMs, startedBeforeMs, cursor }, env) {
+  const dialpadApiKey = env?.DIALPAD_API_KEY;
+  const dialpadBaseUrl = env?.DIALPAD_API_BASE_URL || 'https://dialpad.com/api/v2';
+  if (!dialpadApiKey) throw new Error('DIALPAD_API_KEY environment variable is required');
+
+  const u = new URL(`${dialpadBaseUrl}/call`);
+  u.searchParams.set('target_id', String(targetId));
+  u.searchParams.set('target_type', String(targetType));
+  u.searchParams.set('started_after', String(startedAfterMs));
+  u.searchParams.set('started_before', String(startedBeforeMs));
+  if (cursor) u.searchParams.set('cursor', String(cursor));
+
+  const response = await fetch(u.toString(), {
+    method: 'GET',
+    headers: { Accept: 'application/json', Authorization: `Bearer ${dialpadApiKey}` },
+  });
+
+  if (!response.ok) {
+    const body = await readDialpadBody(response);
+    throw new DialpadHttpError(response.status, body, `Dialpad list-calls failed (HTTP ${response.status})`);
+  }
+  const json = await response.json();
+  return {
+    items: Array.isArray(json?.items) ? json.items : [],
+    cursor: json?.cursor ?? null,
+  };
+}
+
+/**
+ * GET /api/v2/call/{call_id} — single call object lookup. Documented rate
+ * limit: 10 RPM per token. Handler surfaces 429 as a recoverable envelope.
+ */
+export async function getDialpadCall(callId, env) {
+  const dialpadApiKey = env?.DIALPAD_API_KEY;
+  const dialpadBaseUrl = env?.DIALPAD_API_BASE_URL || 'https://dialpad.com/api/v2';
+  if (!dialpadApiKey) throw new Error('DIALPAD_API_KEY environment variable is required');
+
+  const response = await fetch(`${dialpadBaseUrl}/call/${encodeURIComponent(callId)}`, {
+    method: 'GET',
+    headers: { Accept: 'application/json', Authorization: `Bearer ${dialpadApiKey}` },
+  });
+
+  if (!response.ok) {
+    const body = await readDialpadBody(response);
+    throw new DialpadHttpError(response.status, body, `Dialpad get-call failed (HTTP ${response.status})`);
+  }
+  return await response.json();
+}
+
+/**
  * Build contact payload. Only includes fields that have values —
  * Dialpad PATCH clears any field present with an empty value.
  * Omitting a field entirely leaves it untouched.

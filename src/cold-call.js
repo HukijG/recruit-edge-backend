@@ -8,6 +8,7 @@
 
 import { extractRFIdFromDialpadContact, updateRFCandidate, createRFCustomActivity, getRFCandidate, moveJobsToStage } from './rf-client.js';
 import { isMonitoredDialpadUser, getRFUserIdByDialpadId } from './users.js';
+import { DialpadHttpError } from './dialpad-client.js';
 
 // --- Constants ---
 
@@ -185,8 +186,13 @@ export async function fetchCallTranscript(callId, env) {
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Dialpad transcript API error: ${response.status} - ${errorText}`);
+    const text = await response.text();
+    const ct = response.headers.get('content-type') || '';
+    let body = text || null;
+    if (text && ct.includes('application/json')) {
+      try { body = JSON.parse(text); } catch { /* keep as text */ }
+    }
+    throw new DialpadHttpError(response.status, body, `Dialpad transcript API error (HTTP ${response.status})`);
   }
 
   return await response.json();
