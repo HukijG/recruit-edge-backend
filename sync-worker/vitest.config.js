@@ -18,6 +18,7 @@ export default defineConfig({
 				bindings: {
 					RF_API_KEY: 'test-rf-api-key',
 					ADMIN_SECRET: 'test-admin-secret',
+					INTERNAL_SECRET: 'test-internal-secret',
 					DIALPAD_API_KEY: 'test-dialpad-api-key',
 				},
 			},

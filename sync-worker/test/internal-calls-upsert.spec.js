@@ -16,8 +16,9 @@ const samplePayload = {
   direction: 'outbound',
 };
 
-function makeRequest(path, { method = 'POST', body } = {}) {
+function makeRequest(path, { method = 'POST', body, token = env.INTERNAL_SECRET } = {}) {
   const headers = new Headers({ 'Content-Type': 'application/json' });
+  if (token !== null) headers.set('X-Internal-Token', token);
   const init = { method, headers };
   if (body !== undefined) init.body = body;
   return new Request(`http://internal${path}`, init);
@@ -79,5 +80,43 @@ describe('POST /internal/calls/upsert', () => {
       {},
     );
     expect(res.status).toBe(400);
+  });
+
+  it('writes rf_candidate_id as NULL when payload has no contact (cold call)', async () => {
+    const coldCallPayload = {
+      call_id: 'c-cold-1',
+      target: { id: '8000000000000001' },
+      date_started: 1717248000000,
+      total_duration: 60_000,
+      direction: 'inbound',
+    };
+    const res = await worker.fetch(
+      makeRequest('/internal/calls/upsert', { body: JSON.stringify(coldCallPayload) }),
+      env,
+      {},
+    );
+    expect(res.status).toBe(200);
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT call_id, rf_candidate_id FROM calls WHERE call_id = ?')
+      .bind('c-cold-1').all();
+    expect(results[0].rf_candidate_id).toBeNull();
+  });
+
+  it('returns 401 without X-Internal-Token', async () => {
+    const res = await worker.fetch(
+      makeRequest('/internal/calls/upsert', { body: JSON.stringify(samplePayload), token: null }),
+      env,
+      {},
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 401 with wrong X-Internal-Token', async () => {
+    const res = await worker.fetch(
+      makeRequest('/internal/calls/upsert', { body: JSON.stringify(samplePayload), token: 'wrong-token' }),
+      env,
+      {},
+    );
+    expect(res.status).toBe(401);
   });
 });

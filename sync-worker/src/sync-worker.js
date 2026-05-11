@@ -254,6 +254,14 @@ async function tailSyncCallsThin(env) {
 }
 
 async function handleInternal(request, env, ctx) {
+  // Service-binding-only endpoint. Defense-in-depth: even though the
+  // workers_dev subdomain is disabled, require a shared secret in case
+  // the route surface ever expands (Workers Routes / custom domain etc.).
+  const token = request.headers.get('X-Internal-Token');
+  if (!env.INTERNAL_SECRET || !token || !timingSafeEqual(token, env.INTERNAL_SECRET)) {
+    return Response.json({ ok: false, error: 'auth' }, { status: 401 });
+  }
+
   const url = new URL(request.url);
 
   if (url.pathname === '/internal/calls/upsert') {
@@ -268,6 +276,9 @@ async function handleInternal(request, env, ctx) {
     }
     if (!payload?.call_id || !payload?.target?.id || payload?.date_started == null) {
       return Response.json({ ok: false, error: 'missing required fields (call_id, target.id, date_started)' }, { status: 400 });
+    }
+    if (!Number.isFinite(Number(payload.date_started))) {
+      return Response.json({ ok: false, error: 'date_started must be a finite number (UTC ms)' }, { status: 400 });
     }
     try {
       await writeCalls(env, [payload]);
