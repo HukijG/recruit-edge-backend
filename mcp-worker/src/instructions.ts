@@ -12,6 +12,7 @@ export const SERVER_INSTRUCTIONS = [
   "  - rf_job_pipeline          — JOB PIPELINE VIEW: candidates grouped by stage. Use for ANY pipeline / stage-progress / 'submitted' / 'in <stage>' query.",
   "  - rf_job_candidates_filter — flat (non-grouped) job-side list. ONLY when pipeline grouping isn't wanted — custom field projections / analytics-style filters. NOT the right tool for pipeline prompts.",
   "  - rf_cache_status          — diagnostic only, when the user asks about data freshness",
+  "  - rf_candidate_call_notes  — write structured call notes from a recent Dialpad screening call (three-step flow)",
   "",
   "Candidate lookup routing — the line is intent + narrowing context:",
   "  • ONE specific person, id or name only ('show me Jerry', 'fetch his profile', 'pull up 50976') → `rf_candidate_get`. Auto-disambiguates among matches.",

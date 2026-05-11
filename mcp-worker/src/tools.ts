@@ -385,4 +385,63 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
         return respond(data);
       }),
   );
+
+  // ─── rf_candidate_call_notes ────────────────────────────────────────
+  server.registerTool(
+    "rf_candidate_call_notes",
+    {
+      title: "Write structured call notes from a recent Dialpad screening call (three-step flow)",
+      description: [
+        "USE WHEN: the user asks you to write up / draft / create structured call notes for a recent call with a candidate (e.g. 'for my most recent screening call with Sarah, write up the structured call notes').",
+        "",
+        "Three stages keyed by `step`. ONE round-trip per stage. The tool is stateless across calls — each response carries the identifiers needed for the next.",
+        "",
+        "─── step='list_calls' ──────────────────────────────────────────",
+        "Find the consultant's recent calls of 2+ minutes with the named candidate.",
+        "  Required: candidate (fuzzy name or numeric RF id).",
+        "  Time window: PREFER passing started_after/started_before as ISO 8601 — you usually know the user's TZ and can compute the window. Fall back to time_query only for short common phrases ('today', 'yesterday', 'last hour', 'this afternoon', 'last 3 days', 'last week', 'YYYY-MM-DD', '<weekday>'). Anything outside the small fallback set defaults to last 7 days with a warning; convert to ISO instead.",
+        "  Response: {ok: true, candidate: {id, name}, calls: [{call_id, started_at, duration_minutes, direction}, …], window?}",
+        "  IMPORTANT: NEVER surface `call_id` to the user — describe the call instead ('24 min outbound on Monday at 3:15pm'). The user picks one, you re-call step='get_transcript' with that call_id.",
+        "  Recoverable: {ok:false, kind:'no_long_calls' | 'no_dialpad_id' | 'no_candidate'}, or {needs_disambiguation, kind:'candidate', options}.",
+        "",
+        "─── step='get_transcript' ──────────────────────────────────────",
+        "Pull the transcript + rendering brief for one chosen call.",
+        "  Required: call_id (opaque string from step='list_calls' response).",
+        "  Response: {ok: true, candidate: {id, name}, call: {…}, transcript: '<formatted plain text>', guidance: '<markdown template>'}",
+        "  Read the guidance carefully — it defines the exact section layout the team uses. Apply it to the transcript and draft the note in chat for the user to review. Do NOT call step='submit_notes' until the user confirms.",
+        "  Recoverable: {ok:false, kind:'not_your_call' | 'no_rf_candidate' | 'no_candidate' | 'no_transcript' | 'rate_limited' | 'call_not_found'}.",
+        "",
+        "─── step='submit_notes' ────────────────────────────────────────",
+        "Post the finished structured notes to the candidate's RF profile.",
+        "  Required: note (markdown — server converts to HTML), and ONE of: candidate_id (preferred, the numeric id echoed back in stages 1/2) or candidate_fallback (fuzzy name when you lost the id).",
+        "  Response: {ok: true} on success — fully consistent with rf_candidate_add_note.",
+        "  Recoverable on fallback path: {needs_disambiguation, kind:'candidate', options} (rare; only if Claude lost the id and the fuzzy name resolves to multiple).",
+        "",
+        "Attribution is always the consultant whose Access JWT signed this MCP session — no override field.",
+      ].join("\n"),
+      inputSchema: {
+        step: z.enum(["list_calls", "get_transcript", "submit_notes"]),
+        candidate: ref.optional(),
+        started_after: z.string().optional()
+          .describe("ISO 8601 (any TZ offset). Preferred time-window input. Required when step='list_calls' unless time_query is set."),
+        started_before: z.string().optional()
+          .describe("ISO 8601 upper bound; defaults to 'now' when started_after is set without it."),
+        time_query: z.string().optional()
+          .describe("Fallback natural-language window. Supported: 'most recent', 'last hour', 'last <N> hours', 'today', 'yesterday', 'this morning'/'afternoon'/'evening', 'yesterday afternoon'/'evening', 'this week', 'last week', 'last <N> days', 'last <N> weeks', '<weekday>', 'YYYY-MM-DD'. Anything else defaults to 7 days + warning."),
+        call_id: z.string().optional(),
+        candidate_id: z.number().int().optional()
+          .describe("Numeric RF id from a previous stage. Use this on step='submit_notes' when you have it (fast path)."),
+        candidate_fallback: ref.optional()
+          .describe("Fuzzy candidate ref for step='submit_notes' when candidate_id was lost. Goes through the full disambiguation flow."),
+        note: z.string().optional()
+          .describe("Required when step='submit_notes'. Markdown body of the structured call notes."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false },
+    },
+    async (args) =>
+      guarded(async () => {
+        const data = await mwFetch(ctx, "/mcp/candidate-call-notes", args as Record<string, unknown>);
+        return respond(data);
+      }),
+  );
 }
