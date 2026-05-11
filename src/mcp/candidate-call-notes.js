@@ -22,6 +22,7 @@ import { listDialpadCalls, getDialpadCall, DialpadHttpError } from '../dialpad-c
 import { extractRFIdFromDialpadContact } from '../rf-client.js';
 import { getCandidateById } from './d1-read.js';
 import { fetchCallTranscript } from '../cold-call.js';
+import { addNoteForCandidate, handleCandidateAddNote } from './candidate-add-note.js';
 
 export const MIN_TOTAL_DURATION_MS = 120_000;
 export const MAX_LIST_PAGES = 20;
@@ -307,10 +308,81 @@ async function handleGetTranscript({ env, body, consultant }) {
   });
 }
 
+/**
+ * Step 3 of the three-stage flow: post the structured-markdown notes to RF as
+ * a candidate timeline note. Two paths:
+ *
+ *   - Fast path  (candidate_id numeric): D1 lookup → `addNoteForCandidate`
+ *     in-process. No fuzzy resolution, no disambiguation envelope. Cache miss
+ *     surfaces as `{ok: false, kind: 'no_candidate'}` (HTTP 200) — the user
+ *     just chose this candidate in step 1 / step 2, so the right UX is "the
+ *     cache forgot, try again" not "candidate not found."
+ *
+ *   - Fallback path (candidate_fallback fuzzy string): delegates the whole
+ *     candidate-resolution flow to `handleCandidateAddNote` verbatim. The
+ *     sibling's behavior — needs_disambiguation envelope, HTTP 404 +
+ *     `{error: 'candidate not found'}` on resolver miss — flows through
+ *     unchanged. Dialect divergence vs. the fast path's HTTP-200 envelope is
+ *     deliberate: see spec § "Note on the candidate_id-not-in-D1 dialect".
+ *
+ * Attribution is always `consultant.rfUserId` (resolved server-side from the
+ * Access JWT). Both paths funnel the inbound `note` straight to
+ * `addNoteForCandidate`, which is the ONLY caller of `addRFCandidateNote` for
+ * this endpoint — no `user` / `activity_user_id` / `created_by` body field
+ * has any reach, by construction.
+ */
+async function handleSubmitNotes({ env, body, consultant }) {
+  const note = typeof body.note === 'string' ? body.note.trim() : '';
+  if (!note) {
+    return jsonResponse(400, { error: 'note is required' });
+  }
+  const hasId = body.candidate_id != null;
+  const hasFallback = body.candidate_fallback != null;
+  if (hasId && hasFallback) {
+    return jsonResponse(400, {
+      error: 'pass exactly one of candidate_id (numeric) or candidate_fallback (fuzzy ref) — not both',
+    });
+  }
+  if (!hasId && !hasFallback) {
+    return jsonResponse(400, {
+      error: 'candidate_id (numeric) or candidate_fallback (fuzzy ref) is required for step=submit_notes',
+    });
+  }
+
+  if (hasId) {
+    const candidate = await getCandidateById(env, Number(body.candidate_id));
+    if (!candidate) {
+      return jsonResponse(200, {
+        ok: false,
+        kind: 'no_candidate',
+        error: 'candidate not found',
+      });
+    }
+    const res = await addNoteForCandidate({ env, candidate, noteMd: note, consultant });
+    if (!res.ok) {
+      return jsonResponse(res.status ?? 502, { error: res.error });
+    }
+    return jsonResponse(200, { ok: true });
+  }
+
+  // Fallback path: delegate to /mcp/candidate-add-note's handler verbatim so
+  // disambiguation / not-found behave identically to the sibling tool.
+  //
+  // Dialect note: the sibling returns HTTP 404 + {error: 'candidate not found'}
+  // on resolver not_found, whereas the fast path above returns HTTP 200 + the
+  // {ok: false, kind: 'no_candidate'} envelope. The asymmetry is deliberate —
+  // see spec § "Note on the candidate_id-not-in-D1 dialect". Preserving the
+  // sibling's shape on this path means the fallback is a true passthrough.
+  return handleCandidateAddNote({
+    env,
+    body: { candidate: body.candidate_fallback, note },
+    consultant,
+  });
+}
+
 export async function handleCandidateCallNotes({ env, body, consultant }) {
   if (body?.step === 'list_calls') return handleListCalls({ env, body, consultant });
   if (body?.step === 'get_transcript') return handleGetTranscript({ env, body, consultant });
-  // submit_notes wired in Task 7. Until then, every other step returns the
-  // canonical "unknown step" 400.
+  if (body?.step === 'submit_notes') return handleSubmitNotes({ env, body, consultant });
   return jsonResponse(400, { error: 'step must be one of list_calls, get_transcript, submit_notes' });
 }

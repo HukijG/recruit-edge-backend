@@ -510,3 +510,138 @@ describe('/mcp/candidate-call-notes step=get_transcript', () => {
     expect(b.kind).toBe('no_transcript');
   });
 });
+
+describe('/mcp/candidate-call-notes step=submit_notes', () => {
+  it('fast path: candidate_id + note → RF note posted with consultant attribution', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 1 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      step: 'submit_notes',
+      candidate_id: 50976,
+      note: '**Background**\n- 8 yrs at Globex',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b).toEqual({ ok: true });
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    const [url, opts] = globalThis.fetch.mock.calls[0];
+    expect(String(url)).toContain('/candidate/notes/add');
+    const sent = JSON.parse(opts.body);
+    expect(sent.id).toBe(50976);
+    expect(sent.created_by).toBe(900001); // Joel's rfUserId
+    expect(sent.value).toContain('<strong>Background</strong>');
+    expect(sent.value).toContain('<li>8 yrs at Globex</li>');
+  });
+
+  it('note missing → 400', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({ consultantFirstName: 'Joel', step: 'submit_notes', candidate_id: 50976 });
+    expect(r.status).toBe(400);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('both candidate_id and candidate_fallback → 400 XOR', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({
+      consultantFirstName: 'Joel', step: 'submit_notes',
+      candidate_id: 50976, candidate_fallback: 'Sarah', note: 'x',
+    });
+    expect(r.status).toBe(400);
+    const b = await r.json();
+    expect(b.error).toMatch(/exactly one/i);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('neither candidate identifier → 400', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({ consultantFirstName: 'Joel', step: 'submit_notes', note: 'x' });
+    expect(r.status).toBe(400);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('fast path: candidate_id not in D1 → kind=no_candidate (no RF call)', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({
+      consultantFirstName: 'Joel', step: 'submit_notes',
+      candidate_id: 999999, note: 'x',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.ok).toBe(false);
+    expect(b.kind).toBe('no_candidate');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('attribution always = consultant (fast path): override fields on body are ignored', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 1 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      step: 'submit_notes',
+      candidate_id: 50976,
+      note: 'attribution check',
+      // Bogus override attempts — must be ignored.
+      user: 999999,
+      activity_user_id: 888888,
+      created_by: 777777,
+    });
+    expect(r.status).toBe(200);
+    const sent = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    expect(sent.created_by).toBe(900001); // Joel's rfUserId, from the JWT-resolved consultant.
+  });
+
+  it('attribution always = consultant (fallback path): override fields ignored there too', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 1 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel',
+      step: 'submit_notes',
+      candidate_fallback: 'Priya Sharma',
+      note: 'fallback attribution check',
+      user: 999999,
+      activity_user_id: 888888,
+    });
+    expect(r.status).toBe(200);
+    const sent = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    expect(sent.created_by).toBe(900001);
+  });
+
+  it('fast path: RF returns 500 → 502', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('boom', { status: 500 }));
+    const r = await call({
+      consultantFirstName: 'Joel', step: 'submit_notes',
+      candidate_id: 50976, note: 'x',
+    });
+    expect(r.status).toBe(502);
+  });
+
+  it('fallback path: candidate_fallback resolves uniquely → ok', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 1 }), { status: 200 }),
+    );
+    const r = await call({
+      consultantFirstName: 'Joel', step: 'submit_notes',
+      candidate_fallback: 'Priya Sharma', note: 'fallback path',
+    });
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b).toEqual({ ok: true });
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    const sent = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    expect(sent.id).toBe(50976);
+  });
+
+  it('fallback path: candidate_fallback not found → 404', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({
+      consultantFirstName: 'Joel', step: 'submit_notes',
+      candidate_fallback: 'Nobody-McNoFace-1234567', note: 'x',
+    });
+    expect(r.status).toBe(404);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+});
