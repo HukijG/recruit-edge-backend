@@ -30,6 +30,19 @@ describe('fetchCFMetrics', () => {
     expect(result.aiUsage).toEqual({ neurons: 100 });
   });
 
+  it('uses correctly-capitalized GraphQL scalar types', async () => {
+    globalThis.fetch = vi.fn(async (_url: any, init: any) => {
+      const body = JSON.parse(init.body);
+      // GraphQL is case-sensitive on built-in scalars. Lowercase "string!" would be rejected by the server.
+      expect(body.query).toContain(': String!');
+      expect(body.query).not.toMatch(/:\s+string!/);
+      return new Response(JSON.stringify({ data: { viewer: { accounts: [{}] } } }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as any;
+    await fetchCFMetrics({ CF_API_TOKEN: 't', CF_ACCOUNT_ID: 'a', CF_GRAPHQL_ENDPOINT: 'https://x/graphql' });
+  });
+
   it('returns empty arrays + null on a 4xx response', async () => {
     globalThis.fetch = vi.fn(async () => new Response('Unauthorized', { status: 401 })) as any;
     const result = await fetchCFMetrics({ CF_API_TOKEN: 't', CF_ACCOUNT_ID: 'a', CF_GRAPHQL_ENDPOINT: 'https://x/graphql' });

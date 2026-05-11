@@ -11,7 +11,7 @@ export interface CFGraphQLConfig {
 }
 
 const COMBINED_QUERY = `
-  query CombinedMetrics($accountTag: string!, $start: Date, $end: Date) {
+  query CombinedMetrics($accountTag: String!, $start: Date, $end: Date) {
     viewer {
       accounts(filter: { accountTag: $accountTag }) {
         d1StorageAdaptiveGroups(
