@@ -420,15 +420,18 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
         "Attribution is always the consultant whose Access JWT signed this MCP session — no override field.",
       ].join("\n"),
       inputSchema: {
-        step: z.enum(["list_calls", "get_transcript", "submit_notes"]),
-        candidate: ref.optional(),
+        step: z.enum(["list_calls", "get_transcript", "submit_notes"])
+          .describe("Which stage of the flow: 'list_calls' (find candidate's recent calls) → 'get_transcript' (fetch transcript + rendering guidance) → 'submit_notes' (post finished notes to RF)."),
+        candidate: ref.optional()
+          .describe("Required when step='list_calls'. Fuzzy name or numeric RF id. Numeric short-circuits the resolver."),
         started_after: z.string().optional()
           .describe("ISO 8601 (any TZ offset). Preferred time-window input. Required when step='list_calls' unless time_query is set."),
         started_before: z.string().optional()
           .describe("ISO 8601 upper bound; defaults to 'now' when started_after is set without it."),
         time_query: z.string().optional()
           .describe("Fallback natural-language window. Supported: 'most recent', 'last hour', 'last <N> hours', 'today', 'yesterday', 'this morning'/'afternoon'/'evening', 'yesterday afternoon'/'evening', 'this week', 'last week', 'last <N> days', 'last <N> weeks', '<weekday>', 'YYYY-MM-DD'. Anything else defaults to 7 days + warning."),
-        call_id: z.string().optional(),
+        call_id: z.string().optional()
+          .describe("Required when step='get_transcript'. The Dialpad call_id from a previous step='list_calls' response."),
         candidate_id: z.number().int().optional()
           .describe("Numeric RF id from a previous stage. Use this on step='submit_notes' when you have it (fast path)."),
         candidate_fallback: ref.optional()
