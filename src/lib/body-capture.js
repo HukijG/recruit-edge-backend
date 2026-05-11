@@ -1,8 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { trace } from '@opentelemetry/api';
 
-const REDACT_HEADERS = /^(authorization|cookie|set-cookie|x-mcp-token|x-extension-token|x-rf-webhook-token|x-calendar-webhook-token|x-krisp-webhook-token|cf-access-jwt-assertion)$/i;
-const REDACT_HEADER_KEYWORD = /secret|token|api[_-]?key/i;
 const REDACT_BODY_FIELD = /^(password|secret|token|api_key|apikey|client_secret|private_key)$/i;
 const REDACT_QUERY_PARAM = /secret|token|api[_-]?key|apikey/i;
 const MAX_BODY_BYTES = 32 * 1024;
