@@ -233,6 +233,26 @@ describe('fetchCandidatesAddedSince', () => {
     });
   });
 
+  it('on cap, MIN truly wins over MAX (varying timestamps in batch)', async () => {
+    // 50 pages × 100 rows. Page 0 timestamps at 09:00, page 49 at 18:00.
+    const pages = [];
+    for (let p = 0; p < 50; p++) {
+      const hour = String(9 + Math.floor(p / 6)).padStart(2, '0'); // 09..17 across pages
+      pages.push(Array.from({ length: 100 }, (_, i) => ({
+        id: p * 100 + i + 1,
+        name: `c${p * 100 + i + 1}`,
+        added_time: `2024-06-15T${hour}:00:00+0000`,
+      })));
+    }
+    mockSearch(pages);
+    const result = await fetchCandidatesAddedSince(env, '2024-06-15T00:00:00.000Z');
+    expect(result.capped).toBe(true);
+    expect(result.rows).toHaveLength(5000);
+    // MIN(added_time) across the cap is 09:00, which advances from input 00:00.
+    expect(result.suggestedCursor).toBe('2024-06-15T09:00:00.000Z');
+    // If implementation accidentally used MAX, suggestedCursor would be 17:00 (or higher).
+  });
+
   it('cursor never moves backward when MIN(added_time in batch) < input cursor', async () => {
     // Defensive: even if RF returns a candidate older than the cursor due to
     // day-granularity overlap, we keep the cursor at the input.

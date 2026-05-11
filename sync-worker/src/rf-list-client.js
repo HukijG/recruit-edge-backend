@@ -242,13 +242,28 @@ export async function fetchJobPipeline(env, jobId) {
  * Returns candidate ROWS (full RF /candidate/search response items) whose
  * `added_time` is on or after `cursor` (an ISO 8601 datetime).
  *
+ * Uses RF's `/candidate/search` with the `added_on` date filter — we don't use
+ * `/candidate/list` because RF doesn't expose a cursor on it (spec rev 5 RF-2
+ * verified: `/candidate/list` is offset-only, no `since_id`, no documented
+ * sort order). The `added_on` filter system field is documented in the rev-5
+ * RF-7 verification.
+ *
  * Cursor advancement (per spec rev 5):
  *   - Not capped → set to MAX(added_time) seen across all rows.
  *   - Capped → set to MIN(added_time) seen, never moving backward of input.
- *     (Ensures forward progress on huge backlogs while accepting same-day
- *     overlap which is idempotent via INSERT-OR-IGNORE on PK.)
+ *     (Ensures forward progress on huge multi-day backlogs while accepting
+ *     same-day overlap, which is idempotent via INSERT-OR-IGNORE on PK.)
  *
  * Hard cap of 5000 rows per tick (defensive — outage recovery).
+ *
+ * Known edge case: if more than 5000 candidates are added on the SAME day AND
+ * some have `added_time` earlier than the input cursor (i.e., cursor advanced
+ * past noon, batch MIN is at 09:00), the never-backward guard pins the cursor
+ * at the input and the next tick re-fetches the same boundary day. INSERT-OR-
+ * IGNORE absorbs the dupes (no data corruption), but no forward progress is
+ * made until the boundary day clears. Far outside the operating envelope
+ * (typical ≤10 new candidates/tick per spec rev 5 line 333); only reachable
+ * on an unprecedented single-day spike during outage recovery.
  */
 export async function fetchCandidatesAddedSince(env, cursor) {
   const rows = [];
