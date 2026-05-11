@@ -181,7 +181,7 @@ async function handleListCalls({ env, body, consultant }) {
   if (warnings.length) out._meta = { warnings };
   console.log({
     message: `[mcp] candidate-call-notes step=list_calls candidate_id=${candidate.id} calls=${calls.length}`,
-    tool: '/mcp/candidate-call-notes',
+    source: 'mcp-candidate-call-notes',
     step: 'list_calls',
     candidate_id: candidate.id,
     calls_returned: calls.length,
@@ -303,7 +303,7 @@ async function handleGetTranscript({ env, body, consultant }) {
 
   console.log({
     message: `[mcp] candidate-call-notes step=get_transcript candidate_id=${candidate.id} transcript_chars=${text.length}`,
-    tool: '/mcp/candidate-call-notes',
+    source: 'mcp-candidate-call-notes',
     step: 'get_transcript',
     candidate_id: candidate.id,
     transcript_chars: text.length,
@@ -378,7 +378,7 @@ async function handleSubmitNotes({ env, body, consultant }) {
     }
     console.log({
       message: `[mcp] candidate-call-notes step=submit_notes candidate_id=${candidate.id} note_chars=${note.length}`,
-      tool: '/mcp/candidate-call-notes',
+      source: 'mcp-candidate-call-notes',
       step: 'submit_notes',
       candidate_id: candidate.id,
       note_chars: note.length,
