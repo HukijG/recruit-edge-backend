@@ -1,6 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { trace } from "@opentelemetry/api";
 import { mwFetch, MwClientError } from "./mw-client.js";
+import { mcpToolFlow } from "./lib/flow-names.js";
 import type { RequestCtx } from "./index.js";
 
 // ~140k chars ≈ 35k tokens — leaves headroom in Claude's tool-result budget.
@@ -123,11 +125,13 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
       },
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    async (args) =>
-      guarded(async () => {
+    async (args) => {
+      trace.getActiveSpan()?.setAttribute("flow.name", mcpToolFlow("rf_candidate_search"));
+      return guarded(async () => {
         const data = await mwFetch(ctx, "/mcp/candidate-search", args as Record<string, unknown>);
         return respond(data);
-      }),
+      });
+    },
   );
 
   // ─── rf_candidate_get ───────────────────────────────────────────────
@@ -165,11 +169,13 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
       annotations: { readOnlyHint: true, destructiveHint: false },
       _meta: { "anthropic/alwaysLoad": true },
     },
-    async (args) =>
-      guarded(async () => {
+    async (args) => {
+      trace.getActiveSpan()?.setAttribute("flow.name", mcpToolFlow("rf_candidate_get"));
+      return guarded(async () => {
         const data = await mwFetch(ctx, "/mcp/candidate-get", args as Record<string, unknown>);
         return respond(data);
-      }),
+      });
+    },
   );
 
   // ─── rf_candidate_move_stage ────────────────────────────────────────
@@ -195,11 +201,13 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
       },
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
-    async (args) =>
-      guarded(async () => {
+    async (args) => {
+      trace.getActiveSpan()?.setAttribute("flow.name", mcpToolFlow("rf_candidate_move_stage"));
+      return guarded(async () => {
         const data = await mwFetch(ctx, "/mcp/candidate-move-stage", args as Record<string, unknown>);
         return respond(data);
-      }),
+      });
+    },
   );
 
   // ─── rf_candidate_log_interview ─────────────────────────────────────
@@ -247,11 +255,13 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
       },
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
-    async (args) =>
-      guarded(async () => {
+    async (args) => {
+      trace.getActiveSpan()?.setAttribute("flow.name", mcpToolFlow("rf_candidate_log_interview"));
+      return guarded(async () => {
         const data = await mwFetch(ctx, "/mcp/candidate-log-interview", args as Record<string, unknown>);
         return respond(data);
-      }),
+      });
+    },
   );
 
   // ─── rf_job_candidates_filter ───────────────────────────────────────
@@ -281,11 +291,13 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
       },
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    async (args) =>
-      guarded(async () => {
+    async (args) => {
+      trace.getActiveSpan()?.setAttribute("flow.name", mcpToolFlow("rf_job_candidates_filter"));
+      return guarded(async () => {
         const data = await mwFetch(ctx, "/mcp/job-candidates-filter", args as Record<string, unknown>);
         return respond(data);
-      }),
+      });
+    },
   );
 
   // ─── rf_job_pipeline ────────────────────────────────────────────────
@@ -329,11 +341,13 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
       annotations: { readOnlyHint: true, destructiveHint: false },
       _meta: { "anthropic/alwaysLoad": true },
     },
-    async (args) =>
-      guarded(async () => {
+    async (args) => {
+      trace.getActiveSpan()?.setAttribute("flow.name", mcpToolFlow("rf_job_pipeline"));
+      return guarded(async () => {
         const data = await mwFetch(ctx, "/mcp/job-pipeline", args as Record<string, unknown>);
         return respond(data);
-      }),
+      });
+    },
   );
 
   // ─── rf_cache_status ────────────────────────────────────────────────
@@ -349,11 +363,13 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
       inputSchema: {},
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    async () =>
-      guarded(async () => {
+    async () => {
+      trace.getActiveSpan()?.setAttribute("flow.name", mcpToolFlow("rf_cache_status"));
+      return guarded(async () => {
         const data = await mwFetch(ctx, "/mcp/cache-status", {});
         return respond(data);
-      }),
+      });
+    },
   );
 
   // ─── rf_candidate_add_note ──────────────────────────────────────────
@@ -379,11 +395,13 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
       },
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
-    async (args) =>
-      guarded(async () => {
+    async (args) => {
+      trace.getActiveSpan()?.setAttribute("flow.name", mcpToolFlow("rf_candidate_add_note"));
+      return guarded(async () => {
         const data = await mwFetch(ctx, "/mcp/candidate-add-note", args as Record<string, unknown>);
         return respond(data);
-      }),
+      });
+    },
   );
 
   // ─── rf_candidate_call_notes ────────────────────────────────────────
@@ -441,10 +459,12 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
       },
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
-    async (args) =>
-      guarded(async () => {
+    async (args) => {
+      trace.getActiveSpan()?.setAttribute("flow.name", mcpToolFlow("rf_candidate_call_notes"));
+      return guarded(async () => {
         const data = await mwFetch(ctx, "/mcp/candidate-call-notes", args as Record<string, unknown>);
         return respond(data);
-      }),
+      });
+    },
   );
 }
