@@ -11,6 +11,7 @@ Canonical reference for the auth layer across the workers + the convention all n
 - Don't add new shared-secret headers, IdP-of-the-week integrations, body-field identity ("consultantFirstName"-style), or any parallel auth mechanism. They will fragment trust and not survive Spec B's cutover.
 - Webhook endpoints (Dialpad / RF / Krisp / calendar) are NOT user-facing. They keep their existing auth (Dialpad JWT signature, RF URL-secret, Krisp signature, calendar webhook secrets).
 - Service-binding traffic between workers is implicitly trusted within the Cloudflare account boundary. The upstream (Access-protected) worker validates the JWT once and forwards a body field with the verified identity to the downstream worker.
+- The **one exception** to pure trust-within-account: the sync-worker's `/internal/*` routes add a shared-secret gate (`X-Internal-Token`) on top of service-binding trust as defense-in-depth. See below.
 
 If you're unsure whether a new endpoint needs Access:
 
@@ -18,7 +19,7 @@ If you're unsure whether a new endpoint needs Access:
 |---|---|
 | Teammate via browser, extension, or AI client | **Yes** |
 | Cloudflare-side webhook (Dialpad / RF / etc.) | No — keep existing webhook auth |
-| Another internal worker over service binding | No — binding origin is trusted; pass identity in body |
+| Another internal worker over service binding | No — binding origin is trusted; pass identity in body. Add `X-Internal-Token` only when the receiver is sync-worker `/internal/*` (belt-and-braces against Workers Routes / custom domain re-exposure) |
 | Cron / scheduled handler | No — there's no user identity |
 
 ## Current implementation
@@ -71,6 +72,53 @@ If you're unsure whether a new endpoint needs Access:
 - Seed: see [`migrations/0002_seed_users.sql`](../migrations/0002_seed_users.sql) (placeholder emails — substitute at apply-time).
 - Module: [`src/users.js`](../src/users.js) — async, env-first, module-level cache (single bulk SELECT per Worker isolate, never invalidated within an isolate). Adding a teammate = a new migration applied via `wrangler d1 execute --remote`, then redeploy the workers (cold start refreshes the cache).
 
+## Service-binding endpoints (no Access required, but see below)
+
+### `POST /internal/calls/upsert` (sync-worker)
+
+- **Worker:** `rf-mcp-cache-sync` (sync-worker)
+- **Caller:** `rf-dialpad-sync-dev` (main worker) via `SYNC_WORKER` service binding — triggered from `src/webhook/dialpad-hangup-forwarder.js` inside `ctx.waitUntil` on every hangup event.
+- **Implementation:** `handleInternal()` in `sync-worker/src/sync-worker.js`. Validates the token via `timingSafeEqual` against `env.INTERNAL_SECRET`, then calls `writeCalls(env, [payload])` — an INSERT-OR-IGNORE into the `calls` table.
+
+**Two-layer auth (belt-and-braces):**
+
+1. **`workers_dev: false`** in `sync-worker/wrangler.sync.jsonc` — the `https://rf-mcp-cache-sync.<account>.workers.dev/*` public subdomain is disabled. The sync-worker is reachable only via service binding and cron triggers; no internet traffic can reach `/internal/*` at the workers.dev hostname.
+2. **`X-Internal-Token: env.INTERNAL_SECRET`** shared-secret header — `handleInternal` requires this on every `/internal/*` request. Defense-in-depth: the workers.dev hostname check is a Cloudflare platform guarantee; the secret gate ensures the endpoint stays gated even if a Workers Route or custom domain accidentally re-exposes the worker later.
+
+**Why two layers?** The spec (rev 5) originally assumed `workers_dev: false` was sufficient because the Cloudflare account boundary is trusted. A review pass noted that the workers.dev subdomain was enabled by default, and that Workers Routes or a custom domain could re-expose the routes without the developer noticing. The shared secret is the explicit human-legible gate; `workers_dev: false` is the platform guarantee.
+
+**Operator action required at deploy time:** `INTERNAL_SECRET` must be set as a Worker secret on **both** `rf-dialpad-sync-dev` and `rf-mcp-cache-sync` using the **same value**, via the Cloudflare dashboard → Workers → Settings → Variables and Secrets → `INTERNAL_SECRET`. Without this:
+- `handleInternal` returns 401 on every service-binding call.
+- The hangup forwarder silently skips forward (logs a warning: `INTERNAL_SECRET not set — skipping forward`).
+- The calls cache stops receiving live updates from the hangup webhook. Cron tail-sync backfills within 15 minutes — not a data-loss scenario, but real-time freshness is lost for that deploy window.
+
+**Failure mode (forward dropped):** The forwarder uses `ctx.waitUntil` and catches all errors — the hangup webhook always returns 200. If the forward fails, the cron tail-sync backstop writes the call within ~15 minutes. No durable queue; drop-and-rely-on-cron is the explicit design choice (see spec rev 5 "drop after one attempt, rely on cron").
+
+**Cross-reference:** Data flow for calls cache (who writes what, INSERT-OR-IGNORE semantics, calls table schema) lives in `docs/architecture.md`.
+
+### `POST /admin/cache-rebuild` (sync-worker)
+
+- **Worker:** `rf-mcp-cache-sync` (sync-worker)
+- **Auth:** `X-Admin-Token: env.ADMIN_SECRET` (shared secret, unchanged from prior design).
+- **Effect:** Creates a `CacheSeedWorkflow` instance that paginates RF + Dialpad and INSERTs into the thin-immutable tables (`candidates_v2`, `jobs_v2`, `calls`).
+
+**Invocation method change:** `workers_dev: false` on sync-worker means the prior `curl https://rf-mcp-cache-sync.<account>.workers.dev/admin/cache-rebuild?...` URL no longer works. Operators must use one of:
+
+1. **`wrangler dev --remote`** in the `sync-worker/` subtree, then `curl localhost:8787/admin/cache-rebuild?table=<candidates|jobs|calls>` (preferred for interactive dev-loop).
+2. **Cloudflare Workflows API** (preferred for cutover — no code changes):
+   ```bash
+   curl -X POST \
+     -H "Authorization: Bearer $CF_API_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"params": {"table": "candidates"}}' \
+     "https://api.cloudflare.com/client/v4/accounts/<account_id>/workflows/rf-mcp-cache-seed/instances"
+   ```
+3. **Service binding from main worker** with a temporary admin route (operator decision; requires a deploy).
+
+**X-Admin-Token is still required** when reaching the endpoint via `wrangler dev --remote` (option 1) — the `handleAdmin` gate is unchanged.
+
+---
+
 ## State — what's done, what's pending
 
 - ✅ **Spec A (MCP path)** — landed 2026-05-10. Plan A all 14 tasks complete. claude.ai connector live via DCR + OTP. `MCP_EXTENSION_SECRET` deleted from both workers.
@@ -86,4 +134,40 @@ If you're unsure whether a new endpoint needs Access:
 
 ## Tangentially-related open work
 
-- **sync-worker cron is OFF** (disabled 2026-05-10) due to a D1 write-storm. Re-enable only after `writeJobs` / `writeJobPipeline` / `writeCandidatesAndLinks` gate on "is this row actually different from what's already there?". Not auth-related, but tracked here so a re-enable doesn't accidentally happen during auth work and surface as "weird unauthenticated traffic." The cron writes nothing through user-facing routes; it bypasses Access entirely.
+### Cron re-enable scope
+
+The sync-worker cron trigger remains commented out in `sync-worker/wrangler.sync.jsonc` as of this branch (the `"triggers"` block is present but commented). Re-enable is cutover step 2 (operator-driven, after migration `0003_v2_tables.sql` is applied and the new sync-worker code is deployed).
+
+**Two paths run side-by-side during the dual-write phase:**
+
+- **Legacy `tailSync`** — always fires once cron is re-enabled. Writes to the legacy `candidates`, `candidate_jobs`, `jobs`, `job_pipelines` tables (REPLACE-everything semantics, same as before).
+- **New `tailSyncThin`** — fires only when `CRON_THIN_ENABLED='true'` (or `'1'`) is set as a Worker secret/var on sync-worker. Additive-only INSERT-OR-IGNORE into `candidates_v2`, `jobs_v2`, `calls`. Default is `"false"` — the new path is off until the operator explicitly enables it.
+
+The `CRON_THIN_ENABLED` gate is defense-in-depth for the dual-write phase: re-enabling cron does not automatically activate the new write path. The operator sets the flag explicitly after verifying the new tables were created by the migration.
+
+Both paths write to disjoint table sets until cutover step 6 drops the legacy tables. The cron bypasses Access entirely — it writes nothing through user-facing routes.
+
+Not auth-related per se, but tracked here so re-enabling cron during auth work doesn't surface as unexpected unauthenticated traffic.
+
+**Cross-reference:** Full cutover sequence (steps 1–6) in the thin-immutable-cache implementation plan, Tasks 20–25.
+
+### D1 PITR rollback plan
+
+Cutover step 6 drops the legacy tables (`candidates`, `candidate_jobs`, `jobs`, `job_pipelines`) via `migrations/0004_drop_legacy.sql`. This is irreversible via the migration tool — once applied, recovery requires a D1 export/restore.
+
+**Before applying `0004_drop_legacy.sql`**, take a fresh D1 export:
+
+```bash
+npx wrangler d1 export RF_MCP_CACHE --remote --config wrangler.sync.jsonc \
+  --output=backups/rf-mcp-cache-pre-drop-$(date -I).sql
+```
+
+**Recovery procedure** if cutover step 6 needs to be reverted:
+
+```bash
+npx wrangler d1 execute RF_MCP_CACHE --remote \
+  --config wrangler.sync.jsonc \
+  --file=backups/rf-mcp-cache-pre-drop-<date>.sql
+```
+
+Dry-run the restore command against a local D1 (`--local`) before the live cutover to verify the export is valid and the restore completes without errors.
