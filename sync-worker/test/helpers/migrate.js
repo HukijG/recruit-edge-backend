@@ -16,9 +16,10 @@
 
 import init from '../../migrations/0001_init.sql?raw';
 import jobPipelines from '../../migrations/0002_job_pipelines.sql?raw';
+import v2Tables from '../../migrations/0003_v2_tables.sql?raw';
 
 // Concatenate all migration files in order. Add new migrations here.
-const SCHEMA = [init, jobPipelines].join('\n');
+const SCHEMA = [init, jobPipelines, v2Tables].join('\n');
 
 /**
  * Apply migration schema to the given D1 database instance.
