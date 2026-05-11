@@ -91,6 +91,41 @@ describe('listDialpadCalls', () => {
       targetId: '1', targetType: 'user', startedAfterMs: 1, startedBeforeMs: 2,
     }, {})).rejects.toThrow(/DIALPAD_API_KEY/);
   });
+
+  it('returns empty items[] when Dialpad omits the items field', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ cursor: 'x' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const out = await listDialpadCalls({
+      targetId: '1', targetType: 'user', startedAfterMs: 1, startedBeforeMs: 2,
+    }, { DIALPAD_API_KEY: 'k' });
+    expect(out).toEqual({ items: [], cursor: 'x' });
+  });
+
+  it('omits the cursor query param when cursor is empty string', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ items: [], cursor: null }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    await listDialpadCalls({
+      targetId: '1', targetType: 'user', startedAfterMs: 1, startedBeforeMs: 2, cursor: '',
+    }, { DIALPAD_API_KEY: 'k' });
+    const u = new URL(String(globalThis.fetch.mock.calls[0][0]));
+    expect(u.searchParams.has('cursor')).toBe(false);
+  });
+
+  it('propagates transport errors as-is (not wrapped in DialpadHttpError)', async () => {
+    globalThis.fetch = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
+    await expect(listDialpadCalls({
+      targetId: '1', targetType: 'user', startedAfterMs: 1, startedBeforeMs: 2,
+    }, { DIALPAD_API_KEY: 'k' })).rejects.toMatchObject({
+      name: 'TypeError',
+      message: 'Failed to fetch',
+    });
+  });
 });
 
 describe('getDialpadCall', () => {

@@ -459,7 +459,7 @@ export async function listDialpadCalls({ targetId, targetType, startedAfterMs, s
 
   const response = await fetch(u.toString(), {
     method: 'GET',
-    headers: { Accept: 'application/json', Authorization: `Bearer ${dialpadApiKey}` },
+    headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${dialpadApiKey}` },
   });
 
   if (!response.ok) {
@@ -484,7 +484,7 @@ export async function getDialpadCall(callId, env) {
 
   const response = await fetch(`${dialpadBaseUrl}/call/${encodeURIComponent(callId)}`, {
     method: 'GET',
-    headers: { Accept: 'application/json', Authorization: `Bearer ${dialpadApiKey}` },
+    headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${dialpadApiKey}` },
   });
 
   if (!response.ok) {
