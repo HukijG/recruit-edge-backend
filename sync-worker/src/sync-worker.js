@@ -1,3 +1,16 @@
+import { env as workerEnv } from 'cloudflare:workers';
+import { installBodyCapture } from './lib/body-capture.js';
+import { installLogsBridge } from './lib/logs-bridge.js';
+import { bootstrapOtelForWorkflows } from './lib/bootstrap-otel.js';
+
+installBodyCapture();
+installLogsBridge('rf-mcp-cache-sync');
+bootstrapOtelForWorkflows('rf-mcp-cache-sync');
+
+import { instrument } from '@microlabs/otel-cf-workers';
+import { resolveOtelConfig } from './lib/otel-config.js';
+import { trace } from '@opentelemetry/api';
+import { FLOWS } from './lib/flow-names.js';
 import * as rfClient from './rf-list-client.js';
 import { writeCandidatesAndLinks, writeJobs } from './d1-write.js';
 import { readSyncState, writeSyncState, deleteSyncState } from './sync-state.js';
@@ -24,6 +37,7 @@ async function handleAdmin(request, env, ctx) {
 
   const url = new URL(request.url);
   if (url.pathname === '/admin/full-rebuild' && request.method === 'POST') {
+    trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.ADMIN_TRIGGER_FULL_REBUILD);
     const only = url.searchParams.get('only');  // null | 'candidates' | 'jobs' | 'pipelines'
     const instance = await env.REBUILD_WORKFLOW.create({
       id: crypto.randomUUID(),
@@ -96,8 +110,9 @@ export async function tailSync(env) {
   }
 }
 
-export default {
+const handler = {
   async scheduled(event, env, ctx) {
+    trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.CRON_TAIL_SYNC);
     ctx.waitUntil((async () => {
       await tailSync(env);
       if (env.PIPELINE_REBUILD_WORKFLOW?.create) {
@@ -114,6 +129,15 @@ export default {
     return new Response('not found', { status: 404 });
   },
 };
+
+// `instrument()` is the production wiring. In environments where `LD_SDK_KEY` is
+// absent (e.g. the vitest harness — see vitest.config.js for why), we export the
+// raw handler so requests never touch the OTLP exporters. The lib `installLogsBridge`
+// and `bootstrapOtelForWorkflows` already self-skip on missing key; this mirrors
+// that semantic at the handler layer. Same pattern as main worker's src/index.js.
+export default workerEnv.LD_SDK_KEY
+  ? instrument(handler, resolveOtelConfig)
+  : handler;
 
 export { FullRebuildWorkflow } from './workflow.js';
 export { PipelineRebuildWorkflow } from './pipeline-workflow.js';

@@ -40,10 +40,12 @@
   // hash / last_updated against current row before writing).
   // "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
-    "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external"
+    "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external",
+    "LD_OTLP_TRACES_URL": "https://otel.observability.app.launchdarkly.com/v1/traces",
+    "LD_OTLP_LOGS_URL": "https://otel.observability.app.launchdarkly.com/v1/logs"
   },
   "observability": {
     "enabled": true,
-    "logs": { "head_sampling_rate": 1 }
+    "head_sampling_rate": 0.1
   }
 }
