@@ -1,6 +1,14 @@
 import * as rfClient from './rf-list-client.js';
-import { writeCandidatesAndLinks, writeJobs } from './d1-write.js';
+import {
+  writeCandidatesAndLinks,
+  writeJobs,
+  writeCandidatesThin,
+  writeJobsThin,
+  writeCalls,
+} from './d1-write.js';
 import { readSyncState, writeSyncState, deleteSyncState } from './sync-state.js';
+import { listConsultants } from './users-d1-read.js';
+import { fetchCallsForConsultant } from './dialpad-list-client.js';
 
 function timingSafeEqual(a, b) {
   const ea = new TextEncoder().encode(a);
@@ -36,6 +44,8 @@ async function handleAdmin(request, env, ctx) {
 }
 
 const WATCHDOG_HOURS = 6;
+const SIX_HOURS_MS = 6 * 3600_000;
+const ONE_DAY_MS = 24 * 3600_000;
 
 function chunks(arr, n) {
   const out = [];
@@ -96,10 +106,122 @@ export async function tailSync(env) {
   }
 }
 
+/**
+ * Additive-only tail sync (spec rev 5).
+ *
+ * Routes to three INSERT-OR-IGNORE subtasks via Promise.allSettled — one
+ * subtask failing doesn't block the others. Each subtask owns its own
+ * cursor / error log / outer try/catch.
+ *
+ * Subtasks:
+ *   - candidates: /candidate/search added_on > cursor -> writeCandidatesThin
+ *   - jobs:       /job/list full re-scan + /job/pipeline for new jobs only
+ *   - calls:      per-consultant /v2/call started_after = MAX(date_started_ms) - 6h
+ */
+export async function tailSyncThin(env) {
+  await Promise.allSettled([
+    tailSyncCandidatesThin(env),
+    tailSyncJobsThin(env),
+    tailSyncCallsThin(env),
+  ]);
+}
+
+async function tailSyncCandidatesThin(env) {
+  const t0 = Date.now();
+  try {
+    const cursor = (await readSyncState(env, 'last_candidates_added_cursor'))
+      ?? new Date(Date.now() - ONE_DAY_MS).toISOString();
+    const { rows, suggestedCursor, capped } = await rfClient.fetchCandidatesAddedSince(env, cursor);
+    // TODO(hardening): wrap writeCandidatesThin in per-row try/catch if production
+    // logs show frequent thrown rows from to*Row builders. For now, INSERT-OR-IGNORE
+    // semantics mean the next tick re-fetches free if a bad row crashes mid-batch;
+    // the cursor doesn't advance, so no data is lost.
+    await writeCandidatesThin(env, rows);
+    await writeSyncState(env, 'last_candidates_added_cursor', suggestedCursor);
+    console.log({
+      message: `[sync] candidates tick rows=${rows.length} capped=${capped} took=${Date.now() - t0}ms`,
+      source: 'sync-worker', subtask: 'candidates',
+      rows: rows.length, capped, durationMs: Date.now() - t0,
+    });
+  } catch (err) {
+    console.error({
+      message: `[sync] candidates tick failed: ${err.message}`,
+      source: 'sync-worker', subtask: 'candidates',
+      error: err.message, stack: err.stack,
+    });
+  }
+}
+
+async function tailSyncJobsThin(env) {
+  const t0 = Date.now();
+  try {
+    const allJobs = await rfClient.fetchAllJobs(env);
+    const knownIds = new Set(
+      ((await env.RF_MCP_CACHE.prepare('SELECT id FROM jobs_v2').all()).results ?? [])
+        .map(r => r.id)
+    );
+    const newJobs = allJobs.filter(j => !knownIds.has(j.id));
+    const pipelineByJobId = new Map();
+    for (const job of newJobs) {
+      try {
+        const pipeline = await rfClient.fetchJobPipeline(env, job.id);
+        pipelineByJobId.set(job.id, pipeline?.summary ?? []);
+      } catch (err) {
+        console.warn({
+          message: `[sync] /job/pipeline fetch failed job=${job.id}: ${err.message}`,
+          source: 'sync-worker', subtask: 'jobs',
+        });
+      }
+    }
+    await writeJobsThin(env, allJobs, { pipelineByJobId });
+    console.log({
+      message: `[sync] jobs tick total=${allJobs.length} new=${newJobs.length} took=${Date.now() - t0}ms`,
+      source: 'sync-worker', subtask: 'jobs',
+      total: allJobs.length, new: newJobs.length, durationMs: Date.now() - t0,
+    });
+  } catch (err) {
+    console.error({
+      message: `[sync] jobs tick failed: ${err.message}`,
+      source: 'sync-worker', subtask: 'jobs',
+      error: err.message, stack: err.stack,
+    });
+  }
+}
+
+async function tailSyncCallsThin(env) {
+  const t0 = Date.now();
+  try {
+    const consultants = await listConsultants(env);
+    let totalRows = 0;
+    for (const c of consultants) {
+      const lastSeenRow = await env.RF_MCP_CACHE
+        .prepare('SELECT MAX(date_started_ms) AS max FROM calls WHERE target_dialpad_id = ?')
+        .bind(c.dialpadId).first();
+      const lastSeenMs = (lastSeenRow?.max != null) ? lastSeenRow.max : (Date.now() - ONE_DAY_MS);
+      const startedAfterMs = Math.max(0, lastSeenMs - SIX_HOURS_MS);
+      const calls = await fetchCallsForConsultant(env, c.dialpadId, startedAfterMs);
+      await writeCalls(env, calls);
+      totalRows += calls.length;
+    }
+    console.log({
+      message: `[sync] calls tick consultants=${consultants.length} rows=${totalRows} took=${Date.now() - t0}ms`,
+      source: 'sync-worker', subtask: 'calls',
+      consultants: consultants.length, rows: totalRows, durationMs: Date.now() - t0,
+    });
+  } catch (err) {
+    console.error({
+      message: `[sync] calls tick failed: ${err.message}`,
+      source: 'sync-worker', subtask: 'calls',
+      error: err.message, stack: err.stack,
+    });
+  }
+}
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
-      await tailSync(env);
+      await tailSync(env);          // legacy — writes old tables
+      await tailSyncThin(env);      // new — writes _v2 + calls (additive-only INSERT-OR-IGNORE)
       if (env.PIPELINE_REBUILD_WORKFLOW?.create) {
         await env.PIPELINE_REBUILD_WORKFLOW.create({
           id: crypto.randomUUID(),
