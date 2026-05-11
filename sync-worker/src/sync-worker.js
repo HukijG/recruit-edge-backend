@@ -253,6 +253,38 @@ async function tailSyncCallsThin(env) {
   }
 }
 
+async function handleInternal(request, env, ctx) {
+  const url = new URL(request.url);
+
+  if (url.pathname === '/internal/calls/upsert') {
+    if (request.method !== 'POST') {
+      return new Response('method not allowed', { status: 405 });
+    }
+    let payload;
+    try {
+      payload = await request.json();
+    } catch {
+      return Response.json({ ok: false, error: 'invalid json' }, { status: 400 });
+    }
+    if (!payload?.call_id || !payload?.target?.id || payload?.date_started == null) {
+      return Response.json({ ok: false, error: 'missing required fields (call_id, target.id, date_started)' }, { status: 400 });
+    }
+    try {
+      await writeCalls(env, [payload]);
+    } catch (err) {
+      console.error({
+        message: `[internal] calls upsert failed call_id=${payload.call_id}: ${err.message}`,
+        source: 'sync-worker', endpoint: 'internal-calls-upsert',
+        callId: payload.call_id, error: err.message,
+      });
+      return Response.json({ ok: false, error: 'write failed' }, { status: 500 });
+    }
+    return Response.json({ ok: true });
+  }
+
+  return new Response('not found', { status: 404 });
+}
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
@@ -269,6 +301,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/admin/')) return handleAdmin(request, env, ctx);
+    if (url.pathname.startsWith('/internal/')) return handleInternal(request, env, ctx);
     return new Response('not found', { status: 404 });
   },
 };
