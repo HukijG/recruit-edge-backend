@@ -18,6 +18,9 @@
     "DIALPAD_API_BASE_URL": "https://dialpad.com/api/v2",
     "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external"
   },
+  "rules": [
+    { "type": "Text", "globs": ["docs/references/**/*.md"] }
+  ],
   "kv_namespaces": [
     {
       "binding": "SYNC_STATE",
