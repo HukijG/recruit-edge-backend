@@ -10,6 +10,11 @@
       "database_name": "rf-mcp-cache",
       "database_id": "00000000-0000-0000-0000-000000000001",
       "migrations_dir": "migrations"
+    },
+    {
+      "binding": "USERS_DB",
+      "database_name": "rf-users",
+      "database_id": "00000000-0000-0000-0000-000000000002"
     }
   ],
   "kv_namespaces": [
