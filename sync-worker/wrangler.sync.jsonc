@@ -34,6 +34,11 @@
       "binding": "PIPELINE_REBUILD_WORKFLOW",
       "name": "rf-mcp-pipeline-rebuild",
       "class_name": "PipelineRebuildWorkflow"
+    },
+    {
+      "binding": "CACHE_SEED_WORKFLOW",
+      "name": "rf-mcp-cache-seed",
+      "class_name": "CacheSeedWorkflow"
     }
   ],
   // Cron disabled 2026-05-10. Every 15-min tick fired BOTH tail-sync AND

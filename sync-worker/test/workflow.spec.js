@@ -10,7 +10,7 @@
 import { env } from 'cloudflare:test';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { applyMigration } from './helpers/migrate.js';
-import { runFullRebuild } from '../src/workflow.js';
+import { runFullRebuild, runCacheSeed } from '../src/workflow.js';
 import * as rfClient from '../src/rf-list-client.js';
 import { readSyncState, writeSyncState } from '../src/sync-state.js';
 
@@ -219,5 +219,145 @@ describe('runFullRebuild — ?only= gating', () => {
     // No open jobs in test env, so fetchJobPipeline isn't called even on default path.
     // The fact that the run completed without throwing is enough; the per-test
     // open-jobs case is exercised in pipeline-workflow.spec.js.
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runCacheSeed — initial-seed Workflow that populates the thin _v2 + calls
+// tables in production at cutover step 3. Per-table driver:
+//   table='candidates' — paginate /candidate/list to end
+//   table='jobs'       — full /job/list + /job/pipeline per-job
+//   table='calls'      — per-consultant /v2/call paginated, lookback bounded
+//                        by params.since (default 2y).
+//
+// Tests drive runCacheSeed with the same stepShim as runFullRebuild, mocking
+// globalThis.fetch (rather than spying on rf-list-client) so the URL the
+// implementation calls is itself part of the contract being verified.
+// ---------------------------------------------------------------------------
+
+describe('runCacheSeed (table=candidates)', () => {
+  beforeEach(async () => {
+    await applyMigration(env.RF_MCP_CACHE);
+    globalThis.fetch = vi.fn();
+  });
+
+  it('paginates /candidate/list to end and INSERT-OR-IGNOREs into candidates_v2', async () => {
+    const pages = [
+      [
+        { id: 1, name: 'A', added_time: '2024-06-01T12:00:00+0000' },
+        { id: 2, name: 'B', added_time: '2024-06-01T13:00:00+0000' },
+      ],
+      [{ id: 3, name: 'C', added_time: '2024-06-01T14:00:00+0000' }],
+      [],
+    ];
+    let i = 0;
+    globalThis.fetch.mockImplementation(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => pages[i++] ?? [],
+      text: async () => '',
+    }));
+    await runCacheSeed(env, stepShim, 'test-id', { table: 'candidates' });
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT COUNT(*) AS n FROM candidates_v2').all();
+    expect(results[0].n).toBe(3);
+  });
+});
+
+describe('runCacheSeed (table=jobs)', () => {
+  beforeEach(async () => {
+    await applyMigration(env.RF_MCP_CACHE);
+    globalThis.fetch = vi.fn();
+  });
+
+  it('fetches all jobs + per-job pipeline + writes with canonical_pipeline_json', async () => {
+    globalThis.fetch.mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.includes('/job/list')) {
+        return {
+          ok: true, status: 200, headers: new Map(), text: async () => '',
+          json: async () => [
+            { id: 42, name: 'SWE', company: { name: 'Acme' }, created_time: '2024-01-15T09:00:00+0000' },
+          ],
+        };
+      }
+      if (u.includes('/job/pipeline')) {
+        return {
+          ok: true, status: 200, headers: new Map(), text: async () => '',
+          json: async () => ({ summary: [{ id: 1, name: 'Sourced', count: 0 }], detail: [] }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => [], text: async () => '', headers: new Map() };
+    });
+    await runCacheSeed(env, stepShim, 'test-id', { table: 'jobs' });
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT id, name, canonical_pipeline_json FROM jobs_v2 WHERE id = 42').all();
+    expect(results[0].id).toBe(42);
+    expect(JSON.parse(results[0].canonical_pipeline_json)).toEqual([{ id: 1, name: 'Sourced', count: 0 }]);
+  });
+});
+
+describe('runCacheSeed (table=calls)', () => {
+  beforeEach(async () => {
+    await applyMigration(env.RF_MCP_CACHE);
+    // Schema for USERS_DB — the sync-worker has read-only access here, so the
+    // table is created inline (mirrors test/users-d1-read.spec.js).
+    await env.USERS_DB.prepare(`CREATE TABLE IF NOT EXISTS users (
+      email TEXT PRIMARY KEY, rf_user_id INTEGER NOT NULL, dialpad_id TEXT NOT NULL,
+      first_name TEXT NOT NULL, calendar_mode TEXT NOT NULL DEFAULT 'outlook',
+      aliases TEXT, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    )`).run();
+    await env.USERS_DB.prepare("DELETE FROM users").run();
+    await env.USERS_DB.prepare("INSERT INTO users (email, rf_user_id, dialpad_id, first_name) VALUES (?, ?, ?, ?)")
+      .bind('joel@test.local', 1, '1111', 'Joel').run();
+    globalThis.fetch = vi.fn();
+  });
+
+  it('paginates Dialpad /v2/call per consultant and writes into calls', async () => {
+    globalThis.fetch.mockImplementation(async () => ({
+      ok: true, status: 200, headers: new Map(), text: async () => '',
+      json: async () => ({
+        items: [{
+          call_id: 'c-seed-1',
+          target: { id: '1111' },
+          contact: { id: 'shared_contact_pool_Company:X_uid_RF77' },
+          date_started: 1717248000000,
+          total_duration: 60_000,
+          direction: 'outbound',
+        }],
+        cursor: null,
+      }),
+    }));
+    await runCacheSeed(env, stepShim, 'test-id', { table: 'calls' });
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT call_id, target_dialpad_id FROM calls').all();
+    expect(results).toEqual([{ call_id: 'c-seed-1', target_dialpad_id: '1111' }]);
+  });
+
+  it('uses params.since when provided to bound the lookback', async () => {
+    let capturedStartedAfter = null;
+    globalThis.fetch.mockImplementation(async (url) => {
+      capturedStartedAfter = new URL(String(url)).searchParams.get('started_after');
+      return { ok: true, status: 200, headers: new Map(), text: async () => '', json: async () => ({ items: [], cursor: null }) };
+    });
+    await runCacheSeed(env, stepShim, 'test-id', { table: 'calls', since: '2025-01-01T00:00:00Z' });
+    expect(capturedStartedAfter).toBe(String(Date.parse('2025-01-01T00:00:00Z')));
+  });
+});
+
+describe('runCacheSeed (validation)', () => {
+  beforeEach(async () => {
+    await applyMigration(env.RF_MCP_CACHE);
+  });
+
+  it('rejects unknown table param', async () => {
+    await expect(runCacheSeed(env, stepShim, 'id', { table: 'unknown' }))
+      .rejects.toThrow(/table/);
+  });
+
+  it('rejects missing table param', async () => {
+    await expect(runCacheSeed(env, stepShim, 'id', {}))
+      .rejects.toThrow(/table/);
   });
 });

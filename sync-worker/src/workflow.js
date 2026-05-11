@@ -34,9 +34,18 @@ import {
   fetchCustomFieldSchema,
   fetchJobPipeline,
 } from './rf-list-client.js';
-import { writeCandidatesAndLinks, writeJobs, writeJobPipeline } from './d1-write.js';
+import {
+  writeCandidatesAndLinks,
+  writeJobs,
+  writeJobPipeline,
+  writeCandidatesThin,
+  writeJobsThin,
+  writeCalls,
+} from './d1-write.js';
 import { readSyncState, writeSyncState, deleteSyncState } from './sync-state.js';
 import { normalizePipelineDetail } from './pipeline-normalize.js';
+import { listConsultants } from './users-d1-read.js';
+import { fetchCallsForConsultant } from './dialpad-list-client.js';
 
 const PAGE_SIZE = 100;  // RF caps /candidate/list at 100/page
 const RETRY_OPTS = {
@@ -147,5 +156,93 @@ export async function runFullRebuild(env, step, instanceId, params = {}) {
 export class FullRebuildWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
     return runFullRebuild(this.env, step, event.instanceId, event.payload ?? {});
+  }
+}
+
+const SEED_PAGE_SIZE = 100;
+
+/**
+ * Per-table seed driver. params.table ∈ {'candidates', 'jobs', 'calls'}.
+ * params.since (ISO string, optional) bounds the calls lookback (default 2y).
+ *
+ * Step granularity: one step per page (candidates/calls) or one step total
+ * (jobs — only ~100 rows). step.do retries on transient failures; the
+ * INSERT-OR-IGNORE writers make any retry idempotent.
+ */
+export async function runCacheSeed(env, step, instanceId, params = {}) {
+  const table = params.table;
+  if (!['candidates', 'jobs', 'calls'].includes(table)) {
+    throw new Error(`runCacheSeed: unknown table "${table}" (expected candidates|jobs|calls)`);
+  }
+
+  if (table === 'candidates') {
+    // Seed loops until /candidate/list returns an empty page. Unlike the
+    // tail-sync path, we DON'T early-break on rows.length < PAGE_SIZE — for
+    // the one-shot initial seed it's safer to drain to a true empty page in
+    // case RF ever serves a short non-final page.
+    let page = 1;
+    for (;;) {
+      const { rows } = await step.do(
+        `fetch candidates page ${page}`,
+        RETRY_OPTS,
+        async () => fetchCandidateListPage(env, page, SEED_PAGE_SIZE),
+      );
+      if (rows.length === 0) break;
+      await step.do(`write candidates page ${page}`, async () =>
+        writeCandidatesThin(env, rows),
+      );
+      page++;
+    }
+    return;
+  }
+
+  if (table === 'jobs') {
+    const allJobs = await step.do('fetch all jobs', RETRY_OPTS, async () => fetchAllJobs(env));
+    const pipelineByJobId = new Map();
+    for (const job of allJobs) {
+      try {
+        const pipeline = await step.do(`fetch pipeline job=${job.id}`, RETRY_OPTS, async () =>
+          fetchJobPipeline(env, job.id),
+        );
+        pipelineByJobId.set(job.id, pipeline?.summary ?? []);
+      } catch (err) {
+        console.warn({
+          message: `[seed] /job/pipeline fetch failed job=${job.id}: ${err.message}`,
+          source: 'cache-seed', subtask: 'jobs', jobId: job.id,
+        });
+      }
+    }
+    await step.do('write all jobs', async () => writeJobsThin(env, allJobs, { pipelineByJobId }));
+    return;
+  }
+
+  if (table === 'calls') {
+    const consultants = await step.do('list consultants', async () => listConsultants(env));
+    const sinceMs = params.since ? Date.parse(params.since) : Date.now() - 2 * 365 * 24 * 3600_000;
+    for (const c of consultants) {
+      try {
+        const calls = await step.do(`fetch calls user=${c.dialpadId}`, RETRY_OPTS, async () =>
+          fetchCallsForConsultant(env, c.dialpadId, sinceMs),
+        );
+        // Chunk writes by 200 to keep individual D1 batches well under the cap.
+        for (let i = 0; i < calls.length; i += 200) {
+          await step.do(`write calls user=${c.dialpadId} chunk=${i}`, async () =>
+            writeCalls(env, calls.slice(i, i + 200)),
+          );
+        }
+      } catch (err) {
+        console.error({
+          message: `[seed] calls fetch/write failed user=${c.dialpadId}: ${err.message}`,
+          source: 'cache-seed', subtask: 'calls', consultantDialpadId: c.dialpadId,
+        });
+      }
+    }
+    return;
+  }
+}
+
+export class CacheSeedWorkflow extends WorkflowEntrypoint {
+  async run(event, step) {
+    return runCacheSeed(this.env, step, event.instanceId, event.payload);
   }
 }

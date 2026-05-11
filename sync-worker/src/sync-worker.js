@@ -40,6 +40,22 @@ async function handleAdmin(request, env, ctx) {
     return Response.json({ ok: true, workflow_id: instance.id }, { status: 202 });
   }
 
+  if (url.pathname === '/admin/cache-rebuild' && request.method === 'POST') {
+    const table = url.searchParams.get('table');  // 'candidates' | 'jobs' | 'calls'
+    const since = url.searchParams.get('since');  // optional ISO date (calls only)
+    if (!['candidates', 'jobs', 'calls'].includes(table)) {
+      return Response.json({ ok: false, error: `table must be one of candidates|jobs|calls` }, { status: 400 });
+    }
+    if (!env.CACHE_SEED_WORKFLOW?.create) {
+      return Response.json({ ok: false, error: 'CACHE_SEED_WORKFLOW binding missing' }, { status: 500 });
+    }
+    const instance = await env.CACHE_SEED_WORKFLOW.create({
+      id: crypto.randomUUID(),
+      params: { table, since: since || undefined },
+    });
+    return Response.json({ ok: true, workflow_id: instance.id }, { status: 202 });
+  }
+
   return new Response('not found', { status: 404 });
 }
 
@@ -255,4 +271,5 @@ export default {
 };
 
 export { FullRebuildWorkflow } from './workflow.js';
+export { CacheSeedWorkflow } from './workflow.js';
 export { PipelineRebuildWorkflow } from './pipeline-workflow.js';
