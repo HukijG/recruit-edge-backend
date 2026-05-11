@@ -2,6 +2,9 @@
 	"name": "recruit-edge-backend",
 	"version": "0.0.0",
 	"private": true,
+	"workspaces": [
+		"vendor/otel-cf-workers"
+	],
 	"scripts": {
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",

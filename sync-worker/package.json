@@ -16,7 +16,7 @@
     "wrangler": "^4.33.1"
   },
   "dependencies": {
-    "@microlabs/otel-cf-workers": "1.0.0-rc.52",
+    "@microlabs/otel-cf-workers": "file:../vendor/otel-cf-workers",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/api-logs": "^0.217.0",
     "@opentelemetry/exporter-logs-otlp-http": "^0.217.0",

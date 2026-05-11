@@ -173,3 +173,7 @@ Screenshot*.png
 
 # Local stdio MCP reference source — kept for porting / dev/debug only, not part of this monorepo's deployable code
 recruiterflow-mcp-current/
+
+# Vendored fork of @microlabs/otel-cf-workers — dist/ is committed (we rebuild it on source edits) but node_modules is local
+!vendor/otel-cf-workers/dist/
+vendor/otel-cf-workers/node_modules/
