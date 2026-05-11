@@ -193,6 +193,10 @@ export async function runCacheSeed(env, step, instanceId, params = {}) {
       );
       page++;
     }
+    console.log({
+      message: `[seed] candidates done instance=${instanceId} pages=${page}`,
+      source: 'cache-seed', subtask: 'candidates', instanceId, pages: page,
+    });
     return;
   }
 
@@ -213,12 +217,18 @@ export async function runCacheSeed(env, step, instanceId, params = {}) {
       }
     }
     await step.do('write all jobs', async () => writeJobsThin(env, allJobs, { pipelineByJobId }));
+    console.log({
+      message: `[seed] jobs done instance=${instanceId} total=${allJobs.length} pipelines=${pipelineByJobId.size}`,
+      source: 'cache-seed', subtask: 'jobs', instanceId,
+      total: allJobs.length, pipelines: pipelineByJobId.size,
+    });
     return;
   }
 
   if (table === 'calls') {
     const consultants = await step.do('list consultants', async () => listConsultants(env));
     const sinceMs = params.since ? Date.parse(params.since) : Date.now() - 2 * 365 * 24 * 3600_000;
+    let totalRows = 0;
     for (const c of consultants) {
       try {
         const calls = await step.do(`fetch calls user=${c.dialpadId}`, RETRY_OPTS, async () =>
@@ -230,6 +240,7 @@ export async function runCacheSeed(env, step, instanceId, params = {}) {
             writeCalls(env, calls.slice(i, i + 200)),
           );
         }
+        totalRows += calls.length;
       } catch (err) {
         console.error({
           message: `[seed] calls fetch/write failed user=${c.dialpadId}: ${err.message}`,
@@ -237,6 +248,11 @@ export async function runCacheSeed(env, step, instanceId, params = {}) {
         });
       }
     }
+    console.log({
+      message: `[seed] calls done instance=${instanceId} consultants=${consultants.length} rows=${totalRows}`,
+      source: 'cache-seed', subtask: 'calls', instanceId,
+      consultants: consultants.length, rows: totalRows,
+    });
     return;
   }
 }

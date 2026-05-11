@@ -295,6 +295,42 @@ describe('runCacheSeed (table=jobs)', () => {
     expect(results[0].id).toBe(42);
     expect(JSON.parse(results[0].canonical_pipeline_json)).toEqual([{ id: 1, name: 'Sourced', count: 0 }]);
   });
+
+  it('one job pipeline failure does not block other jobs (canonical_pipeline_json null for failed job)', async () => {
+    globalThis.fetch.mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.includes('/job/list')) {
+        return {
+          ok: true, status: 200, headers: new Map(), text: async () => '',
+          json: async () => [
+            { id: 1, name: 'GoodJob', company: { name: 'Co1' }, created_time: '2024-01-01T00:00:00+0000' },
+            { id: 2, name: 'BadPipeline', company: { name: 'Co2' }, created_time: '2024-01-02T00:00:00+0000' },
+          ],
+        };
+      }
+      if (u.includes('/job/pipeline')) {
+        const jobId = new URL(u).searchParams.get('job_id');
+        if (jobId === '2') {
+          return { ok: false, status: 500, text: async () => 'pipeline down', headers: new Map(), json: async () => ({}) };
+        }
+        return {
+          ok: true, status: 200, headers: new Map(), text: async () => '',
+          json: async () => ({ summary: [{ id: 10, name: 'Sourced', count: 0 }], detail: [] }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => [], text: async () => '', headers: new Map() };
+    });
+
+    await runCacheSeed(env, stepShim, 'test-id', { table: 'jobs' });
+
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT id, canonical_pipeline_json FROM jobs_v2 ORDER BY id').all();
+    expect(results).toHaveLength(2);
+    expect(results[0].id).toBe(1);
+    expect(JSON.parse(results[0].canonical_pipeline_json)).toEqual([{ id: 10, name: 'Sourced', count: 0 }]);
+    expect(results[1].id).toBe(2);
+    expect(results[1].canonical_pipeline_json).toBeNull();
+  });
 });
 
 describe('runCacheSeed (table=calls)', () => {
@@ -343,6 +379,39 @@ describe('runCacheSeed (table=calls)', () => {
     });
     await runCacheSeed(env, stepShim, 'test-id', { table: 'calls', since: '2025-01-01T00:00:00Z' });
     expect(capturedStartedAfter).toBe(String(Date.parse('2025-01-01T00:00:00Z')));
+  });
+
+  it('one consultant failure does not block other consultants', async () => {
+    await env.USERS_DB.prepare(`INSERT INTO users (email, rf_user_id, dialpad_id, first_name)
+      VALUES (?, ?, ?, ?)`).bind('b@test.local', 2, '2222', 'B').run();
+
+    globalThis.fetch.mockImplementation(async (url) => {
+      const u = String(url);
+      const targetId = new URL(u).searchParams.get('target_id');
+      if (targetId === '1111') {
+        return { ok: false, status: 500, text: async () => 'dialpad down', headers: new Map(), json: async () => ({}) };
+      }
+      return {
+        ok: true, status: 200, headers: new Map(), text: async () => '',
+        json: async () => ({
+          items: [{
+            call_id: 'c-seed-2222',
+            target: { id: '2222' },
+            contact: { id: 'shared_contact_pool_Company:X_uid_RF88' },
+            date_started: 1717248000000,
+            total_duration: 60_000,
+            direction: 'outbound',
+          }],
+          cursor: null,
+        }),
+      };
+    });
+
+    await runCacheSeed(env, stepShim, 'test-id', { table: 'calls' });
+
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT call_id FROM calls').all();
+    expect(results).toEqual([{ call_id: 'c-seed-2222' }]);
   });
 });
 

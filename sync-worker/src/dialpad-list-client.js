@@ -35,7 +35,14 @@ export async function fetchCallsForConsultant(env, dialpadId, startedAfterMs) {
     if (Array.isArray(json?.items)) items.push(...json.items);
     cursor = json?.cursor ?? null;
     pages++;
-    if (!cursor || pages >= MAX_PAGES) break;
+    if (pages >= MAX_PAGES && cursor) {
+      console.warn({
+        message: `[dialpad-list] hit MAX_PAGES=${MAX_PAGES} truncating; cursor remaining`,
+        source: 'dialpad-list-client', targetId: String(dialpadId), pages,
+      });
+      break;
+    }
+    if (!cursor) break;
   }
   return items;
 }

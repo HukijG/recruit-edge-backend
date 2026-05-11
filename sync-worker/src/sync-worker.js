@@ -46,6 +46,9 @@ async function handleAdmin(request, env, ctx) {
     if (!['candidates', 'jobs', 'calls'].includes(table)) {
       return Response.json({ ok: false, error: `table must be one of candidates|jobs|calls` }, { status: 400 });
     }
+    if (since && !Number.isFinite(Date.parse(since))) {
+      return Response.json({ ok: false, error: `since must be a valid ISO date` }, { status: 400 });
+    }
     if (!env.CACHE_SEED_WORKFLOW?.create) {
       return Response.json({ ok: false, error: 'CACHE_SEED_WORKFLOW binding missing' }, { status: 500 });
     }

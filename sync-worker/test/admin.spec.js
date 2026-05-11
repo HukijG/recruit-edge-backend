@@ -89,3 +89,48 @@ describe('/admin/full-rebuild', () => {
     expect(create.mock.calls[0][0].params.only).toBeNull();
   });
 });
+
+describe('POST /admin/cache-rebuild', () => {
+  it('returns 401 without X-Admin-Token', async () => {
+    const res = await worker.fetch(makeRequest('/admin/cache-rebuild?table=candidates'), env, {});
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 400 for unknown table', async () => {
+    const testEnv = { ...env, CACHE_SEED_WORKFLOW: { create: vi.fn().mockResolvedValue({ id: 'wf-x' }) } };
+    const res = await worker.fetch(
+      makeRequest('/admin/cache-rebuild?table=widgets', { token: ADMIN_SECRET }),
+      testEnv,
+      {},
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/table/);
+  });
+
+  it('returns 400 for malformed since', async () => {
+    const testEnv = { ...env, CACHE_SEED_WORKFLOW: { create: vi.fn().mockResolvedValue({ id: 'wf-x' }) } };
+    const res = await worker.fetch(
+      makeRequest('/admin/cache-rebuild?table=calls&since=not-a-date', { token: ADMIN_SECRET }),
+      testEnv,
+      {},
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/since/);
+  });
+
+  it('returns 202 with workflow_id on valid table', async () => {
+    const mockCreate = vi.fn().mockResolvedValue({ id: 'wf-seed-1' });
+    const testEnv = { ...env, CACHE_SEED_WORKFLOW: { create: mockCreate } };
+    const res = await worker.fetch(
+      makeRequest('/admin/cache-rebuild?table=candidates', { token: ADMIN_SECRET }),
+      testEnv,
+      {},
+    );
+    expect(res.status).toBe(202);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.workflow_id).toBeTruthy();
+  });
+});
