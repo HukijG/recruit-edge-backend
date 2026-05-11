@@ -119,11 +119,20 @@ export async function tailSync(env) {
  *   - calls:      per-consultant /v2/call started_after = MAX(date_started_ms) - 6h
  */
 export async function tailSyncThin(env) {
-  await Promise.allSettled([
+  const results = await Promise.allSettled([
     tailSyncCandidatesThin(env),
     tailSyncJobsThin(env),
     tailSyncCallsThin(env),
   ]);
+  for (const r of results) {
+    if (r.status === 'rejected') {
+      console.error({
+        message: `[sync] unexpected unhandled subtask rejection: ${r.reason?.message ?? r.reason}`,
+        source: 'sync-worker',
+        reason: r.reason?.message ?? String(r.reason),
+      });
+    }
+  }
 }
 
 async function tailSyncCandidatesThin(env) {
@@ -194,14 +203,22 @@ async function tailSyncCallsThin(env) {
     const consultants = await listConsultants(env);
     let totalRows = 0;
     for (const c of consultants) {
-      const lastSeenRow = await env.RF_MCP_CACHE
-        .prepare('SELECT MAX(date_started_ms) AS max FROM calls WHERE target_dialpad_id = ?')
-        .bind(c.dialpadId).first();
-      const lastSeenMs = (lastSeenRow?.max != null) ? lastSeenRow.max : (Date.now() - ONE_DAY_MS);
-      const startedAfterMs = Math.max(0, lastSeenMs - SIX_HOURS_MS);
-      const calls = await fetchCallsForConsultant(env, c.dialpadId, startedAfterMs);
-      await writeCalls(env, calls);
-      totalRows += calls.length;
+      try {
+        const lastSeenRow = await env.RF_MCP_CACHE
+          .prepare('SELECT MAX(date_started_ms) AS max FROM calls WHERE target_dialpad_id = ?')
+          .bind(c.dialpadId).first();
+        const lastSeenMs = (lastSeenRow?.max != null) ? lastSeenRow.max : (Date.now() - ONE_DAY_MS);
+        const startedAfterMs = Math.max(0, lastSeenMs - SIX_HOURS_MS);
+        const calls = await fetchCallsForConsultant(env, c.dialpadId, startedAfterMs);
+        await writeCalls(env, calls);
+        totalRows += calls.length;
+      } catch (err) {
+        console.error({
+          message: `[sync] calls tick consultant=${c.dialpadId} failed: ${err.message}`,
+          source: 'sync-worker', subtask: 'calls',
+          consultantDialpadId: c.dialpadId, error: err.message,
+        });
+      }
     }
     console.log({
       message: `[sync] calls tick consultants=${consultants.length} rows=${totalRows} took=${Date.now() - t0}ms`,
