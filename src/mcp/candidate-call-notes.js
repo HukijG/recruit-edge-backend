@@ -179,6 +179,13 @@ async function handleListCalls({ env, body, consultant }) {
     out.window = window;
   }
   if (warnings.length) out._meta = { warnings };
+  console.log({
+    message: `[mcp] candidate-call-notes step=list_calls candidate_id=${candidate.id} calls=${calls.length}`,
+    tool: '/mcp/candidate-call-notes',
+    step: 'list_calls',
+    candidate_id: candidate.id,
+    calls_returned: calls.length,
+  });
   return jsonResponse(200, out);
 }
 
@@ -294,6 +301,13 @@ async function handleGetTranscript({ env, body, consultant }) {
     });
   }
 
+  console.log({
+    message: `[mcp] candidate-call-notes step=get_transcript candidate_id=${candidate.id} transcript_chars=${text.length}`,
+    tool: '/mcp/candidate-call-notes',
+    step: 'get_transcript',
+    candidate_id: candidate.id,
+    transcript_chars: text.length,
+  });
   return jsonResponse(200, {
     ok: true,
     candidate: { id: candidate.id, name: candidate.name },
@@ -362,6 +376,13 @@ async function handleSubmitNotes({ env, body, consultant }) {
     if (!res.ok) {
       return jsonResponse(res.status ?? 502, { error: res.error });
     }
+    console.log({
+      message: `[mcp] candidate-call-notes step=submit_notes candidate_id=${candidate.id} note_chars=${note.length}`,
+      tool: '/mcp/candidate-call-notes',
+      step: 'submit_notes',
+      candidate_id: candidate.id,
+      note_chars: note.length,
+    });
     return jsonResponse(200, { ok: true });
   }
 

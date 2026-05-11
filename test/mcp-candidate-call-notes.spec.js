@@ -645,3 +645,21 @@ describe('/mcp/candidate-call-notes step=submit_notes', () => {
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 });
+
+describe('/mcp/candidate-call-notes step routing', () => {
+  it('step missing → 400', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({ consultantFirstName: 'Joel' });
+    expect(r.status).toBe(400);
+    const b = await r.json();
+    expect(b.error).toMatch(/list_calls.*get_transcript.*submit_notes/);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('step unknown → 400', async () => {
+    globalThis.fetch = vi.fn();
+    const r = await call({ consultantFirstName: 'Joel', step: 'nope' });
+    expect(r.status).toBe(400);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+});
