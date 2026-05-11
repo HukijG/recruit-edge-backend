@@ -33,6 +33,9 @@ const CURATED_KEYS = [
  * @param {string|null|undefined} url
  * @returns {string|null}
  */
+// RF sometimes sends these sentinel strings instead of a real LinkedIn value.
+const LINKEDIN_SENTINEL_RE = /^(none|n\/a|null|undefined|-)$/i;
+
 function normalizeLinkedInSlug(input) {
   if (!input || typeof input !== 'string') return null;
   const s = input
@@ -47,7 +50,11 @@ function normalizeLinkedInSlug(input) {
   if (urlMatch) return urlMatch[1];
   // Form 2: RF often returns the bare slug only (no URL). Accept any token of
   // alphanumeric / hyphen / underscore as a slug if it doesn't look like a URL.
-  if (!s.includes('/') && !s.includes('.') && /^[a-z0-9_-]+$/i.test(s)) return s;
+  // Block known RF sentinel strings (e.g. "None") before accepting as slug.
+  if (!s.includes('/') && !s.includes('.') && /^[a-z0-9_-]+$/i.test(s)) {
+    if (LINKEDIN_SENTINEL_RE.test(s)) return null;
+    return s;
+  }
   return null;
 }
 
@@ -149,6 +156,78 @@ export function toCandidateRow(rf) {
     last_updated: rf.last_updated ?? null,  // /list lacks this; rebuild compensates via global cursor
     last_activity_at,
     cached_at: new Date().toISOString(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// THIN-IMMUTABLE row builders (spec rev 5).
+// Coexist with toCandidateRow / toCandidateJobRows during the dual-write phase.
+// ---------------------------------------------------------------------------
+
+const RF_UID_RE = /uid_RF(\d+)$/;
+
+function extractRFIdFromContactId(contactId) {
+  if (typeof contactId !== 'string') return null;
+  const m = contactId.match(RF_UID_RE);
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * Build a thin candidates_v2 row from any RF candidate-shaped object
+ * (/candidate/list, /candidate/search, /candidate/get all flow through here).
+ *
+ * @throws if rf.added_time is missing — cron must skip incomplete rows upstream.
+ */
+export function toCandidateThinRow(rf) {
+  if (!rf?.added_time) {
+    throw new Error(`toCandidateThinRow: rf.added_time is required (id=${rf?.id})`);
+  }
+  return {
+    id: rf.id,
+    name: rf.name ?? ([rf.first_name, rf.last_name].filter(Boolean).join(' ') || null),
+    linkedin_profile: normalizeLinkedInSlug(rf.linkedin_profile),
+    added_time_ms: Date.parse(rf.added_time),
+    current_title_at_cache_time: rf.current_title ?? rf.current_designation ?? null,
+    current_company_at_cache_time: rf.current_organization ?? null,
+    cached_at_ms: Date.now(),
+  };
+}
+
+/**
+ * Build a thin jobs_v2 row. Accepts both /job/list shape (company.name) and
+ * /candidate/get's jobs[] shape (client_company_name flat).
+ *
+ * canonical_pipeline_json is set ONLY by the new-job-discovery path in cron;
+ * pure normalization here leaves it null.
+ */
+export function toJobThinRow(rf) {
+  if (!rf?.created_time) {
+    throw new Error(`toJobThinRow: rf.created_time is required (id=${rf?.id})`);
+  }
+  return {
+    id: rf.id,
+    name: rf.name ?? rf.title ?? null,
+    client_company_name: rf.client_company_name ?? rf.company?.name ?? null,
+    added_time_ms: Date.parse(rf.created_time),
+    canonical_pipeline_json: null,
+    cached_at_ms: Date.now(),
+  };
+}
+
+/**
+ * Build a calls row from a Dialpad /v2/call response item OR a hangup webhook
+ * payload (the schemas overlap on every field we use).
+ */
+export function toCallRow(dp) {
+  return {
+    call_id: String(dp.call_id),
+    target_dialpad_id: String(dp.target?.id ?? ''),
+    dialpad_contact_id: dp.contact?.id ?? null,
+    rf_candidate_id: extractRFIdFromContactId(dp.contact?.id),
+    date_started_ms: Number(dp.date_started),
+    duration_ms: Math.round(Number(dp.total_duration ?? 0)),
+    direction: dp.direction ?? null,
+    cached_at_ms: Date.now(),
   };
 }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { toCandidateRow, toCandidateJobRows } from '../src/normalize.js';
+import { toCandidateRow, toCandidateJobRows, toCandidateThinRow, toJobThinRow, toCallRow } from '../src/normalize.js';
 
 const sample = {
   id: 42,
@@ -200,5 +200,154 @@ describe('normalize', () => {
     const row = toCandidateRow({ ...sample, custom_fields: undefined });
     const body = JSON.parse(row.body);
     expect(body.custom_fields_by_name).toBeUndefined();
+  });
+});
+
+describe('toCandidateThinRow', () => {
+  it('extracts id, name, linkedin slug, added_time_ms, snapshot title/company', () => {
+    const rf = {
+      id: 12345,
+      name: 'Jane Doe',
+      first_name: 'Jane',
+      last_name: 'Doe',
+      linkedin_profile: 'https://www.linkedin.com/in/jane-doe/',
+      added_time: '2024-06-01T12:00:00+0000',
+      current_title: 'Director of Engineering',
+      current_organization: 'Acme Corp',
+    };
+    const row = toCandidateThinRow(rf);
+    expect(row).toEqual({
+      id: 12345,
+      name: 'Jane Doe',
+      linkedin_profile: 'jane-doe',
+      added_time_ms: Date.parse('2024-06-01T12:00:00+0000'),
+      current_title_at_cache_time: 'Director of Engineering',
+      current_company_at_cache_time: 'Acme Corp',
+      cached_at_ms: expect.any(Number),
+    });
+  });
+
+  it('handles bare-slug linkedin_profile (RF /candidate/list shape)', () => {
+    const row = toCandidateThinRow({
+      id: 99,
+      name: 'X',
+      linkedin_profile: 'jane-doe',
+      added_time: '2024-06-01T12:00:00+0000',
+    });
+    expect(row.linkedin_profile).toBe('jane-doe');
+  });
+
+  it('returns null linkedin_profile when not parseable', () => {
+    const row = toCandidateThinRow({
+      id: 99,
+      name: 'X',
+      linkedin_profile: 'None',
+      added_time: '2024-06-01T12:00:00+0000',
+    });
+    expect(row.linkedin_profile).toBeNull();
+  });
+
+  it('falls back to first_name + last_name when name absent', () => {
+    const row = toCandidateThinRow({
+      id: 1,
+      first_name: 'Jane',
+      last_name: 'Doe',
+      added_time: '2024-06-01T12:00:00+0000',
+    });
+    expect(row.name).toBe('Jane Doe');
+  });
+
+  it('throws on missing added_time (non-recoverable: cron must skip such rows upstream)', () => {
+    expect(() => toCandidateThinRow({ id: 1, name: 'X' })).toThrow(/added_time/);
+  });
+});
+
+describe('toJobThinRow', () => {
+  it('extracts id, name, company, added_time_ms', () => {
+    const rf = {
+      id: 42,
+      name: 'Senior SWE',
+      company: { id: 7, name: 'Acme Corp' },
+      created_time: '2024-01-15T09:00:00+0000',
+    };
+    const row = toJobThinRow(rf);
+    expect(row).toEqual({
+      id: 42,
+      name: 'Senior SWE',
+      client_company_name: 'Acme Corp',
+      added_time_ms: Date.parse('2024-01-15T09:00:00+0000'),
+      canonical_pipeline_json: null,
+      cached_at_ms: expect.any(Number),
+    });
+  });
+
+  it('accepts client_company_name when company nested object missing (/candidate/get jobs[] shape)', () => {
+    const row = toJobThinRow({
+      id: 42,
+      name: 'X',
+      client_company_name: 'Acme',
+      created_time: '2024-01-15T09:00:00+0000',
+    });
+    expect(row.client_company_name).toBe('Acme');
+  });
+});
+
+describe('toCallRow', () => {
+  it('shapes a Dialpad /v2/call response item into a row', () => {
+    const dp = {
+      call_id: '5678901234',
+      target: { id: '8000000000000001', name: 'Joel' },
+      contact: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF12345', name: 'Jane Doe' },
+      date_started: 1717248000000,
+      total_duration: 180500,
+      direction: 'outbound',
+    };
+    const row = toCallRow(dp);
+    expect(row).toEqual({
+      call_id: '5678901234',
+      target_dialpad_id: '8000000000000001',
+      dialpad_contact_id: 'shared_contact_pool_Company:0000000000000000_uid_RF12345',
+      rf_candidate_id: 12345,
+      date_started_ms: 1717248000000,
+      duration_ms: 180500,
+      direction: 'outbound',
+      cached_at_ms: expect.any(Number),
+    });
+  });
+
+  it('rounds fractional ms in total_duration', () => {
+    const row = toCallRow({
+      call_id: 'c1',
+      target: { id: '1' },
+      contact: { id: 'shared_contact_pool_Company:X_uid_RF1' },
+      date_started: 1,
+      total_duration: 68286.025,
+      direction: 'outbound',
+    });
+    expect(row.duration_ms).toBe(68286);
+  });
+
+  it('returns rf_candidate_id null when contact id does not match the RF pattern', () => {
+    const row = toCallRow({
+      call_id: 'c1',
+      target: { id: '1' },
+      contact: { id: 'something-else' },
+      date_started: 1,
+      total_duration: 1000,
+      direction: 'inbound',
+    });
+    expect(row.rf_candidate_id).toBeNull();
+  });
+
+  it('coerces target.id and contact.id to strings', () => {
+    const row = toCallRow({
+      call_id: 'c1',
+      target: { id: 8000000000000001 },
+      contact: { id: 'shared_contact_pool_Company:X_uid_RF1' },
+      date_started: 1,
+      total_duration: 1000,
+      direction: 'outbound',
+    });
+    expect(row.target_dialpad_id).toBe('8000000000000001');
   });
 });
