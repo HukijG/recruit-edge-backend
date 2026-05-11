@@ -27,6 +27,9 @@ beforeEach(async () => {
     primary_email: 'jerry@x.com', linkedin_profile: 'jerry-smith',
     jobs: [{ job_name: 'Eng', client_company_name: 'Acme', stage_name: 'Sourced' }],
   }), 'Jerry Smith', new Date().toISOString()).run();
+  await env.RF_MCP_CACHE.prepare(
+    'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+  ).bind(42, 'Jerry Smith', null, Date.now(), Date.now()).run();
   await env.RF_MCP_CACHE
     .prepare("INSERT INTO sync_state (key, value) VALUES ('last_tail_sync_at', ?)")
     .bind(new Date().toISOString())
@@ -68,6 +71,9 @@ describe('/mcp/candidate-get', () => {
     ).bind(43, JSON.stringify({
       id: 43, first_name: 'Jerry', last_name: 'Jones', name: 'Jerry Jones',
     }), 'Jerry Jones', new Date().toISOString()).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(43, 'Jerry Jones', null, Date.now(), Date.now()).run();
     // Bump tail cursor so the snapshot rebuilds against the new row set.
     await env.RF_MCP_CACHE.exec("DELETE FROM sync_state WHERE key='last_tail_sync_at'");
     await env.RF_MCP_CACHE

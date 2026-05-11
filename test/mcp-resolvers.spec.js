@@ -26,6 +26,13 @@ const insertCandidate = async (id, name, opts = {}) => {
       new Date().toISOString(),
     )
     .run();
+  // Also seed candidates_v2 so the snapshot (which now reads candidates_v2) can find this candidate.
+  const addedMs = opts.last_activity_at ? Date.parse(opts.last_activity_at) : Date.now();
+  await env.RF_MCP_CACHE.prepare(
+    `INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)`,
+  )
+    .bind(id, name, opts.linkedin_profile ?? null, addedMs, Date.now())
+    .run();
 };
 
 const insertJob = async (id, name, client = null, isOpen = 1) => {

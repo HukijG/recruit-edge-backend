@@ -33,6 +33,9 @@ beforeEach(async () => {
     'Test Candidate',
     new Date().toISOString(),
   ).run();
+  await env.RF_MCP_CACHE.prepare(
+    'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+  ).bind(42, 'Test Candidate', null, Date.now(), Date.now()).run();
 });
 
 afterEach(() => {
@@ -181,6 +184,7 @@ describe('/mcp/candidate-log-interview', () => {
     // Use distinct names that the fuzzy scorer treats as similarly-good
     // matches for "Jordan" — neither is an exact match.
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
     await env.RF_MCP_CACHE.prepare(
       'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
     ).bind(
@@ -188,11 +192,17 @@ describe('/mcp/candidate-log-interview', () => {
       'Jordan Chen', 'Acme', 'AE', new Date().toISOString()
     ).run();
     await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(42, 'Jordan Chen', null, Date.now(), Date.now()).run();
+    await env.RF_MCP_CACHE.prepare(
       'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
     ).bind(
       43, JSON.stringify({ id: 43, name: 'Jordan Patel' }),
       'Jordan Patel', 'Globex', 'CSM', new Date().toISOString()
     ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(43, 'Jordan Patel', null, Date.now(), Date.now()).run();
     globalThis.fetch = vi.fn();
     const r = await call({
       consultantFirstName: 'Joel',
@@ -209,6 +219,7 @@ describe('/mcp/candidate-log-interview', () => {
 
   it('post-narrow: two Jordans, only one is on the specified job → auto-commits', async () => {
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
     // Jordan Chen is on job 100; Jordan Patel is on job 999. Caller asks for
     // log-interview on job 100 — post-narrow should drop Patel and commit.
     await env.RF_MCP_CACHE.prepare(
@@ -221,6 +232,9 @@ describe('/mcp/candidate-log-interview', () => {
       'Jordan Chen', 'Acme', 'AE', new Date().toISOString()
     ).run();
     await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(42, 'Jordan Chen', null, Date.now(), Date.now()).run();
+    await env.RF_MCP_CACHE.prepare(
       'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
     ).bind(
       43, JSON.stringify({
@@ -229,6 +243,9 @@ describe('/mcp/candidate-log-interview', () => {
       }),
       'Jordan Patel', 'Globex', 'CSM', new Date().toISOString()
     ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(43, 'Jordan Patel', null, Date.now(), Date.now()).run();
     globalThis.fetch = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ id: 555 }), { status: 200 }),
     );
@@ -248,6 +265,7 @@ describe('/mcp/candidate-log-interview', () => {
 
   it('post-narrow: two Jordans, neither on the specified job → 400', async () => {
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
     await env.RF_MCP_CACHE.prepare(
       'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
     ).bind(
@@ -258,6 +276,9 @@ describe('/mcp/candidate-log-interview', () => {
       'Jordan Chen', 'Acme', 'AE', new Date().toISOString()
     ).run();
     await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(42, 'Jordan Chen', null, Date.now(), Date.now()).run();
+    await env.RF_MCP_CACHE.prepare(
       'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
     ).bind(
       43, JSON.stringify({
@@ -266,6 +287,9 @@ describe('/mcp/candidate-log-interview', () => {
       }),
       'Jordan Patel', 'Globex', 'CSM', new Date().toISOString()
     ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(43, 'Jordan Patel', null, Date.now(), Date.now()).run();
     globalThis.fetch = vi.fn();
     const r = await call({
       consultantFirstName: 'Joel',

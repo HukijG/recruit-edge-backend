@@ -13,8 +13,9 @@
 
 import init from '../../sync-worker/migrations/0001_init.sql?raw';
 import jobPipelines from '../../sync-worker/migrations/0002_job_pipelines.sql?raw';
+import v2Tables from '../../sync-worker/migrations/0003_v2_tables.sql?raw';
 
-const SCHEMA = [init, jobPipelines].join('\n');
+const SCHEMA = [init, jobPipelines, v2Tables].join('\n');
 
 /**
  * Apply the schema to env.RF_MCP_CACHE.  Drops existing user tables first so

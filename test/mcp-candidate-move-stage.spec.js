@@ -42,6 +42,9 @@ beforeEach(async () => {
       ],
     }],
   }), 'Jerry Smith', new Date().toISOString()).run();
+  await env.RF_MCP_CACHE.prepare(
+    'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+  ).bind(42, 'Jerry Smith', null, Date.now(), Date.now()).run();
 });
 
 afterEach(() => {
@@ -163,6 +166,9 @@ describe('/mcp/candidate-move-stage', () => {
       }),
       'Kevin Park', 'Globex', 'CSM', new Date().toISOString()
     ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(43, 'Kevin Park', null, Date.now(), Date.now()).run();
     globalThis.fetch = vi.fn();
     const r = await call({ consultantFirstName: 'Joel', candidate: 'Jerry', stage: 'Replied' });
     expect(r.status).toBe(200);
@@ -192,6 +198,9 @@ describe('/mcp/candidate-move-stage', () => {
       }),
       'Kevin Park', 'Globex', 'CSM', new Date().toISOString()
     ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(43, 'Kevin Park', null, Date.now(), Date.now()).run();
     globalThis.fetch = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: true }), { status: 200 }),
     );
@@ -223,6 +232,9 @@ describe('/mcp/candidate-move-stage', () => {
       }),
       'Kevin Park', 'Globex', 'CSM', new Date().toISOString()
     ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(43, 'Kevin Park', null, Date.now(), Date.now()).run();
     globalThis.fetch = vi.fn();
     // No `job` filter — both Jerries produce a valid (Replied) tuple.
     const r = await call({ consultantFirstName: 'Joel', candidate: 'Jerry', stage: 'Replied' });

@@ -36,6 +36,9 @@ beforeEach(async () => {
     'Priya Sharma',
     new Date().toISOString(),
   ).run();
+  await env.RF_MCP_CACHE.prepare(
+    'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)',
+  ).bind(50976, 'Priya Sharma', null, Date.now(), Date.now()).run();
 });
 
 afterEach(() => { globalThis.fetch = originalFetch; });
@@ -241,7 +244,10 @@ describe('/mcp/candidate-call-notes step=list_calls', () => {
   it('ambiguous fuzzy → needs_disambiguation', async () => {
     await env.RF_MCP_CACHE.prepare(
       'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)',
-    ).bind(60001, JSON.stringify({ id: 60001, name: 'Sarah Patel' }), 'Sarah Patel', 'Acme', 'AE', new Date().toISOString()).run();
+    ).bind(60001, JSON.stringify({ id: 60001, name: 'Priya Patel' }), 'Priya Patel', 'Acme', 'AE', new Date().toISOString()).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)',
+    ).bind(60001, 'Priya Patel', null, Date.now(), Date.now()).run();
     await env.RF_MCP_CACHE.prepare(
       'UPDATE candidates SET current_organization = ?, current_title = ? WHERE id = 50976',
     ).bind('Globex', 'CSM').run();

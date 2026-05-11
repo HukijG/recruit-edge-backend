@@ -33,6 +33,9 @@ beforeEach(async () => {
     'Test Candidate',
     new Date().toISOString(),
   ).run();
+  await env.RF_MCP_CACHE.prepare(
+    'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+  ).bind(42, 'Test Candidate', null, Date.now(), Date.now()).run();
 });
 
 afterEach(() => {
@@ -148,6 +151,7 @@ describe('/mcp/candidate-add-note', () => {
 
   it('ambiguous fuzzy candidate name → needs_disambiguation kind=candidate, no RF call', async () => {
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
     await env.RF_MCP_CACHE.prepare(
       'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
     ).bind(
@@ -155,11 +159,17 @@ describe('/mcp/candidate-add-note', () => {
       'Jordan Chen', 'Acme', 'AE', new Date().toISOString()
     ).run();
     await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(42, 'Jordan Chen', null, Date.now(), Date.now()).run();
+    await env.RF_MCP_CACHE.prepare(
       'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
     ).bind(
       43, JSON.stringify({ id: 43, name: 'Jordan Patel' }),
       'Jordan Patel', 'Globex', 'CSM', new Date().toISOString()
     ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(43, 'Jordan Patel', null, Date.now(), Date.now()).run();
     resetSnapshot();
     globalThis.fetch = vi.fn();
     const r = await call({
@@ -180,6 +190,7 @@ describe('/mcp/candidate-add-note', () => {
 
   it('ambiguous candidate + job auto-narrows to single survivor → commits', async () => {
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+    await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
     await env.RF_MCP_CACHE.exec('DELETE FROM jobs');
     // Two Jordans; only id=42 is on the Eon SE job.
     await env.RF_MCP_CACHE.prepare(
@@ -193,6 +204,9 @@ describe('/mcp/candidate-add-note', () => {
       'Jordan Chen', new Date().toISOString(),
     ).run();
     await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(42, 'Jordan Chen', null, Date.now(), Date.now()).run();
+    await env.RF_MCP_CACHE.prepare(
       'INSERT INTO candidates (id, body, name, cached_at) VALUES (?, ?, ?, ?)'
     ).bind(
       43, JSON.stringify({
@@ -202,6 +216,9 @@ describe('/mcp/candidate-add-note', () => {
       }),
       'Jordan Patel', new Date().toISOString(),
     ).run();
+    await env.RF_MCP_CACHE.prepare(
+      'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
+    ).bind(43, 'Jordan Patel', null, Date.now(), Date.now()).run();
     await env.RF_MCP_CACHE.prepare(
       'INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at) VALUES (100, ?, ?, ?, 1, ?)'
     ).bind(JSON.stringify({ id: 100, name: 'Eon SE' }), 'Eon SE', 'Eon', new Date().toISOString()).run();

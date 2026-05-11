@@ -250,10 +250,18 @@ export function scoreAny(query, targets) {
  * person; the tighter window matches that expectation.
  */
 export function recencyBoost(record, now = new Date()) {
-  const dateStr = record.last_activity_at || record.added_time;
-  if (!dateStr) return 0;
-  const t = Date.parse(dateStr);
-  if (Number.isNaN(t)) return 0;
+  // New thin-cache shape: added_time_ms is an integer (ms since epoch).
+  // Legacy shape: last_activity_at / added_time are ISO 8601 strings.
+  // Support both during the dual-write phase.
+  let t;
+  if (typeof record.added_time_ms === 'number') {
+    t = record.added_time_ms;
+  } else {
+    const dateStr = record.last_activity_at || record.added_time;
+    if (!dateStr) return 0;
+    t = Date.parse(dateStr);
+    if (Number.isNaN(t)) return 0;
+  }
   const ageDays = (now.getTime() - t) / (1000 * 60 * 60 * 24);
   if (ageDays < 0) return 0.2;
   return Math.max(0, 0.2 * (1 - ageDays / 30));

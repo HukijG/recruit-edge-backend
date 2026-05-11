@@ -97,7 +97,7 @@ export async function resolveCandidate(env, input) {
   const scored = snap.rows
     .map((r) => {
       const base = scoreString(q, r.prepared);
-      const boost = recencyBoost({ last_activity_at: r.last_activity_at });
+      const boost = recencyBoost({ added_time_ms: r.added_time_ms });
       return { id: r.id, name: r.name, score: base * (1 + boost) };
     })
     .filter((r) => r.score >= FUZZY_THRESHOLD)
