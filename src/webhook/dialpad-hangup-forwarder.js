@@ -26,16 +26,26 @@ export async function forwardHangupToSyncWorker(payload, env) {
       body: JSON.stringify(payload),
     });
     if (!res.ok) {
-      const body = await res.text();
-      // Note: sync-worker's error responses do not echo request fields, so
-      // `body` is safe to log. If the receiver ever changes to echo payload
-      // fields in errors, this log would need redaction.
+      // Defensive PII hardening: cap the logged body at 200 chars. Today's
+      // sync-worker error envelopes (`{ok:false, error:'auth'|'invalid json'|...}`)
+      // don't echo request fields, but if a future change interpolates
+      // `payload.contact?.id` or `payload.call_id` into an error string, the
+      // cap limits the blast radius. The INTERNAL_SECRET value is never
+      // substituted into any log payload.
+      const rawBody = await res.text();
+      const body = typeof rawBody === 'string' ? rawBody.slice(0, 200) : null;
       console.warn({
-        message: `[hangup-forwarder] sync-worker rejected upsert status=${res.status} body=${body}`,
+        message: `[hangup-forwarder] sync-worker rejected upsert status=${res.status}`,
         source: 'hangup-forwarder',
         callId: payload?.call_id,
+        status: res.status,
+        body,
       });
     }
+    // 2xx success: deliberately log nothing. Success is the expected path; no
+    // diagnostic value in echoing the response body, and avoiding the body
+    // log removes any chance of incidental data leakage if the sync-worker
+    // success envelope ever changes.
   } catch (err) {
     console.warn({
       message: `[hangup-forwarder] forward failed: ${err.message}`,

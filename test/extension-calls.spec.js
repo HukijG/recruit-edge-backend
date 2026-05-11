@@ -728,4 +728,52 @@ describe('processExtensionCallEvent — hangup forwards to sync-worker', () => {
     }));
     warnSpy.mockRestore();
   });
+
+  it('caps logged sync-worker error body at 200 chars (PII defence-in-depth)', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Build a 1000-char error body that, if a future receiver echoed payload
+    // fields, would be the kind of thing we want truncated.
+    const longBody = 'x'.repeat(1000);
+    syncFetch.mockResolvedValueOnce(new Response(longBody, { status: 500 }));
+    await processExtensionCallEvent({
+      direction: 'outbound', state: 'hangup', call_id: 'c-2',
+      target: { id: JOEL_DIALPAD_ID_UNIT },
+      contact: { id: 'shared_contact_pool_Company:X_uid_RF2' },
+      date_started: 1, total_duration: 1,
+    }, testEnv, ctxStub);
+    expect(warnSpy).toHaveBeenCalledOnce();
+    const logged = warnSpy.mock.calls[0][0];
+    expect(logged.source).toBe('hangup-forwarder');
+    expect(logged.callId).toBe('c-2');
+    expect(logged.status).toBe(500);
+    expect(typeof logged.body).toBe('string');
+    expect(logged.body.length).toBeLessThanOrEqual(200);
+    // Sanity check the cap is the binding constraint here (not the input).
+    expect(logged.body.length).toBe(200);
+    // Defence-in-depth: INTERNAL_SECRET must never appear in any log payload.
+    const serialised = JSON.stringify(logged);
+    expect(serialised).not.toContain(testEnv.INTERNAL_SECRET);
+    warnSpy.mockRestore();
+  });
+
+  it('does NOT log the response body on 2xx success', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Default beforeEach mock returns 200 with `{"ok":true}` — use that.
+    await processExtensionCallEvent({
+      direction: 'outbound', state: 'hangup', call_id: 'c-3',
+      target: { id: JOEL_DIALPAD_ID_UNIT },
+      contact: { id: 'shared_contact_pool_Company:X_uid_RF3' },
+      date_started: 1, total_duration: 1,
+    }, testEnv, ctxStub);
+    // Either no warn call, or if some other warn (e.g. an unrelated one)
+    // happens to fire, none of them should carry a `body` field from the
+    // forwarder's success branch.
+    for (const call of warnSpy.mock.calls) {
+      const arg = call[0];
+      if (arg && typeof arg === 'object' && arg.source === 'hangup-forwarder') {
+        expect(arg).not.toHaveProperty('body');
+      }
+    }
+    warnSpy.mockRestore();
+  });
 });
