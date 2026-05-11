@@ -21,6 +21,7 @@ describe('FLOWS registry', () => {
       expect(FLOWS[key], `FLOWS.${key} should be defined`).toBeDefined();
       expect(typeof FLOWS[key]).toBe('string');
     }
+    expect(Object.keys(FLOWS).sort()).toEqual([...expected].sort());
   });
 
   it('mcpToolFlow returns MCP/<tool_name> shape', () => {
