@@ -310,8 +310,42 @@ describe('toJobThinRow', () => {
     expect(row.name).toBe('Senior SWE');
   });
 
-  it('throws on missing created_time', () => {
-    expect(() => toJobThinRow({ id: 1, name: 'X' })).toThrow(/created_time/);
+  it('accepts rf.added_time as a creation-timestamp fallback', () => {
+    const row = toJobThinRow({
+      id: 7,
+      name: 'X',
+      added_time: '2024-02-20T10:30:00+0000',
+    });
+    expect(row.added_time_ms).toBe(Date.parse('2024-02-20T10:30:00+0000'));
+  });
+
+  it('accepts rf.date_created as a creation-timestamp fallback', () => {
+    const row = toJobThinRow({
+      id: 8,
+      name: 'X',
+      date_created: '2024-03-10T11:00:00+0000',
+    });
+    expect(row.added_time_ms).toBe(Date.parse('2024-03-10T11:00:00+0000'));
+  });
+
+  it('prefers rf.created_time over the other two when multiple are present', () => {
+    const row = toJobThinRow({
+      id: 9,
+      name: 'X',
+      created_time: '2024-01-15T09:00:00+0000',
+      added_time:   '2024-02-20T10:30:00+0000',
+      date_created: '2024-03-10T11:00:00+0000',
+    });
+    expect(row.added_time_ms).toBe(Date.parse('2024-01-15T09:00:00+0000'));
+  });
+
+  it('throws a specific error when all creation timestamp fields are missing', () => {
+    // The thrown error name-checks all three accepted field names so the
+    // per-row resilience log in d1-write.js surfaces the right hint.
+    expect(() => toJobThinRow({ id: 99, name: 'X' }))
+      .toThrow(/missing creation timestamp field.*created_time.*added_time.*date_created/);
+    expect(() => toJobThinRow({ id: 99, name: 'X' }))
+      .toThrow(/job 99/);
   });
 });
 

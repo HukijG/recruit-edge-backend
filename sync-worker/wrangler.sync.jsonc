@@ -34,6 +34,14 @@
       "name": "rf-mcp-rebuild",
       "class_name": "FullRebuildWorkflow"
     },
+    // PIPELINE_REBUILD_WORKFLOW intentionally kept in the binding list so the
+    // exported `PipelineRebuildWorkflow` class still has its registered name
+    // (Workflows require a binding pointing at the class). The cron path no
+    // longer spawns instances; this class is dead infrastructure pending the
+    // cutover step 6 cleanup that drops `job_pipelines` and removes the class.
+    // Until then, leaving the binding avoids a deploy-time class-registration
+    // error if Cloudflare's Workflow runtime tries to materialise instances
+    // already queued from prior deploys.
     {
       "binding": "PIPELINE_REBUILD_WORKFLOW",
       "name": "rf-mcp-pipeline-rebuild",
@@ -60,7 +68,16 @@
     // (or edit vars + redeploy) to enable the additive INSERT-OR-IGNORE tail-sync path
     // during dual-write cutover phase. Default "false" keeps legacy-only behaviour.
     // After cutover step 6 (Task 30), remove this var and the gate in scheduled().
-    "CRON_THIN_ENABLED": "false"
+    "CRON_THIN_ENABLED": "false",
+    // Feature flag: gates the LEGACY tailSync (writes to candidates / candidate_jobs
+    // / jobs / job_pipelines via INSERT-OR-REPLACE). Default "false" — the
+    // legacy writers do not skip unchanged rows and drove the D1 write-storm
+    // that disabled cron on 2026-05-10 (see project memory
+    // `project_sync_cron_disabled.md`). Re-enable only for explicit cutover
+    // diagnostics, via `wrangler secret put CRON_LEGACY_ENABLED` set to
+    // "true" (or "1"). After cutover step 6 the legacy code is dropped and
+    // this var becomes redundant.
+    "CRON_LEGACY_ENABLED": "false"
   },
   "observability": {
     "enabled": true,

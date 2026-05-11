@@ -38,7 +38,8 @@ describe('fetchCallsForConsultant', () => {
     expect(url.searchParams.get('started_after')).toBe('1717248000000');
   });
 
-  it('caps at MAX_PAGES to avoid runaway pagination', async () => {
+  it('caps at MAX_PAGES to avoid runaway pagination and emits a structured warn log', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const pages = Array.from({ length: 30 }, (_, i) => ({
       items: [{ call_id: `c${i}` }],
       cursor: i < 29 ? `t${i}` : null,
@@ -47,6 +48,16 @@ describe('fetchCallsForConsultant', () => {
     const out = await fetchCallsForConsultant(env, '8000000000000001', 0);
     // MAX_PAGES = 25 (well above the 1–3 pages a 15-min cron tick should ever need)
     expect(out.length).toBe(25);
+    // Structured log shape: source identifies the file, pages records the cap
+    // hit, targetId carries the consultant id. The MAX_PAGES = 25 truncation
+    // is a signal worth alerting on (operator should look at the consultant's
+    // call volume and bump MAX_PAGES if legitimate).
+    expect(warnSpy).toHaveBeenCalledWith(expect.objectContaining({
+      source: 'dialpad-list-client',
+      pages: 25,
+      targetId: '8000000000000001',
+      message: expect.stringContaining('MAX_PAGES=25'),
+    }));
   });
 
   it('forwards cursor on subsequent pages (no cursor on first request)', async () => {

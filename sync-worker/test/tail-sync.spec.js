@@ -103,19 +103,24 @@ describe('tailSync', () => {
   });
 });
 
-describe('scheduled() triggers PipelineRebuildWorkflow after tailSync', () => {
-  it('calls PIPELINE_REBUILD_WORKFLOW.create after tailSync completes', async () => {
+describe('scheduled() no longer spawns PipelineRebuildWorkflow', () => {
+  // The `job_pipelines` table is dropped at cutover step 6 and there are no
+  // active consumers of pipeline-cache reads. The workflow class is kept
+  // exported for safety (existing queued instances still need the class
+  // registered) but cron must never instantiate new instances.
+  it('does NOT call PIPELINE_REBUILD_WORKFLOW.create from scheduled()', async () => {
     vi.spyOn(rfClient, 'fetchCandidatesUpdatedSince').mockResolvedValue({ ids: [], suggestedCursor: '2026-05-08T00:00:00Z' });
     vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
     const create = vi.fn().mockResolvedValue({ id: 'wf-1' });
     const testEnv = {
       ...env,
+      // Even with the binding present, the spawn site is removed.
       PIPELINE_REBUILD_WORKFLOW: { create },
     };
     let waitUntilPromise;
     const ctx = { waitUntil: (p) => { waitUntilPromise = p; } };
     await worker.scheduled({}, testEnv, ctx);
     await waitUntilPromise;
-    expect(create).toHaveBeenCalledTimes(1);
+    expect(create).not.toHaveBeenCalled();
   });
 });

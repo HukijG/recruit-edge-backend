@@ -199,18 +199,29 @@ export function toCandidateThinRow(rf) {
  * Build a thin jobs_v2 row. Accepts both /job/list shape (company.name) and
  * /candidate/get's jobs[] shape (client_company_name flat).
  *
+ * RF's /job/list field name for "creation timestamp" was never spec-verified
+ * in the rev-5 doc — we've seen `created_time` in test fixtures but RF's docs
+ * are inconsistent across endpoints (some surfaces use `added_time`,
+ * `date_created`, etc.). Accept all three; throw a specific error if none is
+ * present so the per-row resilience in `d1-write.js` can skip the row + log
+ * the offending RF id without crashing the whole batch.
+ *
  * canonical_pipeline_json is set ONLY by the new-job-discovery path in cron;
  * pure normalization here leaves it null.
  */
 export function toJobThinRow(rf) {
-  if (!rf?.created_time) {
-    throw new Error(`toJobThinRow: rf.created_time is required (id=${rf?.id})`);
+  const createdTime = rf?.created_time ?? rf?.added_time ?? rf?.date_created;
+  if (!createdTime) {
+    throw new Error(
+      `toJobThinRow: missing creation timestamp field on job ${rf?.id}: ` +
+      `expected one of created_time / added_time / date_created`
+    );
   }
   return {
     id: rf.id,
     name: rf.name ?? rf.title ?? null,
     client_company_name: rf.client_company_name ?? rf.company?.name ?? null,
-    added_time_ms: Date.parse(rf.created_time),
+    added_time_ms: Date.parse(createdTime),
     canonical_pipeline_json: null,
     cached_at_ms: Date.now(),
   };

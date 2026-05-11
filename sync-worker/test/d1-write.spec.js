@@ -1,10 +1,14 @@
 import { env } from 'cloudflare:test';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { applyMigration } from './helpers/migrate.js';
 import { writeCandidatesAndLinks, writeJobs, writeJobPipeline, writeCandidatesThin, writeJobsThin, writeCalls } from '../src/d1-write.js';
 
 beforeEach(async () => {
   await applyMigration(env.RF_MCP_CACHE);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 const sample = {
@@ -317,5 +321,127 @@ describe('writeCalls', () => {
       .bind('c-cold-1').all();
     expect(results[0].call_id).toBe('c-cold-1');
     expect(results[0].rf_candidate_id).toBeNull();
+  });
+});
+
+describe('thin writers — per-row resilience (skip_row on builder throw)', () => {
+  // The invariant: a single malformed RF/Dialpad row in a multi-row batch
+  // must NOT abort the whole batch, otherwise the cron cursor doesn't advance
+  // and the next tick re-fetches the same page, crashing on the same bad row
+  // forever. Each writer logs a structured `skip_row` line and continues.
+
+  describe('writeCandidatesThin', () => {
+    it('skips a single malformed row and writes the rest', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const rows = [
+        { id: 1, name: 'Alice', added_time: '2024-06-01T12:00:00+0000' },
+        { id: 2, name: 'Bob (bad - no added_time)' },        // BAD
+        { id: 3, name: 'Carol', added_time: '2024-06-02T12:00:00+0000' },
+      ];
+      await writeCandidatesThin(env, rows);
+
+      const { results } = await env.RF_MCP_CACHE
+        .prepare('SELECT id, name FROM candidates_v2 ORDER BY id').all();
+      expect(results.map(r => r.id)).toEqual([1, 3]);
+      // structured log shape
+      expect(warnSpy).toHaveBeenCalledWith(expect.objectContaining({
+        source: 'd1-write',
+        fn: 'toCandidateThinRow',
+        op: 'skip_row',
+        rfId: 2,
+      }));
+    });
+
+    it('all rows bad → empty batch, no DB write attempted', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const batchSpy = vi.spyOn(env.RF_MCP_CACHE, 'batch');
+      const rows = [
+        { id: 10, name: 'no added_time A' },
+        { id: 11, name: 'no added_time B' },
+      ];
+      await writeCandidatesThin(env, rows);
+
+      const { results } = await env.RF_MCP_CACHE
+        .prepare('SELECT COUNT(*) AS n FROM candidates_v2').all();
+      expect(results[0].n).toBe(0);
+      expect(batchSpy).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('writeJobsThin', () => {
+    it('skips a single malformed row and writes the rest', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const rows = [
+        { id: 100, name: 'Job A', created_time: '2024-01-15T09:00:00+0000' },
+        { id: 101, name: 'Job B (bad - no timestamp)' },        // BAD
+        { id: 102, name: 'Job C', added_time: '2024-02-15T09:00:00+0000' },  // exercise fallback chain
+      ];
+      await writeJobsThin(env, rows);
+
+      const { results } = await env.RF_MCP_CACHE
+        .prepare('SELECT id FROM jobs_v2 ORDER BY id').all();
+      expect(results.map(r => r.id)).toEqual([100, 102]);
+      expect(warnSpy).toHaveBeenCalledWith(expect.objectContaining({
+        source: 'd1-write',
+        fn: 'toJobThinRow',
+        op: 'skip_row',
+        rfId: 101,
+      }));
+    });
+
+    it('all rows bad → empty batch, no DB write', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const batchSpy = vi.spyOn(env.RF_MCP_CACHE, 'batch');
+      await writeJobsThin(env, [{ id: 500 }, { id: 501 }]);   // both missing all timestamp fields
+      const { results } = await env.RF_MCP_CACHE
+        .prepare('SELECT COUNT(*) AS n FROM jobs_v2').all();
+      expect(results[0].n).toBe(0);
+      expect(batchSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('writeCalls', () => {
+    it('skips a single malformed Dialpad row and writes the rest', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const rows = [
+        {
+          call_id: 'c-1',
+          target: { id: '8000000000000001' },
+          contact: { id: 'shared_contact_pool_Company:X_uid_RF1' },
+          date_started: 1717248000000, total_duration: 1000, direction: 'outbound',
+        },
+        { call_id: 'c-bad', date_started: 1717248000000 }, // missing target.id  → throws
+        {
+          call_id: 'c-3',
+          target: { id: '8000000000000001' },
+          contact: { id: 'shared_contact_pool_Company:X_uid_RF3' },
+          date_started: 1717248000000, total_duration: 1000, direction: 'inbound',
+        },
+      ];
+      await writeCalls(env, rows);
+
+      const { results } = await env.RF_MCP_CACHE
+        .prepare('SELECT call_id FROM calls ORDER BY call_id').all();
+      expect(results.map(r => r.call_id)).toEqual(['c-1', 'c-3']);
+      expect(warnSpy).toHaveBeenCalledWith(expect.objectContaining({
+        source: 'd1-write',
+        fn: 'toCallRow',
+        op: 'skip_row',
+      }));
+    });
+
+    it('all rows bad → empty batch, no DB write', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const batchSpy = vi.spyOn(env.RF_MCP_CACHE, 'batch');
+      await writeCalls(env, [
+        { call_id: 'x' },        // missing target.id
+        { date_started: 1 },     // missing call_id
+      ]);
+      const { results } = await env.RF_MCP_CACHE
+        .prepare('SELECT COUNT(*) AS n FROM calls').all();
+      expect(results[0].n).toBe(0);
+      expect(batchSpy).not.toHaveBeenCalled();
+    });
   });
 });

@@ -213,15 +213,51 @@ async function batchInsert(env, sql, rows, cols) {
 }
 
 /**
+ * Build normalized rows from raw RF inputs, skipping (and structured-logging)
+ * any single input whose `builderFn` throws.
+ *
+ * Per-row resilience is load-bearing: a malformed RF row in a 5000-row batch
+ * must NOT abort the entire batch — otherwise the cursor doesn't advance, the
+ * next tick re-fetches the same page, and the same bad row crashes again on
+ * every tick forever (loss of forward progress).
+ *
+ * @param {Array<object>} rfRows - raw RF objects
+ * @param {Function} builderFn   - row builder; may throw
+ * @param {string} fn            - builder name for structured log
+ * @returns {Array<object>}      - successfully-built rows (length <= rfRows.length)
+ */
+function buildRowsResilient(rfRows, builderFn, fn) {
+  if (!rfRows?.length) return [];
+  const out = [];
+  for (const r of rfRows) {
+    try {
+      out.push(builderFn(r));
+    } catch (e) {
+      console.warn({
+        message: `[d1-write] skip_row fn=${fn} rfId=${r?.id} error=${e?.message}`,
+        source: 'd1-write', fn, op: 'skip_row',
+        error: e?.message ?? String(e), rfId: r?.id ?? null,
+      });
+    }
+  }
+  return out;
+}
+
+/**
  * INSERT OR IGNORE candidates into candidates_v2.
  * Re-running with the same RF candidates is safe — existing rows are not
  * overwritten (immutable-cache contract).
+ *
+ * Per-row resilience: a malformed RF row (e.g. missing `added_time`) emits a
+ * structured `skip_row` log line and is omitted from the batch; the rest of
+ * the batch still lands. An entirely empty batch (all rows skipped) is a no-op
+ * — no D1 write attempted.
  *
  * @param {object} env - Worker env with `RF_MCP_CACHE` D1 binding
  * @param {Array<object>} rfCandidates - RF candidate-shaped objects
  */
 export async function writeCandidatesThin(env, rfCandidates) {
-  const rows = rfCandidates.map(toCandidateThinRow);
+  const rows = buildRowsResilient(rfCandidates, toCandidateThinRow, 'toCandidateThinRow');
   await batchInsert(env, CAND_V2_SQL, rows, CAND_V2_COLS);
 }
 
@@ -230,18 +266,26 @@ export async function writeCandidatesThin(env, rfCandidates) {
  * If `opts.pipelineByJobId` (Map<id, stage[]>) is provided, the
  * `canonical_pipeline_json` column is populated for matching job ids.
  *
+ * Per-row resilience: a malformed RF job (e.g. missing all of `created_time` /
+ * `added_time` / `date_created`) emits a structured `skip_row` log and is
+ * omitted; the rest of the batch still lands.
+ *
  * @param {object} env
  * @param {Array<object>} rfJobs - RF job-shaped objects
  * @param {{ pipelineByJobId?: Map<number, Array> }} [opts]
  */
 export async function writeJobsThin(env, rfJobs, opts = {}) {
   const pipelineByJobId = opts.pipelineByJobId ?? new Map();
-  const rows = rfJobs.map(j => {
+  // Wrap toJobThinRow so the pipeline lookup runs inside the resilient try/catch
+  // (a thrown row never reaches the lookup either, so this is purely structural
+  // — the Map.get is cheap and side-effect-free).
+  const builder = (j) => {
     const row = toJobThinRow(j);
     const summary = pipelineByJobId.get(j.id);
     if (summary) row.canonical_pipeline_json = JSON.stringify(summary);
     return row;
-  });
+  };
+  const rows = buildRowsResilient(rfJobs, builder, 'toJobThinRow');
   await batchInsert(env, JOBS_V2_SQL, rows, JOBS_V2_COLS);
 }
 
@@ -249,10 +293,14 @@ export async function writeJobsThin(env, rfJobs, opts = {}) {
  * INSERT OR IGNORE Dialpad calls into the `calls` table.
  * Accepts Dialpad /v2/call list items or hangup webhook payloads.
  *
+ * Per-row resilience: a malformed Dialpad row (e.g. missing `target.id` or
+ * `call_id`) emits a structured `skip_row` log and is omitted; the rest still
+ * lands.
+ *
  * @param {object} env
  * @param {Array<object>} dialpadCalls
  */
 export async function writeCalls(env, dialpadCalls) {
-  const rows = dialpadCalls.map(toCallRow);
+  const rows = buildRowsResilient(dialpadCalls, toCallRow, 'toCallRow');
   await batchInsert(env, CALLS_SQL, rows, CALLS_COLS);
 }

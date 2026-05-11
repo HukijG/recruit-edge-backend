@@ -63,8 +63,13 @@ async function handleAdmin(request, env, ctx) {
 }
 
 const WATCHDOG_HOURS = 6;
+const WATCHDOG_MS = WATCHDOG_HOURS * 3600_000;
 const SIX_HOURS_MS = 6 * 3600_000;
 const ONE_DAY_MS = 24 * 3600_000;
+// Two-year cold-start lookback. Mirrors the admin seed default
+// (workflow.js `runCacheSeed` calls path → 2y) so a fresh deployment without
+// a prior seed doesn't silently lose anything older than 1 day.
+const TWO_YEARS_MS = 2 * 365 * 24 * 3600_000;
 
 function chunks(arr, n) {
   const out = [];
@@ -81,6 +86,56 @@ async function watchdog(env) {
   if (ageMs > WATCHDOG_HOURS * 3600_000) {
     console.warn(`[sync] watchdog clearing stuck in_flight token (age ${Math.floor(ageMs / 60000)}min)`);
     await deleteSyncState(env, 'in_flight');
+  }
+}
+
+/**
+ * Per-subtask in-flight watchdog for the thin tail-sync subtasks.
+ * Mirrors the legacy `watchdog(env)` but takes the in-flight key + a
+ * "subtask-specific last completion timestamp" key — clearing the lease only
+ * when the lease has been held longer than WATCHDOG_HOURS without progress.
+ *
+ * @param {object} env
+ * @param {string} inFlightKey   - sync_state key holding the lease token
+ * @param {string} lastDoneKey   - sync_state key holding the last successful completion ISO time
+ * @param {string} subtask       - short id for log lines
+ */
+async function watchdogSubtask(env, inFlightKey, lastDoneKey, subtask) {
+  const inFlight = await readSyncState(env, inFlightKey);
+  if (!inFlight) return;
+  // The lease itself stores the ISO time it was claimed. If `lastDoneKey`
+  // has been written more recently (i.e. a prior tick succeeded after the
+  // stuck lease was set), the watchdog falls back to that newer timestamp.
+  const leaseClaimed = inFlight;
+  const lastDone = await readSyncState(env, lastDoneKey);
+  // Choose the more recent of (leaseClaimed, lastDone) for age comparison.
+  // Lease value defaults to a parseable ISO string from watchdog claims; on
+  // unparseable garbage the lease is treated as stuck and cleared.
+  const leaseMs = Date.parse(leaseClaimed);
+  const lastDoneMs = lastDone ? Date.parse(lastDone) : NaN;
+  const referenceMs = Math.max(
+    Number.isFinite(leaseMs) ? leaseMs : 0,
+    Number.isFinite(lastDoneMs) ? lastDoneMs : 0,
+  );
+  if (referenceMs === 0) {
+    // Lease has no meaningful timestamp (legacy boolean payload, e.g. "true")
+    // AND there's no completion record either — clear conservatively so we
+    // don't permanently deadlock the subtask.
+    console.warn({
+      message: `[sync] watchdog clearing untimed in_flight token subtask=${subtask}`,
+      source: 'sync-worker', subtask, op: 'watchdog_clear_untimed',
+    });
+    await deleteSyncState(env, inFlightKey);
+    return;
+  }
+  const ageMs = Date.now() - referenceMs;
+  if (ageMs > WATCHDOG_MS) {
+    console.warn({
+      message: `[sync] watchdog clearing stuck in_flight token subtask=${subtask} (age ${Math.floor(ageMs / 60000)}min)`,
+      source: 'sync-worker', subtask, op: 'watchdog_clear',
+      ageMinutes: Math.floor(ageMs / 60000),
+    });
+    await deleteSyncState(env, inFlightKey);
   }
 }
 
@@ -156,16 +211,31 @@ export async function tailSyncThin(env) {
 
 async function tailSyncCandidatesThin(env) {
   const t0 = Date.now();
+  // Watchdog first: if a prior tick crashed without releasing the lease,
+  // clear it after WATCHDOG_HOURS so we don't block forever.
+  await watchdogSubtask(env, 'thin_candidates_in_flight', 'thin_candidates_done_at', 'candidates');
+  if (await readSyncState(env, 'thin_candidates_in_flight')) {
+    console.log({
+      message: '[sync] candidates subtask already in flight, skipping',
+      source: 'sync-worker', subtask: 'candidates', op: 'skip_in_flight',
+    });
+    return;
+  }
+  await writeSyncState(env, 'thin_candidates_in_flight', new Date().toISOString());
   try {
+    // Cold-start default: 2-year lookback (mirrors `runCacheSeed`'s seed
+    // default). The previous 1-day default meant a fresh deployment without
+    // a prior admin seed silently lost anything older than a day.
     const cursor = (await readSyncState(env, 'last_candidates_added_cursor'))
-      ?? new Date(Date.now() - ONE_DAY_MS).toISOString();
+      ?? new Date(Date.now() - TWO_YEARS_MS).toISOString();
     const { rows, suggestedCursor, capped } = await rfClient.fetchCandidatesAddedSince(env, cursor);
-    // TODO(hardening): wrap writeCandidatesThin in per-row try/catch if production
-    // logs show frequent thrown rows from to*Row builders. For now, INSERT-OR-IGNORE
-    // semantics mean the next tick re-fetches free if a bad row crashes mid-batch;
-    // the cursor doesn't advance, so no data is lost.
+    // writeCandidatesThin is per-row resilient: a single malformed RF row
+    // emits a structured `skip_row` log line and is omitted from the batch;
+    // the rest of the page still lands. The cursor still advances because
+    // RF returned a valid page.
     await writeCandidatesThin(env, rows);
     await writeSyncState(env, 'last_candidates_added_cursor', suggestedCursor);
+    await writeSyncState(env, 'thin_candidates_done_at', new Date().toISOString());
     console.log({
       message: `[sync] candidates tick rows=${rows.length} capped=${capped} took=${Date.now() - t0}ms`,
       source: 'sync-worker', subtask: 'candidates',
@@ -177,11 +247,22 @@ async function tailSyncCandidatesThin(env) {
       source: 'sync-worker', subtask: 'candidates',
       error: err.message, stack: err.stack,
     });
+  } finally {
+    await deleteSyncState(env, 'thin_candidates_in_flight');
   }
 }
 
 async function tailSyncJobsThin(env) {
   const t0 = Date.now();
+  await watchdogSubtask(env, 'thin_jobs_in_flight', 'thin_jobs_done_at', 'jobs');
+  if (await readSyncState(env, 'thin_jobs_in_flight')) {
+    console.log({
+      message: '[sync] jobs subtask already in flight, skipping',
+      source: 'sync-worker', subtask: 'jobs', op: 'skip_in_flight',
+    });
+    return;
+  }
+  await writeSyncState(env, 'thin_jobs_in_flight', new Date().toISOString());
   try {
     const allJobs = await rfClient.fetchAllJobs(env);
     const knownIds = new Set(
@@ -202,6 +283,7 @@ async function tailSyncJobsThin(env) {
       }
     }
     await writeJobsThin(env, allJobs, { pipelineByJobId });
+    await writeSyncState(env, 'thin_jobs_done_at', new Date().toISOString());
     console.log({
       message: `[sync] jobs tick total=${allJobs.length} new=${newJobs.length} took=${Date.now() - t0}ms`,
       source: 'sync-worker', subtask: 'jobs',
@@ -213,11 +295,22 @@ async function tailSyncJobsThin(env) {
       source: 'sync-worker', subtask: 'jobs',
       error: err.message, stack: err.stack,
     });
+  } finally {
+    await deleteSyncState(env, 'thin_jobs_in_flight');
   }
 }
 
 async function tailSyncCallsThin(env) {
   const t0 = Date.now();
+  await watchdogSubtask(env, 'thin_calls_in_flight', 'thin_calls_done_at', 'calls');
+  if (await readSyncState(env, 'thin_calls_in_flight')) {
+    console.log({
+      message: '[sync] calls subtask already in flight, skipping',
+      source: 'sync-worker', subtask: 'calls', op: 'skip_in_flight',
+    });
+    return;
+  }
+  await writeSyncState(env, 'thin_calls_in_flight', new Date().toISOString());
   try {
     const consultants = await listConsultants(env);
     let totalRows = 0;
@@ -226,7 +319,14 @@ async function tailSyncCallsThin(env) {
         const lastSeenRow = await env.RF_MCP_CACHE
           .prepare('SELECT MAX(date_started_ms) AS max FROM calls WHERE target_dialpad_id = ?')
           .bind(c.dialpadId).first();
-        const lastSeenMs = (lastSeenRow?.max != null) ? lastSeenRow.max : (Date.now() - ONE_DAY_MS);
+        // Cold-start default: 2-year lookback per consultant. Decision: the
+        // seed default is 2 years (`runCacheSeed`), and the operating envelope
+        // (Dialpad call history across consultants) does fit a 2-year window
+        // without overwhelming the MAX_PAGES=25 cap (call volume per consultant
+        // is at most a few thousand per year). Picking the seed-symmetric
+        // default avoids the same "fresh deploy silently loses old calls" trap
+        // as the candidates cursor (#5).
+        const lastSeenMs = (lastSeenRow?.max != null) ? lastSeenRow.max : (Date.now() - TWO_YEARS_MS);
         const startedAfterMs = Math.max(0, lastSeenMs - SIX_HOURS_MS);
         const calls = await fetchCallsForConsultant(env, c.dialpadId, startedAfterMs);
         await writeCalls(env, calls);
@@ -239,6 +339,7 @@ async function tailSyncCallsThin(env) {
         });
       }
     }
+    await writeSyncState(env, 'thin_calls_done_at', new Date().toISOString());
     console.log({
       message: `[sync] calls tick consultants=${consultants.length} rows=${totalRows} took=${Date.now() - t0}ms`,
       source: 'sync-worker', subtask: 'calls',
@@ -250,6 +351,8 @@ async function tailSyncCallsThin(env) {
       source: 'sync-worker', subtask: 'calls',
       error: err.message, stack: err.stack,
     });
+  } finally {
+    await deleteSyncState(env, 'thin_calls_in_flight');
   }
 }
 
@@ -309,19 +412,50 @@ async function getCacheCronAdditiveFlag(env) {
   return env.CRON_THIN_ENABLED === 'true' || env.CRON_THIN_ENABLED === '1';
 }
 
+/**
+ * Guards the LEGACY tail-sync path behind a runtime flag.
+ *
+ * Background: project memory `project_sync_cron_disabled.md` notes that the
+ * legacy writers (`writeJobs` / `writeJobPipeline` / `writeCandidatesAndLinks`)
+ * INSERT-OR-REPLACE on every tick regardless of whether anything actually
+ * changed — driving ~1M D1 writes/day with zero active consumers. They do not
+ * gate on unchanged rows. Until step 6 of the cutover deletes the legacy code
+ * entirely, gate it OFF at runtime via this flag.
+ *
+ * Default false. To enable temporarily during cutover diagnostics:
+ *   wrangler secret put CRON_LEGACY_ENABLED  # value "true" or "1"
+ * (or edit wrangler vars + redeploy).
+ *
+ * Same value-shape as `getCacheCronAdditiveFlag` — accept "true" or "1".
+ */
+async function getCacheCronLegacyFlag(env) {
+  return env.CRON_LEGACY_ENABLED === 'true' || env.CRON_LEGACY_ENABLED === '1';
+}
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
-      await tailSync(env);          // legacy — always on during dual-write phase
+      // Legacy tailSync is gated OFF by default — its writers don't skip
+      // unchanged rows and drove the D1 write-storm that disabled cron
+      // (2026-05-10). Re-enabled only by explicit operator opt-in.
+      // After cutover step 6 the legacy code is dropped and this gate
+      // becomes redundant. Until then, keep it OFF.
+      if (await getCacheCronLegacyFlag(env)) {
+        await tailSync(env);
+      } else {
+        console.log({
+          message: '[sync] legacy tailSync skipped (CRON_LEGACY_ENABLED=false)',
+          source: 'sync-worker', op: 'skip_legacy_tail_sync',
+        });
+      }
       if (await getCacheCronAdditiveFlag(env)) {
         await tailSyncThin(env);    // new — writes _v2 + calls (additive-only INSERT-OR-IGNORE)
       }
-      if (env.PIPELINE_REBUILD_WORKFLOW?.create) {
-        await env.PIPELINE_REBUILD_WORKFLOW.create({
-          id: crypto.randomUUID(),
-          params: { startedAt: new Date().toISOString() },
-        });
-      }
+      // PIPELINE_REBUILD_WORKFLOW intentionally NOT spawned. The
+      // `job_pipelines` table it writes is dropped at cutover step 6 and
+      // there are no active consumers of pipeline cache reads. The workflow
+      // class is still exported (last-import compat for the running deploy)
+      // but never instantiated from cron.
     })());
   },
   async fetch(request, env, ctx) {
