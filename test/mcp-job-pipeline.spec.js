@@ -1,9 +1,11 @@
 import { env, createExecutionContext } from 'cloudflare:test';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { applyMigration } from './helpers/d1-migrate.js';
 import { applyUsersMigration } from './helpers/users-migrate.js';
 import { _resetCacheForTests } from '../src/users.js';
 import worker from '../src';
+
+const originalFetch = globalThis.fetch;
 
 const insertJob = async (id, name = 'Job ' + id, client = 'Acme') => {
   await env.RF_MCP_CACHE
@@ -13,6 +15,11 @@ const insertJob = async (id, name = 'Job ' + id, client = 'Acme') => {
     .run();
 };
 
+/**
+ * Seed BOTH legacy `candidates` (for fuzzy resolvers / pre-cutover code paths)
+ * AND new `candidates_v2` (the thin-hydration source). Tests that exercise
+ * thin-only hydration only need the v2 row.
+ */
 const insertCandidate = async (id, name, body = {}) => {
   await env.RF_MCP_CACHE
     .prepare(`INSERT INTO candidates (id, body, name, linkedin_profile, current_organization, cached_at)
@@ -26,27 +33,85 @@ const insertCandidate = async (id, name, body = {}) => {
       new Date().toISOString(),
     )
     .run();
-};
-
-const insertPipeline = async (jobId, summary, stageCandidates) => {
   await env.RF_MCP_CACHE
-    .prepare(`INSERT OR REPLACE INTO job_pipelines (job_id, summary_json, stage_candidates_json, fetched_at)
-              VALUES (?, ?, ?, ?)`)
-    .bind(jobId, JSON.stringify(summary), JSON.stringify(stageCandidates), new Date().toISOString())
+    .prepare(`INSERT OR IGNORE INTO candidates_v2
+              (id, name, linkedin_profile, added_time_ms,
+               current_title_at_cache_time, current_company_at_cache_time, cached_at_ms)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .bind(
+      id,
+      name,
+      body.linkedin_profile ?? null,
+      body.added_time_ms ?? Date.now(),
+      body.current_title ?? null,
+      body.current_organization ?? null,
+      Date.now(),
+    )
     .run();
 };
 
+/**
+ * Build a Response-like object mirroring what `globalThis.fetch` returns —
+ * matches the shape the rf-client.js read helpers expect (`r.ok`, `r.status`,
+ * `r.json()`, `r.text()`).
+ */
+const fakeJsonResponse = (json, { status = 200 } = {}) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  json: async () => json,
+  text: async () => (typeof json === 'string' ? json : JSON.stringify(json)),
+});
+const fakeErrorResponse = ({ status = 500, body = '' } = {}) => ({
+  ok: false,
+  status,
+  json: async () => ({}),
+  text: async () => body,
+});
+
+/**
+ * Build a single RF `/job/pipeline` response from a `{<stageName>: [<id>...]}`
+ * map. Honours the `STANDARD_SUMMARY` order; produces `detail[]` entries with
+ * a single `stages[]` move (the current stage) since the handler only cares
+ * about the most-recent `stages[].time` `to`.
+ */
+const buildPipelinePayload = (summary, stageCandidates) => ({
+  summary,
+  detail: Object.entries(stageCandidates).flatMap(([stageName, ids]) =>
+    ids.map((id) => ({
+      candidate: { id, name: 'C' + id },
+      stages: [{ from: null, time: '2026-05-01T00:00:00+0000', to: stageName }],
+    })),
+  ),
+});
+
+/**
+ * Default fetch mock used by every test in this file: route `/job/pipeline`
+ * to a per-test fixture, throw on any unexpected URL so missing mocks fail
+ * loudly rather than silently 404ing.
+ */
+const mockRFPipeline = (pipelinePayload, { onCandidateGet } = {}) => {
+  globalThis.fetch = vi.fn(async (url) => {
+    const u = String(url);
+    if (u.includes('/job/pipeline')) return fakeJsonResponse(pipelinePayload);
+    if (u.includes('/candidate/get')) {
+      if (onCandidateGet) return onCandidateGet(u);
+      throw new Error(`unexpected /candidate/get in test: ${u}`);
+    }
+    throw new Error(`unexpected fetch in test: ${u}`);
+  });
+};
+
 const STANDARD_SUMMARY = [
-  { id: 1, name: 'Sourced',         count: 2 },
-  { id: 2, name: 'Replied',         count: 1 },
+  { id: 1, name: 'Sourced',         count: 0 },
+  { id: 2, name: 'Replied',         count: 0 },
   { id: 3, name: 'Call Booked',     count: 0 },
   { id: 4, name: 'Shortlist',       count: 0 },
-  { id: 5, name: 'CV Sent',         count: 1 },
+  { id: 5, name: 'CV Sent',         count: 0 },
   { id: 6, name: '1st Interview',   count: 0 },
   { id: 7, name: 'Final Interview', count: 0 },
   { id: 8, name: 'Offer',           count: 0 },
   { id: 9, name: 'Hired',           count: 0 },
-  { id: 10, name: 'Disqualified',   count: 1 },
+  { id: 10, name: 'Disqualified',   count: 0 },
 ];
 
 beforeEach(async () => {
@@ -54,9 +119,14 @@ beforeEach(async () => {
   await applyUsersMigration(env);
   _resetCacheForTests();
   await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
+  await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
   await env.RF_MCP_CACHE.exec('DELETE FROM candidate_jobs');
   await env.RF_MCP_CACHE.exec('DELETE FROM jobs');
   await env.RF_MCP_CACHE.exec('DELETE FROM job_pipelines');
+});
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
 });
 
 const call = (b) => worker.fetch(
@@ -74,7 +144,9 @@ describe('/mcp/job-pipeline', () => {
     it('returns CV Sent through Hired in canonical order, excludes Sourced/Replied', async () => {
       await insertJob(984, 'Sales Engineer', 'Eon.io');
       await insertCandidate(7, 'X', { linkedin_profile: 'x-slug' });
-      await insertPipeline(984, STANDARD_SUMMARY, { Sourced: [1, 2], Replied: [3], 'CV Sent': [7] });
+      mockRFPipeline(buildPipelinePayload(STANDARD_SUMMARY, {
+        Sourced: [1, 2], Replied: [3], 'CV Sent': [7],
+      }));
       const r = await call({ job: 984 });
       const body = await r.json();
       expect(body.job).toEqual({ id: 984, name: 'Sales Engineer', client_company_name: 'Eon.io' });
@@ -94,7 +166,7 @@ describe('/mcp/job-pipeline', () => {
   describe('submitted: true', () => {
     it('exact match on "CV Sent" — no fuzzy', async () => {
       await insertJob(984);
-      await insertPipeline(984, STANDARD_SUMMARY, {});
+      mockRFPipeline(buildPipelinePayload(STANDARD_SUMMARY, {}));
       const r = await call({ job: 984, submitted: true });
       const body = await r.json();
       expect(body.stage_breakdown.map((s) => s.stage_name)).toEqual([
@@ -109,7 +181,7 @@ describe('/mcp/job-pipeline', () => {
         { id: 2, name: 'Reviewed', count: 0 },
         { id: 3, name: 'Hired',    count: 0 },
       ];
-      await insertPipeline(984, customSummary, {});
+      mockRFPipeline(buildPipelinePayload(customSummary, {}));
       const r = await call({ job: 984, submitted: true });
       const body = await r.json();
       expect(body.stage_breakdown.map((s) => s.stage_name)).toEqual(['Sourced', 'Reviewed', 'Hired']);
@@ -121,7 +193,7 @@ describe('/mcp/job-pipeline', () => {
     it('exact match', async () => {
       await insertJob(984);
       await insertCandidate(11, 'A', { linkedin_profile: 'a' });
-      await insertPipeline(984, STANDARD_SUMMARY, { Replied: [11] });
+      mockRFPipeline(buildPipelinePayload(STANDARD_SUMMARY, { Replied: [11] }));
       const r = await call({ job: 984, stage: 'Replied' });
       const body = await r.json();
       expect(body.stage_breakdown).toEqual([{ stage_name: 'Replied', count: 1 }]);
@@ -131,7 +203,7 @@ describe('/mcp/job-pipeline', () => {
     it('fuzzy match — "replied" → "Replied"', async () => {
       await insertJob(984);
       await insertCandidate(11, 'A');
-      await insertPipeline(984, STANDARD_SUMMARY, { Replied: [11] });
+      mockRFPipeline(buildPipelinePayload(STANDARD_SUMMARY, { Replied: [11] }));
       const r = await call({ job: 984, stage: 'replied' });
       const body = await r.json();
       expect(body.stage_breakdown).toEqual([{ stage_name: 'Replied', count: 1 }]);
@@ -143,7 +215,7 @@ describe('/mcp/job-pipeline', () => {
         { id: 1, name: '1st Interview', count: 0 },
         { id: 2, name: '2nd Interview', count: 0 },
       ];
-      await insertPipeline(984, ambiguousSummary, {});
+      mockRFPipeline(buildPipelinePayload(ambiguousSummary, {}));
       const r = await call({ job: 984, stage: 'interview' });
       const body = await r.json();
       expect(body.needs_disambiguation).toBe(true);
@@ -154,7 +226,7 @@ describe('/mcp/job-pipeline', () => {
   describe('from / to range', () => {
     it('inclusive on both ends, in canonical order', async () => {
       await insertJob(984);
-      await insertPipeline(984, STANDARD_SUMMARY, {});
+      mockRFPipeline(buildPipelinePayload(STANDARD_SUMMARY, {}));
       const r = await call({ job: 984, from: 'Replied', to: 'Shortlist' });
       const body = await r.json();
       expect(body.stage_breakdown.map((s) => s.stage_name)).toEqual([
@@ -167,7 +239,9 @@ describe('/mcp/job-pipeline', () => {
     it('omitted by default', async () => {
       await insertJob(984);
       await insertCandidate(99, 'DQ');
-      await insertPipeline(984, STANDARD_SUMMARY, { 'CV Sent': [], Disqualified: [99] });
+      mockRFPipeline(buildPipelinePayload(STANDARD_SUMMARY, {
+        'CV Sent': [], Disqualified: [99],
+      }));
       const r = await call({ job: 984 });
       const body = await r.json();
       expect(Object.keys(body.stages)).not.toContain('Disqualified');
@@ -176,30 +250,47 @@ describe('/mcp/job-pipeline', () => {
     it('included when flag set, regardless of default range', async () => {
       await insertJob(984);
       await insertCandidate(99, 'DQ');
-      await insertPipeline(984, STANDARD_SUMMARY, { 'CV Sent': [], Disqualified: [99] });
+      mockRFPipeline(buildPipelinePayload(STANDARD_SUMMARY, {
+        'CV Sent': [], Disqualified: [99],
+      }));
       const r = await call({ job: 984, include_disqualified: true });
       const body = await r.json();
       expect(Object.keys(body.stages)).toContain('Disqualified');
     });
   });
 
-  describe('cold cache', () => {
-    it('returns 200 + warning when no row in job_pipelines', async () => {
+  describe('empty pipeline (no candidates)', () => {
+    it('returns empty stages + zero counts when RF detail[] is empty', async () => {
+      // Replaces the legacy "cold cache" test — under live-fetch there's no
+      // pre-warm step, so an empty pipeline simply produces empty stages.
       await insertJob(984);
+      mockRFPipeline(buildPipelinePayload(STANDARD_SUMMARY, {}));
       const r = await call({ job: 984 });
       const body = await r.json();
       expect(r.status).toBe(200);
-      expect(body.stage_breakdown).toEqual([]);
-      expect(body.stages).toEqual({});
-      expect(body._meta?.warnings?.[0]).toMatch(/cache.*15-min/i);
+      expect(body.ok).toBe(true);
+      expect(body.stages['CV Sent']).toEqual([]);
+      expect(body.stage_breakdown.every((s) => s.count === 0)).toBe(true);
     });
   });
 
   describe('fields param', () => {
-    it('extends defaults — does not replace them', async () => {
+    it('extends defaults — does not replace them (expanded path: per-id /candidate/get)', async () => {
       await insertJob(984);
-      await insertCandidate(7, 'X', { linkedin_profile: 'x', current_organization: 'Acme', current_title: 'CTO' });
-      await insertPipeline(984, STANDARD_SUMMARY, { 'CV Sent': [7] });
+      await insertCandidate(7, 'X', {
+        linkedin_profile: 'x',
+        current_organization: 'Acme',
+        current_title: 'CTO',
+      });
+      mockRFPipeline(
+        buildPipelinePayload(STANDARD_SUMMARY, { 'CV Sent': [7] }),
+        {
+          onCandidateGet: () =>
+            fakeJsonResponse({
+              candidate: { id: 7, name: 'X', linkedin_profile: 'x', current_title: 'CTO' },
+            }),
+        },
+      );
       const r = await call({ job: 984, fields: ['title'] });
       const body = await r.json();
       const c = body.stages['CV Sent'][0];
@@ -212,7 +303,16 @@ describe('/mcp/job-pipeline', () => {
     it('drops unknown field names silently — no _meta on a clean call', async () => {
       await insertJob(984);
       await insertCandidate(7, 'X');
-      await insertPipeline(984, STANDARD_SUMMARY, { 'CV Sent': [7] });
+      mockRFPipeline(
+        buildPipelinePayload(STANDARD_SUMMARY, { 'CV Sent': [7] }),
+        {
+          // Unknown field forces expanded path (any field outside THIN_FIELDS
+          // does); /candidate/get must be mocked even though the unknown field
+          // resolves to nothing.
+          onCandidateGet: () =>
+            fakeJsonResponse({ candidate: { id: 7, name: 'X' } }),
+        },
+      );
       const r = await call({ job: 984, fields: ['totally_unknown_xyz'] });
       const body = await r.json();
       expect(body._meta).toBeUndefined();
@@ -222,15 +322,151 @@ describe('/mcp/job-pipeline', () => {
   describe('job_id short-circuit', () => {
     it('numeric job_id bypasses fuzzy', async () => {
       await insertJob(984);
-      await insertPipeline(984, STANDARD_SUMMARY, {});
+      mockRFPipeline(buildPipelinePayload(STANDARD_SUMMARY, {}));
       const r = await call({ job_id: 984, submitted: true });
       const body = await r.json();
       expect(body.job.id).toBe(984);
     });
 
     it('404 when job_id is unknown', async () => {
+      // No RF mock needed — handler returns 404 before hitting RF.
+      globalThis.fetch = vi.fn(async () => {
+        throw new Error('handler should not call fetch on unknown job_id');
+      });
       const r = await call({ job_id: 99999 });
       expect(r.status).toBe(404);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Thin-vs-expanded hydration (Task 15 — the new behavioural contract).
+  // ─────────────────────────────────────────────────────────────────────
+
+  describe('thin vs expanded hydration', () => {
+    it('thin-only fields → 1 RF /job/pipeline call + 1 D1 batch (no per-id /candidate/get)', async () => {
+      await insertJob(984);
+      await insertCandidate(1, 'A', { linkedin_profile: 'a' });
+      await insertCandidate(2, 'B', { linkedin_profile: 'b' });
+      const fetches = [];
+      globalThis.fetch = vi.fn(async (url) => {
+        fetches.push(String(url));
+        return fakeJsonResponse(buildPipelinePayload(STANDARD_SUMMARY, {
+          'CV Sent': [1, 2],
+        }));
+      });
+      const r = await call({ job: 984, fields: ['id', 'name', 'linkedin_profile'] });
+      const body = await r.json();
+      const rfCalls = fetches.filter((u) => u.includes('/job/pipeline'));
+      const candGets = fetches.filter((u) => u.includes('/candidate/get'));
+      expect(rfCalls).toHaveLength(1);
+      expect(candGets).toHaveLength(0);
+      expect(body.stages['CV Sent']).toHaveLength(2);
+      expect(body.stages['CV Sent'].map((c) => c.id).sort()).toEqual([1, 2]);
+    });
+
+    it('expanded fields → /job/pipeline + N parallel /candidate/get (concurrency capped at 8)', async () => {
+      await insertJob(984);
+      // Seed 30 thin rows so the legacy `candidates` table exists for any
+      // shared lookups; the v2 rows are the source of truth for thin path.
+      for (let i = 1; i <= 30; i++) {
+        await insertCandidate(i, `C${i}`);
+      }
+      let pipelineFetched = 0;
+      let candidateFetched = 0;
+      let inFlight = 0;
+      let observedMaxConcurrency = 0;
+      globalThis.fetch = vi.fn(async (url) => {
+        const u = String(url);
+        if (u.includes('/job/pipeline')) {
+          pipelineFetched++;
+          return fakeJsonResponse(buildPipelinePayload(STANDARD_SUMMARY, {
+            'CV Sent': Array.from({ length: 30 }, (_, i) => i + 1),
+          }));
+        }
+        if (u.includes('/candidate/get')) {
+          candidateFetched++;
+          inFlight++;
+          if (inFlight > observedMaxConcurrency) observedMaxConcurrency = inFlight;
+          // Microtask yield so concurrent invocations actually overlap and the
+          // in-flight count reflects the worker pool's parallelism.
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          inFlight--;
+          const idMatch = u.match(/[?&]id=(\d+)/);
+          const id = idMatch ? Number(idMatch[1]) : 0;
+          return fakeJsonResponse({
+            candidate: { id, name: `C${id}`, current_title: 'CTO' },
+          });
+        }
+        throw new Error(`unexpected fetch: ${u}`);
+      });
+
+      const r = await call({ job: 984, fields: ['id', 'name', 'current_title'] });
+      const body = await r.json();
+      expect(pipelineFetched).toBe(1);
+      expect(candidateFetched).toBe(30);
+      // Hard cap at 8 — defensive against accidental concurrency-bound bumps.
+      expect(observedMaxConcurrency).toBeLessThanOrEqual(8);
+      expect(body.stages['CV Sent']).toHaveLength(30);
+      expect(body.stages['CV Sent'].every((c) => c.current_title === 'CTO')).toBe(true);
+    });
+
+    it('per-id /candidate/get failure during hydration returns partial result + hydration_errors', async () => {
+      await insertJob(984);
+      await insertCandidate(1, 'A');
+      await insertCandidate(2, 'B');
+      globalThis.fetch = vi.fn(async (url) => {
+        const u = String(url);
+        if (u.includes('/job/pipeline')) {
+          return fakeJsonResponse(buildPipelinePayload(STANDARD_SUMMARY, {
+            'CV Sent': [1, 2],
+          }));
+        }
+        if (u.includes('/candidate/get')) {
+          const idMatch = u.match(/[?&]id=(\d+)/);
+          const id = idMatch ? Number(idMatch[1]) : 0;
+          if (id === 1) {
+            return fakeJsonResponse({
+              candidate: { id: 1, name: 'A', current_title: 'CTO' },
+            });
+          }
+          // 502 retry-once will fire, then we return the same 502 on attempt 2
+          // → upstream throws "RF API error: 502 - boom". The handler captures
+          // it as a hydration_errors[] entry instead of throwing.
+          return fakeErrorResponse({ status: 502, body: 'boom' });
+        }
+        throw new Error(`unexpected fetch: ${u}`);
+      });
+
+      const r = await call({ job: 984, fields: ['id', 'name', 'current_title'] });
+      const body = await r.json();
+      expect(body.hydration_errors).toEqual([
+        { id: 2, reason: expect.stringContaining('502') },
+      ]);
+      // Partial success: candidate 1 still surfaces in CV Sent, candidate 2 is
+      // dropped (not present in stages array, but its id is in hydration_errors).
+      expect(body.stages['CV Sent']).toHaveLength(1);
+      expect(body.stages['CV Sent'][0].id).toBe(1);
+      expect(body.stages['CV Sent'][0].current_title).toBe('CTO');
+    });
+
+    it('RF /job/pipeline failure → recoverable pipeline_unavailable envelope', async () => {
+      await insertJob(984);
+      globalThis.fetch = vi.fn(async (url) => {
+        const u = String(url);
+        if (u.includes('/job/pipeline')) {
+          // 500 (not 502) so the one-shot 502-retry is skipped and we surface
+          // the failure on the first attempt.
+          return fakeErrorResponse({ status: 500, body: 'pipeline service down' });
+        }
+        throw new Error(`unexpected fetch: ${u}`);
+      });
+      const r = await call({ job: 984 });
+      const body = await r.json();
+      expect(r.status).toBe(200);
+      expect(body.ok).toBe(false);
+      expect(body.recoverable).toBe(true);
+      expect(body.kind).toBe('pipeline_unavailable');
+      expect(body.error).toMatch(/500/);
     });
   });
 });

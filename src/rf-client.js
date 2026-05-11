@@ -193,6 +193,49 @@ export async function getRFCandidate(candidateId, env) {
 }
 
 /**
+ * GET /job/pipeline?job_id=… — live pass-through used by the MCP pipeline
+ * tools (/mcp/job-pipeline + /mcp/job-candidates-filter).
+ *
+ * Per spec rev 5 RF-4 verification (thin-immutable cache design):
+ * RF returns `{summary: [{id, name, count}], detail: [{candidate: {id, name},
+ * stages: [{from, time, to}]}]}` in one GET. `summary[]` is the canonical
+ * ordered pipeline (includes 0-count stages and `Disqualified`); `detail[]`
+ * carries each candidate's full stage-movement history — the most recent
+ * `stages[].time` `to` is their current stage. No documented pagination at
+ * this scale (largest job's `detail[]` is "a few hundred").
+ *
+ * One-shot 502 retry per the existing `getRFCandidate` pattern — RF's edge
+ * produces transient 502s on read paths.
+ */
+export async function fetchRFJobPipeline(env, jobId) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+  if (!rfApiKey) throw new Error('RF_API_KEY environment variable is required');
+  const url = `${rfBaseUrl}/job/pipeline?job_id=${encodeURIComponent(jobId)}`;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const response = await fetch(url, { method: 'GET', headers: { 'RF-Api-Key': rfApiKey } });
+    if (response.ok) return response.json();
+    const errorText = await response.text();
+    if (response.status === 502 && attempt === 1) {
+      console.warn({
+        message: `[RF pipeline] 502 for job=${jobId}, retrying once`,
+        source: 'rf-job-pipeline',
+        jobId,
+      });
+      continue;
+    }
+    console.error({
+      message: `RF /job/pipeline error job=${jobId} status=${response.status} body=${errorText}`,
+      source: 'rf-job-pipeline',
+      jobId,
+    });
+    throw new Error(`RF /job/pipeline ${response.status}: ${errorText}`);
+  }
+  // Unreachable — the loop either returns or throws on every iteration
+  throw new Error('RF /job/pipeline unreachable');
+}
+
+/**
  * Search RF for a candidate by LinkedIn profile URL.
  */
 export async function searchRFCandidateByLinkedIn(linkedinUrl, env) {
