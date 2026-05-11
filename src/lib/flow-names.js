@@ -7,6 +7,11 @@ export const FLOWS = Object.freeze({
   EXTENSION_CALL_REQUEST: 'ExtensionCallRequest',
   EXTENSION_DIALPAD_SMS: 'ExtensionDialpadSms',
   EXTENSION_CALL_STATE_POLL: 'ExtensionCallStatePoll',
+  EXTENSION_DIALPAD_HANGUP: 'ExtensionDialpadHangup',
+  EXTENSION_CALL_STATS: 'ExtensionCallStats',
+
+  MOBILE_MY_SOURCING_JOBS: 'MobileMySourcingJobs',
+  MOBILE_JOB_PIPELINE: 'MobileJobPipeline',
 
   WEBHOOK_RF: 'WebhookRecruiterflow',
   WEBHOOK_RF_MANUAL: 'WebhookRecruiterflowManual',

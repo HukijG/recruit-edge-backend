@@ -183,6 +183,7 @@ const handler = {
       }
 
       if (url.pathname === '/dialpad-hangup' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_DIALPAD_HANGUP);
         const extAuth = request.headers.get('X-Extension-Token');
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
@@ -191,6 +192,7 @@ const handler = {
       }
 
       if (url.pathname === '/extension-call-status' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_CALL_STATE_POLL);
         const extAuth = request.headers.get('X-Extension-Token');
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
@@ -199,6 +201,7 @@ const handler = {
       }
 
       if (url.pathname === '/my-sourcing-jobs' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.MOBILE_MY_SOURCING_JOBS);
         const extAuth = request.headers.get('X-Extension-Token');
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
@@ -207,6 +210,7 @@ const handler = {
       }
 
       if (url.pathname === '/job-pipeline' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.MOBILE_JOB_PIPELINE);
         const extAuth = request.headers.get('X-Extension-Token');
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
@@ -215,6 +219,7 @@ const handler = {
       }
 
       if (url.pathname === '/call-stats' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_CALL_STATS);
         const extAuth = request.headers.get('X-Extension-Token');
         if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
           return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
