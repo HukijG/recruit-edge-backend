@@ -303,9 +303,9 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
         "  • `submitted: true` — exact 'CV Sent' → end of pipeline",
         "  • none → actively-progressing window (CV Sent → Offer)",
         "",
-        "Cold-cache state: a job opened in RF in the last ~15 min may return `stage_breakdown: []`, `stages: {}`, and `_meta.warnings: ['pipeline cache not yet built...']`. NOT an error — surface to the user as 'try again in ~15 min'.",
+        "Pipeline reads are live to RF (~300-800 ms baseline). No pre-warm needed. On RF unavailable, returns {ok: false, recoverable: true, kind: \"pipeline_unavailable\"}.",
         "",
-        "Default excludes disqualified; pass `include_disqualified: true` to include. Open jobs only (closed jobs reachable via explicit numeric `job` id). Long-tail filters go in `filters: {...}`; unknown keys silently drop.",
+        "Default excludes disqualified; pass `include_disqualified: true` to include. Open jobs only (closed jobs reachable via explicit numeric `job` id).",
       ].join("\n"),
       inputSchema: {
         job: ref,
@@ -321,7 +321,6 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
           .optional()
           .describe("Default false; pass true to include DQ'd candidates."),
         fields: z.array(z.string()).optional(),
-        filters: z.record(z.string(), z.unknown()).optional(),
       },
       annotations: { readOnlyHint: true, destructiveHint: false },
       _meta: { "anthropic/alwaysLoad": true },
