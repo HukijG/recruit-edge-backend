@@ -237,3 +237,64 @@ export async function fetchCustomFieldSchema(env) {
 export async function fetchJobPipeline(env, jobId) {
   return rfGet(env, '/job/pipeline', { job_id: String(jobId) });
 }
+
+/**
+ * Returns candidate ROWS (full RF /candidate/search response items) whose
+ * `added_time` is on or after `cursor` (an ISO 8601 datetime).
+ *
+ * Cursor advancement (per spec rev 5):
+ *   - Not capped → set to MAX(added_time) seen across all rows.
+ *   - Capped → set to MIN(added_time) seen, never moving backward of input.
+ *     (Ensures forward progress on huge backlogs while accepting same-day
+ *     overlap which is idempotent via INSERT-OR-IGNORE on PK.)
+ *
+ * Hard cap of 5000 rows per tick (defensive — outage recovery).
+ */
+export async function fetchCandidatesAddedSince(env, cursor) {
+  const rows = [];
+  let page = 1;
+  const PAGE_SIZE = 100;
+  const HARD_CAP = 5000;
+  let capped = false;
+
+  const cursorMs = Date.parse(cursor);
+  const cursorDate = (cursor || '').slice(0, 10) || '1970-01-01';
+
+  for (;;) {
+    const resp = await rfPost(env, '/candidate/search', {
+      conjunction: 'match-all',
+      filters: [{
+        type: 'date',
+        is_relative: false,
+        filter_type: 'after',
+        date: cursorDate,
+        key: 'added_on',
+      }],
+      items_per_page: String(PAGE_SIZE),
+      current_page: String(page),
+    });
+    const batch = Array.isArray(resp?.data) ? resp.data : (Array.isArray(resp) ? resp : []);
+    if (batch.length === 0) break;
+    for (const row of batch) {
+      rows.push(row);
+      if (rows.length >= HARD_CAP) { capped = true; break; }
+    }
+    if (capped || batch.length < PAGE_SIZE) break;
+    page++;
+  }
+
+  let suggestedCursor = cursor;
+  if (rows.length > 0) {
+    const times = rows.map(r => Date.parse(r.added_time)).filter(n => Number.isFinite(n));
+    if (times.length > 0) {
+      const candidate = capped ? Math.min(...times) : Math.max(...times);
+      // Never move the cursor backward (defensive against day-granularity overlap).
+      suggestedCursor = new Date(Math.max(candidate, cursorMs || 0)).toISOString();
+    }
+  } else if (!capped) {
+    // No new rows AND not capped → nothing changed; keep cursor as-is.
+    suggestedCursor = cursor;
+  }
+
+  return { rows, suggestedCursor, capped };
+}

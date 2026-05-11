@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   fetchCandidate,
   fetchCandidatesUpdatedSince,
+  fetchCandidatesAddedSince,
   fetchAllJobs,
   fetchJobPipeline,
 } from '../src/rf-list-client.js';
@@ -165,5 +166,81 @@ describe('rf-list-client', () => {
     expect(url).toContain('/job/pipeline');
     expect(url).toContain('job_id=984');
     expect(init.headers['RF-Api-Key']).toBe('test');
+  });
+});
+
+// -- fetchCandidatesAddedSince ------------------------------------------------
+// Cap-aware MIN-advance cursor for the rev-5 cron tail-sync. Replaces the
+// stuck-cursor behaviour of fetchCandidatesUpdatedSince when capped; uses RF's
+// `added_on` date filter (which `/candidate/search` accepts, unlike a true
+// id-cursor on `/candidate/list` which RF doesn't support).
+
+beforeEach(() => {
+  globalThis.fetch = vi.fn();
+});
+
+function mockSearch(pages /* Array<Array<candidate>> */) {
+  let i = 0;
+  globalThis.fetch.mockImplementation(async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ data: pages[i++] ?? [] }),
+    text: async () => '',
+  }));
+}
+
+describe('fetchCandidatesAddedSince', () => {
+  it('returns rows + advances cursor to MAX(added_time) when not capped', async () => {
+    mockSearch([
+      [
+        { id: 1, name: 'A', added_time: '2024-06-01T10:00:00+0000' },
+        { id: 2, name: 'B', added_time: '2024-06-01T11:00:00+0000' },
+      ],
+      [], // empty page → end
+    ]);
+    const result = await fetchCandidatesAddedSince(env, '2024-06-01T00:00:00.000Z');
+    expect(result.rows).toHaveLength(2);
+    expect(result.suggestedCursor).toBe('2024-06-01T11:00:00.000Z');
+    expect(result.capped).toBe(false);
+  });
+
+  it('on cap, advances cursor to MIN(added_time) so next tick re-fetches the boundary day', async () => {
+    const pages = [];
+    for (let p = 0; p < 50; p++) {
+      pages.push(Array.from({ length: 100 }, (_, i) => ({
+        id: p * 100 + i + 1,
+        name: `c${p * 100 + i + 1}`,
+        added_time: '2024-06-15T12:00:00+0000',
+      })));
+    }
+    mockSearch(pages);
+    const result = await fetchCandidatesAddedSince(env, '2024-06-15T00:00:00.000Z');
+    expect(result.rows.length).toBe(5000);
+    expect(result.capped).toBe(true);
+    expect(result.suggestedCursor).toBe('2024-06-15T12:00:00.000Z');
+  });
+
+  it('passes added_on filter at day granularity to RF', async () => {
+    mockSearch([[]]);
+    await fetchCandidatesAddedSince(env, '2024-06-15T18:30:00.000Z');
+    const call = globalThis.fetch.mock.calls[0];
+    const body = JSON.parse(call[1].body);
+    expect(body.filters[0]).toMatchObject({
+      key: 'added_on',
+      filter_type: 'after',
+      is_relative: false,
+      date: '2024-06-15',
+    });
+  });
+
+  it('cursor never moves backward when MIN(added_time in batch) < input cursor', async () => {
+    // Defensive: even if RF returns a candidate older than the cursor due to
+    // day-granularity overlap, we keep the cursor at the input.
+    mockSearch([[
+      { id: 1, name: 'old', added_time: '2024-06-14T23:00:00+0000' },
+    ], []]);
+    const inputCursor = '2024-06-15T12:00:00.000Z';
+    const result = await fetchCandidatesAddedSince(env, inputCursor);
+    expect(Date.parse(result.suggestedCursor)).toBeGreaterThanOrEqual(Date.parse(inputCursor));
   });
 });
