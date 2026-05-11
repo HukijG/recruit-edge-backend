@@ -27,6 +27,9 @@ export async function forwardHangupToSyncWorker(payload, env) {
     });
     if (!res.ok) {
       const body = await res.text();
+      // Note: sync-worker's error responses do not echo request fields, so
+      // `body` is safe to log. If the receiver ever changes to echo payload
+      // fields in errors, this log would need redaction.
       console.warn({
         message: `[hangup-forwarder] sync-worker rejected upsert status=${res.status} body=${body}`,
         source: 'hangup-forwarder',

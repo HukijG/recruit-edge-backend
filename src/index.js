@@ -86,7 +86,7 @@ export default {
       }
 
       if (url.pathname === '/webhook/dialpad/extension-calls' && request.method === 'POST') {
-        return await handleDialpadExtensionCallsWebhook(request, env);
+        return await handleDialpadExtensionCallsWebhook(request, env, ctx);
       }
 
       if (url.pathname === '/webhook/apollo' && request.method === 'POST') {
@@ -2436,7 +2436,7 @@ async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
 // that for events we deliberately dropped.
 // ---------------------------------------------------------------------------
 
-async function handleDialpadExtensionCallsWebhook(request, env) {
+async function handleDialpadExtensionCallsWebhook(request, env, ctx) {
   try {
     const authHeader = request.headers.get('Authorization');
     const bodyText = await request.text();
@@ -2457,7 +2457,7 @@ async function handleDialpadExtensionCallsWebhook(request, env) {
       return new Response('Unauthorized - Invalid token', { status: 401 });
     }
 
-    const result = await processExtensionCallEvent(payload, env);
+    const result = await processExtensionCallEvent(payload, env, ctx);
 
     if (result.processed) {
       console.log({

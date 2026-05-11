@@ -27,7 +27,7 @@ function getDOStub(env, dialpadUserId) {
   return env.EXT_CALL_STATE.get(id);
 }
 
-export async function processExtensionCallEvent(payload, env) {
+export async function processExtensionCallEvent(payload, env, ctx) {
   const direction = payload?.direction;
   const targetId = payload?.target?.id;
   const eventState = payload?.state;
@@ -62,10 +62,14 @@ export async function processExtensionCallEvent(payload, env) {
   }
 
   if (TERMINAL_STATES.has(eventState)) {
-    // Fire-and-forget forward to sync-worker for the calls cache.
-    // Failures are logged in the forwarder; cron backfill (tailSyncCallsThin)
-    // catches dropped messages within 15 min.
-    void forwardHangupToSyncWorker(payload, env);
+    // Forward to sync-worker for the calls cache.
+    // ctx.waitUntil registers the async work with the Workers runtime so it
+    // isn't cancelled when the webhook handler returns. Failures are logged
+    // in the forwarder; cron backfill (Task 7's tailSyncCallsThin) catches
+    // dropped messages within 15 min.
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(forwardHangupToSyncWorker(payload, env));
+    }
 
     // Bump the daily call counter for every monitored outbound hangup,
     // regardless of whether the DO has a matching call_id. We want this to

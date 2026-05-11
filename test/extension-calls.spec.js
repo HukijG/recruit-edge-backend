@@ -593,6 +593,9 @@ describe('processExtensionCallEvent — hangup forwards to sync-worker', () => {
 
   const JOEL_DIALPAD_ID_UNIT = '8000000000000001';
 
+  // Execute the promise inline so tests can await and assert on side-effects.
+  const ctxStub = { waitUntil: (p) => { return p; } };
+
   beforeEach(async () => {
     await applyUsersMigration(env);
     _resetCacheForTests();
@@ -622,7 +625,7 @@ describe('processExtensionCallEvent — hangup forwards to sync-worker', () => {
       date_started: 1717248000000,
       total_duration: 180000,
     };
-    await processExtensionCallEvent(payload, testEnv);
+    await processExtensionCallEvent(payload, testEnv, ctxStub);
     expect(syncFetch).toHaveBeenCalledOnce();
     const [url, opts] = syncFetch.mock.calls[0];
     expect(String(url)).toContain('/internal/calls/upsert');
@@ -645,7 +648,7 @@ describe('processExtensionCallEvent — hangup forwards to sync-worker', () => {
       state: 'calling',
       call_id: 'c-1',
       target: { id: JOEL_DIALPAD_ID_UNIT },
-    }, testEnv);
+    }, testEnv, ctxStub);
     expect(syncFetch).not.toHaveBeenCalled();
   });
 
@@ -661,7 +664,7 @@ describe('processExtensionCallEvent — hangup forwards to sync-worker', () => {
       contact: { id: 'shared_contact_pool_Company:X_uid_RF1' },
       date_started: 1,
       total_duration: 1,
-    }, testEnv);
+    }, testEnv, ctxStub);
     // processed:true — hangup DO clear still succeeded despite forward failure
     expect(result.processed).toBe(true);
   });
@@ -675,7 +678,54 @@ describe('processExtensionCallEvent — hangup forwards to sync-worker', () => {
       contact: { id: 'shared_contact_pool_Company:X_uid_RF1' },
       date_started: 1,
       total_duration: 1,
-    }, testEnv);
+    }, testEnv, ctxStub);
     expect(syncFetch).not.toHaveBeenCalled();
+  });
+
+  it('logs warning + skips when env.INTERNAL_SECRET is missing', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const envNoSecret = { ...testEnv, INTERNAL_SECRET: undefined };
+    await processExtensionCallEvent({
+      direction: 'outbound', state: 'hangup', call_id: 'c-1',
+      target: { id: JOEL_DIALPAD_ID_UNIT },
+      contact: { id: 'shared_contact_pool_Company:X_uid_RF1' },
+      date_started: 1, total_duration: 1,
+    }, envNoSecret, ctxStub);
+    expect(syncFetch).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(expect.objectContaining({
+      source: 'hangup-forwarder',
+    }));
+    warnSpy.mockRestore();
+  });
+
+  it('logs warning + skips when env.SYNC_WORKER binding is missing', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const envNoBinding = { ...testEnv, SYNC_WORKER: undefined };
+    await processExtensionCallEvent({
+      direction: 'outbound', state: 'hangup', call_id: 'c-1',
+      target: { id: JOEL_DIALPAD_ID_UNIT },
+      contact: { id: 'shared_contact_pool_Company:X_uid_RF1' },
+      date_started: 1, total_duration: 1,
+    }, envNoBinding, ctxStub);
+    expect(warnSpy).toHaveBeenCalledWith(expect.objectContaining({
+      source: 'hangup-forwarder',
+    }));
+    warnSpy.mockRestore();
+  });
+
+  it('logs warning when sync-worker returns 401', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    syncFetch.mockResolvedValueOnce(new Response('{"ok":false,"error":"auth"}', { status: 401 }));
+    await processExtensionCallEvent({
+      direction: 'outbound', state: 'hangup', call_id: 'c-1',
+      target: { id: JOEL_DIALPAD_ID_UNIT },
+      contact: { id: 'shared_contact_pool_Company:X_uid_RF1' },
+      date_started: 1, total_duration: 1,
+    }, testEnv, ctxStub);
+    expect(warnSpy).toHaveBeenCalledWith(expect.objectContaining({
+      source: 'hangup-forwarder',
+      callId: 'c-1',
+    }));
+    warnSpy.mockRestore();
   });
 });
