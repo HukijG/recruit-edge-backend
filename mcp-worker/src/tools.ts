@@ -259,11 +259,13 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
       description: [
         "DO NOT use this for pipeline-style reads — use `rf_job_pipeline` instead. Pipeline queries ('pipeline', 'submitted', 'in <stage>', 'progress on <job>', stage-by-stage views) belong on `rf_job_pipeline` because it groups by stage and resolves stage names per-job.",
         "",
-        "Use THIS tool only when the user wants a flat (non-grouped) candidate list on a job — e.g. extracting custom field projections (`fields`) or applying long-tail filters (`filters: {...}`) for analytics-style reads where stage grouping isn't wanted.",
+        "Use THIS tool only when the user wants a flat (non-grouped) candidate list on a job — e.g. all candidates in a given stage, or analytics-style projections via fields[]. For pipeline / stage-progress views use rf_job_pipeline instead.",
         "",
         "Pass natural strings — middleware fuzzy-matches job and stage. Numeric ids bypass fuzzy.",
         "",
-        "Lean rows: `{id, name, linkedin_profile}` (linkedin is a full URL). `fields` is additive — defaults always present. Unresolved field names silently drop. `filters: {...}` is the long-tail bag; unknown keys silently drop.",
+        "Inputs: job (id or fuzzy ref), optional stage (single stage name; null = all stages), optional include_disqualified (default false), optional fields[] (defaults to thin: id, name, linkedin_profile), optional limit. Returns flat {ok, job, total, matched: [...], truncated?, hydration_errors?}.",
+        "",
+        "Default excludes disqualified candidates; pass include_disqualified: true to include.",
         "",
         "Capped at `limit` (default 100, max 500). Response includes `truncated: true` when total exceeds.",
         "",
@@ -272,9 +274,12 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
       inputSchema: {
         job: ref,
         stage: ref.optional(),
+        include_disqualified: z
+          .boolean()
+          .optional()
+          .describe("Default false; pass true to include disqualified candidates."),
         fields: z.array(z.string()).optional(),
         limit: z.number().int().min(1).max(500).optional(),
-        filters: z.record(z.string(), z.unknown()).optional(),
       },
       annotations: { readOnlyHint: true, destructiveHint: false },
     },

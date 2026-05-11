@@ -218,7 +218,7 @@ export async function handleJobCandidatesFilter({ env, body }) {
     if (!body.include_disqualified && s.name === 'Disqualified') continue;
 
     const ids =
-      s.name === 'Disqualified' ? disqualified.slice() : (active[s.name] ?? []).slice();
+      (s.name === 'Disqualified' ? disqualified : (active[s.name] ?? [])).slice();
     totalIds += ids.length;
     for (const id of ids) {
       allIdEntries.push({ id, stage: s.name });
