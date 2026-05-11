@@ -186,17 +186,14 @@ describe('/mcp/candidate-get', () => {
     expect(body.candidate.current_title).toBe('Staff Engineer');
   });
 
-  it('candidate id not in thin cache → returns ok:false kind:no_candidate (without RF call)', async () => {
-    // Candidate 42 is in the legacy candidates table (resolveCandidate finds it)
-    // but NOT in candidates_v2 — sanity check should catch this.
+  it('candidate id not in thin cache → returns 404 (no RF call)', async () => {
+    // Post-migration, resolveCandidateThin queries candidates_v2 directly
+    // and returns not_found on miss. candidate-get maps that to legacy 404.
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2 WHERE id = 42');
     globalThis.fetch = vi.fn(); // Should never be called.
 
     const r = await call({ consultantFirstName: 'Joel', id: 42 });
-    expect(r.status).toBe(200);
-    const body = await r.json();
-    expect(body.ok).toBe(false);
-    expect(body.kind).toBe('no_candidate');
+    expect(r.status).toBe(404);
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 

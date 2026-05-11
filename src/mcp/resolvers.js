@@ -20,7 +20,7 @@
  * local MCP can pattern-match a single shape across every endpoint.
  */
 
-import { session, getCandidateById } from './d1-read.js';
+import { session, getThinCandidateById, getCandidatesByIds, getFullCandidateById } from './d1-read.js';
 import { getSnapshot } from './snapshot.js';
 import {
   scoreString,
@@ -73,22 +73,88 @@ function pickWinner(scored) {
 // ─────────────────────── Candidate ───────────────────────
 
 /**
+ * Resolve a candidate reference to a THIN row only — no live RF fetch.
+ *
+ * Mirror of resolveCandidate, but the success value is the thin candidates_v2
+ * row (`{id, name, linkedin_profile, added_time_ms, current_*_at_cache_time}`)
+ * instead of a full RF body. Used by handlers that only need id + name
+ * (e.g. /mcp/candidate-call-notes step=list_calls) — keeps the path
+ * round-trip-free against RF.
+ */
+export async function resolveCandidateThin(env, input) {
+  const coerced = coerceInput(input);
+  if (!coerced) return { ok: false, reason: 'not_found', input };
+
+  if (coerced.kind === 'id') {
+    const row = await getThinCandidateById(env, coerced.value);
+    if (!row) return { ok: false, reason: 'not_found', input };
+    return { ok: true, value: row };
+  }
+
+  const snap = await getSnapshot(env);
+  const q = coerced.value;
+  const scored = snap.rows
+    .map((r) => {
+      const base = scoreString(q, r.prepared);
+      const boost = recencyBoost({ added_time_ms: r.added_time_ms });
+      return { id: r.id, name: r.name, score: base * (1 + boost) };
+    })
+    .filter((r) => r.score >= FUZZY_THRESHOLD)
+    .sort((a, b) => b.score - a.score);
+
+  const decision = pickWinner(scored);
+  if (decision.kind === 'none') return { ok: false, reason: 'not_found', input };
+  if (decision.kind === 'ambiguous') {
+    // Same disambiguation envelope as resolveCandidate (single source of
+    // truth for the wire shape).
+    const ids = decision.options.map((o) => o.id);
+    const rows = await getCandidatesByIds(env, ids);
+    const meta = new Map(rows.map((r) => [r.id, r]));
+    return {
+      ok: false,
+      reason: 'ambiguous',
+      kind: 'candidate',
+      options: decision.options.map((o) => ({
+        id: o.id,
+        name: o.name,
+        score: o.score,
+        current_organization: meta.get(o.id)?.current_company_at_cache_time ?? null,
+        current_title: meta.get(o.id)?.current_title_at_cache_time ?? null,
+      })),
+      hint: `Multiple candidates match "${q}" — please be more specific.`,
+    };
+  }
+  const row = await getThinCandidateById(env, decision.winner.id);
+  if (!row) return { ok: false, reason: 'not_found', input };
+  return { ok: true, value: row };
+}
+
+/**
  * Resolve a candidate reference to a full candidate body.
- * Numeric → D1 lookup. String → fuzzy resolve via the in-memory snapshot.
+ * Numeric → thin-cache id check + live RF `/candidate/get`. String → fuzzy
+ * resolve via the in-memory snapshot, then live-fetch the winner.
+ *
+ * Disambiguation hydrates organisation + title from the thin cache's
+ * `current_*_at_cache_time` snapshot columns (display hints; never live).
+ * On the wire we alias them as `current_organization` / `current_title` to
+ * preserve the existing caller contract.
  *
  * Returns:
- *   { ok: true, value: <candidate-body> }
+ *   { ok: true, value: <full-rf-candidate-body> }
  *   { ok: false, reason: 'not_found', input }
  *   { ok: false, reason: 'ambiguous', kind: 'candidate', options: [...] }
+ *
+ * RF errors (RFRateLimitedError / RFTransientError / RFError) propagate from
+ * the underlying live-fetch — callers wrap and emit the appropriate envelope.
  */
 export async function resolveCandidate(env, input) {
   const coerced = coerceInput(input);
   if (!coerced) return { ok: false, reason: 'not_found', input };
 
   if (coerced.kind === 'id') {
-    const candidate = await getCandidateById(env, coerced.value);
-    if (!candidate) return { ok: false, reason: 'not_found', input };
-    return { ok: true, value: candidate };
+    const res = await getFullCandidateById(env, coerced.value);
+    if (!res.ok) return { ok: false, reason: 'not_found', input };
+    return { ok: true, value: res.value };
   }
 
   // Fuzzy path — score every snapshot row, recency-boost, threshold, sort.
@@ -108,21 +174,18 @@ export async function resolveCandidate(env, input) {
     return { ok: false, reason: 'not_found', input };
   }
   if (decision.kind === 'ambiguous') {
-    // Hydrate organisation + title for each option so the caller has enough
-    // context to pick a winner without a follow-up round-trip.
+    // Hydrate organisation + title for each option from the thin cache's
+    // snapshot columns (display hints). They reflect "at first-sight" values
+    // and are intentionally not live — keeping the caller round-trip free.
     const ids = decision.options.map((o) => o.id);
-    const placeholders = ids.map(() => '?').join(', ');
-    const { results } = await session(env)
-      .prepare(`SELECT id, current_organization, current_title FROM candidates WHERE id IN (${placeholders})`)
-      .bind(...ids)
-      .all();
-    const meta = new Map((results ?? []).map((r) => [r.id, r]));
+    const rows = await getCandidatesByIds(env, ids);
+    const meta = new Map(rows.map((r) => [r.id, r]));
     const options = decision.options.map((o) => ({
       id: o.id,
       name: o.name,
       score: o.score,
-      current_organization: meta.get(o.id)?.current_organization ?? null,
-      current_title: meta.get(o.id)?.current_title ?? null,
+      current_organization: meta.get(o.id)?.current_company_at_cache_time ?? null,
+      current_title: meta.get(o.id)?.current_title_at_cache_time ?? null,
     }));
     return {
       ok: false,
@@ -132,29 +195,37 @@ export async function resolveCandidate(env, input) {
       hint: `Multiple candidates match "${q}" — please be more specific.`,
     };
   }
-  const candidate = await getCandidateById(env, decision.winner.id);
-  if (!candidate) return { ok: false, reason: 'not_found', input };
-  return { ok: true, value: candidate };
+  // Unique fuzzy winner → live-fetch from RF.
+  const res = await getFullCandidateById(env, decision.winner.id);
+  if (!res.ok) return { ok: false, reason: 'not_found', input };
+  return { ok: true, value: res.value };
 }
 
 // ─────────────────────── Job ───────────────────────
 
 /**
- * Load all jobs (id, name, client_company_name, is_open) for fuzzy scoring.
+ * Load all jobs (id, name, client_company_name) for fuzzy scoring.
  * Job count is small (~1k). At that size SELECT-all + score-in-JS on every
  * call is cheap enough (~1ms) that we don't bother with a snapshot module.
+ *
+ * Per spec rev 5 thin schema, `is_open` lives only on RF — it's mutable and
+ * therefore not cached. The `onlyOpen` option is accepted but is currently
+ * a no-op for filtering: the canonical pipeline cache holds all known jobs
+ * including closed ones, and closed-job suppression now happens via RF's
+ * `/job/pipeline` returning empty buckets if the caller follows up.
+ * Recruiters who want closed-job access pass an explicit numeric id (the
+ * `resolveJob` numeric short-circuit bypasses fuzzy entirely).
  */
-async function loadJobs(env, { onlyOpen = false } = {}) {
-  const sql = onlyOpen
-    ? 'SELECT id, name, client_company_name FROM jobs WHERE is_open = 1'
-    : 'SELECT id, name, client_company_name FROM jobs';
-  const { results } = await session(env).prepare(sql).all();
+async function loadJobs(env /*, { onlyOpen = false } = {} */) {
+  const { results } = await session(env)
+    .prepare('SELECT id, name, client_company_name FROM jobs_v2')
+    .all();
   return results ?? [];
 }
 
 /**
  * Resolve a job reference.
- * Numeric → SELECT FROM jobs WHERE id=?  (or accept as-is when
+ * Numeric → SELECT FROM jobs_v2 WHERE id=?  (or accept as-is when
  *           `validateNumeric: false`).
  * String → score against (name + client_company_name), canonicalised via
  *          canonicalizeJobPhrase so "Eon SE" ↔ "Eon Sales Engineer". Closed
@@ -188,7 +259,7 @@ export async function resolveJob(env, input, { restrictTo, onlyOpen = true, vali
       return { ok: true, value: { id: coerced.value, name: null, client_company_name: null } };
     }
     const row = await session(env)
-      .prepare('SELECT id, name, client_company_name FROM jobs WHERE id = ?')
+      .prepare('SELECT id, name, client_company_name FROM jobs_v2 WHERE id = ?')
       .bind(coerced.value)
       .first();
     if (!row) return { ok: false, reason: 'not_found', input };
@@ -345,7 +416,7 @@ export async function resolveOwner(env, input) {
 
   // Fall back to RF user list cached on sync_state — only populated after the
   // first full rebuild. Treat absence as "no match".
-  const row = await env.RF_MCP_CACHE
+  const row = await session(env)
     .prepare("SELECT value FROM sync_state WHERE key = 'users'")
     .first();
   if (!row?.value) return { ok: false, reason: 'not_found', input };

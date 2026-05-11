@@ -10,7 +10,15 @@
  * miniflare's local D1 implementation it isn't, so `session()` falls back to
  * the raw binding — behaviour is identical for our read-only queries because
  * miniflare runs a single SQLite instance with no replicas to route between.
+ *
+ * Per spec rev 5, this module reads ONLY thin / immutable columns from the
+ * `candidates_v2` / `jobs_v2` / `calls` tables.  The legacy body-blob readers
+ * (`SELECT body FROM candidates …`) are gone — callers that need a full
+ * candidate body live-fetch via `getRFCandidate` (in `src/rf-client.js`)
+ * after resolving the numeric id from this layer.
  */
+
+import { getRFCandidate } from '../rf-client.js';
 
 /**
  * Wrap a D1 query in a Sessions-API session for replica routing.
@@ -27,35 +35,28 @@ export function session(env, bookmark = 'first-unconstrained') {
   return db;
 }
 
-export async function getCandidateById(env, id) {
-  const row = await session(env)
-    .prepare('SELECT body FROM candidates WHERE id = ?')
-    .bind(id)
-    .first();
-  return row ? JSON.parse(row.body) : null;
-}
-
-export async function getCandidateByEmail(env, email) {
-  const row = await session(env)
-    .prepare('SELECT body FROM candidates WHERE primary_email = ?')
-    .bind(email.toLowerCase())
-    .first();
-  return row ? JSON.parse(row.body) : null;
-}
-
-export async function getCandidateByLinkedIn(env, slug) {
-  const row = await session(env)
-    .prepare('SELECT body FROM candidates WHERE linkedin_profile = ?')
-    .bind(slug.toLowerCase())
-    .first();
-  return row ? JSON.parse(row.body) : null;
-}
-
 export async function countTable(env, table) {
   const row = await session(env)
     .prepare(`SELECT COUNT(*) AS n FROM ${table}`)
     .first();
   return row?.n ?? 0;
+}
+
+/**
+ * Read a single sync_state value by key. Returns null for missing rows.
+ * Centralised here so handler call sites use a consistent Sessions-API
+ * wrapper around the read.
+ *
+ * @param {object} env
+ * @param {string} key
+ * @returns {Promise<string|null>}
+ */
+export async function readSyncState(env, key) {
+  const row = await session(env)
+    .prepare('SELECT value FROM sync_state WHERE key = ?')
+    .bind(key)
+    .first();
+  return row?.value ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -71,14 +72,43 @@ const SQLITE_PARAMS_PER_CHUNK = 100;
 
 /**
  * Fetch a single thin candidate row by RF id.
- * Returns {id, name, linkedin_profile, added_time_ms} or null if not found.
+ * Returns the full thin row (including current_title_at_cache_time /
+ * current_company_at_cache_time when they're populated) or null on miss.
  */
 export async function getThinCandidateById(env, id) {
   const row = await session(env)
-    .prepare('SELECT id, name, linkedin_profile, added_time_ms FROM candidates_v2 WHERE id = ?')
+    .prepare(`SELECT id, name, linkedin_profile, added_time_ms,
+                     current_title_at_cache_time, current_company_at_cache_time
+              FROM candidates_v2 WHERE id = ?`)
     .bind(Number(id))
     .first();
   return row ?? null;
+}
+
+/**
+ * Resolve a numeric candidate id to a full RF candidate body, going via the
+ * thin-cache sanity check + live RF `/candidate/get`. Used by every MCP
+ * handler that previously read `SELECT body FROM candidates`.
+ *
+ * Returns:
+ *   { ok: true, value: <full-rf-body> }
+ *   { ok: false, reason: 'not_found' }   — id not in thin cache
+ *
+ * RF errors propagate as the typed `RFError` / `RFRateLimitedError` /
+ * `RFTransientError` subclasses (defined in `src/rf-client.js`); the caller
+ * is expected to catch and emit the appropriate envelope. We do NOT swallow
+ * those here — the caller knows which envelope shape to surface (404 vs
+ * 200 + `kind: 'rf_unavailable'`).
+ *
+ * @param {object} env
+ * @param {number|string} id
+ * @returns {Promise<{ok: true, value: object} | {ok: false, reason: 'not_found'}>}
+ */
+export async function getFullCandidateById(env, id) {
+  const thin = await getThinCandidateById(env, id);
+  if (!thin) return { ok: false, reason: 'not_found' };
+  const body = await getRFCandidate(thin.id, env);
+  return { ok: true, value: body };
 }
 
 /**

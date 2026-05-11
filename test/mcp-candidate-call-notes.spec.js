@@ -523,9 +523,19 @@ describe('/mcp/candidate-call-notes step=submit_notes', () => {
   });
 
   it('attribution always = consultant (fallback path): override fields ignored there too', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ id: 1 }), { status: 200 }),
-    );
+    const fetchMock = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/get')) {
+        return new Response(JSON.stringify({
+          candidate: { id: 50976, name: 'Priya Sharma' },
+        }), { status: 200 });
+      }
+      if (u.includes('/candidate/notes/add')) {
+        return new Response(JSON.stringify({ id: 1 }), { status: 200 });
+      }
+      throw new Error('unexpected: ' + u);
+    });
+    globalThis.fetch = fetchMock;
     const r = await call({
       consultantFirstName: 'Joel',
       step: 'submit_notes',
@@ -535,23 +545,40 @@ describe('/mcp/candidate-call-notes step=submit_notes', () => {
       activity_user_id: 888888,
     });
     expect(r.status).toBe(200);
-    const sent = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    const noteCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/candidate/notes/add'));
+    const sent = JSON.parse(noteCall[1].body);
     expect(sent.created_by).toBe(900001);
   });
 
-  it('fast path: RF returns 500 → 502', async () => {
+  it('fast path: RF returns 500 → HTTP 200 with rf_unavailable envelope', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(new Response('boom', { status: 500 }));
     const r = await call({
       consultantFirstName: 'Joel', step: 'submit_notes',
       candidate_id: 50976, note: 'x',
     });
-    expect(r.status).toBe(502);
+    expect(r.status).toBe(200);
+    const b = await r.json();
+    expect(b.ok).toBe(false);
+    expect(b.kind).toBe('rf_unavailable');
+    expect(b.recoverable).toBe(true);
   });
 
   it('fallback path: candidate_fallback resolves uniquely → ok', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ id: 1 }), { status: 200 }),
-    );
+    // Fallback path delegates to handleCandidateAddNote which now
+    // live-fetches the candidate body before posting the note.
+    const fetchMock = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/get')) {
+        return new Response(JSON.stringify({
+          candidate: { id: 50976, name: 'Priya Sharma' },
+        }), { status: 200 });
+      }
+      if (u.includes('/candidate/notes/add')) {
+        return new Response(JSON.stringify({ id: 1 }), { status: 200 });
+      }
+      throw new Error('unexpected: ' + u);
+    });
+    globalThis.fetch = fetchMock;
     const r = await call({
       consultantFirstName: 'Joel', step: 'submit_notes',
       candidate_fallback: 'Priya Sharma', note: 'fallback path',
@@ -559,8 +586,8 @@ describe('/mcp/candidate-call-notes step=submit_notes', () => {
     expect(r.status).toBe(200);
     const b = await r.json();
     expect(b).toEqual({ ok: true });
-    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
-    const sent = JSON.parse(globalThis.fetch.mock.calls[0][1].body);
+    const noteCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/candidate/notes/add'));
+    const sent = JSON.parse(noteCall[1].body);
     expect(sent.id).toBe(50976);
   });
 

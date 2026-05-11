@@ -1,5 +1,5 @@
 import { env } from 'cloudflare:test';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { applyMigration } from './helpers/d1-migrate.js';
 import { applyUsersMigration } from './helpers/users-migrate.js';
 import { _resetCacheForTests } from '../src/users.js';
@@ -11,7 +11,34 @@ import {
   resolveOwner,
 } from '../src/mcp/resolvers.js';
 
+const originalFetch = globalThis.fetch;
+
+/**
+ * Mock globalThis.fetch to handle the live RF /candidate/get call that
+ * resolveCandidate now makes after id resolution. Returns the seeded
+ * candidate body keyed by id-from-the-URL; tests can compose richer fixtures
+ * by passing in their own fetch mock instead.
+ */
+function mockRFCandidateGet(bodiesById) {
+  globalThis.fetch = vi.fn(async (url) => {
+    const u = String(url);
+    if (u.includes('/candidate/get')) {
+      const m = u.match(/[?&]id=(\d+)/);
+      const id = m ? Number(m[1]) : NaN;
+      const body = bodiesById.get(id);
+      if (!body) return new Response('not found', { status: 404 });
+      return new Response(JSON.stringify({ candidate: body }), { status: 200 });
+    }
+    throw new Error('unexpected fetch: ' + u);
+  });
+}
+
 const insertCandidate = async (id, name, opts = {}) => {
+  // Seed BOTH the legacy `candidates` (for legacy-table reads still in
+  // some adjacent test paths, e.g. resolver disambiguation pre-migration)
+  // AND the new `candidates_v2` (the thin cache with snapshot columns
+  // current_title_at_cache_time / current_company_at_cache_time, which
+  // resolveCandidate now reads for disambiguation hydration).
   await env.RF_MCP_CACHE.prepare(
     `INSERT INTO candidates (id, body, name, current_organization, current_title, last_activity_at, cached_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -26,22 +53,44 @@ const insertCandidate = async (id, name, opts = {}) => {
       new Date().toISOString(),
     )
     .run();
-  // Also seed candidates_v2 so the snapshot (which now reads candidates_v2) can find this candidate.
   const addedMs = opts.last_activity_at ? Date.parse(opts.last_activity_at) : Date.now();
   await env.RF_MCP_CACHE.prepare(
-    `INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)`,
+    `INSERT OR IGNORE INTO candidates_v2
+       (id, name, linkedin_profile, added_time_ms,
+        current_title_at_cache_time, current_company_at_cache_time, cached_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(id, name, opts.linkedin_profile ?? null, addedMs, Date.now())
+    .bind(
+      id, name, opts.linkedin_profile ?? null, addedMs,
+      opts.title ?? null, opts.org ?? null, Date.now(),
+    )
     .run();
 };
 
 const insertJob = async (id, name, client = null, isOpen = 1) => {
+  // Seed BOTH the legacy `jobs` table (some tests still reference its
+  // `is_open` semantics in their fixtures) AND the new `jobs_v2` thin cache
+  // (the post-migration read path).  Per spec rev 5 the v2 schema does not
+  // store `is_open` — it's mutable and lives on RF. The legacy "closed jobs
+  // excluded from fuzzy" behaviour is preserved here only because the
+  // resolver test fixture seeded the legacy table; under the new schema
+  // closed jobs are NOT distinguishable from open at the cache layer.
   await env.RF_MCP_CACHE
     .prepare(
       `INSERT INTO jobs (id, body, name, client_company_name, is_open, cached_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
     )
     .bind(id, JSON.stringify({ id, name }), name, client, isOpen, new Date().toISOString())
+    .run();
+  // jobs_v2 ignores `isOpen` entirely (mutable; live on RF). All seeded jobs
+  // are visible to fuzzy resolution post-migration; tests that exercised the
+  // open-only filter now need to opt in via explicit numeric ids.
+  await env.RF_MCP_CACHE
+    .prepare(
+      `INSERT OR IGNORE INTO jobs_v2 (id, name, client_company_name, added_time_ms, cached_at_ms)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .bind(id, name, client, Date.now(), Date.now())
     .run();
 };
 
@@ -63,32 +112,41 @@ beforeEach(async () => {
   await setSyncStateVersion(new Date().toISOString());
 });
 
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+});
+
 describe('resolveCandidate', () => {
-  it('numeric id → loads body', async () => {
+  it('numeric id → live-fetches body from RF', async () => {
     await insertCandidate(42, 'Jerry Smith');
+    mockRFCandidateGet(new Map([[42, { id: 42, name: 'Jerry Smith' }]]));
     const r = await resolveCandidate(env, 42);
     expect(r.ok).toBe(true);
     expect(r.value.id).toBe(42);
     expect(r.value.name).toBe('Jerry Smith');
   });
 
-  it('numeric string id → loads body', async () => {
+  it('numeric string id → live-fetches body from RF', async () => {
     await insertCandidate(42, 'Jerry Smith');
+    mockRFCandidateGet(new Map([[42, { id: 42, name: 'Jerry Smith' }]]));
     const r = await resolveCandidate(env, '42');
     expect(r.ok).toBe(true);
     expect(r.value.id).toBe(42);
   });
 
-  it('unknown numeric id → not_found', async () => {
+  it('unknown numeric id → not_found (no RF call)', async () => {
+    globalThis.fetch = vi.fn();
     const r = await resolveCandidate(env, 999);
     expect(r.ok).toBe(false);
     expect(r.reason).toBe('not_found');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
-  it('fuzzy unique → loads body', async () => {
+  it('fuzzy unique → live-fetches winner body', async () => {
     await insertCandidate(1, 'Jane Doe');
     await insertCandidate(2, 'Bob Smith');
     await insertCandidate(3, 'Alice Jones');
+    mockRFCandidateGet(new Map([[1, { id: 1, name: 'Jane Doe' }]]));
     const r = await resolveCandidate(env, 'Jane Doe');
     expect(r.ok).toBe(true);
     expect(r.value.id).toBe(1);
@@ -184,30 +242,34 @@ describe('resolveJob', () => {
     expect(r.options).toHaveLength(2);
   });
 
-  it('closed jobs are excluded from fuzzy resolution by default', async () => {
-    // Closed job is the only thing the corpus has under that name → fuzzy
-    // ignores it, returns not_found. Recruiter has to pass an explicit id.
+  it('closed jobs ARE visible in fuzzy resolution post-thin-cache (is_open is live, not cached)', async () => {
+    // Spec rev 5: jobs_v2 doesn't store is_open (mutable — lives on RF only).
+    // A name-unique closed job in cache now resolves to that job. Recruiters
+    // who want to exclude closed jobs must either know the open job's id or
+    // rely on the live `/job/list` filter from a higher layer.
     await insertJob(100, 'Old Sales Engineer', 'Eon', 0);
     const r = await resolveJob(env, 'Old Sales Engineer');
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe('not_found');
+    expect(r.ok).toBe(true);
+    expect(r.value.id).toBe(100);
   });
 
-  it('closed job still accessible by numeric id', async () => {
-    // The open-jobs-only filter applies to fuzzy only — explicit numeric ids
-    // still resolve any job. Recruiters who know the id can still address it.
+  it('closed job accessible by numeric id', async () => {
+    // Numeric ids always work — no fuzzy filter applied.
     await insertJob(100, 'Old Sales Engineer', 'Eon', 0);
     const r = await resolveJob(env, 100);
     expect(r.ok).toBe(true);
     expect(r.value.id).toBe(100);
   });
 
-  it('open job at the same name beats the closed sibling', async () => {
+  it('two same-named jobs with one closed → genuine ambiguity at the cache layer', async () => {
+    // Without is_open in cache, the resolver cannot favour the open sibling
+    // automatically. Both score equally → ambiguous. Recruiters who hit this
+    // pass the explicit numeric id.
     await insertJob(100, 'Sales Engineer', 'Eon', 0);
     await insertJob(200, 'Sales Engineer', 'Eon', 1);
     const r = await resolveJob(env, 'Eon SE');
-    expect(r.ok).toBe(true);
-    expect(r.value.id).toBe(200);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('ambiguous');
   });
 
   it('matches client company name', async () => {

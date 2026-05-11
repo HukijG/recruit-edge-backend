@@ -15,12 +15,12 @@
  */
 
 import { jsonResponse } from './router.js';
-import { resolveCandidate, disambiguationPayload } from './resolvers.js';
+import { resolveCandidate, resolveCandidateThin, disambiguationPayload } from './resolvers.js';
 import { resolveTimeWindow } from './call-notes-time.js';
 import { CALL_NOTES_GUIDANCE } from './call-notes-guidance.js';
 import { getDialpadCall, DialpadHttpError } from '../dialpad-client.js';
 import { extractRFIdFromDialpadContact } from '../rf-client.js';
-import { getCandidateById, getCallsForCandidate } from './d1-read.js';
+import { getThinCandidateById, getCallsForCandidate } from './d1-read.js';
 import { fetchCallTranscript } from '../cold-call.js';
 import { addNoteForCandidate, handleCandidateAddNote } from './candidate-add-note.js';
 
@@ -82,7 +82,9 @@ async function handleListCalls({ env, body, consultant }) {
     return jsonResponse(400, { error: 'candidate is required for step=list_calls' });
   }
 
-  const candRes = await resolveCandidate(env, body.candidate);
+  // Thin resolve only — list_calls needs id + name but no full body.
+  // Saves a live RF round-trip on every step=1 invocation.
+  const candRes = await resolveCandidateThin(env, body.candidate);
   if (!candRes.ok) {
     if (candRes.reason === 'ambiguous') {
       return jsonResponse(200, disambiguationPayload(candRes));
@@ -158,7 +160,7 @@ async function handleListCalls({ env, body, consultant }) {
  *      MUST run before the transcript fetch — knowing a call_id should not be
  *      enough to read any teammate's transcript.
  *   5. `extractRFIdFromDialpadContact` on `call.contact.id` — null → no_rf_candidate.
- *   6. `getCandidateById` from D1 — null → no_candidate (cache miss).
+ *   6. `getThinCandidateById` from D1 — null → no_candidate (cache miss).
  *   7. `fetchCallTranscript` — DialpadHttpError 404 → no_transcript; other non-2xx → 502.
  *   8. `formatTranscript` produces empty string (moments-only transcript) → no_transcript.
  *   9. Success: candidate id+name, lean call summary, formatted transcript text,
@@ -221,7 +223,9 @@ async function handleGetTranscript({ env, body, consultant }) {
     });
   }
 
-  const candidate = await getCandidateById(env, Number(rfId));
+  // get_transcript only needs candidate {id, name} for the response — thin
+  // row is sufficient, no live RF fetch needed.
+  const candidate = await getThinCandidateById(env, Number(rfId));
   if (!candidate) {
     return jsonResponse(200, {
       ok: false,
@@ -319,7 +323,11 @@ async function handleSubmitNotes({ env, body, consultant }) {
   }
 
   if (hasId) {
-    const candidate = await getCandidateById(env, Number(body.candidate_id));
+    // Thin row is sufficient — addNoteForCandidate only reads candidate.id.
+    // The user just chose this candidate in step 1/2; if the thin cache
+    // doesn't know them, the cache forgot — surface no_candidate (HTTP 200)
+    // rather than 404, per spec § "candidate_id-not-in-D1 dialect".
+    const candidate = await getThinCandidateById(env, Number(body.candidate_id));
     if (!candidate) {
       return jsonResponse(200, {
         ok: false,
@@ -329,7 +337,15 @@ async function handleSubmitNotes({ env, body, consultant }) {
     }
     const res = await addNoteForCandidate({ env, candidate, noteMd: note, consultant });
     if (!res.ok) {
-      return jsonResponse(res.status ?? 502, { error: res.error });
+      // Lean envelope: HTTP 200 + {ok:false, kind, error}; 400 stays 400 for
+      // invalid input (empty note).
+      if (res.status === 400) {
+        return jsonResponse(400, { ok: false, kind: res.kind ?? 'invalid_input', error: res.error });
+      }
+      const payload = { ok: false, kind: res.kind ?? 'rf_unavailable', error: res.error };
+      if (res.recoverable != null) payload.recoverable = res.recoverable;
+      if (res.retry_after_ms != null) payload.retry_after_ms = res.retry_after_ms;
+      return jsonResponse(200, payload);
     }
     console.log({
       message: `[mcp] candidate-call-notes step=submit_notes candidate_id=${candidate.id} note_chars=${note.length}`,
