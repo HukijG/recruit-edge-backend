@@ -260,6 +260,16 @@ describe('toCandidateThinRow', () => {
   it('throws on missing added_time (non-recoverable: cron must skip such rows upstream)', () => {
     expect(() => toCandidateThinRow({ id: 1, name: 'X' })).toThrow(/added_time/);
   });
+
+  it('aliases RF current_designation -> current_title_at_cache_time', () => {
+    const row = toCandidateThinRow({
+      id: 1,
+      name: 'X',
+      current_designation: 'Engineer',
+      added_time: '2024-06-01T12:00:00+0000',
+    });
+    expect(row.current_title_at_cache_time).toBe('Engineer');
+  });
 });
 
 describe('toJobThinRow', () => {
@@ -289,6 +299,19 @@ describe('toJobThinRow', () => {
       created_time: '2024-01-15T09:00:00+0000',
     });
     expect(row.client_company_name).toBe('Acme');
+  });
+
+  it('falls back to rf.title when name absent', () => {
+    const row = toJobThinRow({
+      id: 1,
+      title: 'Senior SWE',
+      created_time: '2024-01-15T09:00:00+0000',
+    });
+    expect(row.name).toBe('Senior SWE');
+  });
+
+  it('throws on missing created_time', () => {
+    expect(() => toJobThinRow({ id: 1, name: 'X' })).toThrow(/created_time/);
   });
 });
 
@@ -349,5 +372,15 @@ describe('toCallRow', () => {
       direction: 'outbound',
     });
     expect(row.target_dialpad_id).toBe('8000000000000001');
+  });
+
+  it('throws when dp.target.id is missing', () => {
+    expect(() => toCallRow({
+      call_id: 'c1',
+      contact: { id: 'shared_contact_pool_Company:X_uid_RF1' },
+      date_started: 1,
+      total_duration: 1000,
+      direction: 'outbound',
+    })).toThrow(/target/);
   });
 });

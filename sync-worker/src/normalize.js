@@ -25,6 +25,9 @@ const CURATED_KEYS = [
   'jobs',
 ];
 
+// RF sometimes sends these sentinel strings instead of a real LinkedIn value.
+const LINKEDIN_SENTINEL_RE = /^(none|n\/a|null|undefined|-)$/i;
+
 /**
  * Extract the slug portion from a LinkedIn URL or slug string.
  * Handles https/http, www prefix, trailing slashes, and query/hash params.
@@ -33,8 +36,6 @@ const CURATED_KEYS = [
  * @param {string|null|undefined} url
  * @returns {string|null}
  */
-// RF sometimes sends these sentinel strings instead of a real LinkedIn value.
-const LINKEDIN_SENTINEL_RE = /^(none|n\/a|null|undefined|-)$/i;
 
 function normalizeLinkedInSlug(input) {
   if (!input || typeof input !== 'string') return null;
@@ -161,7 +162,8 @@ export function toCandidateRow(rf) {
 
 // ---------------------------------------------------------------------------
 // THIN-IMMUTABLE row builders (spec rev 5).
-// Coexist with toCandidateRow / toCandidateJobRows during the dual-write phase.
+// TODO(cutover-step-6): once toCandidateRow / toCandidateJobRows are deleted,
+// remove this divider header — the builders below become the only ones.
 // ---------------------------------------------------------------------------
 
 const RF_UID_RE = /uid_RF(\d+)$/;
@@ -219,6 +221,12 @@ export function toJobThinRow(rf) {
  * payload (the schemas overlap on every field we use).
  */
 export function toCallRow(dp) {
+  if (!dp?.target?.id) {
+    throw new Error(`toCallRow: dp.target.id is required (call_id=${dp?.call_id})`);
+  }
+  if (dp.call_id == null) {
+    throw new Error(`toCallRow: dp.call_id is required`);
+  }
   return {
     call_id: String(dp.call_id),
     target_dialpad_id: String(dp.target?.id ?? ''),
