@@ -55,7 +55,12 @@
   // hash / last_updated against current row before writing).
   // "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
-    "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external"
+    "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external",
+    // Feature flag: flip to "true" (or "1") via `wrangler secret put CRON_THIN_ENABLED`
+    // (or edit vars + redeploy) to enable the additive INSERT-OR-IGNORE tail-sync path
+    // during dual-write cutover phase. Default "false" keeps legacy-only behaviour.
+    // After cutover step 6 (Task 30), remove this var and the gate in scheduled().
+    "CRON_THIN_ENABLED": "false"
   },
   "observability": {
     "enabled": true,

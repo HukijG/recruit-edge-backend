@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import { tailSyncThin } from '../src/sync-worker.js';
+import worker, { tailSyncThin } from '../src/sync-worker.js';
+import * as rfClient from '../src/rf-list-client.js';
 import { applyMigration } from './helpers/migrate.js';
 
 beforeEach(async () => {
@@ -261,5 +262,56 @@ describe('tailSyncThin', () => {
     const { results } = await env.RF_MCP_CACHE
       .prepare('SELECT call_id FROM calls').all();
     expect(results).toEqual([{ call_id: 'c-2222-1' }]);
+  });
+});
+
+describe('getCacheCronAdditiveFlag gate in scheduled()', () => {
+  // Helper: run the scheduled handler and wait for its ctx.waitUntil promise.
+  async function runScheduled(testEnv) {
+    let waitUntilPromise;
+    const ctx = { waitUntil: (p) => { waitUntilPromise = p; } };
+    await worker.scheduled({}, testEnv, ctx);
+    await waitUntilPromise;
+  }
+
+  beforeEach(async () => {
+    // Stub legacy tailSync so it doesn't hit RF API.
+    vi.spyOn(rfClient, 'fetchCandidatesUpdatedSince').mockResolvedValue({
+      ids: [],
+      suggestedCursor: '2026-01-01T00:00:00.000Z',
+    });
+    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
+    // Stub the fetch used inside tailSyncThin subtasks.
+    globalThis.fetch = vi.fn().mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/search')) {
+        return {
+          ok: true, status: 200, headers: new Map(), text: async () => '',
+          json: async () => ({ data: [{ id: 777, name: 'FlagTest', added_time: '2026-01-01T01:00:00+0000' }] }),
+        };
+      }
+      if (u.includes('/job/list')) {
+        return { ok: true, status: 200, headers: new Map(), text: async () => '', json: async () => [] };
+      }
+      return { ok: true, status: 200, headers: new Map(), text: async () => '', json: async () => ({ items: [], cursor: null }) };
+    });
+  });
+
+  it('does NOT write thin tables when CRON_THIN_ENABLED is unset (flag off)', async () => {
+    // env from cloudflare:test does not have CRON_THIN_ENABLED set.
+    await runScheduled(env);
+
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT id FROM candidates_v2').all();
+    expect(results).toEqual([]); // tailSyncThin was not called; no thin rows written
+  });
+
+  it('writes thin tables when CRON_THIN_ENABLED="true" (flag on)', async () => {
+    const testEnv = { ...env, CRON_THIN_ENABLED: 'true' };
+    await runScheduled(testEnv);
+
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT id FROM candidates_v2').all();
+    expect(results).toEqual([{ id: 777 }]); // tailSyncThin ran; thin row landed
   });
 });

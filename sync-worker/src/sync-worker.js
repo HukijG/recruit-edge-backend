@@ -296,11 +296,26 @@ async function handleInternal(request, env, ctx) {
   return new Response('not found', { status: 404 });
 }
 
+/**
+ * Guards the additive INSERT-OR-IGNORE tail-sync path behind a runtime flag
+ * so the operator can flip the dual-write phase on/off without a deploy.
+ * Default false — the new cron is OFF until the operator sets the var.
+ *
+ * No LaunchDarkly SDK integration exists in sync-worker yet. When LD plumbing
+ * is added, replace this env-var check with a proper LD client call
+ * (no per-consultant context needed for a cron — use a generic worker context).
+ */
+async function getCacheCronAdditiveFlag(env) {
+  return env.CRON_THIN_ENABLED === 'true' || env.CRON_THIN_ENABLED === '1';
+}
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
-      await tailSync(env);          // legacy — writes old tables
-      await tailSyncThin(env);      // new — writes _v2 + calls (additive-only INSERT-OR-IGNORE)
+      await tailSync(env);          // legacy — always on during dual-write phase
+      if (await getCacheCronAdditiveFlag(env)) {
+        await tailSyncThin(env);    // new — writes _v2 + calls (additive-only INSERT-OR-IGNORE)
+      }
       if (env.PIPELINE_REBUILD_WORKFLOW?.create) {
         await env.PIPELINE_REBUILD_WORKFLOW.create({
           id: crypto.randomUUID(),
