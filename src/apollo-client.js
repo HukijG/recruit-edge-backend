@@ -32,7 +32,6 @@ export async function enrichPerson(params, options, env) {
 		});
 
 		if (!response.ok) {
-			console.error({ message: `Apollo enrichPerson failed with status ${response.status}`, source: 'apollo' });
 			return null;
 		}
 
@@ -70,7 +69,6 @@ export async function searchPeople(params, env) {
 		});
 
 		if (!response.ok) {
-			console.error({ message: `Apollo searchPeople failed with status ${response.status}`, source: 'apollo' });
 			return [];
 		}
 

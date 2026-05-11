@@ -236,7 +236,7 @@ const handler = {
       });
 
     } catch (error) {
-      console.error('Worker error:', error);
+      console.error({ source: 'worker', message: 'Worker error', error: error?.message ?? String(error), stack: error?.stack });
       return new Response('Internal Server Error', {
         status: 500,
         headers: corsHeaders
@@ -291,14 +291,8 @@ async function handleRecruiterflowWebhook(request, env) {
 
     if (eventType === 'Created' || eventType === 'Updated') {
       // Sync to Dialpad FIRST with original RF data — don't let enrichment mutate the candidate object
-      const synced = await syncCandidateToDialpad(candidate, env);
+      await syncCandidateToDialpad(candidate, env);
       await cacheCandidate(candidate, env);
-      console.log({
-        message: `[RF] → ${synced ? 'Dialpad upsert + cached' : 'skipped Dialpad (validation), cached'} candidate=${candidate.id}`,
-        source: 'rf',
-        action: synced ? 'dialpad_upsert' : 'skipped_validation',
-        candidateId: candidate.id,
-      });
 
       // Apollo enrichment on Created events only, for Joel's candidates
       // Runs AFTER Dialpad sync — enrichment updates RF + Dialpad independently if it finds better data
@@ -372,15 +366,8 @@ async function handleManualRFWebhook(request, env, url) {
     });
 
     // Sync to Dialpad FIRST with original RF data
-    const synced = await syncCandidateToDialpad(candidate, env);
+    await syncCandidateToDialpad(candidate, env);
     await cacheCandidate(candidate, env);
-
-    console.log({
-      message: `[RF/manual] → ${synced ? 'Dialpad upsert + cached' : 'skipped Dialpad (validation), cached'} candidate=${candidate.id}`,
-      source: 'rf-manual',
-      action: synced ? 'dialpad_upsert' : 'skipped_validation',
-      candidateId: candidate.id,
-    });
 
     // Enrichment runs AFTER Dialpad sync — updates RF + Dialpad independently if it finds better data
     try {
@@ -514,15 +501,6 @@ async function processDialpadContactUpdate(contact, env) {
         console.error({ message: '[Dialpad] cache warming failed', source: 'dialpad', candidateId: rfCandidateId, error: e.message });
       }
     }
-
-    console.log({
-      message: `[Dialpad] → RF update + cached candidate=${rfCandidateId}`,
-      source: 'dialpad',
-      action: 'rf_update',
-      candidateId: rfCandidateId,
-      updatedFields: Object.keys(updateData),
-      updateData,
-    });
 
   } catch (error) {
     console.error({ message: `[Dialpad] sync error candidate=${rfCandidateId}: ${error.message}`, source: 'dialpad', candidateId: rfCandidateId });
@@ -695,14 +673,7 @@ async function processCalendarEvent(payload, env) {
   try {
     const stageResult = await moveToCallBooked(candidateId, currentCandidate, env);
     stageMoved = stageResult.moved;
-    if (stageMoved) {
-      console.log({
-        message: `[Calendar] → moved to Call Booked in job=${stageResult.jobId}`,
-        source: 'calendar',
-        candidateId,
-        jobId: stageResult.jobId,
-      });
-    } else {
+    if (!stageMoved) {
       console.log({
         message: `[Calendar] → stage not moved: ${stageResult.reason}`,
         source: 'calendar',
@@ -1036,7 +1007,6 @@ async function handleApolloWebhook(request, env, url) {
       await updateRFCandidate(rfId, { phone_number: mergedPhones }, env);
       // Debounce prevents the eventual RF Updated webhook from re-syncing to Dialpad
       await env.SYNC_STATE.put(`sync:RF${rfId}`, 'true', { expirationTtl: 60 });
-      console.log({ message: `[Apollo] → RF updated with phone`, source: 'apollo', rfId, phone: phoneStr });
     } else {
       console.log({ message: `[Apollo] → phone already in RF, skipped RF update`, source: 'apollo', rfId, phone: phoneStr });
     }
@@ -1054,14 +1024,6 @@ async function handleApolloWebhook(request, env, url) {
     if (cached) {
       await cacheCandidate({ ...cached, phone_number: phoneStr }, env);
     }
-
-    console.log({
-      message: `[Apollo] → done rfId=${rfId} phone=${phoneStr}`,
-      source: 'apollo',
-      action: 'apollo_phone_sync',
-      rfId,
-      phone: phoneStr,
-    });
 
     return new Response('OK', { status: 200 });
 
@@ -1139,11 +1101,6 @@ async function handleTestColdCall(request, env, url) {
  */
 async function processExistingRFCandidate(existing, ext, label, env) {
   const rfId = existing.id;
-  console.log({
-    message: `[Candidates] ${label} — already in RF (id=${rfId}), checking Dialpad`,
-    source: 'candidates-endpoint',
-  });
-
   const currentExp = ext.experience?.find(e => e.isCurrent);
   const nameParts = ext.fullName.trim().split(/\s+/);
 
@@ -1184,7 +1141,6 @@ async function processExistingRFCandidate(existing, ext, label, env) {
 
     dialpadSynced = await syncCandidateToDialpad(rfCandidate, env);
     await cacheCandidate(rfCandidate, env);
-    console.log({ message: `[Candidates] ${label} — created Dialpad contact rfId=${rfId}`, source: 'candidates-endpoint' });
   } else {
     // Already in Dialpad — only update company name and job title
     const patchFields = {};
@@ -1198,7 +1154,6 @@ async function processExistingRFCandidate(existing, ext, label, env) {
         // empty email/phone arrays back to RF and clearing existing data
         await env.SYNC_STATE.put(`sync:RF${rfId}`, 'true', { expirationTtl: 60 });
         dialpadSynced = true;
-        console.log({ message: `[Candidates] ${label} — patched Dialpad (company/title only) rfId=${rfId}`, source: 'candidates-endpoint' });
       } catch (error) {
         console.error({ message: `[Candidates] ${label} — Dialpad PATCH failed: ${error.message}`, source: 'candidates-endpoint' });
       }
@@ -1222,13 +1177,11 @@ async function processExistingRFCandidate(existing, ext, label, env) {
             timestamp: new Date().toISOString(),
           }), { expirationTtl: 900 });
           phoneRequested = true;
-          console.log({ message: `[Candidates] ${label} — phone reveal requested (apolloId=${apolloPerson.id})`, source: 'candidates-endpoint', rfId });
         } else {
           await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
             noMatch: true,
             timestamp: new Date().toISOString(),
           }), { expirationTtl: 900 });
-          console.log({ message: `[Candidates] ${label} — Apollo returned no match, flagged to skip future attempts`, source: 'candidates-endpoint', rfId });
         }
       } catch (error) {
         console.error({ message: `[Candidates] ${label} — phone reveal failed (non-fatal): ${error.message}`, source: 'candidates-endpoint', rfId });
@@ -1284,12 +1237,6 @@ async function processOneCandidate(ext, i, total, env, consultantRfUserId) {
     // Map extension payload → RF candidate/add format
     const rfPayload = mapExtensionToRFCandidate(ext, consultantRfUserId);
 
-    console.log({
-      message: `[Candidates] ${label} — creating in RF`,
-      source: 'candidates-endpoint',
-      rfPayload,
-    });
-
     // Create in RF
     let rfResult;
     try {
@@ -1323,12 +1270,6 @@ async function processOneCandidate(ext, i, total, env, consultantRfUserId) {
       return { fullName: ext.fullName, status: 'error', reason: 'no_rf_id', rfResult };
     }
 
-    console.log({
-      message: `[Candidates] ${label} — created in RF (id=${rfId})`,
-      source: 'candidates-endpoint',
-      rfId,
-    });
-
     // Build candidate for Dialpad sync + cache from extension data directly
     // No need to GET from RF — new candidates won't have email/phone yet
     const currentExp = ext.experience?.find(e => e.isCurrent);
@@ -1350,13 +1291,6 @@ async function processOneCandidate(ext, i, total, env, consultantRfUserId) {
     const synced = await syncCandidateToDialpad(rfCandidate, env);
     await cacheCandidate(rfCandidate, env);
 
-    console.log({
-      message: `[Candidates] ${label} — ${synced ? 'Dialpad synced + cached' : 'Dialpad skipped (validation), cached'} rfId=${rfId}`,
-      source: 'candidates-endpoint',
-      rfId,
-      dialpadSynced: synced,
-    });
-
     // Apollo phone reveal — LinkedIn URL is already correct from the extension,
     // just look up the person and request phone. No verification/fallback/LinkedIn correction.
     let phoneRequested = false;
@@ -1371,18 +1305,6 @@ async function processOneCandidate(ext, i, total, env, consultantRfUserId) {
             timestamp: new Date().toISOString(),
           }), { expirationTtl: 900 });
           phoneRequested = true;
-          console.log({
-            message: `[Candidates] ${label} — phone reveal requested (apolloId=${apolloPerson.id})`,
-            source: 'candidates-endpoint',
-            rfId,
-            apolloPersonId: apolloPerson.id,
-          });
-        } else {
-          console.log({
-            message: `[Candidates] ${label} — Apollo lookup returned no person, skipping phone reveal`,
-            source: 'candidates-endpoint',
-            rfId,
-          });
         }
       } catch (error) {
         console.error({ message: `[Candidates] ${label} — phone reveal failed (non-fatal): ${error.message}`, source: 'candidates-endpoint', rfId });
@@ -1602,14 +1524,6 @@ async function handleAddToJobEndpoint(request, env, ctx, corsHeaders) {
         try {
           await setJobCandidateConsultantId(rfId, jobId, consultantRfUserId, env);
           await cacheConsultantForJobLink(rfId, jobId, consultantRfUserId, env);
-          console.log({
-            message: `[AddToJob] rfId=${rfId} → job ${jobId} consultant_id=${consultantRfUserId} ✓ (status=${addResult.status})`,
-            source: 'add-to-job',
-            rfId,
-            jobId,
-            consultantRfUserId,
-            status: addResult.status,
-          });
         } catch (error) {
           addResult.consultantWriteFailed = true;
           console.error({ message: `[AddToJob] rfId=${rfId} → consultant_id write failed: ${error.message}`, source: 'add-to-job' });
@@ -2424,26 +2338,11 @@ async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
     const callId = await stub.getCallId();
 
     if (callId) {
-      console.log({
-        message: `[ExtCallStatus] poll consultant=${consultantFirstName} active callId=${callId} → in_progress`,
-        source: 'extension-call-status',
-        consultantFirstName,
-        dialpadId: user.dialpadId,
-        callId,
-        returnedState: 'in_progress',
-      });
       return new Response(JSON.stringify({ state: 'in_progress' }), {
         status: 200, headers: responseHeaders,
       });
     }
 
-    console.log({
-      message: `[ExtCallStatus] poll consultant=${consultantFirstName} no active call → ended`,
-      source: 'extension-call-status',
-      consultantFirstName,
-      dialpadId: user.dialpadId,
-      returnedState: 'ended',
-    });
     return new Response(JSON.stringify({ state: 'ended' }), {
       status: 200, headers: responseHeaders,
     });

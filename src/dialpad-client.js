@@ -31,13 +31,6 @@ export async function createOrUpdateDialpadContact(candidate, env) {
   const contactData = buildContactData(candidate, uid);
 
   try {
-    console.log({
-      message: `[Dialpad] upserting contact uid=${uid}`,
-      source: 'dialpad',
-      contactId,
-      contactData,
-    });
-
     // Try PATCH (update) first — avoids Dialpad firing "Created" events
     const patchUrl = `${dialpadBaseUrl}/contacts/${encodeURIComponent(contactId)}`;
     const patchResponse = await fetch(patchUrl, {
@@ -48,7 +41,6 @@ export async function createOrUpdateDialpadContact(candidate, env) {
 
     if (patchResponse.ok) {
       const result = await patchResponse.json();
-      console.log({ message: `[Dialpad] PATCH success uid=${uid}`, source: 'dialpad', contactId });
       return { success: true, contactId, uid, method: 'update', dialpadResponse: result };
     }
 
@@ -67,7 +59,6 @@ export async function createOrUpdateDialpadContact(candidate, env) {
       }
 
       const result = await putResponse.json();
-      console.log({ message: `[Dialpad] PUT success (created) uid=${uid}`, source: 'dialpad', contactId });
       return { success: true, contactId, uid, method: 'create', dialpadResponse: result };
     }
 
@@ -76,7 +67,7 @@ export async function createOrUpdateDialpadContact(candidate, env) {
     throw new Error(`Dialpad PATCH error: ${patchResponse.status} - ${errorText}`);
 
   } catch (error) {
-    console.error('Dialpad API error:', error.message);
+    console.error({ source: 'dialpad', message: 'Dialpad API error', error: error.message });
     throw error;
   }
 }
@@ -134,13 +125,6 @@ export async function patchDialpadContact(rfId, fields, env) {
   const contactId = buildDialpadContactId(rfId);
   const patchUrl = `${dialpadBaseUrl}/contacts/${encodeURIComponent(contactId)}`;
 
-  console.log({
-    message: `[Dialpad] PATCH rfId=${rfId} fields=${Object.keys(fields).join(',')}`,
-    source: 'dialpad',
-    contactId,
-    fields,
-  });
-
   const response = await fetch(patchUrl, {
     method: 'PATCH',
     headers: {
@@ -157,7 +141,6 @@ export async function patchDialpadContact(rfId, fields, env) {
   }
 
   const result = await response.json();
-  console.log({ message: `[Dialpad] PATCH success rfId=${rfId}`, source: 'dialpad', contactId });
   return result;
 }
 

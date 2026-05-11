@@ -56,7 +56,7 @@ function parseAliases(raw, email) {
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : null;
   } catch (err) {
-    console.error(`[users] malformed aliases JSON for ${email}: ${err.message}`);
+    console.error({ source: 'users', message: 'malformed aliases JSON', email, error: err.message });
     return null;
   }
 }

@@ -38,13 +38,6 @@ export async function updateRFCandidate(candidateId, updateData, env) {
 
   const bodyJson = JSON.stringify(payload);
 
-  // Inline request body in message so it surfaces in queryable CF Logs
-  // (structured `requestBody` field is stored but not indexed).
-  console.log({
-    message: `RF update request candidate=${candidateId} body=${bodyJson}`,
-    candidateId,
-  });
-
   const response = await fetch(`${rfBaseUrl}/candidate/update`, {
     method: 'POST',
     headers: {
@@ -55,12 +48,6 @@ export async function updateRFCandidate(candidateId, updateData, env) {
   });
 
   const responseText = await response.text();
-
-  // Inline status + body so non-200s and validation errors are visible in CF Logs.
-  console.log({
-    message: `RF update response candidate=${candidateId} status=${response.status} body=${responseText}`,
-    candidateId,
-  });
 
   if (!response.ok) {
     throw new Error(`RF API error: ${response.status} - ${responseText}`);
@@ -91,13 +78,6 @@ export async function addRFCandidate(candidateData, env) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    console.error({
-      source: 'rf',
-      op: 'add_candidate',
-      message: `RF add candidate error: ${response.status}`,
-      status: response.status,
-      body_preview: typeof errorText === 'string' ? errorText.slice(0, 4096) : String(errorText).slice(0, 4096),
-    });
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
@@ -190,7 +170,6 @@ export async function getRFCandidate(candidateId, env) {
       continue;
     }
 
-    console.error(`RF get error: ${response.status}`, errorText);
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
@@ -229,7 +208,6 @@ export async function searchRFCandidateByLinkedIn(linkedinUrl, env) {
     const responseText = await response.text();
 
     if (!response.ok) {
-      console.error({ message: `RF search error status=${response.status} body=${responseText} searchedUrl=${linkedinUrl}`, source: 'rf-search' });
       return null;
     }
 
@@ -288,8 +266,6 @@ export async function searchRFCandidateByEmail(email, env) {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`RF search error: ${response.status}`, errorText);
       return null;
     }
 
@@ -298,7 +274,7 @@ export async function searchRFCandidateByEmail(email, env) {
 
     return candidates.length > 0 ? candidates[0] : null;
   } catch (error) {
-    console.error('RF search failed:', error.message);
+    console.error({ source: 'rf-search', message: 'RF search failed', error: error.message });
     return null;
   }
 }
@@ -334,13 +310,6 @@ export async function addRFCandidateNote(candidateId, htmlContent, createdBy, en
 
   if (!response.ok) {
     const errorText = await response.text();
-    console.error({
-      source: 'rf',
-      op: 'add_note',
-      message: `RF add note error: ${response.status}`,
-      status: response.status,
-      body_preview: typeof errorText === 'string' ? errorText.slice(0, 4096) : String(errorText).slice(0, 4096),
-    });
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
@@ -399,7 +368,6 @@ export async function createRFCustomActivity(activityData, env) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    console.error(`RF custom activity error: ${response.status}`, errorText);
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
@@ -498,7 +466,6 @@ export async function moveToCallBooked(candidateId, candidateData, env) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    console.error(`RF move-to-stage error: ${response.status}`, errorText);
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
@@ -619,7 +586,6 @@ export async function moveJobsToStage(candidateId, candidateData, options, env) 
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error({ message: `RF move-to-stage error candidate=${candidateId} job=${job.job_id} status=${response.status} body=${errorText}`, source: 'rf-move-stage' });
       throw new Error(`RF API error: ${response.status} - ${errorText}`);
     }
 
@@ -654,7 +620,6 @@ export async function listOpenJobs(env) {
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error(`RF job/list error: ${response.status}`, errorText);
       throw new Error(`RF API error: ${response.status} - ${errorText}`);
     }
 
@@ -724,13 +689,6 @@ export async function searchCandidatesByJobAndStage({ jobId, stageName, maxPages
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error({
-        message: `RF candidate/search error status=${response.status} body=${errorText}`,
-        source: 'rf-search',
-        jobId,
-        stageName,
-        page,
-      });
       throw new Error(`RF API error: ${response.status} - ${errorText}`);
     }
 
@@ -780,7 +738,6 @@ export async function setJobCandidateConsultantId(candidateId, jobId, consultant
 
   if (!response.ok) {
     const errorText = await response.text();
-    console.error(`RF set-consultant-field error candidate=${candidateId} job=${jobId} status=${response.status}`, errorText);
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
@@ -807,7 +764,6 @@ export async function getJobCandidateConsultantId(candidateId, jobId, env) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    console.error(`RF get-consultant-field error candidate=${candidateId} job=${jobId} status=${response.status}`, errorText);
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
@@ -844,13 +800,6 @@ export async function addCandidateToJob(candidateId, jobId, env) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    console.error({
-      source: 'rf',
-      op: 'add_to_job',
-      message: `RF add-to-job error: ${response.status}`,
-      status: response.status,
-      body_preview: typeof errorText === 'string' ? errorText.slice(0, 4096) : String(errorText).slice(0, 4096),
-    });
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 
@@ -924,7 +873,6 @@ export async function listCandidateActivities(candidateId, env) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    console.error(`RF activity-list error candidate=${candidateId} status=${response.status}`, errorText);
     throw new Error(`RF API error: ${response.status} - ${errorText}`);
   }
 

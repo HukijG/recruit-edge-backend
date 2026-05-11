@@ -263,50 +263,28 @@ export async function processCallEvent(payload, env) {
   const contactId = payload.contact?.id;
   const contactName = payload.contact?.name;
 
-  console.log({
-    message: `[ColdCall] processing call_id=${callId}`,
-    source: 'cold-call',
-    step: 'enter',
-    callId,
-    state,
-    direction: payload.direction,
-    contactId,
-    contactName,
-    targetId: payload.target?.id,
-    targetName: payload.target?.name,
-    dateStarted: payload.date_started,
-    hasTranscriptionText: !!payload.transcription_text,
-  });
-
   // --- Pre-LLM filters ---
 
   if (!await isMonitoredDialpadUser(env, payload.target?.id)) {
-    console.log({ message: `[ColdCall] skipped: not a monitored target user (target=${payload.target?.id})`, source: 'cold-call', step: 'filter', callId });
     return { processed: false, isColdCall: false, outcome: null, reason: 'not target user' };
   }
 
   if (!isOutboundCall(payload.direction)) {
-    console.log({ message: `[ColdCall] skipped: inbound call`, source: 'cold-call', step: 'filter', callId });
     return { processed: false, isColdCall: false, outcome: null, reason: 'not outbound' };
   }
 
   const rfCandidateId = extractRFIdFromDialpadContact(contactId);
   if (!rfCandidateId) {
-    console.log({ message: `[ColdCall] skipped: no RF candidate ID (contact=${contactId})`, source: 'cold-call', step: 'filter', callId, contactId });
     return { processed: false, isColdCall: false, outcome: null, reason: 'no RF candidate' };
   }
-
-  console.log({ message: `[ColdCall] matched RF candidate=${rfCandidateId}`, source: 'cold-call', step: 'match', callId, rfCandidateId, contactName });
 
   // Dedup — set BEFORE expensive operations to prevent retry storms hitting AI
   const dedupeKey = `coldcall:${callId}`;
   const alreadyProcessed = await env.SYNC_STATE.get(dedupeKey);
   if (alreadyProcessed) {
-    console.log({ message: `[ColdCall] skipped: already processed (dedup key exists)`, source: 'cold-call', step: 'dedup', callId });
     return { processed: false, isColdCall: false, outcome: null, reason: 'already processed' };
   }
   await env.SYNC_STATE.put(dedupeKey, 'true', { expirationTtl: 300 });
-  console.log({ message: `[ColdCall] dedup key set`, source: 'cold-call', step: 'dedup', callId });
 
   // --- Get transcript ---
 
@@ -329,7 +307,6 @@ export async function processCallEvent(payload, env) {
   }
 
   if (!transcriptText) {
-    console.log({ message: `[ColdCall] skipped: no transcript text available`, source: 'cold-call', step: 'transcript', callId, state });
     return { processed: false, isColdCall: false, outcome: null, reason: 'no transcript text' };
   }
 
@@ -373,15 +350,6 @@ export async function processCallEvent(payload, env) {
 
   const existingTags = candidate?.tags;
   const mergedTags = mergeTag(existingTags, COLD_CALL_TAG);
-  console.log({
-    message: `[ColdCall] tags read: existing=${JSON.stringify(existingTags)} merged=${JSON.stringify(mergedTags)}`,
-    source: 'cold-call',
-    step: 'tags_read',
-    callId,
-    rfCandidateId,
-    existingTags,
-    mergedTags,
-  });
 
   const callTimestamp = payload.date_started || payload.event_timestamp || Date.now();
   const activityTime = formatActivityTime(callTimestamp);
@@ -397,13 +365,11 @@ export async function processCallEvent(payload, env) {
     const actionItems = await extractActionItems(transcriptText, env);
     if (actionItems) {
       activityText += `\n\nNext steps:\n${actionItems}`;
-      console.log({ message: `[ColdCall] action items extracted`, source: 'cold-call', step: 'action_items', callId });
     }
   } else if (classification.outcome === 'connected_negative') {
     const notes = await extractNegativeCallNotes(transcriptText, env);
     if (notes) {
       activityText += `\n\nNotes:\n${notes}`;
-      console.log({ message: `[ColdCall] negative-call notes extracted`, source: 'cold-call', step: 'negative_notes', callId });
     }
   }
 
@@ -423,19 +389,6 @@ export async function processCallEvent(payload, env) {
     }, env);
 
     await updateRFCandidate(rfCandidateId, { source: 'Cold Call', tags: mergedTags }, env);
-
-    console.log({
-      message: `[ColdCall] RF updated: activity="${formattedActivityText}" + source=Cold Call + tags=${JSON.stringify(mergedTags)}`,
-      source: 'cold-call',
-      step: 'rf_update',
-      callId,
-      rfCandidateId,
-      contactName,
-      activityText: formattedActivityText,
-      outcome: classification.outcome,
-      tags: mergedTags,
-      activityUserId,
-    });
   } catch (error) {
     console.error({ message: `[ColdCall] RF update failed: ${error.message}`, source: 'cold-call', step: 'rf_update', callId, rfCandidateId });
     return { processed: true, isColdCall: true, outcome: classification.outcome, reason: `classified as cold call but RF update failed: ${error.message}` };

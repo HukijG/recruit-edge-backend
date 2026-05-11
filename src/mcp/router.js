@@ -38,7 +38,7 @@ export async function routeMcp(request, env, ctx, handlers) {
   if (typeof body.consultantEmail === 'string') {
     consultant = await getUserByEmail(env, body.consultantEmail);
   } else if (typeof body.consultantFirstName === 'string') {
-    console.warn(`[mcp] legacy consultantFirstName fallback; tool=${tool}`);
+    console.warn({ source: 'mcp-router', message: '[mcp] legacy consultantFirstName fallback', tool });
     consultant = await getUserByFirstName(env, body.consultantFirstName);
   }
   if (!consultant) {

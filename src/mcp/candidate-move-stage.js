@@ -112,7 +112,7 @@ export async function handleCandidateMoveStage({ env, body, consultant }) {
         user_id: consultant.rfUserId,
       });
     } catch (err) {
-      console.error('move-stage RF call failed:', err);
+      console.error({ source: 'mcp-move-stage', message: 'move-stage RF call failed', error: err?.message ?? String(err) });
       return jsonResponse(502, { error: 'RF move-to-stage failed' });
     }
     return jsonResponse(200, {
@@ -185,7 +185,7 @@ export async function handleCandidateMoveStage({ env, body, consultant }) {
         user_id: consultant.rfUserId,
       });
     } catch (err) {
-      console.error('move-stage RF call failed:', err);
+      console.error({ source: 'mcp-move-stage', message: 'move-stage RF call failed', error: err?.message ?? String(err) });
       return jsonResponse(502, { error: 'RF move-to-stage failed' });
     }
     return jsonResponse(200, {
