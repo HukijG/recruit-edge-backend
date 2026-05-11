@@ -9,6 +9,7 @@ import { instrument } from '@microlabs/otel-cf-workers';
 import { resolveOtelConfig } from './lib/otel-config.js';
 import { trace } from '@opentelemetry/api';
 import { FLOWS } from './lib/flow-names.js';
+import { readInboundTraceLink } from './lib/trace-link.js';
 import {
   createOrUpdateDialpadContact, patchDialpadContact, getDialpadContact,
   getUserCallerId, initiateCall, buildCallerIdsFromDialpad, sendSMS,
@@ -111,6 +112,8 @@ const handler = {
 
       if (url.pathname === '/webhook/apollo' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.WEBHOOK_APOLLO_ENRICHMENT);
+        const link = readInboundTraceLink(request);
+        if (link) trace.getActiveSpan()?.addLink({ context: link });
         return await handleApolloWebhook(request, env, url);
       }
 

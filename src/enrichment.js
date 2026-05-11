@@ -8,6 +8,7 @@
 import { enrichPerson, searchPeople, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from './apollo-client.js';
 import { updateRFCandidate } from './rf-client.js';
 import { patchDialpadContact } from './dialpad-client.js';
+import { makeAsyncCallbackUrl } from './lib/trace-link.js';
 
 function log(data) {
 	console.log({ source: 'enrichment', ...data });
@@ -158,7 +159,7 @@ export async function enrichCandidate(candidate, fullCandidate, env) {
 
 	// Step 6: Phone reveal
 	log({ message: `[enrich] requesting phone reveal for apolloId=${apolloPerson.id}`, rfId });
-	const webhookUrl = buildApolloWebhookUrl(rfId, env);
+	const webhookUrl = makeAsyncCallbackUrl(buildApolloWebhookUrl(rfId, env), {});
 	await enrichPerson(
 		{ id: apolloPerson.id },
 		{ reveal_phone_number: true, webhook_url: webhookUrl },
