@@ -253,8 +253,8 @@ describe('writeJobsThin', () => {
   it('inserts a new job', async () => {
     await writeJobsThin(env, [job]);
     const { results } = await env.RF_MCP_CACHE
-      .prepare('SELECT id, name, client_company_name FROM jobs_v2 WHERE id = 42').all();
-    expect(results[0]).toMatchObject({ id: 42, name: 'Senior SWE', client_company_name: 'Acme' });
+      .prepare('SELECT id, name, client_company_name, canonical_pipeline_json FROM jobs_v2 WHERE id = 42').all();
+    expect(results[0]).toEqual({ id: 42, name: 'Senior SWE', client_company_name: 'Acme', canonical_pipeline_json: null });
   });
 
   it('writes canonical_pipeline_json when provided as second arg map', async () => {
@@ -300,5 +300,22 @@ describe('writeCalls', () => {
     const { results } = await env.RF_MCP_CACHE
       .prepare('SELECT duration_ms FROM calls WHERE call_id = ?').bind('c-1').all();
     expect(results[0].duration_ms).toBe(180000); // first write wins (INSERT-OR-IGNORE)
+  });
+
+  it('writes rf_candidate_id as NULL when contact id has no uid_RF marker (cold call)', async () => {
+    const coldCall = {
+      call_id: 'c-cold-1',
+      target: { id: '8000000000000001' },
+      contact: { id: 'unknown-contact-no-uid-suffix' },
+      date_started: 1717248000000,
+      total_duration: 60000,
+      direction: 'inbound',
+    };
+    await writeCalls(env, [coldCall]);
+    const { results } = await env.RF_MCP_CACHE
+      .prepare('SELECT call_id, rf_candidate_id FROM calls WHERE call_id = ?')
+      .bind('c-cold-1').all();
+    expect(results[0].call_id).toBe('c-cold-1');
+    expect(results[0].rf_candidate_id).toBeNull();
   });
 });
