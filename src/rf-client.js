@@ -2,6 +2,7 @@
  * RecruiterFlow API Client
  */
 
+import { trace, SpanStatusCode } from '@opentelemetry/api';
 import {
   getCachedConsultantForJobLink, cacheConsultantForJobLink,
   cacheCandidateDetails, getCachedCandidateDetails,
@@ -208,6 +209,8 @@ export async function searchRFCandidateByLinkedIn(linkedinUrl, env) {
     const responseText = await response.text();
 
     if (!response.ok) {
+      trace.getActiveSpan()?.setStatus({ code: SpanStatusCode.ERROR, message: `RF ${response.status}` });
+      console.warn({ source: 'rf', message: 'search non-OK', status: response.status, function: 'searchByLinkedIn' });
       return null;
     }
 
@@ -266,6 +269,8 @@ export async function searchRFCandidateByEmail(email, env) {
     });
 
     if (!response.ok) {
+      trace.getActiveSpan()?.setStatus({ code: SpanStatusCode.ERROR, message: `RF ${response.status}` });
+      console.warn({ source: 'rf', message: 'search non-OK', status: response.status, function: 'searchByEmail' });
       return null;
     }
 

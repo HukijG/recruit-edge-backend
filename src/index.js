@@ -266,6 +266,7 @@ async function handleRecruiterflowWebhook(request, env) {
     }
 
     const eventType = request.headers.get('RF-Event-Type');
+    trace.getActiveSpan()?.setAttribute('rf.event_type', eventType || 'unknown');
     const clonedRequest = request.clone();
     const payload = await request.json();
     const candidate = payload?.candidate;
@@ -350,6 +351,8 @@ async function handleManualRFWebhook(request, env, url) {
       return new Response('Bad Request', { status: 400 });
     }
 
+    trace.getActiveSpan()?.setAttribute('rf.event_type', 'manual');
+
     console.log({
       message: `[RF/manual] candidate=${candidate.id} "${candidate.name}"`,
       source: 'rf-manual',
@@ -416,6 +419,8 @@ async function handleDialpadWebhook(request, env) {
     if (!payload) {
       return new Response('Unauthorized - Invalid token', { status: 401 });
     }
+
+    trace.getActiveSpan()?.setAttribute('dialpad.event_type', payload.event || 'unknown');
 
     const contact = payload.contact;
 
@@ -889,6 +894,8 @@ async function handleDialpadCallWebhook(request, env) {
     if (!payload) {
       return new Response('Unauthorized - Invalid token', { status: 401 });
     }
+
+    trace.getActiveSpan()?.setAttribute('dialpad.event_type', payload.state || 'unknown');
 
     console.log({
       message: `[Dialpad/calls] ${payload.state} call_id=${payload.call_id}`,
@@ -2400,6 +2407,8 @@ async function handleDialpadExtensionCallsWebhook(request, env) {
     if (!payload) {
       return new Response('Unauthorized - Invalid token', { status: 401 });
     }
+
+    trace.getActiveSpan()?.setAttribute('dialpad.event_type', payload.state || 'unknown');
 
     const result = await processExtensionCallEvent(payload, env);
 

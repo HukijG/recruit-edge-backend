@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "rf-dialpad-sync-dev",
   "main": "src/index.js",
-  "compatibility_date": "2025-09-02",
+  "compatibility_date": "2026-05-10",
   "compatibility_flags": ["nodejs_compat"],
   "ai": {
     "binding": "AI"

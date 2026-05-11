@@ -3,11 +3,13 @@ import type { CFMetricsResult } from './cf-graphql.js';
 export interface OTLPMetricsConfig {
 	LD_OTLP_METRICS_URL: string;
 	LD_SDK_KEY: string;
+	CF_ACCOUNT_ID: string;
 }
 
 export async function pushOTelMetrics(config: OTLPMetricsConfig, metrics: CFMetricsResult): Promise<void> {
 	const now = Date.now() * 1_000_000;
-	const accountId = 'YOUR_CF_ACCOUNT_ID';
+	if (!config.CF_ACCOUNT_ID) throw new Error('CF_ACCOUNT_ID is required for metrics-poller');
+	const accountId = config.CF_ACCOUNT_ID;
 
 	const buildDataPoints = (kvPairs: { value: number; dims: Record<string, string> }[]) =>
 		kvPairs.map((p) => ({
@@ -53,9 +55,26 @@ export async function pushOTelMetrics(config: OTLPMetricsConfig, metrics: CFMetr
 		],
 	};
 
-	await fetch(config.LD_OTLP_METRICS_URL, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(payload),
-	});
+	let response: Response;
+	try {
+		response = await fetch(config.LD_OTLP_METRICS_URL, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(payload),
+		});
+	} catch (err) {
+		console.error({
+			source: 'metrics-poller',
+			message: 'OTLP push failed (network)',
+			error: String(err),
+		});
+		return;
+	}
+	if (!response.ok) {
+		console.error({
+			source: 'metrics-poller',
+			message: 'OTLP push HTTP error',
+			status: response.status,
+		});
+	}
 }

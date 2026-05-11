@@ -10,6 +10,7 @@
     "head_sampling_rate": 0.1
   },
   "vars": {
+    "CF_ACCOUNT_ID": "YOUR_CF_ACCOUNT_ID",
     "CF_GRAPHQL_ENDPOINT": "https://api.cloudflare.com/client/v4/graphql",
     "LD_OTLP_METRICS_URL": "https://otel.observability.app.launchdarkly.com/v1/metrics",
     "LD_OTLP_TRACES_URL": "https://otel.observability.app.launchdarkly.com/v1/traces",
