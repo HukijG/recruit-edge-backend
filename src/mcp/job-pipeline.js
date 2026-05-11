@@ -50,6 +50,7 @@ import { projectWithLinkedIn } from './linkedin.js';
 import { resolveJob, resolveStage, disambiguationPayload } from './resolvers.js';
 import { session, getCandidatesByIds } from './d1-read.js';
 import { fetchRFJobPipeline, getRFCandidate } from '../rf-client.js';
+import { pMapLimit } from './concurrency.js';
 
 const DEFAULT_FIELDS = ['id', 'name', 'linkedin_profile'];
 const SUBMITTED_LANDMARK = 'CV Sent';
@@ -72,34 +73,6 @@ const THIN_FIELDS = new Set([
 function isThinOnly(fields) {
   if (!Array.isArray(fields) || fields.length === 0) return true;
   return fields.every((f) => THIN_FIELDS.has(f));
-}
-
-/**
- * Parallel map with concurrency cap. Returns a result array in input order
- * with shape `[{ok: true, value} | {ok: false, error}, ...]`.
- *
- * Used by the expanded-hydration fan-out — concurrency cap (default 8 per
- * spec rev 5 RF-6) protects RF from a thundering herd on large stages while
- * keeping latency bounded. Per-id failures are captured (never thrown) so
- * one bad candidate doesn't poison the rest of the response.
- */
-async function pMapLimit(items, limit, fn) {
-  const results = new Array(items.length);
-  let next = 0;
-  async function worker() {
-    while (true) {
-      const i = next++;
-      if (i >= items.length) return;
-      try {
-        results[i] = { ok: true, value: await fn(items[i], i) };
-      } catch (err) {
-        results[i] = { ok: false, error: err };
-      }
-    }
-  }
-  const workerCount = Math.min(limit, items.length);
-  await Promise.all(Array.from({ length: workerCount }, worker));
-  return results;
 }
 
 /**
