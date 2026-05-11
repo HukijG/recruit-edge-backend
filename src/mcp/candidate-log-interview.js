@@ -16,10 +16,17 @@
  */
 
 import { jsonResponse } from './router.js';
-import { getCandidateById } from './d1-read.js';
-import { resolveCandidate, resolveJob } from './resolvers.js';
+import { readSyncState } from './d1-read.js';
+import { resolveCandidate, resolveCandidateThin, resolveJob } from './resolvers.js';
+import {
+  getRFCandidate,
+  createRFCustomActivity,
+  RFRateLimitedError,
+} from '../rf-client.js';
+import { pMapLimit } from './concurrency.js';
 
 const DEFAULT_DURATION_MIN = 60;
+const HYDRATION_CONCURRENCY = 8;
 // Fallback only — used if the sync-worker hasn't yet populated
 // `sync_state.activity_types` (e.g. before the first full rebuild).
 const ACTIVITY_TYPE_INTERVIEW_FALLBACK = 1003;
@@ -32,13 +39,11 @@ const ACTIVITY_TYPE_INTERVIEW_FALLBACK = 1003;
  * isn't available yet.
  */
 async function getInterviewActivityTypeId(env) {
-  const row = await env.RF_MCP_CACHE
-    .prepare("SELECT value FROM sync_state WHERE key = 'activity_types'")
-    .first();
-  if (!row?.value) return ACTIVITY_TYPE_INTERVIEW_FALLBACK;
+  const value = await readSyncState(env, 'activity_types');
+  if (!value) return ACTIVITY_TYPE_INTERVIEW_FALLBACK;
   let types;
   try {
-    types = JSON.parse(row.value);
+    types = JSON.parse(value);
   } catch {
     return ACTIVITY_TYPE_INTERVIEW_FALLBACK;
   }
@@ -88,34 +93,75 @@ export async function handleCandidateLogInterview({ env, body, consultant }) {
     return jsonResponse(400, { error: 'candidate is required' });
   }
 
-  // Resolve candidate(s). Single id / unique fuzzy → one option. Ambiguous →
-  // load all top-K bodies for post-narrow consideration so we can drop any
-  // candidates that don't match the optional `body.job` filter.
-  const candRes = await resolveCandidate(env, body.candidate);
+  // Resolve candidate(s). Use the thin resolver by default — full body is
+  // only needed for the optional `job` filter post-narrow, in which case
+  // we live-fetch on demand per option below.
+  let candRes;
+  try {
+    candRes = await resolveCandidateThin(env, body.candidate);
+  } catch (e) {
+    if (e instanceof RFRateLimitedError) {
+      return jsonResponse(200, {
+        ok: false, kind: 'rate_limited', recoverable: false,
+        retry_after_ms: e.retryAfterMs ?? null,
+        error: 'RF rate limited',
+      });
+    }
+    return jsonResponse(200, {
+      ok: false, kind: 'rf_unavailable', recoverable: true,
+      error: e?.message ?? String(e),
+    });
+  }
   let candidateOptions;
   if (candRes.ok) {
-    candidateOptions = [candRes.value];
+    // Thin row has id + name + snapshot title/org but NOT jobs[]. Project to
+    // the candidate shape the legacy code path consumed.
+    const t = candRes.value;
+    candidateOptions = [{
+      id: t.id,
+      name: t.name,
+      current_organization: t.current_company_at_cache_time ?? null,
+      current_title: t.current_title_at_cache_time ?? null,
+    }];
   } else if (candRes.reason === 'ambiguous') {
-    const bodies = await Promise.all(
-      candRes.options.map((o) => getCandidateById(env, o.id)),
-    );
-    candidateOptions = bodies.filter(Boolean);
+    // Each option carries thin display hints. Job filter (below) will
+    // live-fetch jobs[] per option as needed.
+    candidateOptions = candRes.options.map((o) => ({
+      id: o.id,
+      name: o.name,
+      current_organization: o.current_organization ?? null,
+      current_title: o.current_title ?? null,
+    }));
   } else {
-    return jsonResponse(404, { error: 'candidate not found' });
+    // Lean envelope: HTTP 200 + {ok:false, kind:'no_candidate'} — consistent
+    // with the rest of the system. The consumer apologises + asks for a
+    // better-narrowed reference rather than crashing on a 404.
+    return jsonResponse(200, { ok: false, kind: 'no_candidate', error: 'candidate not found' });
   }
 
   // If `body.job` is set, validate that each candidate has a non-DQ link to
-  // that job. Drop candidates that don't — auto-narrow win when only one
-  // ambiguous candidate is on the requested job. The job context itself
-  // isn't used by RF's activity-create (activities attach to a candidate,
-  // not a candidate-job link); resolution runs to filter the candidate set.
+  // that job. jobs[] is mutable → must live-fetch each option's body. Drop
+  // candidates that don't survive the filter — auto-narrow win when only one
+  // ambiguous candidate is on the requested job.
   if (body.job != null) {
+    const bodies = await pMapLimit(
+      candidateOptions.map((c) => c.id),
+      HYDRATION_CONCURRENCY,
+      async (id) => getRFCandidate(id, env),
+    );
     const validated = [];
-    for (const c of candidateOptions) {
-      const nonDq = (c.jobs ?? []).filter((j) => !j.disqualified);
+    for (let i = 0; i < candidateOptions.length; i++) {
+      const r = bodies[i];
+      if (!r.ok) continue;
+      const fullBody = r.value;
+      const nonDq = (fullBody.jobs ?? []).filter((j) => !j.disqualified);
       if (nonDq.length === 0) continue;
       const jobRes = await resolveJob(env, body.job, { restrictTo: nonDq });
-      if (jobRes.ok || jobRes.reason === 'ambiguous') validated.push(c);
+      if (jobRes.ok || jobRes.reason === 'ambiguous') {
+        // Carry the live body forward so we don't re-fetch when narrowed
+        // to a single candidate below.
+        validated.push({ ...candidateOptions[i], _liveBody: fullBody });
+      }
     }
     candidateOptions = validated;
   }
@@ -158,20 +204,35 @@ export async function handleCandidateLogInterview({ env, body, consultant }) {
     : '';
 
   const activity_type_id = await getInterviewActivityTypeId(env);
-  const r = await fetch(`${env.RF_API_BASE_URL}/custom-activity/create`, {
-    method: 'POST',
-    headers: { 'RF-Api-Key': env.RF_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+  let activity;
+  try {
+    // Delegate to the shared `createRFCustomActivity` helper so that 429
+    // (RFRateLimitedError, with RFC-7231-compliant Retry-After parsing
+    // including HTTP-date), 5xx (RFTransientError), and other non-2xx
+    // (RFError) all surface as the canonical typed errors.
+    activity = await createRFCustomActivity({
       candidate_id: candidate.id,
       activity_type_id,
       activity_text: text || `${body.kind ?? 'Interview'} scheduled`,
       activity_user_id: consultant.rfUserId,
       start_time: start.toISOString(),
       end_time: end.toISOString(),
-    }),
-  });
-  if (!r.ok) return jsonResponse(502, { error: `RF activity create failed: ${r.status}` });
-  const activity = await r.json();
+    }, env);
+  } catch (err) {
+    // Lean envelope: HTTP 200 + {ok:false, kind, error}. 429 → rate_limited
+    // (non-recoverable); other non-2xx → rf_unavailable (recoverable).
+    if (err instanceof RFRateLimitedError) {
+      return jsonResponse(200, {
+        ok: false, kind: 'rate_limited', recoverable: false,
+        retry_after_ms: err.retryAfterMs ?? null,
+        error: 'RF rate limited',
+      });
+    }
+    return jsonResponse(200, {
+      ok: false, kind: 'rf_unavailable', recoverable: true,
+      error: `RF activity create failed: ${err?.status ?? err?.message ?? 'unknown'}`,
+    });
+  }
 
   const calendarMode = consultant.calendarMode ?? 'outlook';
   // Recruiter-only calendar block — never include the candidate's email in

@@ -220,35 +220,34 @@ describe('/mcp/candidate-log-interview', () => {
   it('post-narrow: two Jordans, only one is on the specified job → auto-commits', async () => {
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
-    // Jordan Chen is on job 100; Jordan Patel is on job 999. Caller asks for
-    // log-interview on job 100 — post-narrow should drop Patel and commit.
-    await env.RF_MCP_CACHE.prepare(
-      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
-    ).bind(
-      42, JSON.stringify({
-        id: 42, name: 'Jordan Chen',
-        jobs: [{ job_id: 100, job_name: 'Eng', disqualified: false }],
-      }),
-      'Jordan Chen', 'Acme', 'AE', new Date().toISOString()
-    ).run();
+    // Job filter triggers live RF fetches per option to inspect jobs[].
     await env.RF_MCP_CACHE.prepare(
       'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
     ).bind(42, 'Jordan Chen', null, Date.now(), Date.now()).run();
     await env.RF_MCP_CACHE.prepare(
-      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
-    ).bind(
-      43, JSON.stringify({
-        id: 43, name: 'Jordan Patel',
-        jobs: [{ job_id: 999, job_name: 'PM', disqualified: false }],
-      }),
-      'Jordan Patel', 'Globex', 'CSM', new Date().toISOString()
-    ).run();
-    await env.RF_MCP_CACHE.prepare(
       'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
     ).bind(43, 'Jordan Patel', null, Date.now(), Date.now()).run();
-    globalThis.fetch = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ id: 555 }), { status: 200 }),
-    );
+    const fetchMock = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/get')) {
+        const m = u.match(/[?&]id=(\d+)/);
+        const id = m ? Number(m[1]) : 0;
+        if (id === 42) return new Response(JSON.stringify({
+          candidate: { id: 42, name: 'Jordan Chen',
+            jobs: [{ job_id: 100, job_name: 'Eng', disqualified: false }] },
+        }), { status: 200 });
+        if (id === 43) return new Response(JSON.stringify({
+          candidate: { id: 43, name: 'Jordan Patel',
+            jobs: [{ job_id: 999, job_name: 'PM', disqualified: false }] },
+        }), { status: 200 });
+        return new Response('?', { status: 404 });
+      }
+      if (u.includes('/custom-activity/create')) {
+        return new Response(JSON.stringify({ id: 555 }), { status: 200 });
+      }
+      throw new Error('unexpected: ' + u);
+    });
+    globalThis.fetch = fetchMock;
     const r = await call({
       consultantFirstName: 'Joel',
       candidate: 'Jordan',
@@ -260,37 +259,35 @@ describe('/mcp/candidate-log-interview', () => {
     const b = await r.json();
     expect(b.ok).toBe(true);
     expect(b.activity.candidate_id).toBe(42);
-    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
   });
 
-  it('post-narrow: two Jordans, neither on the specified job → 400', async () => {
+  it('post-narrow: two Jordans, neither on the specified job → 400 (job filter live-fetches per option)', async () => {
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
-    await env.RF_MCP_CACHE.prepare(
-      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
-    ).bind(
-      42, JSON.stringify({
-        id: 42, name: 'Jordan Chen',
-        jobs: [{ job_id: 999, job_name: 'PM', disqualified: false }],
-      }),
-      'Jordan Chen', 'Acme', 'AE', new Date().toISOString()
-    ).run();
     await env.RF_MCP_CACHE.prepare(
       'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
     ).bind(42, 'Jordan Chen', null, Date.now(), Date.now()).run();
     await env.RF_MCP_CACHE.prepare(
-      'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)'
-    ).bind(
-      43, JSON.stringify({
-        id: 43, name: 'Jordan Patel',
-        jobs: [{ job_id: 888, job_name: 'CSM Lead', disqualified: false }],
-      }),
-      'Jordan Patel', 'Globex', 'CSM', new Date().toISOString()
-    ).run();
-    await env.RF_MCP_CACHE.prepare(
       'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
     ).bind(43, 'Jordan Patel', null, Date.now(), Date.now()).run();
-    globalThis.fetch = vi.fn();
+    const fetchMock = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/get')) {
+        const m = u.match(/[?&]id=(\d+)/);
+        const id = m ? Number(m[1]) : 0;
+        if (id === 42) return new Response(JSON.stringify({
+          candidate: { id: 42, name: 'Jordan Chen',
+            jobs: [{ job_id: 999, job_name: 'PM', disqualified: false }] },
+        }), { status: 200 });
+        if (id === 43) return new Response(JSON.stringify({
+          candidate: { id: 43, name: 'Jordan Patel',
+            jobs: [{ job_id: 888, job_name: 'CSM Lead', disqualified: false }] },
+        }), { status: 200 });
+        return new Response('?', { status: 404 });
+      }
+      throw new Error('unexpected: ' + u);
+    });
+    globalThis.fetch = fetchMock;
     const r = await call({
       consultantFirstName: 'Joel',
       candidate: 'Jordan',
@@ -299,25 +296,26 @@ describe('/mcp/candidate-log-interview', () => {
       start_time: '2026-05-08T10:00:00+01:00',
     });
     expect(r.status).toBe(400);
-    expect(globalThis.fetch).not.toHaveBeenCalled();
+    // Per-option /candidate/get fired; no /custom-activity/create.
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/custom-activity/create'))).toBe(false);
   });
 
   it('candidate_id + job_id bypass fuzzy resolvers', async () => {
-    // Re-seed candidate 42 with a jobs array so job_id: 100 passes the filter.
-    await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
-    await env.RF_MCP_CACHE.prepare(
-      'INSERT INTO candidates (id, body, name, cached_at) VALUES (42, ?, ?, ?)'
-    ).bind(
-      JSON.stringify({
-        id: 42, name: 'Test Candidate', primary_email: 't@x.com',
-        jobs: [{ job_id: 100, job_name: 'Eng', disqualified: false }],
-      }),
-      'Test Candidate',
-      new Date().toISOString(),
-    ).run();
-    globalThis.fetch = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ ok: true, id: 999 }), { status: 200 }),
-    );
+    // job_id: 100 sets body.job which triggers the job-filter live-fetch path.
+    const fetchMock = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/get')) {
+        return new Response(JSON.stringify({
+          candidate: { id: 42, name: 'Test Candidate', primary_email: 't@x.com',
+            jobs: [{ job_id: 100, job_name: 'Eng', disqualified: false }] },
+        }), { status: 200 });
+      }
+      if (u.includes('/custom-activity/create')) {
+        return new Response(JSON.stringify({ ok: true, id: 999 }), { status: 200 });
+      }
+      throw new Error('unexpected: ' + u);
+    });
+    globalThis.fetch = fetchMock;
     const r = await call({
       consultantFirstName: 'Joel',
       candidate_id: 42,
@@ -331,7 +329,7 @@ describe('/mcp/candidate-log-interview', () => {
     expect(body.activity.candidate_id).toBe(42);
   });
 
-  it('returns 502 if RF activity-create fails', async () => {
+  it('returns HTTP 200 + rf_unavailable when RF activity-create fails 500', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(
       new Response('rf went boom', { status: 500 }),
     );
@@ -341,8 +339,11 @@ describe('/mcp/candidate-log-interview', () => {
       kind: '1st Interview',
       start_time: '2026-05-08T10:00:00+01:00',
     });
-    expect(r.status).toBe(502);
+    expect(r.status).toBe(200);
     const b = await r.json();
+    expect(b.ok).toBe(false);
+    expect(b.kind).toBe('rf_unavailable');
+    expect(b.recoverable).toBe(true);
     expect(b.error).toContain('500');
   });
 });

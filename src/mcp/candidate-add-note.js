@@ -16,31 +16,49 @@
  */
 
 import { jsonResponse } from './router.js';
-import { getCandidateById } from './d1-read.js';
-import { resolveCandidate, resolveJob } from './resolvers.js';
+import { resolveCandidateThin, resolveJob } from './resolvers.js';
 import { mdToHtml } from './markdown.js';
-import { addRFCandidateNote } from '../rf-client.js';
+import {
+  addRFCandidateNote,
+  getRFCandidate,
+  RFRateLimitedError,
+} from '../rf-client.js';
+import { pMapLimit } from './concurrency.js';
+
+const HYDRATION_CONCURRENCY = 8;
 
 /**
  * In-process primitive. Caller has already resolved the candidate and
  * brought the consultant record from the router. Returns the same
  * lean envelope the HTTP handler emits: `{ok: true}` on success, or
- * `{ok: false, status, error}` on a recoverable failure.
+ * `{ok: false, kind, error}` on a recoverable failure.
  *
- * No echo of the candidate or RF note id — every response byte costs
- * Claude context tokens, and Claude already has the candidate identity
- * from the request. The RF note id is not used downstream.
+ * Recoverable shape mirrors the project-wide lean envelope:
+ *   • RF rate-limit → `kind: 'rate_limited'`, `recoverable: false`,
+ *     `retry_after_ms`.
+ *   • RF transient / other → `kind: 'rf_unavailable'`, `recoverable: true`.
+ *   • Empty note → `kind: 'invalid_input'`, HTTP 400 upstream.
  */
 export async function addNoteForCandidate({ env, candidate, noteMd, consultant }) {
   if (!String(noteMd ?? '').trim()) {
-    return { ok: false, status: 400, error: 'note is required' };
+    return { ok: false, status: 400, kind: 'invalid_input', error: 'note is required' };
   }
   const html = mdToHtml(noteMd);
   try {
     await addRFCandidateNote(candidate.id, html, consultant.rfUserId, env);
   } catch (err) {
     console.error('add-note RF call failed:', err);
-    return { ok: false, status: 502, error: 'RF notes/add failed' };
+    if (err instanceof RFRateLimitedError) {
+      return {
+        ok: false,
+        status: 200,
+        kind: 'rate_limited',
+        recoverable: false,
+        retry_after_ms: err.retryAfterMs ?? null,
+        error: 'RF rate limited',
+      };
+    }
+    return { ok: false, status: 200, kind: 'rf_unavailable', recoverable: true, error: 'RF notes/add failed' };
   }
   return { ok: true };
 }
@@ -66,30 +84,71 @@ export async function handleCandidateAddNote({ env, body, consultant }) {
   }
 
   // ─── Resolve candidate ──────────────────────────────────────────────
-  const candRes = await resolveCandidate(env, body.candidate);
+  // Thin resolve only — notes only need candidate.id + name. The optional
+  // `job` filter triggers per-option live-fetches below (jobs[] is mutable
+  // → not cached).
+  let candRes;
+  try {
+    candRes = await resolveCandidateThin(env, body.candidate);
+  } catch (e) {
+    if (e instanceof RFRateLimitedError) {
+      return jsonResponse(200, {
+        ok: false,
+        kind: 'rate_limited',
+        recoverable: false,
+        retry_after_ms: e.retryAfterMs ?? null,
+        error: 'RF rate limited',
+      });
+    }
+    return jsonResponse(200, {
+      ok: false,
+      kind: 'rf_unavailable',
+      recoverable: true,
+      error: e?.message ?? String(e),
+    });
+  }
   let candidateOptions;
   if (candRes.ok) {
-    candidateOptions = [candRes.value];
+    const t = candRes.value;
+    candidateOptions = [{
+      id: t.id,
+      name: t.name,
+      current_organization: t.current_company_at_cache_time ?? null,
+      current_title: t.current_title_at_cache_time ?? null,
+    }];
   } else if (candRes.reason === 'ambiguous') {
-    const bodies = await Promise.all(
-      candRes.options.map((o) => getCandidateById(env, o.id)),
-    );
-    candidateOptions = bodies.filter(Boolean);
+    candidateOptions = candRes.options.map((o) => ({
+      id: o.id,
+      name: o.name,
+      current_organization: o.current_organization ?? null,
+      current_title: o.current_title ?? null,
+    }));
   } else {
-    return jsonResponse(404, { error: 'candidate not found' });
+    // Lean envelope: HTTP 200 + {ok:false, kind:'no_candidate'} — consistent
+    // with the rest of the system. The consumer apologises + asks for a
+    // better-narrowed reference rather than crashing on a 404.
+    return jsonResponse(200, { ok: false, kind: 'no_candidate', error: 'candidate not found' });
   }
 
   // ─── Optional job filter (auto-narrow) ──────────────────────────────
   // Notes attach to the candidate, not to a candidate-job link. `job` is
   // purely a disambiguator that drops candidates without a non-DQ link
-  // to that job. Same shape as candidate-log-interview.js.
+  // to that job. jobs[] is mutable → live-fetch per option.
   if (body.job != null) {
+    const bodies = await pMapLimit(
+      candidateOptions.map((c) => c.id),
+      HYDRATION_CONCURRENCY,
+      async (id) => getRFCandidate(id, env),
+    );
     const validated = [];
-    for (const c of candidateOptions) {
-      const nonDq = (c.jobs ?? []).filter((j) => !j.disqualified);
+    for (let i = 0; i < candidateOptions.length; i++) {
+      const r = bodies[i];
+      if (!r.ok) continue;
+      const fullBody = r.value;
+      const nonDq = (fullBody.jobs ?? []).filter((j) => !j.disqualified);
       if (nonDq.length === 0) continue;
       const jobRes = await resolveJob(env, body.job, { restrictTo: nonDq });
-      if (jobRes.ok || jobRes.reason === 'ambiguous') validated.push(c);
+      if (jobRes.ok || jobRes.reason === 'ambiguous') validated.push(candidateOptions[i]);
     }
     candidateOptions = validated;
   }
@@ -123,7 +182,15 @@ export async function handleCandidateAddNote({ env, body, consultant }) {
   });
 
   if (!res.ok) {
-    return jsonResponse(res.status ?? 502, { error: res.error });
+    // Lean envelope: HTTP 200 + {ok:false, kind, error}. 400 stays 400 for
+    // hard-input violations (empty note).
+    if (res.status === 400) {
+      return jsonResponse(400, { ok: false, kind: res.kind ?? 'invalid_input', error: res.error });
+    }
+    const payload = { ok: false, kind: res.kind ?? 'rf_unavailable', error: res.error };
+    if (res.recoverable != null) payload.recoverable = res.recoverable;
+    if (res.retry_after_ms != null) payload.retry_after_ms = res.retry_after_ms;
+    return jsonResponse(200, payload);
   }
   return jsonResponse(200, { ok: true });
 }

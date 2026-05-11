@@ -22,21 +22,58 @@
  */
 
 import { jsonResponse } from './router.js';
-import { getCandidateById } from './d1-read.js';
+import { getFullCandidateById } from './d1-read.js';
 import {
   resolveCandidate,
   resolveJob,
   resolveStage,
 } from './resolvers.js';
+import {
+  getRFCandidate,
+  classifyRFResponse,
+  RFRateLimitedError,
+} from '../rf-client.js';
+import { pMapLimit } from './concurrency.js';
 
+const HYDRATION_CONCURRENCY = 8;
+
+/**
+ * RF /candidate/move-to-stage with typed-error classification. Delegates to
+ * the shared `classifyRFResponse` helper so that 429 (RFRateLimitedError, with
+ * RFC-7231-compliant Retry-After parsing including HTTP-date), 5xx
+ * (RFTransientError), and other non-2xx (RFError) all surface as the canonical
+ * typed errors. The caller maps these to the lean response envelope.
+ */
 async function callRfMoveStage(env, payload) {
   const r = await fetch(`${env.RF_API_BASE_URL}/candidate/move-to-stage`, {
     method: 'POST',
     headers: { 'RF-Api-Key': env.RF_API_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!r.ok) throw new Error(`RF move-to-stage ${r.status}: ${await r.text()}`);
+  if (!r.ok) {
+    const text = await r.text();
+    throw classifyRFResponse(r, text);
+  }
   return r.json();
+}
+
+/**
+ * Map a thrown error from callRfMoveStage into the lean response envelope.
+ * Centralised so both the fast-path short-circuit and the tuple-commit
+ * branch agree.
+ */
+function moveStageErrorResponse(err) {
+  if (err instanceof RFRateLimitedError) {
+    return jsonResponse(200, {
+      ok: false, kind: 'rate_limited', recoverable: false,
+      retry_after_ms: err.retryAfterMs ?? null,
+      error: 'RF rate limited',
+    });
+  }
+  return jsonResponse(200, {
+    ok: false, kind: 'rf_unavailable', recoverable: true,
+    error: 'RF move-to-stage failed',
+  });
 }
 
 /**
@@ -96,9 +133,27 @@ export async function handleCandidateMoveStage({ env, body, consultant }) {
 
   // ─── Fast path: all three *_id fields present → skip resolver/post-narrow ───
   // Used on follow-up turns where Claude has the IDs from a prior response.
+  // Still validates the candidate-job-stage tuple by live-fetching the full
+  // RF body (thin cache only has id+name; jobs[]/stages live only on RF).
   if (body.candidate_id != null && body.job_id != null && body.stage_id != null) {
-    const candidate = await getCandidateById(env, Number(body.candidate_id));
-    if (!candidate) return jsonResponse(404, { error: 'candidate not found', candidate_id: body.candidate_id });
+    let candRes;
+    try {
+      candRes = await getFullCandidateById(env, Number(body.candidate_id));
+    } catch (err) {
+      if (err instanceof RFRateLimitedError) {
+        return jsonResponse(200, {
+          ok: false, kind: 'rate_limited', recoverable: false,
+          retry_after_ms: err.retryAfterMs ?? null,
+          error: 'RF rate limited',
+        });
+      }
+      return jsonResponse(200, {
+        ok: false, kind: 'rf_unavailable', recoverable: true,
+        error: err?.message ?? String(err),
+      });
+    }
+    if (!candRes.ok) return jsonResponse(404, { error: 'candidate not found', candidate_id: body.candidate_id });
+    const candidate = candRes.value;
     const link = (candidate.jobs ?? []).find((j) => Number(j.job_id) === Number(body.job_id));
     if (!link) return jsonResponse(404, { error: 'candidate is not on that job', candidate_id: body.candidate_id, job_id: body.job_id });
     const stage = (link.stages ?? []).find((s) => Number(s.id) === Number(body.stage_id));
@@ -113,7 +168,7 @@ export async function handleCandidateMoveStage({ env, body, consultant }) {
       });
     } catch (err) {
       console.error('move-stage RF call failed:', err);
-      return jsonResponse(502, { error: 'RF move-to-stage failed' });
+      return moveStageErrorResponse(err);
     }
     return jsonResponse(200, {
       ok: true,
@@ -142,17 +197,35 @@ export async function handleCandidateMoveStage({ env, body, consultant }) {
     body = { ...body, stage: Number(body.stage_id) };
   }
 
-  // 1. Resolve candidate(s). Single id / unique fuzzy → one option.
-  //    Ambiguous → load all top-K bodies for post-narrow consideration.
-  const candRes = await resolveCandidate(env, body.candidate);
+  // 1. Resolve candidate(s). Single id / unique fuzzy → one option (full
+  //    body live-fetched from RF by resolveCandidate). Ambiguous → fan out
+  //    to /candidate/get per option for the post-narrow check.
+  let candRes;
+  try {
+    candRes = await resolveCandidate(env, body.candidate);
+  } catch (err) {
+    if (err instanceof RFRateLimitedError) {
+      return jsonResponse(200, {
+        ok: false, kind: 'rate_limited', recoverable: false,
+        retry_after_ms: err.retryAfterMs ?? null,
+        error: 'RF rate limited',
+      });
+    }
+    return jsonResponse(200, {
+      ok: false, kind: 'rf_unavailable', recoverable: true,
+      error: err?.message ?? String(err),
+    });
+  }
   let candidateOptions;
   if (candRes.ok) {
     candidateOptions = [candRes.value];
   } else if (candRes.reason === 'ambiguous') {
-    const bodies = await Promise.all(
-      candRes.options.map((o) => getCandidateById(env, o.id)),
+    const bodies = await pMapLimit(
+      candRes.options.map((o) => o.id),
+      HYDRATION_CONCURRENCY,
+      async (id) => getRFCandidate(id, env),
     );
-    candidateOptions = bodies.filter(Boolean);
+    candidateOptions = bodies.filter((r) => r.ok).map((r) => r.value);
   } else {
     return jsonResponse(404, { error: 'candidate not found' });
   }
@@ -186,7 +259,7 @@ export async function handleCandidateMoveStage({ env, body, consultant }) {
       });
     } catch (err) {
       console.error('move-stage RF call failed:', err);
-      return jsonResponse(502, { error: 'RF move-to-stage failed' });
+      return moveStageErrorResponse(err);
     }
     return jsonResponse(200, {
       ok: true,
