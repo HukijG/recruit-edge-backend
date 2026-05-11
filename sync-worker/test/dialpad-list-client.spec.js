@@ -46,6 +46,27 @@ describe('fetchCallsForConsultant', () => {
     mockPages(pages);
     const out = await fetchCallsForConsultant(env, '8000000000000001', 0);
     // MAX_PAGES = 25 (well above the 1–3 pages a 15-min cron tick should ever need)
-    expect(out.length).toBeLessThanOrEqual(25);
+    expect(out.length).toBe(25);
+  });
+
+  it('forwards cursor on subsequent pages (no cursor on first request)', async () => {
+    mockPages([
+      { items: [{ call_id: 'a' }], cursor: 't1' },
+      { items: [{ call_id: 'b' }], cursor: null },
+    ]);
+    await fetchCallsForConsultant(env, '8000000000000001', 1717248000000);
+    expect(globalThis.fetch.mock.calls[0][0]).not.toContain('cursor=');
+    expect(new URL(globalThis.fetch.mock.calls[1][0]).searchParams.get('cursor')).toBe('t1');
+  });
+
+  it('throws with HTTP status in message on non-2xx', async () => {
+    globalThis.fetch.mockImplementation(async () => ({
+      ok: false, status: 401,
+      text: async () => 'unauthorized',
+      json: async () => ({}),
+      headers: new Map(),
+    }));
+    await expect(fetchCallsForConsultant(env, '8000000000000001', 0))
+      .rejects.toThrow(/HTTP 401/);
   });
 });
