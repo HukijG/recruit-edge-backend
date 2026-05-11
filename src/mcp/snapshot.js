@@ -16,6 +16,10 @@ async function readVersion(env) {
     .prepare("SELECT value FROM sync_state WHERE key = 'last_candidates_added_cursor'")
     .first();
   if (row?.value) return row.value;
+  // TODO(task-30): remove this legacy-cursor fallback once cutover step 6 + Task 30
+  // drop the legacy code paths. Until then, this fallback prevents a snapshot black-hole
+  // during the dual-write rollout window (between sync-worker dual-write deploy and the
+  // new cron's first run).
   const legacy = await env.RF_MCP_CACHE
     .prepare("SELECT value FROM sync_state WHERE key = 'last_tail_sync_at'")
     .first();

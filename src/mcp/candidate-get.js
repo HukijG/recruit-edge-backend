@@ -28,6 +28,10 @@ export async function handleCandidateGet({ env, body }) {
     const scored = snap.rows
       .map((r) => {
         const base = scoreString(q, r.prepared);
+        // TODO(task-14): snapshot rows now expose `added_time_ms` (not `last_activity_at`),
+        // so this boost is silently 0 until candidate-get is rewritten in Task 14. recencyBoost
+        // gracefully returns 0 when the field is undefined; no crash, but recency-rank is
+        // disabled for this codepath until Task 14 ships.
         const boost = recencyBoost({ last_activity_at: r.last_activity_at });
         return { id: r.id, name: r.name, score: base * (1 + boost) };
       })

@@ -191,6 +191,10 @@ async function pureFuzzy(env, body, limit) {
   const scored = snap.rows
     .map((r) => {
       const base = scoreString(q, r.prepared);
+      // TODO(task-13): snapshot rows now expose `added_time_ms` (not `last_activity_at`),
+      // so this boost is silently 0 until pureFuzzy is rewritten in Task 13. recencyBoost
+      // gracefully returns 0 when the field is undefined; no crash, but recency-rank is
+      // disabled for this codepath until Task 13 ships.
       const boost = recencyBoost({ last_activity_at: r.last_activity_at });
       return { id: r.id, name: r.name, score: base * (1 + boost) };
     })
