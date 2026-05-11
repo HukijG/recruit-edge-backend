@@ -1,0 +1,25 @@
+{
+  "name": "rf-cf-metrics-poller",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --config wrangler.metrics.jsonc",
+    "deploy": "wrangler deploy --config wrangler.metrics.jsonc",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "wrangler": "^4.33.1",
+    "vitest": "^4.1.5",
+    "typescript": "^5.0.0",
+    "@cloudflare/workers-types": "^4.0.0"
+  },
+  "dependencies": {
+    "@microlabs/otel-cf-workers": "file:../vendor/otel-cf-workers",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/api-logs": "^0.217.0",
+    "@opentelemetry/sdk-logs": "^0.217.0",
+    "@opentelemetry/exporter-logs-otlp-http": "^0.217.0",
+    "@opentelemetry/resources": "^2.7.1"
+  }
+}
