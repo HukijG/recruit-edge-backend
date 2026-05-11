@@ -223,7 +223,7 @@ Stages and their data flow:
 
 Full design: the candidate-call-notes design (2026-05-10).
 
-Bundle wiring: the call-notes rendering brief lives in `docs/references/call_notes_guidance.md` and is imported into the worker bundle via wrangler's text-loader rule (`rules: [{type: "Text", globs: ["docs/references/**/*.md"]}]`). Editing the .md and redeploying is the operator's path to update the guidance.
+Bundle wiring: the call-notes rendering brief lives in `docs/references/call_notes_guidance.md` and is imported into the worker bundle via wrangler's text-loader rule (`rules: [{type: "Text", globs: ["**/*.md"], fallthrough: false}]`). The glob is broad because wrangler matches it against resolved absolute paths, not project-relative paths — only one source file actually imports a `.md` (`src/mcp/call-notes-guidance.js`), so the broad glob is safe in practice. `fallthrough: false` silences wrangler's "shadowed default rules" warning. Editing the .md and redeploying is the operator's path to update the guidance.
 
 ### Default fields
 
