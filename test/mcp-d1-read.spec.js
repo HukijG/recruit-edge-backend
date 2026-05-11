@@ -103,11 +103,6 @@ import {
   getCallsForCandidate,
 } from '../src/mcp/d1-read.js';
 
-beforeEach(async () => {
-  await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
-  await env.RF_MCP_CACHE.exec('DELETE FROM calls');
-});
-
 describe('getThinCandidateById', () => {
   it('returns the row when found', async () => {
     await env.RF_MCP_CACHE.prepare(
@@ -155,6 +150,14 @@ describe('getCandidatesByIds', () => {
     ).run();
     const out = await getCandidatesByIds(env, [5, 999, 1000]);
     expect(out.map(r => r.id)).toEqual([5]);
+  });
+  it('dedups duplicate input ids (preserves first-occurrence order)', async () => {
+    await env.RF_MCP_CACHE.batch([
+      env.RF_MCP_CACHE.prepare(`INSERT INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (1, 'A', null, 1, 1)`),
+      env.RF_MCP_CACHE.prepare(`INSERT INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (5, 'E', null, 5, 5)`),
+    ]);
+    const out = await getCandidatesByIds(env, [5, 5, 1, 5]);
+    expect(out.map(r => r.id)).toEqual([5, 1]);
   });
 });
 

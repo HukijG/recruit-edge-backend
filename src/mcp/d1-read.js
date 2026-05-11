@@ -74,7 +74,7 @@ const SQLITE_PARAMS_PER_CHUNK = 100;
  * Returns {id, name, linkedin_profile, added_time_ms} or null if not found.
  */
 export async function getThinCandidateById(env, id) {
-  const row = await env.RF_MCP_CACHE
+  const row = await session(env)
     .prepare('SELECT id, name, linkedin_profile, added_time_ms FROM candidates_v2 WHERE id = ?')
     .bind(Number(id))
     .first();
@@ -89,6 +89,9 @@ export async function getThinCandidateById(env, id) {
  * current_company_at_cache_time.  Ids absent from the cache are silently
  * omitted (no error).
  *
+ * Duplicate ids in input are deduped; output preserves the order of FIRST
+ * occurrence per input id.
+ *
  * Used by pipeline tools (Tasks 15/16) for thin-only hydration of an
  * RF /job/pipeline response.
  *
@@ -98,13 +101,14 @@ export async function getThinCandidateById(env, id) {
  */
 export async function getCandidatesByIds(env, ids) {
   if (!Array.isArray(ids) || ids.length === 0) return [];
-  const numericIds = ids.map(Number).filter(Number.isFinite);
+  // Dedup: preserves first-occurrence order, drops non-finite values.
+  const numericIds = [...new Set(ids.map(Number).filter(Number.isFinite))];
 
   const byId = new Map();
   for (let i = 0; i < numericIds.length; i += SQLITE_PARAMS_PER_CHUNK) {
     const chunk = numericIds.slice(i, i + SQLITE_PARAMS_PER_CHUNK);
     const placeholders = chunk.map(() => '?').join(', ');
-    const { results } = await env.RF_MCP_CACHE
+    const { results } = await session(env)
       .prepare(`SELECT id, name, linkedin_profile, added_time_ms,
                        current_title_at_cache_time, current_company_at_cache_time
                 FROM candidates_v2 WHERE id IN (${placeholders})`)
@@ -136,7 +140,7 @@ export async function getCallsForCandidate(env, targetDialpadId, rfCandidateId, 
   const startedBeforeMs = opts.startedBeforeMs ?? Date.now();
   const limit           = opts.limit ?? 20;
 
-  const { results } = await env.RF_MCP_CACHE
+  const { results } = await session(env)
     .prepare(`SELECT call_id, date_started_ms, duration_ms, direction
               FROM calls
               WHERE target_dialpad_id = ?
