@@ -808,6 +808,10 @@ The MCP worker is **stateless**: it owns no D1, no KV, no Durable Object, no RF 
 
 Full middleware semantics (resolvers, ID short-circuit, default fields per endpoint, lean disambiguation envelopes, recovery shapes, custom-field universe memoization) live in [`docs/mcp-middleware.md`](mcp-middleware.md). That doc is the working reference for adding a new MCP endpoint or changing resolver behaviour.
 
+### Dialpad-call → structured RF note (MCP)
+
+`rf_candidate_call_notes` is a recruiter-driven three-step flow: list Dialpad calls (≥2 min) with a candidate → fetch the chosen call's transcript and the call-notes rendering brief → submit the structured markdown back to RF as a candidate note via `/candidate/notes/add`. Authentication is the same Access-JWT-derived consultant; an additional per-record check on stage 2 (`call.target.id == consultant.dialpadId`) prevents cross-consultant transcript reads. Lives at `/mcp/candidate-call-notes`; full spec in `docs/archive/specs/2026-05-10-candidate-call-notes-design.md`.
+
 ---
 
 ## Sync worker — `rf-mcp-cache-sync`

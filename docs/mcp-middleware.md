@@ -157,6 +157,7 @@ Every endpoint that accepts a `candidate` / `job` / `stage` / `owner` reference 
 | `/mcp/candidate-move-stage` | `candidate_id`, `job_id`, `stage_id` — when ALL THREE present, fast-path direct commit |
 | `/mcp/candidate-log-interview` | `candidate_id`, `job_id` |
 | `/mcp/candidate-add-note` | `candidate_id`, `job_id` |
+| `/mcp/candidate-call-notes` | `candidate_id` (step=submit_notes — fast path that bypasses fuzzy resolve; the fuzzy fallback uses `candidate_fallback` instead) |
 | `/mcp/job-pipeline` | `job_id` |
 | `/mcp/job-candidates-filter` | `job_id` |
 
@@ -176,6 +177,8 @@ When a `*_id` field is present, the corresponding fuzzy-name field (`candidate`,
 
 - When candidate is fuzzy-ambiguous but only one match has the requested job/stage → worker auto-commits, no round-trip.
 - When ≥2 tuples remain → `kind` is the smallest level of variation (candidates differ → `candidate`, same candidate but jobs differ → `job`, etc.) and options carry just enough tuple context to disambiguate at that level.
+
+`candidate-call-notes` step=list_calls uses the same standard `needs_disambiguation` envelope when the fuzzy candidate name resolves to multiple options; its step=submit_notes fallback path delegates to `candidate-add-note` so the disambiguation semantics are identical.
 
 ### Stage resolution coverage
 
@@ -205,8 +208,22 @@ All under `/mcp/*`. Identity is the verified `consultantEmail` body field (forwa
 | `/mcp/candidate-move-stage` | Fuzzy-resolves candidate/job/stage, calls RF `/candidate/move-to-stage` attributed to consultant. |
 | `/mcp/candidate-log-interview` | Fuzzy-resolves candidate (+ optional job restricted to candidate's jobs); creates RF custom activity (interview activity-type id resolved dynamically from `sync_state.activity_types`); returns `outlook_url` (recruiter-only block — no candidate email on `to=`) and optional `gcal_hint` based on `consultant.calendarMode`. |
 | `/mcp/candidate-add-note` | Fuzzy-resolves candidate (+ optional job restricted to candidate's jobs); renders markdown body → HTML via `marked` (in `src/mcp/markdown.js`); calls RF `/candidate/notes/add` attributed to `consultant.rfUserId` from the JWT. No `mentions` resolution, no attribution override. Success returns `{ok: true}` only — no echo back (per the lean-response convention). Exposes an internal `addNoteForCandidate(...)` for in-process reuse. |
+| `/mcp/candidate-call-notes` | Three-stage Dialpad-call → structured RF note. `step='list_calls'` fuzzy-resolves candidate + paginates `GET /api/v2/call` (target_id=consultant.dialpadId, target_type='user'), filters to ≥2 min `total_duration` matching the candidate's RF id (via `extractRFIdFromDialpadContact` on `call.contact.id`). `step='get_transcript'` checks `call.target.id == consultant.dialpadId`, derives candidate, fetches `/transcripts/{call_id}`, filters to `type='transcript'` lines, returns transcript + the call-notes rendering brief. `step='submit_notes'` delegates to `addNoteForCandidate` (fast path) or `handleCandidateAddNote` (fuzzy fallback). |
 | `/mcp/job-candidates-filter` | Fuzzy-resolves `job` (or `job_id` short-circuit). Reads active candidates from `job_pipelines.stage_candidates_json`; hydrates from `candidates`. `stage` filter (fuzzy against `summary_json`); `limit` (default 100, max 500); `truncated` flag when more matched than fit. |
 | `/mcp/job-pipeline` | Fuzzy-resolves `job` (or `job_id` short-circuit). Reads canonical pipeline from `job_pipelines.summary_json`; hydrates active candidates from `candidates`. Filters: `stage` (single, fuzzy), `from`/`to` (range, fuzzy against `summary[]`), `submitted: true` (exact match on 'CV Sent' → end of pipeline). Default: same as `submitted`. Disqualified excluded unless `include_disqualified: true`. Cold-cache returns 200 + warning. |
+
+### Three-step Dialpad-call-to-note flow
+
+`/mcp/candidate-call-notes` is the only multi-stage endpoint on the MCP surface. It exists because Claude has to round-trip with the user between stages (which call → user picks one → notes drafted → user accepts → commit), so the natural shape is three separate API calls keyed by a `step` discriminator.
+
+Stages and their data flow:
+1. `list_calls`: candidate ref + time window → list of `{call_id, started_at, duration_minutes, direction}`. Candidate ambiguity returns the standard `needs_disambiguation` envelope; no Dialpad call is made.
+2. `get_transcript`: `call_id` → `{candidate, call, transcript, guidance}`. Per-record auth: `call.target.id == consultant.dialpadId` (rejected as `kind: 'not_your_call'` otherwise — Access JWT plus this per-record check is the layered authorization).
+3. `submit_notes`: `candidate_id` (fast) OR `candidate_fallback` (fuzzy) plus markdown `note` → `{ok: true}`. The fuzzy path delegates to `handleCandidateAddNote` verbatim.
+
+Full design: the candidate-call-notes design (2026-05-10).
+
+Bundle wiring: the call-notes rendering brief lives in `docs/references/call_notes_guidance.md` and is imported into the worker bundle via wrangler's text-loader rule (`rules: [{type: "Text", globs: ["docs/references/**/*.md"]}]`). Editing the .md and redeploying is the operator's path to update the guidance.
 
 ### Default fields
 
