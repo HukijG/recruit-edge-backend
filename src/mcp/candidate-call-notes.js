@@ -15,7 +15,7 @@
  */
 
 import { jsonResponse } from './router.js';
-import { resolveCandidate } from './resolvers.js';
+import { resolveCandidate, disambiguationPayload } from './resolvers.js';
 import { resolveTimeWindow } from './call-notes-time.js';
 import { CALL_NOTES_GUIDANCE } from './call-notes-guidance.js';
 import { listDialpadCalls, DialpadHttpError } from '../dialpad-client.js';
@@ -84,12 +84,7 @@ async function handleListCalls({ env, body, consultant }) {
   const candRes = await resolveCandidate(env, body.candidate);
   if (!candRes.ok) {
     if (candRes.reason === 'ambiguous') {
-      return jsonResponse(200, {
-        needs_disambiguation: true,
-        kind: 'candidate',
-        options: candRes.options,
-        hint: candRes.hint,
-      });
+      return jsonResponse(200, disambiguationPayload(candRes));
     }
     return jsonResponse(200, {
       ok: false,

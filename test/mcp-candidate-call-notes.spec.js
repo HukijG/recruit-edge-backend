@@ -327,6 +327,8 @@ describe('/mcp/candidate-call-notes step=list_calls', () => {
     expect(b._meta?.warnings ?? []).toEqual(expect.arrayContaining([
       expect.stringMatching(/unrecognised time_query/i),
     ]));
+    expect(b.ok).toBe(false);
+    expect(b.kind).toBe('no_long_calls');
   });
 
   it('non-RF contact (numeric local id, no uid_RF substring) is dropped', async () => {
