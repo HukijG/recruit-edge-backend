@@ -22,6 +22,7 @@ export default defineWorkersConfig({
 						APOLLO_WEBHOOK_SECRET: 'test-apollo-webhook-secret',
 						ACCESS_TEAM_DOMAIN: 'https://test.cloudflareaccess.com',
 						ACCESS_AUD_MCP: 'a'.repeat(64),  // 64-char hex shape matches production Access AUD format
+						ACCESS_AUD_MIDDLEWARE: 'b'.repeat(64),  // distinct from ACCESS_AUD_MCP so audience-mismatch tests are not no-ops
 						INTERNAL_SECRET: 'test-internal-secret',
 						// LD_SDK_KEY intentionally omitted — its absence is the signal that src/index.js uses
 						// to skip the @microlabs `instrument()` wrap (and logs-bridge to skip its install). In

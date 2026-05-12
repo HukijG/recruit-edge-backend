@@ -18,7 +18,8 @@
     "DIALPAD_API_BASE_URL": "https://dialpad.com/api/v2",
     "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external",
     "LD_OTLP_TRACES_URL": "https://otel.observability.app.launchdarkly.com/v1/traces",
-    "LD_OTLP_LOGS_URL": "https://otel.observability.app.launchdarkly.com/v1/logs"
+    "LD_OTLP_LOGS_URL": "https://otel.observability.app.launchdarkly.com/v1/logs",
+    "ACCESS_TEAM_DOMAIN": "https://example-team.cloudflareaccess.com"
   },
   "rules": [
     { "type": "Text", "globs": ["**/*.md"], "fallthrough": false }
