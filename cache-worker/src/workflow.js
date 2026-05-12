@@ -20,7 +20,8 @@
  */
 
 import * as cfWorkers from 'cloudflare:workers';
-import { trace, SpanStatusCode } from '@opentelemetry/api';
+import { SpanStatusCode } from '@opentelemetry/api';
+import { getWorkflowTracer, flushWorkflowSpans } from './lib/bootstrap-otel.js';
 
 const { WorkflowEntrypoint } = cfWorkers;
 // `NonRetryableError` is only present on newer compatibility dates. The test
@@ -158,7 +159,7 @@ export async function runFullRebuild(env, step, instanceId, params = {}) {
 
 export class FullRebuildWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
-    const tracer = trace.getTracer('rf-mcp-cache-sync');
+    const tracer = getWorkflowTracer('rf-mcp-cache-sync', 'rf-mcp-cache-sync');
     return await tracer.startActiveSpan(
       'WorkflowFullRebuild',
       { attributes: { 'flow.name': FLOWS.WORKFLOW_FULL_REBUILD, 'workflow.id': event.instanceId } },
@@ -166,7 +167,7 @@ export class FullRebuildWorkflow extends WorkflowEntrypoint {
         try {
           return await runFullRebuild(
             this.env,
-            instrumentedStep(step, 'rf-mcp-cache-sync', event.instanceId),
+            instrumentedStep(step, tracer, event.instanceId),
             event.instanceId,
             event.payload ?? {},
           );
@@ -176,6 +177,7 @@ export class FullRebuildWorkflow extends WorkflowEntrypoint {
           throw err;
         } finally {
           span.end();
+          await flushWorkflowSpans();
         }
       }
     );
@@ -282,7 +284,7 @@ export async function runCacheSeed(env, step, instanceId, params = {}) {
 
 export class CacheSeedWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
-    const tracer = trace.getTracer('rf-mcp-cache-sync');
+    const tracer = getWorkflowTracer('rf-mcp-cache-sync', 'rf-mcp-cache-sync');
     return await tracer.startActiveSpan(
       'WorkflowCacheSeed',
       { attributes: { 'flow.name': FLOWS.WORKFLOW_CACHE_SEED, 'workflow.id': event.instanceId } },
@@ -290,7 +292,7 @@ export class CacheSeedWorkflow extends WorkflowEntrypoint {
         try {
           return await runCacheSeed(
             this.env,
-            instrumentedStep(step, 'rf-mcp-cache-sync', event.instanceId),
+            instrumentedStep(step, tracer, event.instanceId),
             event.instanceId,
             event.payload,
           );
@@ -300,6 +302,7 @@ export class CacheSeedWorkflow extends WorkflowEntrypoint {
           throw err;
         } finally {
           span.end();
+          await flushWorkflowSpans();
         }
       }
     );

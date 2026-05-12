@@ -1,7 +1,17 @@
-import { trace, SpanStatusCode } from '@opentelemetry/api';
+import { SpanStatusCode } from '@opentelemetry/api';
 
-export function instrumentedStep(step, tracerName, instanceId) {
-  const tracer = trace.getTracer(tracerName);
+/**
+ * Wraps a Workflow `step` API so each step.do / step.waitForEvent invocation
+ * emits its own child span on the supplied tracer. The tracer is passed in
+ * explicitly so Workflow callers can hand in their LOCAL Workflow tracer —
+ * see `lib/bootstrap-otel.js` for why Workflow contexts need a local
+ * TracerProvider instead of relying on the @opentelemetry/api global.
+ *
+ * @param {object} step       - Real Workflow step API (or test shim)
+ * @param {Tracer} tracer     - OTel Tracer instance — emit child spans on this
+ * @param {string} instanceId - Workflow instance id (for span attributes)
+ */
+export function instrumentedStep(step, tracer, instanceId) {
   return {
     do(name, configOrFn, maybeFn) {
       const hasConfig = typeof configOrFn !== 'function';

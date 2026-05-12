@@ -1,11 +1,9 @@
 import { env as workerEnv } from 'cloudflare:workers';
 import { installBodyCapture } from './lib/body-capture.js';
 import { installLogsBridge } from './lib/logs-bridge.js';
-import { bootstrapOtelForWorkflows } from './lib/bootstrap-otel.js';
 
 installBodyCapture();
 installLogsBridge('rf-mcp-cache-sync');
-bootstrapOtelForWorkflows('rf-mcp-cache-sync');
 
 import { instrument } from '@microlabs/otel-cf-workers';
 import { resolveOtelConfig } from './lib/otel-config.js';
@@ -527,9 +525,10 @@ const handler = {
 
 // `instrument()` is the production wiring. In environments where `LD_SDK_KEY` is
 // absent (e.g. the vitest harness — see vitest.config.js for why), we export the
-// raw handler so requests never touch the OTLP exporters. The lib `installLogsBridge`
-// and `bootstrapOtelForWorkflows` already self-skip on missing key; this mirrors
-// that semantic at the handler layer. Same pattern as main worker's src/index.js.
+// raw handler so requests never touch the OTLP exporters. `installLogsBridge`
+// and the Workflow tracer (see `lib/bootstrap-otel.js` — `getWorkflowTracer`)
+// already self-skip on missing key; this mirrors that semantic at the handler
+// layer. Same pattern as main worker's src/index.js.
 export default workerEnv.LD_SDK_KEY
   ? instrument(handler, resolveOtelConfig)
   : handler;

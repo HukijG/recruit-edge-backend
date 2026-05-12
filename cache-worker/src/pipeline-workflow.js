@@ -14,13 +14,14 @@
  */
 
 import * as cfWorkers from 'cloudflare:workers';
-import { trace, SpanStatusCode } from '@opentelemetry/api';
+import { SpanStatusCode } from '@opentelemetry/api';
 import * as rfClient from './rf-list-client.js';
 import { writeJobPipeline } from './d1-write.js';
 import { readSyncState, writeSyncState, deleteSyncState } from './sync-state.js';
 import { normalizePipelineDetail } from './pipeline-normalize.js';
 import { FLOWS } from './lib/flow-names.js';
 import { instrumentedStep } from './lib/instrumented-step.js';
+import { getWorkflowTracer, flushWorkflowSpans } from './lib/bootstrap-otel.js';
 
 const { WorkflowEntrypoint } = cfWorkers;
 // `NonRetryableError` is only present on newer compatibility dates. The test
@@ -85,7 +86,7 @@ export async function runPipelineRebuild(env, step, instanceId, params = {}) {
 
 export class PipelineRebuildWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
-    const tracer = trace.getTracer('rf-mcp-cache-sync');
+    const tracer = getWorkflowTracer('rf-mcp-cache-sync', 'rf-mcp-cache-sync');
     return await tracer.startActiveSpan(
       'WorkflowPipelineRebuild',
       { attributes: { 'flow.name': FLOWS.WORKFLOW_PIPELINE_REBUILD, 'workflow.id': event.instanceId } },
@@ -93,7 +94,7 @@ export class PipelineRebuildWorkflow extends WorkflowEntrypoint {
         try {
           return await runPipelineRebuild(
             this.env,
-            instrumentedStep(step, 'rf-mcp-cache-sync', event.instanceId),
+            instrumentedStep(step, tracer, event.instanceId),
             event.instanceId,
             event.payload ?? {},
           );
@@ -103,6 +104,7 @@ export class PipelineRebuildWorkflow extends WorkflowEntrypoint {
           throw err;
         } finally {
           span.end();
+          await flushWorkflowSpans();
         }
       }
     );

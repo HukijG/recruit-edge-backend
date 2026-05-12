@@ -10,8 +10,14 @@
 import { env } from 'cloudflare:test';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { applyMigration } from './helpers/migrate.js';
-import { runFullRebuild, runCacheSeed } from '../src/workflow.js';
+import {
+  runFullRebuild,
+  runCacheSeed,
+  FullRebuildWorkflow,
+  CacheSeedWorkflow,
+} from '../src/workflow.js';
 import * as rfClient from '../src/rf-list-client.js';
+import * as bootstrapOtel from '../src/lib/bootstrap-otel.js';
 import { readSyncState, writeSyncState } from '../src/sync-state.js';
 
 const stepShim = {
@@ -428,5 +434,69 @@ describe('runCacheSeed (validation)', () => {
   it('rejects missing table param', async () => {
     await expect(runCacheSeed(env, stepShim, 'id', {}))
       .rejects.toThrow(/table/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workflow class `run()` body — verifies `flushWorkflowSpans` is awaited in
+// the `finally` block after run() completes. Workflow contexts have no
+// `ctx.waitUntil`, and the BatchSpanProcessor's scheduled flush will not fire
+// before the run context tears down — without an explicit forced flush at
+// end of run, spans buffered locally during the Workflow body never reach
+// LaunchDarkly. The bootstrap-otel module exposes the local provider; this
+// test mocks `flushWorkflowSpans` and verifies the call.
+//
+// We bypass the WorkflowEntrypoint constructor (which has strict runtime
+// requirements) and invoke `run.call(fakeThis, ...)` directly with a step
+// shim — same shim form used in the existing runFullRebuild / runCacheSeed
+// tests above.
+// ---------------------------------------------------------------------------
+
+describe('Workflow class — flushWorkflowSpans on completion', () => {
+  beforeEach(async () => {
+    await applyMigration(env.RF_MCP_CACHE);
+  });
+
+  it('FullRebuildWorkflow.run awaits flushWorkflowSpans after successful body', async () => {
+    const flushSpy = vi.spyOn(bootstrapOtel, 'flushWorkflowSpans').mockResolvedValue();
+    vi.spyOn(rfClient, 'fetchCandidateListPage').mockResolvedValueOnce({ rows: [], total: null });
+    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchUsers').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchActivityTypes').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchCustomFieldSchema').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchJobPipeline').mockResolvedValue({ summary: [], detail: [] });
+
+    const fakeThis = { env };
+    await FullRebuildWorkflow.prototype.run.call(fakeThis, { instanceId: 'inst-1', payload: {} }, stepShim);
+
+    expect(flushSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('FullRebuildWorkflow.run awaits flushWorkflowSpans even on failure path', async () => {
+    const flushSpy = vi.spyOn(bootstrapOtel, 'flushWorkflowSpans').mockResolvedValue();
+    vi.spyOn(rfClient, 'fetchCandidateListPage').mockResolvedValueOnce({ rows: [], total: null });
+    vi.spyOn(rfClient, 'fetchAllJobs').mockRejectedValue(new Error('boom-flush-test'));
+
+    const fakeThis = { env };
+    await expect(
+      FullRebuildWorkflow.prototype.run.call(fakeThis, { instanceId: 'inst-2', payload: {} }, stepShim),
+    ).rejects.toThrow('boom-flush-test');
+
+    expect(flushSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('CacheSeedWorkflow.run awaits flushWorkflowSpans after successful body', async () => {
+    const flushSpy = vi.spyOn(bootstrapOtel, 'flushWorkflowSpans').mockResolvedValue();
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true, status: 200, headers: new Map(), text: async () => '',
+      json: async () => [],
+    }));
+    const fakeThis = { env };
+    await CacheSeedWorkflow.prototype.run.call(
+      fakeThis,
+      { instanceId: 'seed-1', payload: { table: 'candidates' } },
+      stepShim,
+    );
+    expect(flushSpy).toHaveBeenCalledTimes(1);
   });
 });

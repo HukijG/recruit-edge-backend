@@ -8,12 +8,18 @@ const span = {
 };
 const startActiveSpanMock = vi.fn(async (name, opts, fn) => fn(span));
 
+// SpanStatusCode is still imported from @opentelemetry/api for the ERROR status
+// path; the tracer itself is now passed in directly (not resolved via
+// trace.getTracer). Mock only SpanStatusCode here.
 vi.mock('@opentelemetry/api', () => ({
-  trace: { getTracer: () => ({ startActiveSpan: startActiveSpanMock }) },
   SpanStatusCode: { OK: 1, ERROR: 2 },
 }));
 
 import { instrumentedStep } from '../../src/lib/instrumented-step.js';
+
+function makeTracer() {
+  return { startActiveSpan: startActiveSpanMock };
+}
 
 describe('instrumentedStep', () => {
   it('wraps step.do(name, fn) form and emits a child span', async () => {
@@ -23,7 +29,7 @@ describe('instrumentedStep', () => {
       sleep: vi.fn(),
       sleepUntil: vi.fn(),
     };
-    const wrapped = instrumentedStep(stepInner, 'tracer', 'instance-123');
+    const wrapped = instrumentedStep(stepInner, makeTracer(), 'instance-123');
     await wrapped.do('fetch-data', async () => 'ok');
     expect(startActiveSpanMock).toHaveBeenCalled();
     const [name, opts] = startActiveSpanMock.mock.calls[0];
@@ -36,7 +42,7 @@ describe('instrumentedStep', () => {
   it('wraps step.do(name, config, fn) form', async () => {
     startActiveSpanMock.mockClear();
     const stepInner = { do: vi.fn(async (name, config, fn) => fn()) };
-    const wrapped = instrumentedStep(stepInner, 'tracer', 'inst');
+    const wrapped = instrumentedStep(stepInner, makeTracer(), 'inst');
     const config = { retries: { limit: 3, delay: '5 seconds' } };
     await wrapped.do('fetch-data', config, async () => 'ok');
     expect(startActiveSpanMock).toHaveBeenCalled();
@@ -46,7 +52,7 @@ describe('instrumentedStep', () => {
   it('records exceptions on the step span', async () => {
     span.recordException.mockClear();
     const stepInner = { do: vi.fn(async (name, fn) => fn()) };
-    const wrapped = instrumentedStep(stepInner, 'tracer', 'inst');
+    const wrapped = instrumentedStep(stepInner, makeTracer(), 'inst');
     await expect(wrapped.do('failing', async () => { throw new Error('boom'); })).rejects.toThrow('boom');
     expect(span.recordException).toHaveBeenCalled();
   });
@@ -57,7 +63,7 @@ describe('instrumentedStep', () => {
       sleep: vi.fn(async () => 'slept'),
       sleepUntil: vi.fn(async () => 'slept-until'),
     };
-    const wrapped = instrumentedStep(stepInner, 'tracer', 'inst');
+    const wrapped = instrumentedStep(stepInner, makeTracer(), 'inst');
     await wrapped.sleep('pause', '5 seconds');
     expect(stepInner.sleep).toHaveBeenCalledWith('pause', '5 seconds');
     await wrapped.sleepUntil('wait', new Date(0));
@@ -72,7 +78,7 @@ describe('instrumentedStep', () => {
       sleepUntil: vi.fn(),
       waitForEvent: vi.fn(async () => ({ approved: true })),
     };
-    const wrapped = instrumentedStep(stepInner, 'tracer', 'inst-1');
+    const wrapped = instrumentedStep(stepInner, makeTracer(), 'inst-1');
     await wrapped.waitForEvent('await-approval', { type: 'manager-approval', timeout: '24 hours' });
     expect(startActiveSpanMock).toHaveBeenCalled();
     const [name, opts] = startActiveSpanMock.mock.calls.at(-1);
