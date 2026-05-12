@@ -11,7 +11,7 @@ beforeAll(async () => {
   // Phantom-resolution guard: vite's resolver will silently fall back to the
   // main worker's `src/access-auth.js` (one dir up) if this file disappears.
   // Asserting the sentinel makes that failure mode loud instead of silent.
-  expect(_MODULE_ID).toBe("mcp-worker/access-auth");
+  expect(_MODULE_ID).toBe("mcp-remote/access-auth");
 
   ({ makeJwt, publicJwk } = await setupJwtFixture());
 });
@@ -20,7 +20,7 @@ function reqWith(headers: Record<string, string>): Request {
   return new Request("http://x/mcp", { method: "POST", headers });
 }
 
-describe("verifyAccessJwt (mcp-worker)", () => {
+describe("verifyAccessJwt (mcp-remote)", () => {
   it("returns null when no header is present", async () => {
     const claims = await verifyAccessJwt(reqWith({}), env, env.ACCESS_AUD_MCP);
     expect(claims).toBeNull();

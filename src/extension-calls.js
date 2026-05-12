@@ -62,7 +62,7 @@ export async function processExtensionCallEvent(payload, env, ctx) {
   }
 
   if (TERMINAL_STATES.has(eventState)) {
-    // Forward to sync-worker for the calls cache.
+    // Forward to cache-worker for the calls cache.
     // ctx.waitUntil registers the async work with the Workers runtime so it
     // isn't cancelled when the webhook handler returns. Failures are logged
     // in the forwarder; cron backfill (Task 7's tailSyncCallsThin) catches

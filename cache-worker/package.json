@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --config wrangler.sync.jsonc",
-    "deploy": "wrangler deploy --config wrangler.sync.jsonc",
-    "migrate:local": "wrangler d1 migrations apply rf-mcp-cache --local --config wrangler.sync.jsonc",
-    "migrate:remote": "wrangler d1 migrations apply rf-mcp-cache --remote --config wrangler.sync.jsonc",
+    "dev": "wrangler dev --config wrangler.cache.jsonc",
+    "deploy": "wrangler deploy --config wrangler.cache.jsonc",
+    "migrate:local": "wrangler d1 migrations apply rf-mcp-cache --local --config wrangler.cache.jsonc",
+    "migrate:remote": "wrangler d1 migrations apply rf-mcp-cache --remote --config wrangler.cache.jsonc",
     "test": "vitest run"
   },
   "devDependencies": {

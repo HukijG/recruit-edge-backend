@@ -4,7 +4,7 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
 	plugins: [
 		cloudflareTest({
-			wrangler: { configPath: './wrangler.sync.jsonc' },
+			wrangler: { configPath: './wrangler.cache.jsonc' },
 			// Required: workflow bindings are incompatible with isolatedStorage.
 			// (vitest-pool-workers throws if both are set.) Tests share one D1
 			// instance and rely on applyMigration() in beforeEach to reset state.

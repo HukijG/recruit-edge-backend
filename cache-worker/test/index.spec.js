@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import worker, { tailSync, tailSyncThin } from '../src/sync-worker.js';
+import worker, { tailSync, tailSyncThin } from '../src/index.js';
 import * as rfClient from '../src/rf-list-client.js';
 import { readSyncState, writeSyncState } from '../src/sync-state.js';
 import { applyMigration } from './helpers/migrate.js';

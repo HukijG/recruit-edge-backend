@@ -581,10 +581,10 @@ describe('/dialpad-hangup', () => {
 });
 
 // ---------------------------------------------------------------------------
-// processExtensionCallEvent — hangup forwards to sync-worker
+// processExtensionCallEvent — hangup forwards to cache-worker
 // ---------------------------------------------------------------------------
 
-describe('processExtensionCallEvent — hangup forwards to sync-worker', () => {
+describe('processExtensionCallEvent — hangup forwards to cache-worker', () => {
   // Use the real cloudflare:test env (has EXT_CALL_STATE DO, SYNC_STATE KV,
   // USERS_DB D1) and augment it with a mocked SYNC_WORKER binding so we can
   // assert on the POST without a real service binding.
@@ -713,7 +713,7 @@ describe('processExtensionCallEvent — hangup forwards to sync-worker', () => {
     warnSpy.mockRestore();
   });
 
-  it('logs warning when sync-worker returns 401', async () => {
+  it('logs warning when cache-worker returns 401', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     syncFetch.mockResolvedValueOnce(new Response('{"ok":false,"error":"auth"}', { status: 401 }));
     await processExtensionCallEvent({
@@ -729,7 +729,7 @@ describe('processExtensionCallEvent — hangup forwards to sync-worker', () => {
     warnSpy.mockRestore();
   });
 
-  it('caps logged sync-worker error body at 200 chars (PII defence-in-depth)', async () => {
+  it('caps logged cache-worker error body at 200 chars (PII defence-in-depth)', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     // Build a 1000-char error body that, if a future receiver echoed payload
     // fields, would be the kind of thing we want truncated.

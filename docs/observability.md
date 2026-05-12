@@ -19,7 +19,7 @@ Every Cloudflare worker in this repo emits OpenTelemetry traces and logs to Laun
    │ /v1/logs         │ /v1/logs         │ /v1/logs                │ /v1/traces, /v1/logs
    │                  │                  │                         │
 ┌──┴──────────────┐ ┌─┴────────────────┐ ┌┴───────────────────┐ ┌─┴──────────────────┐
-│  main worker     │ │  sync-worker     │ │  mcp-worker        │ │  metrics-poller    │
+│  main worker     │ │  cache-worker     │ │  mcp-remote        │ │  metrics-poller    │
 │  rf-dialpad-     │ │  rf-mcp-cache-   │ │  rf-mcp-remote     │ │  rf-cf-metrics-    │
 │  sync-dev        │ │  sync            │ │                    │ │  poller            │
 │                  │ │                  │ │                    │ │                    │
@@ -66,7 +66,7 @@ The consequence: **LaunchDarkly is the PII custodian** for candidate names, emai
 
 **Acceptable defense-in-depth hygiene** is wired up and tested:
 
-- **Auth header redaction is automatic.** `Authorization` and `Cookie` headers are never captured into span attributes. The header-allowlist code is in `src/lib/body-capture.js` (plus byte-identical copies in `sync-worker/`, `mcp-worker/`, `metrics-poller/`).
+- **Auth header redaction is automatic.** `Authorization` and `Cookie` headers are never captured into span attributes. The header-allowlist code is in `src/lib/body-capture.js` (plus byte-identical copies in `cache-worker/`, `mcp-remote/`, `metrics-poller/`).
 - **Body-field redaction.** Keys matching the regex `password|secret|token|api_key|apikey|client_secret|private_key` are replaced with `[REDACTED]` in captured JSON request and response bodies. Nested objects are walked recursively.
 - **URL query-parameter redaction.** Parameters matching the regex `secret|token|api[_-]?key|apikey|email|linkedin|phone|attendee_email|attendee_phone` get their value replaced with `[REDACTED]` in both `url.full` and `url.query` span attributes. This is a widened set added in the post-merge fix pass — it covers calendar-webhook query strings as well as legacy `?email=…` style RF callback URLs.
 - **Two runtime kill switches**, both via Cloudflare secrets, no redeploy required:
@@ -89,19 +89,19 @@ Every worker's entry module installs in this exact order at module top, **before
 
 **Ordering invariant.** Body capture must wrap the real `globalThis.fetch` **before** `@microlabs`' `instrument()` proxy wraps it. Otherwise `installBodyCapture()` would wrap the @microlabs proxy, and the body-stamping path would run inside the wrong span scope. The "install body capture → install logs bridge → instrument" sequence at the top of every worker's entry module enforces this. See `vendor/otel-cf-workers/VENDOR.md` for the @microlabs internal details.
 
-**Sync worker addition.** The sync worker additionally calls `bootstrapOtelForWorkflows('rf-mcp-cache-sync')` at module load. Cloudflare Workflow runs do not go through the same `instrument()` wrap as fetch handlers — their `run()` lifecycle is invoked by the platform outside the fetch entry. `bootstrap-otel.js` registers a global `TracerProvider` at module load so the Workflow body has something to call `trace.getTracer(...)` against.
+**Cache worker addition.** The cache worker additionally calls `bootstrapOtelForWorkflows('rf-mcp-cache-sync')` at module load. Cloudflare Workflow runs do not go through the same `instrument()` wrap as fetch handlers — their `run()` lifecycle is invoked by the platform outside the fetch entry. `bootstrap-otel.js` registers a global `TracerProvider` at module load so the Workflow body has something to call `trace.getTracer(...)` against.
 
 **File pointers per worker:**
 - main: `src/index.js` (top of file)
-- sync: `sync-worker/src/sync-worker.js` (top of file)
-- mcp: `mcp-worker/src/index.ts` (top of file)
+- sync: `cache-worker/src/index.js` (top of file)
+- mcp: `mcp-remote/src/index.ts` (top of file)
 - poller: `metrics-poller/src/index.ts` (top of file)
 
 ## Helpers reference
 
 Every worker has a byte-identical `lib/` directory with the five core helpers (plus per-worker additions). Edit one copy and copy across; the closed-set drift tests guard against silent divergence.
 
-- **`flow-names`** — `src/lib/flow-names.js` + `sync-worker/src/lib/flow-names.js` + `mcp-worker/src/lib/flow-names.ts` + `metrics-poller/src/lib/flow-names.ts`. Closed-set frozen enum of every entry-handler label used by the worker. Usage: `import { FLOWS } from './lib/flow-names'; trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.MY_HANDLER);`. Each worker has a sibling `test/lib/flow-names.spec.{js,ts}` that asserts the set is closed + frozen — any silent drift fails CI.
+- **`flow-names`** — `src/lib/flow-names.js` + `cache-worker/src/lib/flow-names.js` + `mcp-remote/src/lib/flow-names.ts` + `metrics-poller/src/lib/flow-names.ts`. Closed-set frozen enum of every entry-handler label used by the worker. Usage: `import { FLOWS } from './lib/flow-names'; trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.MY_HANDLER);`. Each worker has a sibling `test/lib/flow-names.spec.{js,ts}` that asserts the set is closed + frozen — any silent drift fails CI.
 
 - **`otel-config` (`resolveOtelConfig`)** — `src/lib/otel-config.js` + 3 sibling copies. Assembles the @microlabs `TraceConfig`: exporter URL (`env.LD_OTLP_TRACES_URL` || the LD default), service name, `launchdarkly.project_id` resource attribute, head sampler ratio 1.0 with `acceptRemote: true`, tail sampler `[isHeadSampled, isRootErrorSpan]`, and the `postProcessor` that injects the LD resource attribute and PII URL redaction. Throws if `env.LD_SDK_KEY` is missing.
 
@@ -115,9 +115,9 @@ Every worker has a byte-identical `lib/` directory with the five core helpers (p
 
 - **`trace-link`** — `src/lib/trace-link.js` (main + sync). `makeAsyncCallbackUrl(baseUrl, extraParams)` (kickoff side) appends an `_otel_trace` query param containing the active trace's `traceparent`-shaped fingerprint. `readInboundTraceLink(request)` (receiving side) parses that param back into a `SpanContext` you can attach via `addLink({ context })` on the receiving span. Used for async webhook-callback patterns — the canonical site is Apollo enrichment kickoff + completion webhook.
 
-- **`instrumented-step`** — `sync-worker/src/lib/instrumented-step.js` (sync worker only). `instrumentedStep(step, tracerName, instanceId)` returns a wrapped `step` object whose `do(...)` invocations are surrounded by a per-attempt span (so Workflow retries are individually visible under the outer Workflow span). The wrapper is pure observability — it preserves `step.do` idempotency semantics by re-entering the closure on retries, which gets each attempt its own child span. Each Workflow class uses this throughout its `run()` body.
+- **`instrumented-step`** — `cache-worker/src/lib/instrumented-step.js` (cache worker only). `instrumentedStep(step, tracerName, instanceId)` returns a wrapped `step` object whose `do(...)` invocations are surrounded by a per-attempt span (so Workflow retries are individually visible under the outer Workflow span). The wrapper is pure observability — it preserves `step.do` idempotency semantics by re-entering the closure on retries, which gets each attempt its own child span. Each Workflow class uses this throughout its `run()` body.
 
-- **`bootstrap-otel`** — `sync-worker/src/lib/bootstrap-otel.js` (sync worker only). Registers a global `TracerProvider` at module load so Workflow `run()` bodies have something to `trace.getTracer(...)` against. Cloudflare invokes Workflow runs outside the fetch handler entry, so the `instrument()` wrap on the default export doesn't cover them.
+- **`bootstrap-otel`** — `cache-worker/src/lib/bootstrap-otel.js` (cache worker only). Registers a global `TracerProvider` at module load so Workflow `run()` bodies have something to `trace.getTracer(...)` against. Cloudflare invokes Workflow runs outside the fetch handler entry, so the `instrument()` wrap on the default export doesn't cover them.
 
 ## Adding a new entry handler
 
@@ -169,9 +169,9 @@ Use `runAI(env, modelName, input, options?)` from `src/lib/ai-instrument.js`. Di
 
 1. Wrap the `run(event, step)` body in `tracer.startActiveSpan('Workflow<Name>', { attributes: { 'flow.name': FLOWS.WORKFLOW_X, 'workflow.id': event.instanceId } }, async (span) => { ... });`.
 2. Wrap the `step` parameter via `instrumentedStep(step, '<service-name>', event.instanceId)` and use the wrapped version throughout the body (so retries become individually visible).
-3. Add the corresponding `FLOWS.WORKFLOW_X` constant to `sync-worker/src/lib/flow-names.js` and update its closed-set test.
+3. Add the corresponding `FLOWS.WORKFLOW_X` constant to `cache-worker/src/lib/flow-names.js` and update its closed-set test.
 
-The sync worker's `bootstrap-otel.js` is called once at module load — you do not need to add a per-Workflow bootstrap.
+The cache worker's `bootstrap-otel.js` is called once at module load — you do not need to add a per-Workflow bootstrap.
 
 ## Sampling, kill switches, cost
 
@@ -219,7 +219,7 @@ Dashboards are LD-UI configured (not in code). The handover at `docs/handovers/2
 
 - **Traces present but no `flow.name`.** The handler didn't set the attribute. Grep for the route in `src/index.js` (or the equivalent in the affected worker), confirm `trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.X);` is at the top of the handler body, **before** any branching or early return.
 
-- **Workflow traces missing.** Confirm `bootstrapOtelForWorkflows()` runs at module top in `sync-worker/src/sync-worker.js`. Without it, the Workflow `run()` body has no global `TracerProvider` registered and every `trace.getTracer(...).startActiveSpan(...)` call is a no-op (returns the API's default no-op span).
+- **Workflow traces missing.** Confirm `bootstrapOtelForWorkflows()` runs at module top in `cache-worker/src/index.js`. Without it, the Workflow `run()` body has no global `TracerProvider` registered and every `trace.getTracer(...).startActiveSpan(...)` call is a no-op (returns the API's default no-op span).
 
 - **`http.response.body` missing on a fetch span.** Check `LOG_NO_BODY` / `OTEL_DISABLED` env vars (if either is set, body content is suppressed). Check the response `content-type` — non-text/JSON content-types (binary, images) are skipped. Check the response size — if `…[truncated, original >${MAX_BODY_BYTES} bytes]` appears at the end of `http.response.body`, the body was oversized and truncated.
 

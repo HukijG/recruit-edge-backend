@@ -230,7 +230,7 @@ async function handleGetTranscript({ env, body, consultant }) {
     return jsonResponse(200, {
       ok: false,
       kind: 'no_candidate',
-      error: 'Linked RF candidate not in the cache; ask the sync worker to rebuild.',
+      error: 'Linked RF candidate not in the cache; ask the cache worker to rebuild.',
     });
   }
 

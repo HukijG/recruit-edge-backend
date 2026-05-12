@@ -1,10 +1,10 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "rf-mcp-cache-sync",
-  "main": "src/sync-worker.js",
+  "main": "src/index.js",
   "compatibility_date": "2026-05-04",
   "compatibility_flags": ["nodejs_compat"],
-  // Disable the default workers.dev subdomain — sync-worker is reachable only via
+  // Disable the default workers.dev subdomain — cache-worker is reachable only via
   // service binding (from main worker) and cron triggers. This closes off the
   // https://rf-mcp-cache-sync.<account>.workers.dev/* public surface.
   "workers_dev": false,

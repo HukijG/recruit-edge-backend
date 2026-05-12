@@ -7,9 +7,9 @@
  * Joel-only logic, extension consultantFirstName resolution, MCP
  * consultantEmail resolution) read from here.
  *
- * `USERS_DB` is owned by the MAIN worker — it is NOT the sync-worker's
+ * `USERS_DB` is owned by the MAIN worker — it is NOT the cache-worker's
  * `RF_MCP_CACHE` D1 (which holds candidates/jobs and follows the "only the
- * sync worker writes D1" invariant). USERS_DB writes happen through migrations
+ * cache worker writes D1" invariant). USERS_DB writes happen through migrations
  * applied by the operator; this module never writes.
  *
  * Identity records are keyed by lowercase email (the `email` PK column has a

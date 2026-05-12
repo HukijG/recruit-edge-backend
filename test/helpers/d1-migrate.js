@@ -2,18 +2,18 @@
  * Test helper: apply the D1 schema to the main worker's test DB.
  *
  * The main worker doesn't ship its own migrations — it shares the cache
- * schema with sync-worker, which is the sole writer.  Importing the SQL via
+ * schema with cache-worker, which is the sole writer.  Importing the SQL via
  * Vite's `?raw` query keeps the FS read at bundle time so the test runs
  * inside the Workers sandbox without needing node:fs at runtime.
  *
- * Mirrors `sync-worker/test/helpers/migrate.js`, but takes the worker `env`
+ * Mirrors `cache-worker/test/helpers/migrate.js`, but takes the worker `env`
  * (rather than a raw D1 handle) so call-sites read naturally as
  * `await applyMigration(env)`.
  */
 
-import init from '../../sync-worker/migrations/0001_init.sql?raw';
-import jobPipelines from '../../sync-worker/migrations/0002_job_pipelines.sql?raw';
-import v2Tables from '../../sync-worker/migrations/0003_v2_tables.sql?raw';
+import init from '../../cache-worker/migrations/0001_init.sql?raw';
+import jobPipelines from '../../cache-worker/migrations/0002_job_pipelines.sql?raw';
+import v2Tables from '../../cache-worker/migrations/0003_v2_tables.sql?raw';
 
 const SCHEMA = [init, jobPipelines, v2Tables].join('\n');
 

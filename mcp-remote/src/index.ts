@@ -77,7 +77,7 @@ const handler = {
 // absent (e.g. the vitest harness), we export the raw handler so requests never
 // touch the OTLP exporters. The lib `installLogsBridge` already self-skips on
 // missing key; this mirrors that semantic at the handler layer. Same pattern as
-// main + sync workers.
+// main + cache workers.
 //
 // `as typeof handler` retains the literal handler type for downstream consumers
 // (tests import worker.fetch and call it with a DOM Request — the widened

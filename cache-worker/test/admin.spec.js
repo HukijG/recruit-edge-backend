@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { env } from 'cloudflare:test';
-import worker from '../src/sync-worker.js';
+import worker from '../src/index.js';
 
 const ADMIN_SECRET = 'test-admin-secret';
 

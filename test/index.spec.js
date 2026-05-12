@@ -25,7 +25,7 @@ beforeEach(async () => {
 // rather than module-hardcoded — see src/rf-client.js / src/enrichment.js).
 const JOEL_RF_USER_ID = 900001;
 
-describe('RF-Dialpad Sync Worker', () => {
+describe('Main worker (rf-dialpad-sync-dev)', () => {
 	it('/health returns 200 with status message', async () => {
 		const request = new Request('http://example.com/health');
 		const ctx = createExecutionContext();

@@ -78,7 +78,7 @@ const HYDRATION_CONCURRENCY = 8;
  * field that forces the fan-out, or call `rf_candidate_get` per id.
  *
  * Keep in sync with `candidates_v2` columns in
- * `sync-worker/migrations/0003_v2_tables.sql`.
+ * `cache-worker/migrations/0003_v2_tables.sql`.
  */
 const THIN_FIELDS = new Set([
   'id',

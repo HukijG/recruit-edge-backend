@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import worker from '../src/sync-worker.js';
+import worker from '../src/index.js';
 import { applyMigration } from './helpers/migrate.js';
 
 beforeEach(async () => {

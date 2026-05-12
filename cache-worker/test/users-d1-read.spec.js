@@ -3,7 +3,7 @@ import { env } from 'cloudflare:test';
 import { listConsultants } from '../src/users-d1-read.js';
 
 beforeAll(async () => {
-  // Create the users table (no migrations_dir on sync-worker side; main worker owns schema).
+  // Create the users table (no migrations_dir on cache-worker side; main worker owns schema).
   // Use prepare().run() — exec() has quirks with multi-line statements in this harness
   // (mirrors the approach in test/helpers/migrate.js).
   await env.USERS_DB.prepare(

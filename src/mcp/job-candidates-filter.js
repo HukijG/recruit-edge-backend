@@ -73,7 +73,7 @@ const HYDRATION_CONCURRENCY = 8;
  * `rf_job_candidates_filter` descriptor.
  *
  * Keep in sync with `candidates_v2` columns in
- * `sync-worker/migrations/0003_v2_tables.sql`.
+ * `cache-worker/migrations/0003_v2_tables.sql`.
  */
 const THIN_FIELDS = new Set([
   'id',

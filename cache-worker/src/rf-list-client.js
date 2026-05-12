@@ -1,5 +1,5 @@
 /**
- * RecruiterFlow read-only list client (sync-worker side).
+ * RecruiterFlow read-only list client (cache-worker side).
  *
  * Pure-fetch wrapper around the small set of RF endpoints the tail-sync and
  * rebuild paths need. No caching, no retries, no SDK — that lives in the main

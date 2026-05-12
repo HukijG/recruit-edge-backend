@@ -19,7 +19,7 @@ async function readVersion(db) {
   if (row?.value) return row.value;
   // TODO(task-30): remove this legacy-cursor fallback once cutover step 6 + Task 30
   // drop the legacy code paths. Until then, this fallback prevents a snapshot black-hole
-  // during the dual-write rollout window (between sync-worker dual-write deploy and the
+  // during the dual-write rollout window (between cache-worker dual-write deploy and the
   // new cron's first run).
   const legacy = await db
     .prepare("SELECT value FROM sync_state WHERE key = 'last_tail_sync_at'")
@@ -43,7 +43,7 @@ async function loadRows(db) {
 export async function getSnapshot(env) {
   // One D1 Sessions handle per refresh: the version-cursor read and the row
   // load share the same bookmark so we get read-after-write consistency
-  // against the sync-worker's latest commit.
+  // against the cache-worker's latest commit.
   const db = session(env);
   const version = await readVersion(db);
   const cached = G[KEY];

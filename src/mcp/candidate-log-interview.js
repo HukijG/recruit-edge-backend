@@ -27,14 +27,14 @@ import { pMapLimit } from './concurrency.js';
 
 const DEFAULT_DURATION_MIN = 60;
 const HYDRATION_CONCURRENCY = 8;
-// Fallback only — used if the sync-worker hasn't yet populated
+// Fallback only — used if the cache-worker hasn't yet populated
 // `sync_state.activity_types` (e.g. before the first full rebuild).
 const ACTIVITY_TYPE_INTERVIEW_FALLBACK = 1003;
 
 /**
  * Resolve the RF activity-type id whose name matches "interview" (case-
  * insensitive) from the cached `sync_state.activity_types`. The cache is
- * populated by the sync-worker's full-rebuild flow as a JSON-encoded
+ * populated by the cache-worker's full-rebuild flow as a JSON-encoded
  * `[{id,name},...]`. Falls back to the legacy hardcoded id if the cache
  * isn't available yet.
  */

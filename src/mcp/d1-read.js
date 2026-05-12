@@ -1,7 +1,7 @@
 /**
  * D1 read helpers for the MCP middleware surface.
  *
- * The sync-worker is the sole writer to the rf-mcp-cache D1 database; this
+ * The cache-worker is the sole writer to the rf-mcp-cache D1 database; this
  * worker is read-only.  All reads are wrapped in a Sessions-API session so
  * D1 can route to the closest replica while preserving read-your-writes
  * semantics for callers that thread a bookmark through.

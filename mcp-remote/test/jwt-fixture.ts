@@ -1,5 +1,5 @@
 /**
- * Shared JWT-minting fixture for mcp-worker tests.
+ * Shared JWT-minting fixture for mcp-remote tests.
  *
  * Call `setupJwtFixture()` in a `beforeAll` block. It generates an RSA key pair,
  * injects the public key into `access-auth.ts` via `_setJwksForTests`, and returns

@@ -6,7 +6,7 @@ describe('FLOWS (mcp)', () => {
     expect(Object.isFrozen(FLOWS)).toBe(true);
   });
 
-  it('contains the closed set of mcp-worker flow keys', () => {
+  it('contains the closed set of mcp-remote flow keys', () => {
     expect(Object.keys(FLOWS).sort()).toEqual(['MCP_HEALTH', 'MCP_POST'].sort());
     expect(FLOWS.MCP_HEALTH).toBe('MCP/Health');
     expect(FLOWS.MCP_POST).toBe('MCP/Post');

@@ -10,7 +10,7 @@ Each alert in `#rf-alerts` is paired with a short runbook of what to check and h
 
 ## Alert 1: D1 write storm (>5000 writes/min)
 
-**What it means:** Some path is writing > 5k rows/min to D1. Normal traffic peaks ~500/min. Likely candidates: a re-enabled sync-worker cron without unchanged-row gating, or a runaway loop in main worker.
+**What it means:** Some path is writing > 5k rows/min to D1. Normal traffic peaks ~500/min. Likely candidates: a re-enabled cache-worker cron without unchanged-row gating, or a runaway loop in main worker.
 
 **First checks:**
 1. LD Dashboard 2 → D1 writes/min panel. Which database (`RF_MCP_CACHE` or `USERS_DB`)?
@@ -45,10 +45,10 @@ Each alert in `#rf-alerts` is paired with a short runbook of what to check and h
 2. Upgrade LD plan (overage $1.50/M).
 3. Trim a noisy `flow.name`'s sampling specifically.
 
-## Alert 5: Sync-worker cron unexpectedly fired
+## Alert 5: Cache-worker cron unexpectedly fired
 
 **Action:**
-1. Disable cron immediately in `sync-worker/wrangler.sync.jsonc` (remove cron trigger). Deploy.
+1. Disable cron immediately in `cache-worker/wrangler.cache.jsonc` (remove cron trigger). Deploy.
 2. Verify alert stops firing.
 3. Coordinate with the unchanged-row-gating work before re-enabling.
 
@@ -70,7 +70,7 @@ Each alert in `#rf-alerts` is paired with a short runbook of what to check and h
 - If cron deregistered, `wrangler deploy --config metrics-poller/wrangler.metrics.jsonc` re-registers it from the config.
 - If persistent and you want to force a tick to confirm fix, trigger a manual run via `wrangler dispatch` against the poller worker.
 
-## Alert 7: Sync-worker Workflow stuck (open > 1h without completion span)
+## Alert 7: Cache-worker Workflow stuck (open > 1h without completion span)
 
 **What it means:** A `FullRebuildWorkflow` or `PipelineRebuildWorkflow` instance has been running for over an hour without a corresponding completion / error span on the same `workflow.id`. Either the Workflow is hung, has been retrying indefinitely, or its completion span never emitted.
 
@@ -93,10 +93,10 @@ If body capture is leaking sensitive data through a flow that's actively being d
 ```bash
 # Main worker
 wrangler secret put LOG_NO_BODY                                              # paste: 1
-# Sync worker
-wrangler secret put LOG_NO_BODY --config sync-worker/wrangler.sync.jsonc     # paste: 1
+# Cache worker
+wrangler secret put LOG_NO_BODY --config cache-worker/wrangler.cache.jsonc     # paste: 1
 # MCP worker
-wrangler secret put LOG_NO_BODY --config mcp-worker/wrangler.mcp.jsonc       # paste: 1
+wrangler secret put LOG_NO_BODY --config mcp-remote/wrangler.mcp.jsonc       # paste: 1
 # Metrics-poller
 wrangler secret put LOG_NO_BODY --config metrics-poller/wrangler.metrics.jsonc # paste: 1
 ```
@@ -106,8 +106,8 @@ The body-capture wrapper checks `env.LOG_NO_BODY === '1'` on every invocation an
 To re-enable body capture:
 ```bash
 wrangler secret delete LOG_NO_BODY
-wrangler secret delete LOG_NO_BODY --config sync-worker/wrangler.sync.jsonc
-wrangler secret delete LOG_NO_BODY --config mcp-worker/wrangler.mcp.jsonc
+wrangler secret delete LOG_NO_BODY --config cache-worker/wrangler.cache.jsonc
+wrangler secret delete LOG_NO_BODY --config mcp-remote/wrangler.mcp.jsonc
 wrangler secret delete LOG_NO_BODY --config metrics-poller/wrangler.metrics.jsonc
 ```
 
@@ -127,10 +127,10 @@ The wholesale emergency lever. Use this when:
 ```bash
 # Main worker
 wrangler secret put OTEL_DISABLED                                              # paste: 1
-# Sync worker
-wrangler secret put OTEL_DISABLED --config sync-worker/wrangler.sync.jsonc     # paste: 1
+# Cache worker
+wrangler secret put OTEL_DISABLED --config cache-worker/wrangler.cache.jsonc     # paste: 1
 # MCP worker
-wrangler secret put OTEL_DISABLED --config mcp-worker/wrangler.mcp.jsonc       # paste: 1
+wrangler secret put OTEL_DISABLED --config mcp-remote/wrangler.mcp.jsonc       # paste: 1
 # Metrics-poller
 wrangler secret put OTEL_DISABLED --config metrics-poller/wrangler.metrics.jsonc # paste: 1
 ```

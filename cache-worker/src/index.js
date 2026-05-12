@@ -138,7 +138,7 @@ async function watchdogSubtask(env, inFlightKey, lastDoneKey, subtask) {
     // don't permanently deadlock the subtask.
     console.warn({
       message: `[sync] watchdog clearing untimed in_flight token subtask=${subtask}`,
-      source: 'sync-worker', subtask, op: 'watchdog_clear_untimed',
+      source: 'cache-worker', subtask, op: 'watchdog_clear_untimed',
     });
     await deleteSyncState(env, inFlightKey);
     return;
@@ -147,7 +147,7 @@ async function watchdogSubtask(env, inFlightKey, lastDoneKey, subtask) {
   if (ageMs > WATCHDOG_MS) {
     console.warn({
       message: `[sync] watchdog clearing stuck in_flight token subtask=${subtask} (age ${Math.floor(ageMs / 60000)}min)`,
-      source: 'sync-worker', subtask, op: 'watchdog_clear',
+      source: 'cache-worker', subtask, op: 'watchdog_clear',
       ageMinutes: Math.floor(ageMs / 60000),
     });
     await deleteSyncState(env, inFlightKey);
@@ -217,7 +217,7 @@ export async function tailSyncThin(env) {
     if (r.status === 'rejected') {
       console.error({
         message: `[sync] unexpected unhandled subtask rejection: ${r.reason?.message ?? r.reason}`,
-        source: 'sync-worker',
+        source: 'cache-worker',
         reason: r.reason?.message ?? String(r.reason),
       });
     }
@@ -238,7 +238,7 @@ async function tailSyncCandidatesThin(env) {
         span.setAttribute('skipped', 'in_flight');
         console.log({
           message: '[sync] candidates subtask already in flight, skipping',
-          source: 'sync-worker', subtask: 'candidates', op: 'skip_in_flight',
+          source: 'cache-worker', subtask: 'candidates', op: 'skip_in_flight',
         });
         span.end();
         return;
@@ -262,7 +262,7 @@ async function tailSyncCandidatesThin(env) {
         span.setAttribute('capped', capped);
         console.log({
           message: `[sync] candidates tick rows=${rows.length} capped=${capped} took=${Date.now() - t0}ms`,
-          source: 'sync-worker', subtask: 'candidates',
+          source: 'cache-worker', subtask: 'candidates',
           rows: rows.length, capped, durationMs: Date.now() - t0,
         });
       } catch (err) {
@@ -270,7 +270,7 @@ async function tailSyncCandidatesThin(env) {
         span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message || err) });
         console.error({
           message: `[sync] candidates tick failed: ${err.message}`,
-          source: 'sync-worker', subtask: 'candidates',
+          source: 'cache-worker', subtask: 'candidates',
           error: err.message, stack: err.stack,
         });
       } finally {
@@ -293,7 +293,7 @@ async function tailSyncJobsThin(env) {
         span.setAttribute('skipped', 'in_flight');
         console.log({
           message: '[sync] jobs subtask already in flight, skipping',
-          source: 'sync-worker', subtask: 'jobs', op: 'skip_in_flight',
+          source: 'cache-worker', subtask: 'jobs', op: 'skip_in_flight',
         });
         span.end();
         return;
@@ -314,7 +314,7 @@ async function tailSyncJobsThin(env) {
           } catch (err) {
             console.warn({
               message: `[sync] /job/pipeline fetch failed job=${job.id}: ${err.message}`,
-              source: 'sync-worker', subtask: 'jobs',
+              source: 'cache-worker', subtask: 'jobs',
             });
           }
         }
@@ -324,7 +324,7 @@ async function tailSyncJobsThin(env) {
         span.setAttribute('total_jobs', allJobs.length);
         console.log({
           message: `[sync] jobs tick total=${allJobs.length} new=${newJobs.length} took=${Date.now() - t0}ms`,
-          source: 'sync-worker', subtask: 'jobs',
+          source: 'cache-worker', subtask: 'jobs',
           total: allJobs.length, new: newJobs.length, durationMs: Date.now() - t0,
         });
       } catch (err) {
@@ -332,7 +332,7 @@ async function tailSyncJobsThin(env) {
         span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message || err) });
         console.error({
           message: `[sync] jobs tick failed: ${err.message}`,
-          source: 'sync-worker', subtask: 'jobs',
+          source: 'cache-worker', subtask: 'jobs',
           error: err.message, stack: err.stack,
         });
       } finally {
@@ -355,7 +355,7 @@ async function tailSyncCallsThin(env) {
         span.setAttribute('skipped', 'in_flight');
         console.log({
           message: '[sync] calls subtask already in flight, skipping',
-          source: 'sync-worker', subtask: 'calls', op: 'skip_in_flight',
+          source: 'cache-worker', subtask: 'calls', op: 'skip_in_flight',
         });
         span.end();
         return;
@@ -384,7 +384,7 @@ async function tailSyncCallsThin(env) {
           } catch (err) {
             console.error({
               message: `[sync] calls tick consultant=${c.dialpadId} failed: ${err.message}`,
-              source: 'sync-worker', subtask: 'calls',
+              source: 'cache-worker', subtask: 'calls',
               consultantDialpadId: c.dialpadId, error: err.message,
             });
           }
@@ -394,7 +394,7 @@ async function tailSyncCallsThin(env) {
         span.setAttribute('consultants', consultants.length);
         console.log({
           message: `[sync] calls tick consultants=${consultants.length} rows=${totalRows} took=${Date.now() - t0}ms`,
-          source: 'sync-worker', subtask: 'calls',
+          source: 'cache-worker', subtask: 'calls',
           consultants: consultants.length, rows: totalRows, durationMs: Date.now() - t0,
         });
       } catch (err) {
@@ -402,7 +402,7 @@ async function tailSyncCallsThin(env) {
         span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message || err) });
         console.error({
           message: `[sync] calls tick failed: ${err.message}`,
-          source: 'sync-worker', subtask: 'calls',
+          source: 'cache-worker', subtask: 'calls',
           error: err.message, stack: err.stack,
         });
       } finally {
@@ -446,7 +446,7 @@ async function handleInternal(request, env, ctx) {
     } catch (err) {
       console.error({
         message: `[internal] calls upsert failed call_id=${payload.call_id}: ${err.message}`,
-        source: 'sync-worker', endpoint: 'internal-calls-upsert',
+        source: 'cache-worker', endpoint: 'internal-calls-upsert',
         callId: payload.call_id, error: err.message,
       });
       return Response.json({ ok: false, error: 'write failed' }, { status: 500 });
@@ -462,7 +462,7 @@ async function handleInternal(request, env, ctx) {
  * so the operator can flip the dual-write phase on/off without a deploy.
  * Default false — the new cron is OFF until the operator sets the var.
  *
- * No LaunchDarkly SDK integration exists in sync-worker yet. When LD plumbing
+ * No LaunchDarkly SDK integration exists in cache-worker yet. When LD plumbing
  * is added, replace this env-var check with a proper LD client call
  * (no per-consultant context needed for a cron — use a generic worker context).
  */
@@ -504,7 +504,7 @@ const handler = {
       } else {
         console.log({
           message: '[sync] legacy tailSync skipped (CRON_LEGACY_ENABLED=false)',
-          source: 'sync-worker', op: 'skip_legacy_tail_sync',
+          source: 'cache-worker', op: 'skip_legacy_tail_sync',
         });
       }
       if (await getCacheCronAdditiveFlag(env)) {

@@ -1,5 +1,5 @@
 /**
- * Sync-worker side of Dialpad call listing.
+ * Cache-worker side of Dialpad call listing.
  *
  * Wraps GET /api/v2/call?target_id=…&target_type=user&started_after=… with
  * cursor pagination, capped at MAX_PAGES = 25 (a 15-min cron tick should never

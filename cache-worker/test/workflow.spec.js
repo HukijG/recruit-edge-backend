@@ -336,7 +336,7 @@ describe('runCacheSeed (table=jobs)', () => {
 describe('runCacheSeed (table=calls)', () => {
   beforeEach(async () => {
     await applyMigration(env.RF_MCP_CACHE);
-    // Schema for USERS_DB — the sync-worker has read-only access here, so the
+    // Schema for USERS_DB — the cache-worker has read-only access here, so the
     // table is created inline (mirrors test/users-d1-read.spec.js).
     await env.USERS_DB.prepare(`CREATE TABLE IF NOT EXISTS users (
       email TEXT PRIMARY KEY, rf_user_id INTEGER NOT NULL, dialpad_id TEXT NOT NULL,

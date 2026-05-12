@@ -1,7 +1,7 @@
 /**
  * LinkedIn URL output normalization.
  *
- * D1 stores bare slugs (sync-worker `normalizeLinkedInSlug` strips URLs at
+ * D1 stores bare slugs (cache-worker `normalizeLinkedInSlug` strips URLs at
  * ingest). Callers want full URLs. This module turns slugs into URLs at
  * output time only — no ingest / cache changes, so the writer stays the
  * single source of truth.

@@ -45,7 +45,7 @@ This runs `tsup` (configured in `tsup.config.ts`) which produces `dist/index.js`
 Declared as an npm workspace in the root `package.json`:
 
 ```jsonc
-"workspaces": ["sync-worker", "mcp-worker", "vendor/otel-cf-workers"]
+"workspaces": ["cache-worker", "mcp-remote", "vendor/otel-cf-workers"]
 ```
 
 Workers' `package.json` files keep their `"@microlabs/otel-cf-workers": "1.0.0-rc.52"` dependency declaration unchanged. npm resolves the name to this workspace (the version in `vendor/otel-cf-workers/package.json` matches the dep range), symlinks it into the shared root `node_modules/`, and esbuild/wrangler bundling resolves through that symlink.

@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:test';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { applyMigration } from './helpers/migrate.js';
-import worker, { tailSync } from '../src/sync-worker.js';
+import worker, { tailSync } from '../src/index.js';
 import * as rfClient from '../src/rf-list-client.js';
 import { readSyncState, writeSyncState } from '../src/sync-state.js';
 

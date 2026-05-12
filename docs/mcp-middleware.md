@@ -1,8 +1,8 @@
 # MCP Middleware
 
-Server side of the MCP layer. A thin router (`src/mcp/router.js`) under `/mcp/*` resolves the consultant from a verified Access JWT (`consultantEmail` body field, forwarded over the service binding from `rf-mcp-remote` — see `docs/security.md`), then dispatches to per-tool middleware handlers in `src/mcp/`. Read-only against a shared D1 cache (`RF_MCP_CACHE`). Pipeline data is **not cached** — every `job-pipeline` / `job-candidates-filter` read goes live to RF (see § Pipeline reads below). Cron is gated behind two env vars (`CRON_THIN_ENABLED` and `CRON_LEGACY_ENABLED`), both default `'false'`. The new thin path activates at cutover step 5; the legacy path remains inert until step 6 drops it entirely. See `docs/architecture.md` § Sync worker.
+Server side of the MCP layer. A thin router (`src/mcp/router.js`) under `/mcp/*` resolves the consultant from a verified Access JWT (`consultantEmail` body field, forwarded over the service binding from `rf-mcp-remote` — see `docs/security.md`), then dispatches to per-tool middleware handlers in `src/mcp/`. Read-only against a shared D1 cache (`RF_MCP_CACHE`). Pipeline data is **not cached** — every `job-pipeline` / `job-candidates-filter` read goes live to RF (see § Pipeline reads below). Cron is gated behind two env vars: `CRON_THIN_ENABLED='true'` (set 2026-05-12 as cutover step 5 — the active additive path) and `CRON_LEGACY_ENABLED='false'` (legacy path inert until cutover step 6 drops it). Both fall back to `'false'` in code when the var is unset. See `docs/architecture.md` § Cache worker.
 
-The `rf-mcp-remote` MCP worker (`mcp-worker/`) is the public Streamable-HTTP front; it validates the Access JWT, then service-binds into this `/mcp/*` surface. Architecture overview in `docs/architecture.md`. Auth shape in `docs/security.md`.
+The `rf-mcp-remote` MCP worker (`mcp-remote/`) is the public Streamable-HTTP front; it validates the Access JWT, then service-binds into this `/mcp/*` surface. Architecture overview in `docs/architecture.md`. Auth shape in `docs/security.md`.
 
 ## Mental model
 
@@ -30,7 +30,7 @@ The ambiguity envelope shape is consistent across all four resolvers so handlers
 
 **Do NOT add client-side normalisation on the consumer.** If a query is hard to resolve, expand the resolver. If a fuzzy field needs a new alias path (e.g. an acronym map), put it server-side in `fuzzy.js` / `resolvers.js`.
 
-### Lean tool definitions — `mcp-worker/src/tools.ts`
+### Lean tool definitions — `mcp-remote/src/tools.ts`
 
 For each `server.registerTool(...)` block:
 
@@ -112,26 +112,26 @@ If you cannot tick all seven, the design is not ready to ship.
 | Worker | Role |
 |---|---|
 | **Main worker** (`rf-dialpad-sync-dev`) | Reader. Serves `/mcp/*`. Reads D1. **Never writes.** |
-| **Sync worker** (`sync-worker/`, isolated subtree, own `wrangler.jsonc`, deployed independently via GitHub build watch path) | Sole writer. Runs the cron tail-sync (every 15 min) and the admin-triggered full rebuild Workflow. **Sole writer to D1.** |
+| **Cache worker** (`cache-worker/`, isolated subtree, own `wrangler.jsonc`, deployed independently via GitHub build watch path) | Sole writer. Runs the cron tail-sync (every 15 min) and the admin-triggered full rebuild Workflow. **Sole writer to D1.** |
 
 > **Discipline rule: no main-worker code path may write D1.** That invariant keeps the sync surface auditable and prevents schema drift between writers.
 
 ## Storage
 
-**D1 binding** `RF_MCP_CACHE` is shared between both workers (sync writes, main reads). Schema across migrations in `sync-worker/migrations/`:
+**D1 binding** `RF_MCP_CACHE` is shared between both workers (sync writes, main reads). Schema across migrations in `cache-worker/migrations/`:
 - `candidates`, `candidate_jobs`, `jobs`, `sync_state` — `0001_init.sql`
 - `job_pipelines` — `0002_job_pipelines.sql` (per-job pipeline snapshot, legacy; no longer consulted by any MCP handler — scheduled for removal at cutover step 6)
 - `candidates_v2`, `jobs_v2`, `calls` — `0003_v2_tables.sql` (thin schema; additive-only writes; INSERT-OR-IGNORE on PK only)
 
-`candidates_v2` stores thin rows `{id, name, linkedin_profile, added_time_ms, current_title_at_cache_time, current_company_at_cache_time, cached_at_ms}` — the source for the in-memory snapshot and D1 batch hydration. The old `mcp:pipeline:{jobId}` and `mcp:job-candidates:{jobId}` KV keys are gone; the `job_pipelines` D1 table is scheduled for removal at cutover step 6 (`0004_drop_legacy.sql` in `sync-worker/migrations-pending/`); MCP pipeline reads no longer consult it — they go live to RF.
+`candidates_v2` stores thin rows `{id, name, linkedin_profile, added_time_ms, current_title_at_cache_time, current_company_at_cache_time, cached_at_ms}` — the source for the in-memory snapshot and D1 batch hydration. The old `mcp:pipeline:{jobId}` and `mcp:job-candidates:{jobId}` KV keys are gone; the `job_pipelines` D1 table is scheduled for removal at cutover step 6 (`0004_drop_legacy.sql` in `cache-worker/migrations-pending/`); MCP pipeline reads no longer consult it — they go live to RF.
 
 Tail sync inserts newly-added candidates into `candidates_v2` and `calls` via INSERT-OR-IGNORE (additive only; no UPDATEs). Version key `last_candidates_added_cursor` in `sync_state` gates snapshot refreshes (falls back to `last_tail_sync_at` during the dual-write transition window).
 
 ## Auth
 
 - `/mcp/*` (main worker) accepts only service-binding traffic from `rf-mcp-remote`. Identity arrives as the `consultantEmail` body field; no shared-secret header. `MCP_EXTENSION_SECRET` was retired 2026-05-10. See `docs/security.md` for the JWT validation flow.
-- A transitional `consultantFirstName` body fallback survives in `src/mcp/router.js` for legacy local-MCP installs; it logs `[mcp] legacy consultantFirstName fallback` and is dropped when Spec B Phase 3 lands.
-- `ADMIN_SECRET` — sync worker only, in `X-Admin-Token` header for `POST /admin/full-rebuild`. Internal admin path; not user-facing.
+- A transitional `consultantFirstName` body fallback survives in `src/mcp/router.js` for legacy local-MCP installs; it logs `[mcp] legacy consultantFirstName fallback` and is dropped at the auth Phase 3 cutover.
+- `ADMIN_SECRET` — cache worker only, in `X-Admin-Token` header for `POST /admin/full-rebuild`. Internal admin path; not user-facing.
 
 ## Entity-reference resolvers
 
@@ -261,12 +261,12 @@ Recipe for a new `/mcp/<name>` endpoint:
    ```
    Defaults always present; `body.fields` extends. LinkedIn slugs auto-normalized to URLs at output.
 5. **`_meta`.** Don't emit it on success. If the caller did something they should know about (cold cache, missing landmark, falling back), accumulate `warnings: string[]` and emit `_meta: { warnings }` only when non-empty. Each warning ≤ ~80 chars.
-6. **D1 reads.** Use `session(env)` from `./d1-read.js` to get a session-pinned reader (sync-worker writes are read-after-write consistent within the session). NEVER write to D1 from the main worker — that's the sync worker's exclusive responsibility.
-7. **Tests.** Add `test/mcp-<name>.spec.js` modeled on the existing specs (e.g. `test/mcp-job-pipeline.spec.js`). Use `import { env, createExecutionContext } from 'cloudflare:test';` and `applyMigration(env)` in `beforeEach`. Identity arrives in the body — pass either `consultantEmail: 'joel@<test-domain>'` (current path) or `consultantFirstName: 'Joel'` (legacy fallback path, exercised by existing specs while it remains wired). The `X-MCP-Token` header is no longer validated; specs that still set it work fine but the header is a no-op.
-8. **Consumer surface.** Tool registrations + descriptions live in `mcp-worker/src/tools.ts` (`registerTools`). Add a `server.registerTool(...)` block there with the body params, response shape, and the default field set so the LLM client's tool list reflects the new endpoint. If the new tool is the read endpoint Claude should always have loaded, set `_meta: { "anthropic/alwaysLoad": true }`.
+6. **D1 reads.** Use `session(env)` from `./d1-read.js` to get a session-pinned reader (cache-worker writes are read-after-write consistent within the session). NEVER write to D1 from the main worker — that's the cache worker's exclusive responsibility.
+7. **Tests.** Add `test/mcp-<name>.spec.js` modeled on the existing specs (e.g. `test/mcp-job-pipeline.spec.js`). Use `import { env, createExecutionContext } from 'cloudflare:test';` and `applyMigration(env)` in `beforeEach`. Identity arrives in the body — pass either `consultantEmail: 'alex@<test-domain>'` (current path) or `consultantFirstName: 'Alex'` (legacy fallback path, exercised by existing specs while it remains wired). The `X-MCP-Token` header is no longer validated; specs that still set it work fine but the header is a no-op.
+8. **Consumer surface.** Tool registrations + descriptions live in `mcp-remote/src/tools.ts` (`registerTools`). Add a `server.registerTool(...)` block there with the body params, response shape, and the default field set so the LLM client's tool list reflects the new endpoint. If the new tool is the read endpoint Claude should always have loaded, set `_meta: { "anthropic/alwaysLoad": true }`.
 9. **Endpoint table.** Add a row to the table above. If the endpoint adds a new `*_id` body field, add it to the ID short-circuit table too.
 
-If the new endpoint requires data NOT already in D1, that's a sync-worker change — extend the tail-sync writer, not the read path. Read paths must never call RF directly except for the write endpoints (`move-stage`, `log-interview`, etc.) and the pipeline tools (`job-pipeline`, `job-candidates-filter`, `candidate-get`) where it's intentional.
+If the new endpoint requires data NOT already in D1, that's a cache-worker change — extend the tail-sync writer, not the read path. Read paths must never call RF directly except for the write endpoints (`move-stage`, `log-interview`, etc.) and the pipeline tools (`job-pipeline`, `job-candidates-filter`, `candidate-get`) where it's intentional.
 
 ### Candidate search pattern (tier-1 + single RF call)
 
@@ -331,23 +331,9 @@ RF's `/job/pipeline?job_id=X` returns a canonical, ordered `summary[]` of stages
 
 Landmark stages used by the defaults / submitted ("CV Sent", "Offer", "Hired") do exact-name lookup first, then fuzzy-resolve against the per-job list. When a landmark isn't present in the job's actual pipeline, `submitted: true` falls back to the full canonical list and emits a `_meta.warnings` entry.
 
-### Tool descriptor changes (Tasks 11-17)
+### Tool descriptor conventions (`mcp-remote/src/tools.ts`)
 
-Changes landed in `mcp-worker/src/tools.ts` alongside the middleware refactor:
+The consumer-facing tool descriptors follow the same lean-surface rules as the rest of this doc:
 
-**`rf_candidate_search`:**
-- `include_disqualified` renamed to `disqualified`. Semantics changed: `true` returns ONLY disqualified candidates (not additive). Default omitted/false: non-DQ'd only.
-- `updated_after` / `updated_before` removed (mutable, not load-bearing; silently dropped in prior version).
-- `warning: 'filter_unverified'` documented in description — RF was unreachable, results are tier-1 only.
-- `warning: 'custom_field_map_unavailable'` documented — `/candidate/custom-field/list` was unreachable; offending `technology`/`segment`/`role` filter dropped (search still runs).
-- Success envelopes carry `ok: true`. RF rate limit surfaces as `{ok: false, kind: 'rate_limited', recoverable: false, retry_after_ms}` at HTTP 200.
-
-**`rf_job_pipeline`:**
-- Stale "cold cache" hint removed (pipeline cache is gone; the tool is now always live to RF).
-- Orphan `filters: {...}` field removed from input schema.
-- Description updated to reflect live RF reads and `pipeline_unavailable` recoverable failure.
-
-**`rf_job_candidates_filter`:**
-- Orphan `filters: {...}` field removed from input schema.
-- `include_disqualified` added (was missing; `rf_job_pipeline` had it, filter didn't).
-- Description updated to document live RF reads, `hydration_errors[]`, and `truncated`.
+- **`rf_candidate_search`** — `disqualified: true` returns ONLY disqualified candidates (not additive); omitted/false means non-DQ'd only. Mutable, non-load-bearing time filters (`updated_*`) are not exposed. The description documents the recoverable warnings (`filter_unverified` when RF is unreachable, `custom_field_map_unavailable` when the custom-field list can't be fetched) and the `{ok: false, kind: 'rate_limited', retry_after_ms}` shape for RF rate limits.
+- **`rf_job_pipeline`** / **`rf_job_candidates_filter`** — both read live RF (no pipeline cache), expose `include_disqualified` (default false), and document `pipeline_unavailable` / `hydration_errors[]` / `truncated` in their descriptions. Neither carries an orphan `filters` object — filters are named top-level fields.

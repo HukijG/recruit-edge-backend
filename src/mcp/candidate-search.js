@@ -156,7 +156,7 @@ function fuzzyResolveCustomFieldOption(cfMeta, input) {
  *
  * Inputs are read from BOTH the top-level body fields (existing wire contract)
  * AND the optional `filters` long-tail bag (forward-compat per the MCP tool
- * descriptor in `mcp-worker/src/tools.ts`).
+ * descriptor in `mcp-remote/src/tools.ts`).
  *
  * `resolved.{jobId,ownerId,stageName}` carry post-fuzzy-resolver canonical
  * values. `resolved.customFieldFilters` carries pre-built `custom_field.<id>`
