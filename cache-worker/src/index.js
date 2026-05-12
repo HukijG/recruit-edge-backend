@@ -18,8 +18,7 @@ import {
   writeCalls,
 } from './d1-write.js';
 import { readSyncState, writeSyncState, deleteSyncState } from './sync-state.js';
-import { listConsultants } from './users-d1-read.js';
-import { fetchCallsForConsultant } from './dialpad-list-client.js';
+import { listDialpadCalls } from './dialpad-list-client.js';
 
 function timingSafeEqual(a, b) {
   const ea = new TextEncoder().encode(a);
@@ -360,40 +359,22 @@ async function tailSyncCallsThin(env) {
       }
       await writeSyncState(env, 'thin_calls_in_flight', new Date().toISOString());
       try {
-        const consultants = await listConsultants(env);
-        let totalRows = 0;
-        for (const c of consultants) {
-          try {
-            const lastSeenRow = await env.RF_MCP_CACHE
-              .prepare('SELECT MAX(date_started_ms) AS max FROM calls WHERE target_dialpad_id = ?')
-              .bind(c.dialpadId).first();
-            // Cold-start default: 2-year lookback per consultant. Decision: the
-            // seed default is 2 years (`runCacheSeed`), and the operating envelope
-            // (Dialpad call history across consultants) does fit a 2-year window
-            // without overwhelming the MAX_PAGES=25 cap (call volume per consultant
-            // is at most a few thousand per year). Picking the seed-symmetric
-            // default avoids the same "fresh deploy silently loses old calls" trap
-            // as the candidates cursor (#5).
-            const lastSeenMs = (lastSeenRow?.max != null) ? lastSeenRow.max : (Date.now() - TWO_YEARS_MS);
-            const startedAfterMs = Math.max(0, lastSeenMs - SIX_HOURS_MS);
-            const calls = await fetchCallsForConsultant(env, c.dialpadId, startedAfterMs);
-            await writeCalls(env, calls);
-            totalRows += calls.length;
-          } catch (err) {
-            console.error({
-              message: `[sync] calls tick consultant=${c.dialpadId} failed: ${err.message}`,
-              source: 'cache-worker', subtask: 'calls',
-              consultantDialpadId: c.dialpadId, error: err.message,
-            });
-          }
-        }
+        // Global watermark across all calls — Dialpad's /v2/call is an org-wide
+        // listing keyed off `target.id` per item, so we don't fan out by
+        // consultant. The 6h overlap absorbs the started_after strict-GT
+        // semantics + clock skew. Cold-start default is 2 years.
+        const lastSeenRow = await env.RF_MCP_CACHE
+          .prepare('SELECT MAX(date_started_ms) AS max FROM calls').first();
+        const lastSeenMs = (lastSeenRow?.max != null) ? lastSeenRow.max : (Date.now() - TWO_YEARS_MS);
+        const startedAfterMs = Math.max(0, lastSeenMs - SIX_HOURS_MS);
+        const calls = await listDialpadCalls({ startedAfterMs }, env);
+        await writeCalls(env, calls);
         await writeSyncState(env, 'thin_calls_done_at', new Date().toISOString());
-        span.setAttribute('rows_inserted', totalRows);
-        span.setAttribute('consultants', consultants.length);
+        span.setAttribute('rows_inserted', calls.length);
         console.log({
-          message: `[sync] calls tick consultants=${consultants.length} rows=${totalRows} took=${Date.now() - t0}ms`,
+          message: `[sync] calls tick rows=${calls.length} took=${Date.now() - t0}ms`,
           source: 'cache-worker', subtask: 'calls',
-          consultants: consultants.length, rows: totalRows, durationMs: Date.now() - t0,
+          rows: calls.length, durationMs: Date.now() - t0,
         });
       } catch (err) {
         span.recordException(err);

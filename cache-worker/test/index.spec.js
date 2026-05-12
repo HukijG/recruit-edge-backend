@@ -155,33 +155,37 @@ describe('tailSyncThin', () => {
     expect(pipelineCalled).toBe(0);
   });
 
-  it('fans out calls per consultant from listConsultants', async () => {
-    await env.USERS_DB.prepare(`INSERT INTO users (email, rf_user_id, dialpad_id, first_name)
-      VALUES (?, ?, ?, ?), (?, ?, ?, ?)`)
-      .bind(
-        'a@test.local', 1, '1111', 'A',
-        'b@test.local', 2, '2222', 'B',
-      ).run();
-
+  it('makes one org-wide /v2/call fetch (no per-consultant fan-out) and writes every call', async () => {
     let callsCallCount = 0;
+    let lastCallsUrl = null;
     mockJSON(async (url) => {
       const u = String(url);
       if (u.includes('/candidate/search')) return { ok: true, status: 200, json: async () => ({ data: [] }), text: async () => '', headers: new Map() };
       if (u.includes('/job/list')) return { ok: true, status: 200, json: async () => [], text: async () => '', headers: new Map() };
       if (u.includes('/v2/call')) {
         callsCallCount++;
-        const targetId = new URL(u).searchParams.get('target_id');
+        lastCallsUrl = u;
         return {
           ok: true, status: 200, headers: new Map(), text: async () => '',
           json: async () => ({
-            items: [{
-              call_id: `c-${targetId}-1`,
-              target: { id: targetId },
-              contact: { id: 'shared_contact_pool_Company:X_uid_RF99' },
-              date_started: 1717248000000,
-              total_duration: 60_000,
-              direction: 'outbound',
-            }],
+            items: [
+              {
+                call_id: 'c-1111-1',
+                target: { id: '1111' },
+                contact: { id: 'shared_contact_pool_Company:X_uid_RF99' },
+                date_started: 1717248000000,
+                total_duration: 60_000,
+                direction: 'outbound',
+              },
+              {
+                call_id: 'c-2222-1',
+                target: { id: '2222' },
+                contact: { id: 'shared_contact_pool_Company:X_uid_RF99' },
+                date_started: 1717248060000,
+                total_duration: 60_000,
+                direction: 'outbound',
+              },
+            ],
             cursor: null,
           }),
         };
@@ -191,7 +195,9 @@ describe('tailSyncThin', () => {
 
     await tailSyncThin(env);
 
-    expect(callsCallCount).toBe(2); // one per consultant
+    expect(callsCallCount).toBe(1);
+    // Org-wide fetch — no target_id filter, attribution comes from item.target.id.
+    expect(new URL(lastCallsUrl).searchParams.has('target_id')).toBe(false);
     const { results } = await env.RF_MCP_CACHE
       .prepare('SELECT call_id, target_dialpad_id FROM calls ORDER BY call_id').all();
     expect(results).toEqual([
@@ -226,48 +232,6 @@ describe('tailSyncThin', () => {
     expect(results).toEqual([{ id: 99 }]);
   });
 
-  it('one consultant failure does not block the others', async () => {
-    await env.USERS_DB.prepare(`INSERT INTO users (email, rf_user_id, dialpad_id, first_name)
-      VALUES (?, ?, ?, ?), (?, ?, ?, ?)`)
-      .bind(
-        'a@test.local', 1, '1111', 'A',
-        'b@test.local', 2, '2222', 'B',
-      ).run();
-
-    globalThis.fetch.mockImplementation(async (url) => {
-      const u = String(url);
-      if (u.includes('/candidate/search')) return { ok: true, status: 200, json: async () => ({ data: [] }), text: async () => '', headers: new Map() };
-      if (u.includes('/job/list')) return { ok: true, status: 200, json: async () => [], text: async () => '', headers: new Map() };
-      if (u.includes('/v2/call')) {
-        const targetId = new URL(u).searchParams.get('target_id');
-        if (targetId === '1111') {
-          return { ok: false, status: 500, text: async () => 'dialpad down', headers: new Map(), json: async () => ({}) };
-        }
-        return {
-          ok: true, status: 200, headers: new Map(), text: async () => '',
-          json: async () => ({
-            items: [{
-              call_id: 'c-2222-1',
-              target: { id: '2222' },
-              contact: { id: 'shared_contact_pool_Company:X_uid_RF99' },
-              date_started: 1717248000000,
-              total_duration: 60_000,
-              direction: 'outbound',
-            }],
-            cursor: null,
-          }),
-        };
-      }
-      return { ok: true, status: 200, json: async () => ({}), text: async () => '', headers: new Map() };
-    });
-
-    await tailSyncThin(env);
-
-    // Consultant 1's call fetch failed; consultant 2's call still landed.
-    const { results } = await env.RF_MCP_CACHE
-      .prepare('SELECT call_id FROM calls').all();
-    expect(results).toEqual([{ call_id: 'c-2222-1' }]);
-  });
 });
 
 describe('getCacheCronAdditiveFlag gate in scheduled()', () => {

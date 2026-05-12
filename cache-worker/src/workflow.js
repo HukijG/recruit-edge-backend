@@ -47,8 +47,7 @@ import {
 } from './d1-write.js';
 import { readSyncState, writeSyncState, deleteSyncState } from './sync-state.js';
 import { normalizePipelineDetail } from './pipeline-normalize.js';
-import { listConsultants } from './users-d1-read.js';
-import { fetchCallsForConsultant } from './dialpad-list-client.js';
+import { listDialpadCalls } from './dialpad-list-client.js';
 import { FLOWS } from './lib/flow-names.js';
 import { instrumentedStep } from './lib/instrumented-step.js';
 
@@ -253,32 +252,26 @@ export async function runCacheSeed(env, step, instanceId, params = {}) {
   }
 
   if (table === 'calls') {
-    const consultants = await step.do('list consultants', async () => listConsultants(env));
-    const sinceMs = params.since ? Date.parse(params.since) : Date.now() - 2 * 365 * 24 * 3600_000;
-    let totalRows = 0;
-    for (const c of consultants) {
-      try {
-        const calls = await step.do(`fetch calls user=${c.dialpadId}`, RETRY_OPTS, async () =>
-          fetchCallsForConsultant(env, c.dialpadId, sinceMs),
-        );
-        // Chunk writes by 200 to keep individual D1 batches well under the cap.
-        for (let i = 0; i < calls.length; i += 200) {
-          await step.do(`write calls user=${c.dialpadId} chunk=${i}`, async () =>
-            writeCalls(env, calls.slice(i, i + 200)),
-          );
-        }
-        totalRows += calls.length;
-      } catch (err) {
-        console.error({
-          message: `[seed] calls fetch/write failed user=${c.dialpadId}: ${err.message}`,
-          source: 'cache-seed', subtask: 'calls', consultantDialpadId: c.dialpadId,
-        });
-      }
+    // Seed = backfill every concluded org-wide call. Dialpad's /v2/call is a
+    // single org-wide listing; per-call attribution is on item.target.id, so
+    // we never fan out per consultant. Optional params.since bounds the
+    // lookback; otherwise we pull the full target history Dialpad will return.
+    const startedAfterMs = params.since ? Date.parse(params.since) : undefined;
+    // maxPages 1000 ≈ 50k calls upper bound — bigger than any realistic
+    // two-year org backfill; the 25-page tail-sync cap would have truncated
+    // mid-history.
+    const calls = await step.do('fetch calls', RETRY_OPTS, async () =>
+      listDialpadCalls({ startedAfterMs, maxPages: 1000 }, env),
+    );
+    // Chunk writes by 200 to keep individual D1 batches well under the cap.
+    for (let i = 0; i < calls.length; i += 200) {
+      await step.do(`write calls chunk=${i}`, async () =>
+        writeCalls(env, calls.slice(i, i + 200)),
+      );
     }
     console.log({
-      message: `[seed] calls done instance=${instanceId} consultants=${consultants.length} rows=${totalRows}`,
-      source: 'cache-seed', subtask: 'calls', instanceId,
-      consultants: consultants.length, rows: totalRows,
+      message: `[seed] calls done instance=${instanceId} rows=${calls.length}`,
+      source: 'cache-seed', subtask: 'calls', instanceId, rows: calls.length,
     });
     return;
   }

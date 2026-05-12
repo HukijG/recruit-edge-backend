@@ -343,82 +343,65 @@ describe('runCacheSeed (table=jobs)', () => {
 describe('runCacheSeed (table=calls)', () => {
   beforeEach(async () => {
     await applyMigration(env.RF_MCP_CACHE);
-    // Schema for USERS_DB — the cache-worker has read-only access here, so the
-    // table is created inline (mirrors test/users-d1-read.spec.js).
-    await env.USERS_DB.prepare(`CREATE TABLE IF NOT EXISTS users (
-      email TEXT PRIMARY KEY, rf_user_id INTEGER NOT NULL, dialpad_id TEXT NOT NULL,
-      first_name TEXT NOT NULL, calendar_mode TEXT NOT NULL DEFAULT 'outlook',
-      aliases TEXT, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-      updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-    )`).run();
-    await env.USERS_DB.prepare("DELETE FROM users").run();
-    await env.USERS_DB.prepare("INSERT INTO users (email, rf_user_id, dialpad_id, first_name) VALUES (?, ?, ?, ?)")
-      .bind('joel@test.local', 1, '1111', 'Joel').run();
     globalThis.fetch = vi.fn();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
   });
 
-  it('paginates Dialpad /v2/call per consultant and writes into calls', async () => {
+  it('paginates /v2/call org-wide (no target_id) and writes every call into the calls table', async () => {
+    // Two items in one page — one per consultant. Dialpad attribution lives on
+    // target.id; the seed never fans out per consultant.
     globalThis.fetch.mockImplementation(async () => ({
       ok: true, status: 200, headers: new Map(), text: async () => '',
       json: async () => ({
-        items: [{
-          call_id: 'c-seed-1',
-          target: { id: '1111' },
-          contact: { id: 'shared_contact_pool_Company:X_uid_RF77' },
-          date_started: 1717248000000,
-          total_duration: 60_000,
-          direction: 'outbound',
-        }],
+        items: [
+          {
+            call_id: 'c-seed-1111',
+            target: { id: '1111' },
+            contact: { id: 'shared_contact_pool_Company:X_uid_RF77' },
+            date_started: 1717248000000,
+            total_duration: 60_000,
+            direction: 'outbound',
+          },
+          {
+            call_id: 'c-seed-2222',
+            target: { id: '2222' },
+            contact: { id: 'shared_contact_pool_Company:X_uid_RF88' },
+            date_started: 1717248060000,
+            total_duration: 90_000,
+            direction: 'outbound',
+          },
+        ],
         cursor: null,
       }),
     }));
     await runCacheSeed(env, stepShim, 'test-id', { table: 'calls' });
     const { results } = await env.RF_MCP_CACHE
-      .prepare('SELECT call_id, target_dialpad_id FROM calls').all();
-    expect(results).toEqual([{ call_id: 'c-seed-1', target_dialpad_id: '1111' }]);
+      .prepare('SELECT call_id, target_dialpad_id FROM calls ORDER BY call_id').all();
+    expect(results).toEqual([
+      { call_id: 'c-seed-1111', target_dialpad_id: '1111' },
+      { call_id: 'c-seed-2222', target_dialpad_id: '2222' },
+    ]);
+    // Single org-wide fetch, no target_id filter.
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    const url = new URL(globalThis.fetch.mock.calls[0][0]);
+    expect(url.searchParams.has('target_id')).toBe(false);
+    expect(url.searchParams.has('started_after')).toBe(false);
   });
 
-  it('uses params.since when provided to bound the lookback', async () => {
-    let capturedStartedAfter = null;
+  it('omits started_after by default (full history) and applies params.since when provided', async () => {
+    const urls = [];
     globalThis.fetch.mockImplementation(async (url) => {
-      capturedStartedAfter = new URL(String(url)).searchParams.get('started_after');
+      urls.push(String(url));
       return { ok: true, status: 200, headers: new Map(), text: async () => '', json: async () => ({ items: [], cursor: null }) };
-    });
-    await runCacheSeed(env, stepShim, 'test-id', { table: 'calls', since: '2025-01-01T00:00:00Z' });
-    expect(capturedStartedAfter).toBe(String(Date.parse('2025-01-01T00:00:00Z')));
-  });
-
-  it('one consultant failure does not block other consultants', async () => {
-    await env.USERS_DB.prepare(`INSERT INTO users (email, rf_user_id, dialpad_id, first_name)
-      VALUES (?, ?, ?, ?)`).bind('b@test.local', 2, '2222', 'B').run();
-
-    globalThis.fetch.mockImplementation(async (url) => {
-      const u = String(url);
-      const targetId = new URL(u).searchParams.get('target_id');
-      if (targetId === '1111') {
-        return { ok: false, status: 500, text: async () => 'dialpad down', headers: new Map(), json: async () => ({}) };
-      }
-      return {
-        ok: true, status: 200, headers: new Map(), text: async () => '',
-        json: async () => ({
-          items: [{
-            call_id: 'c-seed-2222',
-            target: { id: '2222' },
-            contact: { id: 'shared_contact_pool_Company:X_uid_RF88' },
-            date_started: 1717248000000,
-            total_duration: 60_000,
-            direction: 'outbound',
-          }],
-          cursor: null,
-        }),
-      };
     });
 
     await runCacheSeed(env, stepShim, 'test-id', { table: 'calls' });
+    expect(new URL(urls[0]).searchParams.has('started_after')).toBe(false);
 
-    const { results } = await env.RF_MCP_CACHE
-      .prepare('SELECT call_id FROM calls').all();
-    expect(results).toEqual([{ call_id: 'c-seed-2222' }]);
+    urls.length = 0;
+    await runCacheSeed(env, stepShim, 'test-id', { table: 'calls', since: '2025-01-01T00:00:00Z' });
+    expect(new URL(urls[0]).searchParams.get('started_after'))
+      .toBe(String(Date.parse('2025-01-01T00:00:00Z')));
   });
 });
 
