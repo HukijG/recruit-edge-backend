@@ -266,9 +266,12 @@ describe('getCacheCronAdditiveFlag gate in scheduled()', () => {
     });
   });
 
-  it('does NOT write thin tables when CRON_THIN_ENABLED is unset (flag off)', async () => {
-    // env from cloudflare:test does not have CRON_THIN_ENABLED set.
-    await runScheduled(env);
+  it('does NOT write thin tables when CRON_THIN_ENABLED="false"', async () => {
+    // The wrangler default flipped to "true" on 2026-05-12 (Phase H of the
+    // thin-cache cutover); explicit override here keeps the test isolated
+    // from the wrangler config.
+    const testEnv = { ...env, CRON_THIN_ENABLED: 'false' };
+    await runScheduled(testEnv);
 
     const { results } = await env.RF_MCP_CACHE
       .prepare('SELECT id FROM candidates_v2').all();

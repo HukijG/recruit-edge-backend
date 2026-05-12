@@ -68,7 +68,7 @@
     // (or edit vars + redeploy) to enable the additive INSERT-OR-IGNORE tail-sync path
     // during dual-write cutover phase. Default "false" keeps legacy-only behaviour.
     // After cutover step 6 (Task 30), remove this var and the gate in scheduled().
-    "CRON_THIN_ENABLED": "false",
+    "CRON_THIN_ENABLED": "true",
     // Feature flag: gates the LEGACY tailSync (writes to candidates / candidate_jobs
     // / jobs / job_pipelines via INSERT-OR-REPLACE). Default "false" — the
     // legacy writers do not skip unchanged rows and drove the D1 write-storm
