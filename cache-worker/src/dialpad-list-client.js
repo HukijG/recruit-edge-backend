@@ -1,90 +1,103 @@
 /**
  * Cache-worker Dialpad call-list client.
  *
- * GET /api/v2/call — every query parameter on the Dialpad spec is optional;
- * the client reflects that. Omit `targetId` / `targetType` to list org-wide
- * (requires a company admin API key per the Dialpad spec, which DIALPAD_API_KEY
- * already is — it's the same value used by the main worker for the call/SMS
- * endpoints). Seed callers leave `startedAfterMs` undefined for the full
- * history; cron callers pass a watermark for incremental fetch.
+ * Every Dialpad /v2/call query parameter is optional; the client reflects the
+ * spec. Omit `targetId` + `targetType` to list org-wide (DIALPAD_API_KEY is
+ * already a company admin key — same value the main worker uses). Each call's
+ * `target.id` carries per-consultant attribution, so callers never fan out
+ * by user — one paginated request covers the whole org.
  *
- * Internal cursor pagination. `maxPages` caps runaway loops (default 25,
- * sized for tail-sync; seed passes a higher cap).
+ * Two entry points:
  *
- * Each call's `target.id` carries the per-consultant attribution, so callers
- * never fan out by user — one paginated call covers the whole org.
+ * - `listDialpadCallsPage(opts, env)` — single page. Returns `{ items, cursor }`.
+ *   Use this when the caller drives pagination externally (Workflow step.do
+ *   per page, so each step stays well under the 10-min step.do timeout and
+ *   the cursor checkpoints between steps).
  *
- * Response items per spec: `{ cursor, items: Call[] }`. Each item has at
- * minimum `call_id`, `target.id`, `contact.id`, `date_started`,
- * `total_duration`, `direction`.
+ * - `listDialpadCalls(opts, env)` — internal cursor loop, capped at
+ *   `opts.maxPages` (default 25). Use this for short, bounded reads (e.g.
+ *   cron tail-sync over a small recency window) where a single Worker
+ *   isolate has time to drain to the end.
  *
- * @param {object} opts
- * @param {string|number} [opts.targetId]       - filter to a single target id
- * @param {string} [opts.targetType]            - 'user' | 'callcenter' | 'office' | …
- * @param {number} [opts.startedAfterMs]        - UTC ms-since-epoch lower bound (exclusive)
- * @param {number} [opts.startedBeforeMs]       - UTC ms-since-epoch upper bound
- * @param {boolean} [opts.includeAnonymized]    - include deleted-user calls
- * @param {number} [opts.maxPages]              - pagination safety cap (default 25)
- * @param {object} env
- * @returns {Promise<Array>} concatenated `items[]` across all pages
+ * Per-page structured `console.log` captures URL + status + item count.
+ * Workflow contexts have no global ContextManager outside @microlabs's
+ * instrument() wrap, so body-capture can't stamp http.url / http.response.body
+ * on Workflow spans — log records are the legibility surface for the inner
+ * Dialpad fetch.
  */
 const DEFAULT_MAX_PAGES = 25;
 
-export async function listDialpadCalls(opts, env) {
+/**
+ * @param {object} opts
+ * @param {string|number} [opts.targetId]
+ * @param {string} [opts.targetType]
+ * @param {number} [opts.startedAfterMs]
+ * @param {number} [opts.startedBeforeMs]
+ * @param {boolean} [opts.includeAnonymized]
+ * @param {string} [opts.cursor]                — pass through from a previous page
+ * @param {object} env
+ * @returns {Promise<{items: Array, cursor: string|null}>}
+ */
+export async function listDialpadCallsPage(opts, env) {
   if (!env?.DIALPAD_API_KEY) throw new Error('DIALPAD_API_KEY environment variable is required');
   const baseUrl = env.DIALPAD_API_BASE_URL || 'https://dialpad.com/api/v2';
   const o = opts ?? {};
-  const maxPages = o.maxPages ?? DEFAULT_MAX_PAGES;
 
+  const u = new URL(`${baseUrl}/call`);
+  if (o.targetId != null) u.searchParams.set('target_id', String(o.targetId));
+  if (o.targetType != null) u.searchParams.set('target_type', String(o.targetType));
+  if (o.startedAfterMs != null) u.searchParams.set('started_after', String(o.startedAfterMs));
+  if (o.startedBeforeMs != null) u.searchParams.set('started_before', String(o.startedBeforeMs));
+  if (o.includeAnonymized) u.searchParams.set('include_anonymized', 'true');
+  if (o.cursor) u.searchParams.set('cursor', String(o.cursor));
+
+  const r = await fetch(u.toString(), {
+    method: 'GET',
+    headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${env.DIALPAD_API_KEY}` },
+  });
+  if (!r.ok) {
+    const body = await r.text();
+    console.error({
+      message: `[dialpad-list] page failed status=${r.status}`,
+      source: 'dialpad-list-client',
+      url: u.toString(),
+      status: r.status,
+      body: typeof body === 'string' ? body.slice(0, 500) : null,
+    });
+    throw new Error(`Dialpad /v2/call failed (HTTP ${r.status}): ${body}`);
+  }
+  const json = await r.json();
+  const items = Array.isArray(json?.items) ? json.items : [];
+  const cursor = json?.cursor ?? null;
+
+  console.log({
+    message: `[dialpad-list] page status=${r.status} items=${items.length} cursor=${cursor ? 'y' : 'n'}`,
+    source: 'dialpad-list-client',
+    url: u.toString(),
+    status: r.status,
+    item_count: items.length,
+    has_cursor: !!cursor,
+  });
+  return { items, cursor };
+}
+
+/**
+ * @param {object} opts                — see listDialpadCallsPage; plus:
+ * @param {number} [opts.maxPages]     — pagination safety cap (default 25)
+ * @param {object} env
+ * @returns {Promise<Array>} concatenated `items[]` across all pages
+ */
+export async function listDialpadCalls(opts, env) {
+  const o = opts ?? {};
+  const maxPages = o.maxPages ?? DEFAULT_MAX_PAGES;
   const items = [];
   let cursor = null;
   let pages = 0;
   for (;;) {
-    const u = new URL(`${baseUrl}/call`);
-    if (o.targetId != null) u.searchParams.set('target_id', String(o.targetId));
-    if (o.targetType != null) u.searchParams.set('target_type', String(o.targetType));
-    if (o.startedAfterMs != null) u.searchParams.set('started_after', String(o.startedAfterMs));
-    if (o.startedBeforeMs != null) u.searchParams.set('started_before', String(o.startedBeforeMs));
-    if (o.includeAnonymized) u.searchParams.set('include_anonymized', 'true');
-    if (cursor) u.searchParams.set('cursor', String(cursor));
-
+    const r = await listDialpadCallsPage({ ...o, cursor }, env);
+    items.push(...r.items);
+    cursor = r.cursor;
     pages++;
-    const r = await fetch(u.toString(), {
-      method: 'GET',
-      headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${env.DIALPAD_API_KEY}` },
-    });
-    if (!r.ok) {
-      const body = await r.text();
-      console.error({
-        message: `[dialpad-list] page ${pages} failed status=${r.status}`,
-        source: 'dialpad-list-client',
-        url: u.toString(),
-        status: r.status,
-        body: typeof body === 'string' ? body.slice(0, 500) : null,
-        page: pages,
-      });
-      throw new Error(`Dialpad /v2/call failed (HTTP ${r.status}): ${body}`);
-    }
-    const json = await r.json();
-    const pageItems = Array.isArray(json?.items) ? json.items : [];
-    items.push(...pageItems);
-    cursor = json?.cursor ?? null;
-
-    // Per-page structured log. Workflow contexts have no active span (no global
-    // ContextManager outside @microlabs's instrument() wrap), so body-capture
-    // can't stamp http.url / http.response.body on Workflow spans — log records
-    // are the legibility surface for the inner Dialpad fetch.
-    console.log({
-      message: `[dialpad-list] page ${pages} status=${r.status} items=${pageItems.length} cumulative=${items.length} cursor=${cursor ? 'y' : 'n'}`,
-      source: 'dialpad-list-client',
-      url: u.toString(),
-      status: r.status,
-      item_count: pageItems.length,
-      cumulative: items.length,
-      has_cursor: !!cursor,
-      page: pages,
-    });
-
     if (pages >= maxPages && cursor) {
       console.warn({
         message: `[dialpad-list] hit maxPages=${maxPages} truncating; cursor remaining`,

@@ -47,7 +47,7 @@ import {
 } from './d1-write.js';
 import { readSyncState, writeSyncState, deleteSyncState } from './sync-state.js';
 import { normalizePipelineDetail } from './pipeline-normalize.js';
-import { listDialpadCalls } from './dialpad-list-client.js';
+import { listDialpadCallsPage } from './dialpad-list-client.js';
 import { FLOWS } from './lib/flow-names.js';
 import { instrumentedStep } from './lib/instrumented-step.js';
 
@@ -256,22 +256,42 @@ export async function runCacheSeed(env, step, instanceId, params = {}) {
     // single org-wide listing; per-call attribution is on item.target.id, so
     // we never fan out per consultant. Optional params.since bounds the
     // lookback; otherwise we pull the full target history Dialpad will return.
+    //
+    // Pagination uses step.do per page so each step stays well under the
+    // CF Workflows 10-min step.do timeout. The cursor checkpoints in each
+    // step's persisted output, so a workflow restart resumes deterministically
+    // from the last cached step.
     const startedAfterMs = params.since ? Date.parse(params.since) : undefined;
-    // maxPages 1000 ≈ 50k calls upper bound — bigger than any realistic
-    // two-year org backfill; the 25-page tail-sync cap would have truncated
-    // mid-history.
-    const calls = await step.do('fetch calls', RETRY_OPTS, async () =>
-      listDialpadCalls({ startedAfterMs, maxPages: 1000 }, env),
-    );
-    // Chunk writes by 200 to keep individual D1 batches well under the cap.
-    for (let i = 0; i < calls.length; i += 200) {
-      await step.do(`write calls chunk=${i}`, async () =>
-        writeCalls(env, calls.slice(i, i + 200)),
-      );
+    const SEED_MAX_PAGES = 10000;  // safety bound: 10k pages × 50 items = 500k calls cap
+    let cursor = null;
+    let totalRows = 0;
+    let pageNo = 0;
+    let truncated = false;
+    for (;;) {
+      pageNo++;
+      const result = await step.do(`fetch+write calls page=${pageNo}`, RETRY_OPTS, async () => {
+        const page = await listDialpadCallsPage({ startedAfterMs, cursor }, env);
+        if (page.items.length > 0) {
+          await writeCalls(env, page.items);
+        }
+        return { itemCount: page.items.length, nextCursor: page.cursor };
+      });
+      totalRows += result.itemCount;
+      cursor = result.nextCursor;
+      if (!cursor) break;
+      if (pageNo >= SEED_MAX_PAGES) {
+        truncated = true;
+        console.warn({
+          message: `[seed] calls truncated at pageNo=${pageNo} cursor remaining`,
+          source: 'cache-seed', subtask: 'calls', instanceId, pages: pageNo,
+        });
+        break;
+      }
     }
     console.log({
-      message: `[seed] calls done instance=${instanceId} rows=${calls.length}`,
-      source: 'cache-seed', subtask: 'calls', instanceId, rows: calls.length,
+      message: `[seed] calls done instance=${instanceId} pages=${pageNo} rows=${totalRows}${truncated ? ' (truncated)' : ''}`,
+      source: 'cache-seed', subtask: 'calls', instanceId,
+      pages: pageNo, rows: totalRows, truncated,
     });
     return;
   }

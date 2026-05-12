@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { listDialpadCalls } from '../src/dialpad-list-client.js';
+import { listDialpadCalls, listDialpadCallsPage } from '../src/dialpad-list-client.js';
 
 const env = {
   DIALPAD_API_KEY: 'test-key',
@@ -100,7 +100,7 @@ describe('listDialpadCalls', () => {
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
-  it('emits a structured per-page log with url, status, item_count, cumulative', async () => {
+  it('emits a structured per-page log with url, status, item_count, has_cursor', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     mockPages([
       { items: [{ call_id: 'a' }, { call_id: 'b' }], cursor: 't1' },
@@ -112,15 +112,11 @@ describe('listDialpadCalls', () => {
       source: 'dialpad-list-client',
       status: 200,
       item_count: 2,
-      cumulative: 2,
       has_cursor: true,
-      page: 1,
     }));
     expect(logSpy).toHaveBeenNthCalledWith(2, expect.objectContaining({
       item_count: 1,
-      cumulative: 3,
       has_cursor: false,
-      page: 2,
     }));
     expect(logSpy.mock.calls[0][0].url).toMatch(/started_after=1717248000000/);
   });
@@ -148,7 +144,71 @@ describe('listDialpadCalls', () => {
     expect(errorSpy).toHaveBeenCalledWith(expect.objectContaining({
       source: 'dialpad-list-client',
       status: 401,
-      page: 1,
     }));
+  });
+});
+
+describe('listDialpadCallsPage', () => {
+  it('returns { items, cursor } for a single page (no internal loop)', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    globalThis.fetch.mockImplementation(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ items: [{ call_id: 'a' }, { call_id: 'b' }], cursor: 'next-tok' }),
+      text: async () => '',
+      headers: new Map([['content-type', 'application/json']]),
+    }));
+    const r = await listDialpadCallsPage({}, env);
+    expect(r).toEqual({ items: [{ call_id: 'a' }, { call_id: 'b' }], cursor: 'next-tok' });
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes opts.cursor through to the URL', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    globalThis.fetch.mockImplementation(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ items: [], cursor: null }),
+      text: async () => '',
+      headers: new Map([['content-type', 'application/json']]),
+    }));
+    await listDialpadCallsPage({ cursor: 'tok-42' }, env);
+    const url = new URL(globalThis.fetch.mock.calls[0][0]);
+    expect(url.searchParams.get('cursor')).toBe('tok-42');
+  });
+
+  it('omits all filter params when opts is empty', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    globalThis.fetch.mockImplementation(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ items: [], cursor: null }),
+      text: async () => '',
+      headers: new Map([['content-type', 'application/json']]),
+    }));
+    await listDialpadCallsPage({}, env);
+    const url = new URL(globalThis.fetch.mock.calls[0][0]);
+    expect(url.searchParams.has('target_id')).toBe(false);
+    expect(url.searchParams.has('target_type')).toBe(false);
+    expect(url.searchParams.has('started_after')).toBe(false);
+    expect(url.searchParams.has('started_before')).toBe(false);
+    expect(url.searchParams.has('cursor')).toBe(false);
+  });
+
+  it('returns cursor: null when Dialpad does not send one', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    globalThis.fetch.mockImplementation(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ items: [{ call_id: 'a' }] }),
+      text: async () => '',
+      headers: new Map([['content-type', 'application/json']]),
+    }));
+    const r = await listDialpadCallsPage({}, env);
+    expect(r.cursor).toBeNull();
+  });
+
+  it('throws on non-2xx (caller responsible for retry)', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    globalThis.fetch.mockImplementation(async () => ({
+      ok: false, status: 500, text: async () => 'oops', json: async () => ({}), headers: new Map(),
+    }));
+    await expect(listDialpadCallsPage({}, env)).rejects.toThrow(/HTTP 500/);
   });
 });

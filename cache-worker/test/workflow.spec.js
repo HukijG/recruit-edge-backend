@@ -347,45 +347,65 @@ describe('runCacheSeed (table=calls)', () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
   });
 
-  it('paginates /v2/call org-wide (no target_id) and writes every call into the calls table', async () => {
-    // Two items in one page — one per consultant. Dialpad attribution lives on
-    // target.id; the seed never fans out per consultant.
-    globalThis.fetch.mockImplementation(async () => ({
-      ok: true, status: 200, headers: new Map(), text: async () => '',
-      json: async () => ({
-        items: [
-          {
-            call_id: 'c-seed-1111',
-            target: { id: '1111' },
-            contact: { id: 'shared_contact_pool_Company:X_uid_RF77' },
-            date_started: 1717248000000,
-            total_duration: 60_000,
-            direction: 'outbound',
-          },
-          {
-            call_id: 'c-seed-2222',
-            target: { id: '2222' },
-            contact: { id: 'shared_contact_pool_Company:X_uid_RF88' },
-            date_started: 1717248060000,
-            total_duration: 90_000,
-            direction: 'outbound',
-          },
-        ],
+  it('paginates /v2/call org-wide via step.do per page, threading cursor between steps, and writes every call', async () => {
+    // Three pages worth, exercising the cursor-handoff between step.do
+    // invocations. Each page is its own /v2/call request; the workflow
+    // emits one step.do per page so each step is bounded.
+    const pages = [
+      {
+        cursor: 'tok-a',
+        items: [{
+          call_id: 'c-1', target: { id: '1111' },
+          contact: { id: 'shared_contact_pool_Company:X_uid_RF77' },
+          date_started: 1717248000000, total_duration: 60_000, direction: 'outbound',
+        }],
+      },
+      {
+        cursor: 'tok-b',
+        items: [{
+          call_id: 'c-2', target: { id: '2222' },
+          contact: { id: 'shared_contact_pool_Company:X_uid_RF88' },
+          date_started: 1717248060000, total_duration: 90_000, direction: 'outbound',
+        }],
+      },
+      {
         cursor: null,
-      }),
-    }));
+        items: [{
+          call_id: 'c-3', target: { id: '1111' },
+          contact: { id: 'shared_contact_pool_Company:X_uid_RF99' },
+          date_started: 1717248120000, total_duration: 30_000, direction: 'outbound',
+        }],
+      },
+    ];
+    const fetchedCursors = [];
+    let i = 0;
+    globalThis.fetch.mockImplementation(async (url) => {
+      const u = new URL(String(url));
+      fetchedCursors.push(u.searchParams.get('cursor'));
+      const page = pages[i++];
+      return {
+        ok: true, status: 200, headers: new Map(), text: async () => '',
+        json: async () => page,
+      };
+    });
+
     await runCacheSeed(env, stepShim, 'test-id', { table: 'calls' });
+
     const { results } = await env.RF_MCP_CACHE
       .prepare('SELECT call_id, target_dialpad_id FROM calls ORDER BY call_id').all();
     expect(results).toEqual([
-      { call_id: 'c-seed-1111', target_dialpad_id: '1111' },
-      { call_id: 'c-seed-2222', target_dialpad_id: '2222' },
+      { call_id: 'c-1', target_dialpad_id: '1111' },
+      { call_id: 'c-2', target_dialpad_id: '2222' },
+      { call_id: 'c-3', target_dialpad_id: '1111' },
     ]);
-    // Single org-wide fetch, no target_id filter.
-    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
-    const url = new URL(globalThis.fetch.mock.calls[0][0]);
-    expect(url.searchParams.has('target_id')).toBe(false);
-    expect(url.searchParams.has('started_after')).toBe(false);
+    // First request carries no cursor; subsequent requests forward the cursor
+    // returned by the previous page.
+    expect(fetchedCursors).toEqual([null, 'tok-a', 'tok-b']);
+    // Org-wide listing — no target_id on any request.
+    for (const call of globalThis.fetch.mock.calls) {
+      const u = new URL(String(call[0]));
+      expect(u.searchParams.has('target_id')).toBe(false);
+    }
   });
 
   it('omits started_after by default (full history) and applies params.since when provided', async () => {
