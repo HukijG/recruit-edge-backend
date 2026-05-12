@@ -2121,9 +2121,21 @@ describe('E2E: /candidate-details', () => {
 describe('E2E: /candidate-details — JWT auth', () => {
 	afterEach(() => { globalThis.fetch = originalFetch; });
 
-	it('returns 200 with full details under JWT, ignoring body consultantFirstName', async () => {
-		// JWT identifies Joel; body sabotages with 'Alice'. Worker MUST use
-		// the JWT identity and return the same shape the legacy path returns.
+	it('returns 200 with Joel\'s picked job under JWT, ignoring body consultantFirstName', async () => {
+		// Sabotage: body asks for Alice (rfUserId=900002), JWT identifies Joel
+		// (rfUserId=900001). Worker MUST pick Joel's job per the JWT, NOT
+		// Alice's per the body. Two open jobs on the candidate — Job A is
+		// Joel's, Job B is Alice's. The KV consultant cache is pre-populated
+		// so pickConsultantJob resolves without falling through to RF.
+		//
+		// Job B (Alice's) appears FIRST in candidate.jobs AND has a more
+		// recent stage_moved — meaning every "non-identity" path
+		// (raw jobs[0], stage-moved-desc-without-match) would return Job B.
+		// Asserting Job A's title proves the JWT identity drove the pick.
+		const JOB_A_ID = 8810; // Joel's job
+		const JOB_B_ID = 8811; // Alice's job
+		const JOB_A_TITLE = 'Senior Backend Engineer';
+		const JOB_B_TITLE = 'Staff Frontend Engineer';
 		const fullCandidate = buildFullRFCandidate({
 			id: 80100,
 			linkedin_profile: 'https://www.linkedin.com/in/jwt-details-person',
@@ -2131,8 +2143,39 @@ describe('E2E: /candidate-details — JWT auth', () => {
 			last_name: 'Details',
 			name: 'JWT Details',
 			phone_number: [{ phone_number: '5559876543', type: 1 }],
-			jobs: [],
+			jobs: [
+				{
+					// Job B — Alice's, listed FIRST + more recent stage_moved
+					// so it would win every fallback path.
+					job_id: JOB_B_ID,
+					is_open: true,
+					name: JOB_B_TITLE,
+					company: { name: 'Acme Inc' },
+					stage_name: 'Replied',
+					stage_moved: '2026-05-01T12:00:00+00:00',
+					added_to_job_by: { id: 900002, name: 'Alice Tester' },
+					stages: [{ id: 1, name: 'Sourced' }, { id: 2, name: 'Replied' }],
+				},
+				{
+					// Job A — Joel's. Only picked if the JWT identity drives
+					// the resolver.
+					job_id: JOB_A_ID,
+					is_open: true,
+					name: JOB_A_TITLE,
+					company: { name: 'Acme Inc' },
+					stage_name: 'Sourced',
+					stage_moved: '2026-04-15T08:00:00+00:00',
+					added_to_job_by: { id: 900001, name: 'Joel Haines' },
+					stages: [{ id: 1, name: 'Sourced' }, { id: 2, name: 'Replied' }],
+				},
+			],
 		});
+
+		// Pre-populate the consultant cache for both job-candidate links so
+		// pickConsultantJob resolves entirely from KV (no RF fallback fetch).
+		const { cacheConsultantForJobLink } = await import('../src/cache.js');
+		await cacheConsultantForJobLink(80100, JOB_A_ID, 900001, env); // Joel
+		await cacheConsultantForJobLink(80100, JOB_B_ID, 900002, env); // Alice
 
 		mockFetch([
 			rfSearchRoute([fullCandidate]),
@@ -2163,6 +2206,13 @@ describe('E2E: /candidate-details — JWT auth', () => {
 		expect(json.fullName).toBe('JWT Details');
 		expect(json.phoneNumber).toBe('+15559876543');
 		expect(json.activities).toEqual([]);
+		// Discriminator: Joel's job MUST be picked, NOT Alice's. If the body
+		// firstName had won, json.job.title would equal JOB_B_TITLE.
+		expect(json.job).toEqual({
+			title: JOB_A_TITLE,
+			company: 'Acme Inc',
+			stage: 'Sourced',
+		});
 	});
 });
 
