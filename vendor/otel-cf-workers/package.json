@@ -1,0 +1,42 @@
+{
+	"name": "@microlabs/otel-cf-workers",
+	"version": "1.0.0-rc.52",
+	"module": "./dist/index.js",
+	"type": "module",
+	"types": "./dist/index.d.ts",
+	"exports": "./dist/index.js",
+	"scripts": {
+		"clean": "rimraf ./dist",
+		"build:src": "tsup",
+		"build": "tsup",
+		"check:types": "tsc --noEmit",
+		"watch": "tsc --watch",
+		"test": "vitest run",
+		"test:dev": "vitest"
+	},
+	"files": [
+		"dist"
+	],
+	"homepage": "https://github.com/evanderkoogh/otel-cf-workers#readme",
+	"dependencies": {
+		"@opentelemetry/core": "^2.0.0",
+		"@opentelemetry/exporter-trace-otlp-http": "^0.200.0",
+		"@opentelemetry/otlp-exporter-base": "^0.200.0",
+		"@opentelemetry/otlp-transformer": "^0.200.0",
+		"@opentelemetry/resources": "^2.0.0",
+		"@opentelemetry/sdk-trace-base": "^2.0.0",
+		"@opentelemetry/semantic-conventions": "^1.33.0"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.8.30",
+		"@cloudflare/workers-types": "^4.20250510.0",
+		"rimraf": "^6.0.1",
+		"tsup": "^8.4.0",
+		"typescript": "^5.8.3",
+		"vitest": "^2.1.9"
+	},
+	"peerDependencies": {
+		"@opentelemetry/api": "~1.9.0"
+	},
+	"license": "BSD-3-Clause"
+}

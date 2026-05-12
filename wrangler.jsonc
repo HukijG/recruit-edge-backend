@@ -2,21 +2,23 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "rf-dialpad-sync-dev",
   "main": "src/index.js",
-  "compatibility_date": "2025-09-02",
+  "compatibility_date": "2026-05-10",
   "compatibility_flags": ["nodejs_compat"],
   "ai": {
     "binding": "AI"
   },
   "observability": {
     "enabled": true,
+    "head_sampling_rate": 0.1,
     "logs": {
-      "invocation_logs": false,
-      "head_sampling_rate": 1
+      "invocation_logs": false
     }
   },
   "vars": {
     "DIALPAD_API_BASE_URL": "https://dialpad.com/api/v2",
-    "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external"
+    "RF_API_BASE_URL": "https://api.recruiterflow.com/api/external",
+    "LD_OTLP_TRACES_URL": "https://otel.observability.app.launchdarkly.com/v1/traces",
+    "LD_OTLP_LOGS_URL": "https://otel.observability.app.launchdarkly.com/v1/logs"
   },
   "rules": [
     { "type": "Text", "globs": ["**/*.md"], "fallthrough": false }

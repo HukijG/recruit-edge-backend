@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rf-cf-metrics-poller",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "triggers": { "crons": ["0 * * * *"] },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  },
+  "vars": {
+    "CF_ACCOUNT_ID": "YOUR_CF_ACCOUNT_ID",
+    "CF_GRAPHQL_ENDPOINT": "https://api.cloudflare.com/client/v4/graphql",
+    "LD_OTLP_METRICS_URL": "https://otel.observability.app.launchdarkly.com/v1/metrics",
+    "LD_OTLP_TRACES_URL": "https://otel.observability.app.launchdarkly.com/v1/traces",
+    "LD_OTLP_LOGS_URL": "https://otel.observability.app.launchdarkly.com/v1/logs"
+  }
+}

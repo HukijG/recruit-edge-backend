@@ -1,0 +1,4 @@
+{
+  "@microlabs/otel-cf-workers": "1.0.0-rc.52",
+  "node": "v22.x.x"
+}

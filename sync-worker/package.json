@@ -11,8 +11,18 @@
     "test": "vitest run"
   },
   "devDependencies": {
-    "wrangler": "^4.33.1",
+    "@cloudflare/vitest-pool-workers": "^0.16.3",
     "vitest": "^4.1.5",
-    "@cloudflare/vitest-pool-workers": "^0.16.3"
+    "wrangler": "^4.33.1"
+  },
+  "dependencies": {
+    "@microlabs/otel-cf-workers": "file:../vendor/otel-cf-workers",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/api-logs": "^0.217.0",
+    "@opentelemetry/exporter-logs-otlp-http": "^0.217.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.217.0",
+    "@opentelemetry/resources": "^2.7.1",
+    "@opentelemetry/sdk-logs": "^0.217.0",
+    "@opentelemetry/sdk-trace-base": "^2.7.1"
   }
 }

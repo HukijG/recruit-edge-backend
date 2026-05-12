@@ -20,6 +20,7 @@
  */
 
 import * as cfWorkers from 'cloudflare:workers';
+import { trace, SpanStatusCode } from '@opentelemetry/api';
 
 const { WorkflowEntrypoint } = cfWorkers;
 // `NonRetryableError` is only present on newer compatibility dates. The test
@@ -46,6 +47,8 @@ import { readSyncState, writeSyncState, deleteSyncState } from './sync-state.js'
 import { normalizePipelineDetail } from './pipeline-normalize.js';
 import { listConsultants } from './users-d1-read.js';
 import { fetchCallsForConsultant } from './dialpad-list-client.js';
+import { FLOWS } from './lib/flow-names.js';
+import { instrumentedStep } from './lib/instrumented-step.js';
 
 const PAGE_SIZE = 100;  // RF caps /candidate/list at 100/page
 const RETRY_OPTS = {
@@ -155,7 +158,27 @@ export async function runFullRebuild(env, step, instanceId, params = {}) {
 
 export class FullRebuildWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
-    return runFullRebuild(this.env, step, event.instanceId, event.payload ?? {});
+    const tracer = trace.getTracer('rf-mcp-cache-sync');
+    return await tracer.startActiveSpan(
+      'WorkflowFullRebuild',
+      { attributes: { 'flow.name': FLOWS.WORKFLOW_FULL_REBUILD, 'workflow.id': event.instanceId } },
+      async (span) => {
+        try {
+          return await runFullRebuild(
+            this.env,
+            instrumentedStep(step, 'rf-mcp-cache-sync', event.instanceId),
+            event.instanceId,
+            event.payload ?? {},
+          );
+        } catch (err) {
+          span.recordException(err);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message || err) });
+          throw err;
+        } finally {
+          span.end();
+        }
+      }
+    );
   }
 }
 

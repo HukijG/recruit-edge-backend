@@ -47,7 +47,7 @@ export async function addNoteForCandidate({ env, candidate, noteMd, consultant }
   try {
     await addRFCandidateNote(candidate.id, html, consultant.rfUserId, env);
   } catch (err) {
-    console.error('add-note RF call failed:', err);
+    console.error({ source: 'mcp-add-note', message: 'add-note RF call failed', error: err?.message ?? String(err) });
     if (err instanceof RFRateLimitedError) {
       return {
         ok: false,

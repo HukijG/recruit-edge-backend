@@ -167,6 +167,20 @@ This file does NOT duplicate that material. References below use the Access auth
 | `mcp-worker/test/{access-auth,auth,tool-dispatch}.spec.ts`, `mcp-worker/test/jwt-fixture.ts`, `mcp-worker/test/env.d.ts` | TypeScript tests with a shared RSA-keypair JWT fixture. |
 | `mcp-worker/vitest.config.ts` | Vitest config; injects `ACCESS_TEAM_DOMAIN` and a fixture-derived `ACCESS_AUD_MCP` into the test env. |
 
+### Observability libs (all workers)
+
+| File | Purpose |
+|------|---------|
+| `src/lib/*.js`, `sync-worker/src/lib/*.js`, `mcp-worker/src/lib/*.ts`, `metrics-poller/src/lib/*.ts` | OTel helpers — `flow-names`, `otel-config`, `body-capture`, `logs-bridge`, `ld-resource-injector`, plus per-worker additions (`ai-instrument`, `trace-link`, `instrumented-step`, `bootstrap-otel`). Byte-identical copies across workers with closed-set drift tests. See `docs/observability.md`. |
+| `metrics-poller/` | Separate worker `rf-cf-metrics-poller`. Hourly cron pulls D1 / KV / AI metrics from Cloudflare GraphQL Analytics, pushes OTel metric records to LaunchDarkly's `/v1/metrics`. See `docs/observability.md`. |
+| `vendor/otel-cf-workers/` | Forked + patched `@microlabs/otel-cf-workers` v1.0.0-rc.52 (npm workspace). Carries a 5-line patch to `BatchTraceSpanProcessor.exportSpans()` that invokes the `postProcessor` callback (without it, `launchdarkly.project_id` resource attribute injection silently doesn't reach LD). See `vendor/otel-cf-workers/VENDOR.md`. |
+
+---
+
+## Observability
+
+Every worker emits OTel traces + logs to LaunchDarkly Observability. The pipeline (architecture, helpers, kill switches, dashboards, alert wiring, PII trade-off rationale) is documented in `docs/observability.md`; alert runbooks at `docs/observability-runbooks.md`. The four workers each have their own `lib/` directory of byte-identical helpers (`flow-names`, `otel-config`, `body-capture`, `logs-bridge`, `ld-resource-injector`, plus per-worker additions). A separate `metrics-poller/` worker polls Cloudflare GraphQL Analytics hourly and pushes OTel metrics to LD. Cloudflare native observability stays enabled at `head_sampling_rate: 0.1` on every worker as an always-on no-cost fallback.
+
 ---
 
 ## Endpoints

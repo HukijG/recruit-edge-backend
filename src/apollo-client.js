@@ -4,6 +4,8 @@
  * Provides people enrichment and search via the Apollo.io API.
  */
 
+import { trace, SpanStatusCode } from '@opentelemetry/api';
+
 const APOLLO_BASE_URL = 'https://api.apollo.io/api/v1';
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -32,7 +34,8 @@ export async function enrichPerson(params, options, env) {
 		});
 
 		if (!response.ok) {
-			console.error({ message: `Apollo enrichPerson failed with status ${response.status}`, source: 'apollo' });
+			trace.getActiveSpan()?.setStatus({ code: SpanStatusCode.ERROR, message: `Apollo ${response.status}` });
+			console.warn({ source: 'apollo', message: 'enrichPerson non-OK', status: response.status });
 			return null;
 		}
 
@@ -70,7 +73,8 @@ export async function searchPeople(params, env) {
 		});
 
 		if (!response.ok) {
-			console.error({ message: `Apollo searchPeople failed with status ${response.status}`, source: 'apollo' });
+			trace.getActiveSpan()?.setStatus({ code: SpanStatusCode.ERROR, message: `Apollo ${response.status}` });
+			console.warn({ source: 'apollo', message: 'searchPeople non-OK', status: response.status });
 			return [];
 		}
 

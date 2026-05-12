@@ -8,6 +8,7 @@
 import { enrichPerson, searchPeople, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from './apollo-client.js';
 import { updateRFCandidate } from './rf-client.js';
 import { patchDialpadContact } from './dialpad-client.js';
+import { makeAsyncCallbackUrl } from './lib/trace-link.js';
 
 function log(data) {
 	console.log({ source: 'enrichment', ...data });
@@ -82,19 +83,9 @@ export async function enrichCandidate(candidate, fullCandidate, env) {
 
 	// Step 2: Enrich via LinkedIn
 	if (candidate.linkedin_profile) {
-		log({ message: `[enrich] LinkedIn lookup: ${candidate.linkedin_profile}`, rfId });
 		apolloPerson = await enrichPerson({ linkedin_url: candidate.linkedin_profile }, {}, env);
 
-		if (apolloPerson) {
-			log({
-				message: `[enrich] LinkedIn returned: "${apolloPerson.first_name} ${apolloPerson.last_name}" @ "${apolloPerson.organization?.name || 'N/A'}"`,
-				rfId,
-				apolloId: apolloPerson.id,
-				apolloName: `${apolloPerson.first_name} ${apolloPerson.last_name}`,
-				apolloOrg: apolloPerson.organization?.name || null,
-				apolloTitle: apolloPerson.title || null,
-			});
-		} else {
+		if (!apolloPerson) {
 			log({ message: `[enrich] LinkedIn lookup returned no person`, rfId });
 		}
 	} else {
@@ -135,12 +126,6 @@ export async function enrichCandidate(candidate, fullCandidate, env) {
 			}, {}, env);
 
 			if (apolloPerson) {
-				log({
-					message: `[enrich] name+org returned: "${apolloPerson.first_name} ${apolloPerson.last_name}" apolloId=${apolloPerson.id}`,
-					rfId,
-					apolloId: apolloPerson.id,
-					apolloLinkedIn: apolloPerson.linkedin_url || null,
-				});
 				if (apolloPerson.linkedin_url) {
 					correctedLinkedIn = apolloPerson.linkedin_url;
 				}
@@ -157,8 +142,7 @@ export async function enrichCandidate(candidate, fullCandidate, env) {
 	}
 
 	// Step 6: Phone reveal
-	log({ message: `[enrich] requesting phone reveal for apolloId=${apolloPerson.id}`, rfId });
-	const webhookUrl = buildApolloWebhookUrl(rfId, env);
+	const webhookUrl = makeAsyncCallbackUrl(buildApolloWebhookUrl(rfId, env), {});
 	await enrichPerson(
 		{ id: apolloPerson.id },
 		{ reveal_phone_number: true, webhook_url: webhookUrl },
@@ -169,7 +153,6 @@ export async function enrichCandidate(candidate, fullCandidate, env) {
 	if (correctedLinkedIn) {
 		try {
 			await updateRFCandidate(rfId, { linkedin_profile: correctedLinkedIn }, env);
-			log({ message: `[enrich] updated RF LinkedIn to ${correctedLinkedIn}`, rfId });
 		} catch (err) {
 			logError({ message: `[enrich] failed to update RF LinkedIn: ${err.message}`, rfId });
 		}
@@ -177,7 +160,6 @@ export async function enrichCandidate(candidate, fullCandidate, env) {
 		// Patch Dialpad contact with ONLY the corrected LinkedIn — nothing else
 		try {
 			await patchDialpadContact(rfId, { urls: [correctedLinkedIn] }, env);
-			log({ message: `[enrich] patched Dialpad LinkedIn to ${correctedLinkedIn}`, rfId });
 		} catch (err) {
 			logError({ message: `[enrich] failed to patch Dialpad LinkedIn: ${err.message}`, rfId });
 		}
@@ -220,15 +202,11 @@ async function fallbackSearch(candidate, fullCandidate, rfId, env) {
 	const namePart = isSingleCharLast ? rfFirst : `${rfFirst} ${rfLast}`;
 	const keywords = `${namePart} ${(candidate.current_organization || '').trim()}`;
 
-	log({ message: `[fallback] searching: keywords="${keywords}" title="${(candidate.current_title || '').trim()}"`, rfId });
-
 	const results = await searchPeople({
 		q_keywords: keywords,
 		person_titles: [(candidate.current_title || '').trim()],
 		include_similar_titles: false,
 	}, env);
-
-	log({ message: `[fallback] search returned ${results.length} raw results`, rfId });
 
 	// Pre-filter: first name match, last_name_obfuscated letter check, cap at 5
 	const filtered = filterSearchResults(results, candidate);

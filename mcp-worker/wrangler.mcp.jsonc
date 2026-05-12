@@ -8,10 +8,12 @@
     { "binding": "MIDDLEWARE", "service": "rf-dialpad-sync-dev" }
   ],
   "vars": {
-    "ACCESS_TEAM_DOMAIN": "https://example-team.cloudflareaccess.com"
+    "ACCESS_TEAM_DOMAIN": "https://example-team.cloudflareaccess.com",
+    "LD_OTLP_TRACES_URL": "https://otel.observability.app.launchdarkly.com/v1/traces",
+    "LD_OTLP_LOGS_URL": "https://otel.observability.app.launchdarkly.com/v1/logs"
   },
   "observability": {
     "enabled": true,
-    "logs": { "head_sampling_rate": 1 }
+    "head_sampling_rate": 0.1
   }
 }

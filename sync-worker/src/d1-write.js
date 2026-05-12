@@ -108,6 +108,7 @@ export async function writeCandidatesAndLinks(env, rfCandidates) {
       // Flushing now keeps the next candidate's full statement set together
       // in a fresh batch — never splits a candidate across batches.
       await env.RF_MCP_CACHE.batch(batch);
+      console.log({ source: 'd1-write', table: 'candidates', op: 'replace', row_count: batch.length });
       batch = [];
     }
 
@@ -116,6 +117,7 @@ export async function writeCandidatesAndLinks(env, rfCandidates) {
 
   if (batch.length) {
     await env.RF_MCP_CACHE.batch(batch);
+    console.log({ source: 'd1-write', table: 'candidates', op: 'replace', row_count: batch.length });
   }
 }
 
@@ -142,7 +144,9 @@ export async function writeJobs(env, jobs) {
     )
   );
   for (let i = 0; i < stmts.length; i += D1_BATCH_CAP) {
-    await env.RF_MCP_CACHE.batch(stmts.slice(i, i + D1_BATCH_CAP));
+    const chunk = stmts.slice(i, i + D1_BATCH_CAP);
+    await env.RF_MCP_CACHE.batch(chunk);
+    console.log({ source: 'd1-write', table: 'jobs', op: 'replace', row_count: chunk.length });
   }
 }
 
@@ -163,6 +167,7 @@ export async function writeJobPipeline(env, jobId, summary, stageCandidates) {
     .prepare(JP_INSERT_SQL)
     .bind(jobId, JSON.stringify(summary ?? []), JSON.stringify(stageCandidates ?? {}), now)
     .run();
+  console.log({ source: 'd1-write', table: 'job_pipelines', op: 'replace', row_count: 1 });
 }
 
 // ---------------------------------------------------------------------------

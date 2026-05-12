@@ -2,6 +2,9 @@
 	"name": "recruit-edge-backend",
 	"version": "0.0.0",
 	"private": true,
+	"workspaces": [
+		"vendor/otel-cf-workers"
+	],
 	"scripts": {
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
@@ -15,6 +18,12 @@
 		"wrangler": "^4.33.1"
 	},
 	"dependencies": {
+		"@microlabs/otel-cf-workers": "1.0.0-rc.52",
+		"@opentelemetry/api": "^1.9.1",
+		"@opentelemetry/api-logs": "^0.217.0",
+		"@opentelemetry/exporter-logs-otlp-http": "^0.217.0",
+		"@opentelemetry/resources": "^2.7.1",
+		"@opentelemetry/sdk-logs": "^0.217.0",
 		"jose": "^6.1.0",
 		"marked": "^16.4.2"
 	}

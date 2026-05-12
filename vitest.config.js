@@ -23,6 +23,11 @@ export default defineWorkersConfig({
 						ACCESS_TEAM_DOMAIN: 'https://test.cloudflareaccess.com',
 						ACCESS_AUD_MCP: 'a'.repeat(64),  // 64-char hex shape matches production Access AUD format
 						INTERNAL_SECRET: 'test-internal-secret',
+						// LD_SDK_KEY intentionally omitted — its absence is the signal that src/index.js uses
+						// to skip the @microlabs `instrument()` wrap (and logs-bridge to skip its install). In
+						// production, the secret is set, so instrument() + logs-bridge are active. Setting it
+						// here would force the OTLP exporters to fire on every test request, polluting tests
+						// that count globalThis.fetch invocations and breaking strict-zero-calls assertions.
 					},
 					d1Databases: {
 						RF_MCP_CACHE: 'rf-mcp-cache-test',

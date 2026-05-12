@@ -16,7 +16,7 @@ export async function verifyJWT(token, secret) {
 
     return payload;
   } catch (error) {
-    console.error('JWT verification failed:', error.message);
+    console.error({ source: 'auth', message: 'JWT verification failed', error: error.message });
     return null;
   }
 }

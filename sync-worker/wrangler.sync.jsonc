@@ -77,10 +77,12 @@
     // diagnostics, via `wrangler secret put CRON_LEGACY_ENABLED` set to
     // "true" (or "1"). After cutover step 6 the legacy code is dropped and
     // this var becomes redundant.
-    "CRON_LEGACY_ENABLED": "false"
+    "CRON_LEGACY_ENABLED": "false",
+    "LD_OTLP_TRACES_URL": "https://otel.observability.app.launchdarkly.com/v1/traces",
+    "LD_OTLP_LOGS_URL": "https://otel.observability.app.launchdarkly.com/v1/logs"
   },
   "observability": {
     "enabled": true,
-    "logs": { "head_sampling_rate": 1 }
+    "head_sampling_rate": 0.1
   }
 }
