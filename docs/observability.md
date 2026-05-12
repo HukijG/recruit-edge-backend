@@ -248,13 +248,24 @@ What each one covers:
 
 - **Metrics-poller stale (no new metrics arriving).** See Alert 6 in `docs/observability-runbooks.md`. Common cause: expired `CF_API_TOKEN` secret.
 
+## Entry-handler body capture
+
+In addition to the `installBodyCapture()` outbound-fetch wrap, every worker captures the **inbound** request body and **outbound** response body on the entry span via the `captureInboundBody(request, span?)` / `captureResponseBody(response, span?)` helpers in `lib/body-capture.{js,ts}`. Without these, the entry span shows only `http.request.body.size` and you can't tell *what* the worker received or returned — the bodies are owned by the platform-emitted `fetchHandler` span and never flow through `globalThis.fetch` to be picked up by the outbound wrap.
+
+Wired in at:
+- `mcp-remote/src/index.ts` — captures the Claude-facing MCP envelope on the root `MCP/Post` span (`http.request.body`) and the streamed response (`http.response.body` — skipped for SSE content-type, which is the normal MCP transport).
+- `src/mcp/router.js` — captures the service-binding inbound body on every `/mcp/*` route's `MCP/Proxy` span, plus the outgoing JSON response body. Adds two outcome attributes for fast filtering: `mcp.tool` (the path) and `mcp.outcome.kind` (`ok` | `needs_disambiguation` | `<recoverable-failure-kind>`).
+- `mcp-remote/src/mw-client.ts` — `mwFetch` stamps `mcp.tool.args` (resolved payload with auth-derived consultantEmail) before the service-binding call and `mcp.tool.result` + `mcp.middleware.status` + `mcp.outcome.kind` after — so every `MCP/rf_*` tool span carries its full request/response without drilling into the inner service-binding client span.
+
+All three call sites honour the same `LOG_NO_BODY=1` / `OTEL_DISABLED=1` kill switches as the outbound wrapper.
+
+Outbound responses larger than `MAX_BODY_BYTES` (32 KB) get truncated with the `…[truncated, original >${MAX_BODY_BYTES} bytes]` suffix — same redaction + size discipline as the outbound wrapper.
+
 ## Known gaps (instrumentation work pending)
 
-- **Inbound request body is NOT captured on the root fetchHandler span.** Body-capture wrapper only patches `globalThis.fetch` (outbound). Inbound MCP / webhook bodies are invisible in LD. Fix: small patch to read `request.clone().text()` at entry and stamp `http.request.body` on the root span. Sibling-copy across all 4 workers' `lib/body-capture.{js,ts}`.
+- **MCP handler internal flow is partially spanned.** A `/mcp/candidate-get` trace now carries `mcp.tool.args` + `mcp.tool.result` + `mcp.outcome.kind` on the tool span and `http.request.body` + `http.response.body` on the entry span — so the inbound payload and outbound shape are visible without drilling into auto-instrumented child spans. The decisions BETWEEN entry and outbound RF call (snapshot load, tier-1 fuzzy match, tier-2 RF routing, predicate build, response shaping) still show only as `console.log` lines correlated by `trace_id`, not as named child spans. Adding `tracer.startActiveSpan` calls at decision points inside `src/mcp/{candidate-search,candidate-get,job-pipeline,job-candidates-filter,candidate-call-notes,snapshot,resolvers,fuzzy}.js` is the next refinement; the user-visible "received body X / executed call Y / returned B" narrative is already satisfied by the entry-span body capture + auto-instrumented outbound RF fetch.
 
-- **MCP handler internal flow is NOT spanned.** A `/mcp/candidate-get` trace shows the inbound span + auto-instrumented D1 lookup + outbound RF fetch — but NOT the decisions in between (snapshot load, tier-1 fuzzy match, tier-2 RF routing, predicate build, response shaping). These have structured `console.log` lines (which DO appear in LD's Logs tab, correlated by `trace_id`) but no spans. Fix: add `tracer.startActiveSpan` calls at decision points inside `src/mcp/{candidate-search,candidate-get,job-pipeline,job-candidates-filter,candidate-call-notes,snapshot,resolvers,fuzzy}.js`. Estimated 2–4 h of work.
-
-- **LD alerts not yet built.** Five alerts originally planned (D1 write storm, AI usage, per-worker error rate ×4, ingest near ceiling, cron stall). Dashboards above are live; alerts pending. SQL query bodies preserved in `docs/archived/handoffs/2026-05-11-observability-merge-prep.md` § 6.5.
+- **LD alerts not yet built.** Five alerts originally planned (D1 write storm, AI usage, per-worker error rate ×4, ingest near ceiling, cron stall). Dashboards above are live; alerts pending. SQL query bodies preserved in the merge-prep working notes.
 
 ## Reference
 

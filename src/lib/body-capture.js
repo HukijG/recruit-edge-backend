@@ -172,3 +172,70 @@ function redactQueryParams(urlString) {
     return u.toString();
   } catch { return urlString; }
 }
+
+/**
+ * Read the inbound request body and stamp it onto the active span as
+ * `http.request.body` (redacted). Idempotent — safe to call once per request.
+ *
+ * Why this exists: `installBodyCapture()` wraps `globalThis.fetch`, so OUTBOUND
+ * fetches get their bodies on the corresponding fetch-client span. The root
+ * `fetchHandler` server span receives nothing — the platform doesn't surface
+ * the inbound body through the @microlabs instrumentation. Without this
+ * helper, a /mcp/* trace shows only `http.request.body.size` on the root span,
+ * which makes "what did Claude actually ask for?" essentially unanswerable.
+ *
+ * Honours `LOG_NO_BODY=1` and `OTEL_DISABLED=1` for parity with the outbound
+ * wrapper's kill-switch semantics.
+ *
+ * Returns the (redacted) body string the caller can use for its own logging /
+ * dispatch logic, or null when capture was skipped / failed. Never throws.
+ *
+ * @param {Request} request
+ * @param {*} span - OTel Span (optional — defaults to the active span)
+ * @returns {Promise<string|null>}
+ */
+export async function captureInboundBody(request, span) {
+  if (env && env.OTEL_DISABLED === '1') return null;
+  if (env && env.LOG_NO_BODY === '1') return null;
+  const ct = request.headers?.get?.('content-type') || '';
+  if (!TEXT_CT_RE.test(ct)) return null;
+  let text;
+  try { text = await request.clone().text(); } catch { return null; }
+  const processed = processBody(text);
+  if (processed === null) return null;
+  try {
+    const target = span || trace.getActiveSpan();
+    target?.setAttribute('http.request.body', processed);
+  } catch { /* never throw on telemetry */ }
+  return processed;
+}
+
+/**
+ * Read the outbound response body and stamp it onto the active span as
+ * `http.response.body` (redacted). Pair with `captureInboundBody` to give the
+ * root fetchHandler span the same request/response symmetry that
+ * `installBodyCapture` gives to outbound fetch spans.
+ *
+ * Returns the response unchanged (after teeing for capture), so the caller
+ * can drop it in: `return await captureResponseBody(response, span)`.
+ * On any failure the original response is returned untouched.
+ *
+ * @param {Response} response
+ * @param {*} span - OTel Span (optional — defaults to the active span)
+ * @returns {Promise<Response>}
+ */
+export async function captureResponseBody(response, span) {
+  if (env && env.OTEL_DISABLED === '1') return response;
+  if (env && env.LOG_NO_BODY === '1') return response;
+  try {
+    const cloned = response.clone();
+    const text = await safeReadResponseBody(cloned);
+    if (text !== null) {
+      try {
+        const target = span || trace.getActiveSpan();
+        target?.setAttribute('http.response.body', text);
+      } catch { /* never throw on telemetry */ }
+    }
+  } catch { /* swallow — telemetry must not break the response path */ }
+  return response;
+}

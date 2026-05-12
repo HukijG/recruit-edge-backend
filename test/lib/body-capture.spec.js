@@ -198,3 +198,88 @@ describe('body-capture', () => {
     expect(setAttributeMock).not.toHaveBeenCalled();
   });
 });
+
+describe('captureInboundBody / captureResponseBody', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    // Earlier tests in this file call `vi.doMock('cloudflare:workers', ...)`
+    // with kill-switch flags set; without resetting here the leaked mock
+    // would suppress body capture in every test below. Reapply the default
+    // (no flags set) explicitly.
+    vi.doMock('cloudflare:workers', () => ({ env: { LOG_NO_BODY: undefined } }));
+    setAttributeMock.mockClear();
+  });
+
+  it('stamps http.request.body on the active span from an inbound JSON Request', async () => {
+    const { captureInboundBody } = await import('../../src/lib/body-capture.js');
+    const req = new Request('https://internal/mcp/candidate-get', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 49243, fields: ['phone'] }),
+    });
+    const result = await captureInboundBody(req);
+    expect(result).toContain('"id":49243');
+    const reqCall = setAttributeMock.mock.calls.find(([k]) => k === 'http.request.body');
+    expect(reqCall).toBeDefined();
+    expect(reqCall[1]).toContain('"fields":["phone"]');
+  });
+
+  it('redacts password / token fields in the inbound body', async () => {
+    const { captureInboundBody } = await import('../../src/lib/body-capture.js');
+    const req = new Request('https://internal/x', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Joel', api_key: 'sk_secret' }),
+    });
+    const result = await captureInboundBody(req);
+    expect(result).toContain('"api_key":"[REDACTED]"');
+    expect(result).toContain('"name":"Joel"');
+  });
+
+  it('returns null for non-JSON/text content types (skips binary)', async () => {
+    const { captureInboundBody } = await import('../../src/lib/body-capture.js');
+    const req = new Request('https://internal/x', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: 'binary-body',
+    });
+    const result = await captureInboundBody(req);
+    expect(result).toBeNull();
+    const reqCall = setAttributeMock.mock.calls.find(([k]) => k === 'http.request.body');
+    expect(reqCall).toBeUndefined();
+  });
+
+  it('stamps http.response.body on the active span from a Response', async () => {
+    const { captureResponseBody } = await import('../../src/lib/body-capture.js');
+    const res = new Response(JSON.stringify({ ok: true, count: 3 }), {
+      headers: { 'content-type': 'application/json' },
+    });
+    const returned = await captureResponseBody(res);
+    expect(returned).toBe(res);
+    const respCall = setAttributeMock.mock.calls.find(([k]) => k === 'http.response.body');
+    expect(respCall).toBeDefined();
+    expect(respCall[1]).toContain('"ok":true');
+  });
+
+  it('captureResponseBody returns the response unchanged on failure paths', async () => {
+    const { captureResponseBody } = await import('../../src/lib/body-capture.js');
+    const res = new Response('not-json', { headers: { 'content-type': 'text/plain' } });
+    const returned = await captureResponseBody(res);
+    // Even on text/plain (still in the allowlist), the response object is the same instance.
+    expect(returned).toBe(res);
+  });
+
+  it('captureInboundBody honours LOG_NO_BODY=1', async () => {
+    vi.doMock('cloudflare:workers', () => ({ env: { LOG_NO_BODY: '1' } }));
+    const { captureInboundBody } = await import('../../src/lib/body-capture.js');
+    const req = new Request('https://internal/x', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Joel' }),
+    });
+    const result = await captureInboundBody(req);
+    expect(result).toBeNull();
+    const reqCall = setAttributeMock.mock.calls.find(([k]) => k === 'http.request.body');
+    expect(reqCall).toBeUndefined();
+  });
+});

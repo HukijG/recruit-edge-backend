@@ -1,5 +1,5 @@
 import { env as workerEnv } from "cloudflare:workers";
-import { installBodyCapture } from "./lib/body-capture.js";
+import { installBodyCapture, captureInboundBody, captureResponseBody } from "./lib/body-capture.js";
 import { installLogsBridge, withLogsFlush } from "./lib/logs-bridge.js";
 
 installBodyCapture();
@@ -57,9 +57,18 @@ const handler = {
 
     trace.getActiveSpan()?.setAttribute("flow.name", FLOWS.MCP_POST);
 
+    // Inbound body capture on the entry span. The body carries the MCP
+    // JSON-RPC envelope from Claude — without this, the trace shows only
+    // http.request.body.size and you can't tell what was actually asked.
+    // No-op when LOG_NO_BODY=1 / OTEL_DISABLED=1.
+    const rootSpan = trace.getActiveSpan();
+    try { await captureInboundBody(request, rootSpan); } catch { /* never block on telemetry */ }
+
     const claims = await verifyAccessJwt(request, env, env.ACCESS_AUD_MCP);
     if (!claims) {
-      return jsonResponse(401, { ok: false, error: "Invalid or missing Access JWT" });
+      const res = jsonResponse(401, { ok: false, error: "Invalid or missing Access JWT" });
+      await captureResponseBody(res, rootSpan);
+      return res;
     }
 
     trace.getActiveSpan()?.setAttribute("consultant.email", claims.email);
@@ -69,7 +78,14 @@ const handler = {
     const consultantEmail = claims.email;
 
     const server = createServer({ env, consultantEmail });
-    return createMcpHandler(server)(request, env, execCtx);
+    const res = await createMcpHandler(server)(request, env, execCtx);
+    // Stamp the MCP response body on the entry span. Note: the
+    // SSE/text-event-stream content-type used by the MCP transport will
+    // skip body capture (captureResponseBody only reads JSON/text/form),
+    // so this is a no-op for streamed responses — those still show up via
+    // the per-tool `MCP/rf_*` spans the handler emits.
+    await captureResponseBody(res, rootSpan);
+    return res;
   },
 } satisfies ExportedHandler<Env>;
 

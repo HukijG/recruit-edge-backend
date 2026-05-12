@@ -172,3 +172,54 @@ function redactQueryParams(urlString) {
     return u.toString();
   } catch { return urlString; }
 }
+
+/**
+ * Read the inbound request body and stamp it onto the active span as
+ * `http.request.body` (redacted). See `src/lib/body-capture.js` in the main
+ * worker for the rationale — this is a byte-equivalent sibling copy of that
+ * helper, kept in sync per the lib-drift discipline.
+ *
+ * @param {Request} request
+ * @param {*} span - OTel Span (optional — defaults to the active span)
+ * @returns {Promise<string|null>}
+ */
+export async function captureInboundBody(request, span) {
+  if (env && env.OTEL_DISABLED === '1') return null;
+  if (env && env.LOG_NO_BODY === '1') return null;
+  const ct = request.headers?.get?.('content-type') || '';
+  if (!TEXT_CT_RE.test(ct)) return null;
+  let text;
+  try { text = await request.clone().text(); } catch { return null; }
+  const processed = processBody(text);
+  if (processed === null) return null;
+  try {
+    const target = span || trace.getActiveSpan();
+    target?.setAttribute('http.request.body', processed);
+  } catch { /* never throw on telemetry */ }
+  return processed;
+}
+
+/**
+ * Read the outbound response body and stamp it onto the active span as
+ * `http.response.body` (redacted). Sibling copy of the helper in the main
+ * worker's `src/lib/body-capture.js`.
+ *
+ * @param {Response} response
+ * @param {*} span - OTel Span (optional — defaults to the active span)
+ * @returns {Promise<Response>}
+ */
+export async function captureResponseBody(response, span) {
+  if (env && env.OTEL_DISABLED === '1') return response;
+  if (env && env.LOG_NO_BODY === '1') return response;
+  try {
+    const cloned = response.clone();
+    const text = await safeReadResponseBody(cloned);
+    if (text !== null) {
+      try {
+        const target = span || trace.getActiveSpan();
+        target?.setAttribute('http.response.body', text);
+      } catch { /* never throw on telemetry */ }
+    }
+  } catch { /* swallow — telemetry must not break the response path */ }
+  return response;
+}

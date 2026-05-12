@@ -172,3 +172,43 @@ function redactQueryParams(urlString: string): string {
     return u.toString();
   } catch { return urlString; }
 }
+
+/**
+ * Read the inbound request body and stamp it onto the active span as
+ * `http.request.body` (redacted). TypeScript sibling copy.
+ */
+export async function captureInboundBody(request: Request, span?: any): Promise<string | null> {
+  if (env && (env as any).OTEL_DISABLED === '1') return null;
+  if (env && (env as any).LOG_NO_BODY === '1') return null;
+  const ct = request.headers?.get?.('content-type') || '';
+  if (!TEXT_CT_RE.test(ct)) return null;
+  let text: string;
+  try { text = await request.clone().text(); } catch { return null; }
+  const processed = processBody(text);
+  if (processed === null) return null;
+  try {
+    const target = span || trace.getActiveSpan();
+    target?.setAttribute('http.request.body', processed);
+  } catch { /* never throw on telemetry */ }
+  return processed;
+}
+
+/**
+ * Read the outbound response body and stamp it onto the active span as
+ * `http.response.body` (redacted). TypeScript sibling copy.
+ */
+export async function captureResponseBody(response: Response, span?: any): Promise<Response> {
+  if (env && (env as any).OTEL_DISABLED === '1') return response;
+  if (env && (env as any).LOG_NO_BODY === '1') return response;
+  try {
+    const cloned = response.clone();
+    const text = await safeReadResponseBody(cloned);
+    if (text !== null) {
+      try {
+        const target = span || trace.getActiveSpan();
+        target?.setAttribute('http.response.body', text);
+      } catch { /* never throw on telemetry */ }
+    }
+  } catch { /* swallow — telemetry must not break the response path */ }
+  return response;
+}

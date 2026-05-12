@@ -1,4 +1,6 @@
+import { trace } from '@opentelemetry/api';
 import { getUserByEmail, getUserByFirstName } from '../users.js';
+import { captureInboundBody, captureResponseBody } from '../lib/body-capture.js';
 
 export function jsonResponse(status, payload) {
   return new Response(JSON.stringify(payload), {
@@ -27,6 +29,17 @@ export async function routeMcp(request, env, ctx, handlers) {
   const url = new URL(request.url);
   const tool = url.pathname;
 
+  // Inbound body capture on the active root span. Lets the trace UI show
+  // "Claude asked for: candidate-get id=49243 fields=['phone']" without
+  // having to drill into the service-binding client span on the upstream
+  // worker. Pair with `captureResponseBody` below for full request/response
+  // symmetry on the entry handler. Honours LOG_NO_BODY / OTEL_DISABLED.
+  const span = trace.getActiveSpan();
+  if (span) {
+    span.setAttribute('mcp.tool', tool);
+    try { await captureInboundBody(request, span); } catch { /* never block on telemetry */ }
+  }
+
   // No X-MCP-Token check. The only caller is the rf-mcp-remote service binding
   // (within the Cloudflare account boundary). Identity arrives as consultantEmail
   // in the body, derived by the MCP worker from a verified Access JWT.
@@ -42,13 +55,36 @@ export async function routeMcp(request, env, ctx, handlers) {
     consultant = await getUserByFirstName(env, body.consultantFirstName);
   }
   if (!consultant) {
-    return logged(tool, t0, jsonResponse(403, { ok: false, error: 'Unknown consultant' }));
+    const res = jsonResponse(403, { ok: false, error: 'Unknown consultant' });
+    await captureResponseBody(res, span);
+    return logged(tool, t0, res);
   }
+  if (span) span.setAttribute('mcp.consultant.email', consultant.email ?? '');
 
   const handler = handlers[url.pathname];
   if (!handler) {
-    return logged(tool, t0, jsonResponse(404, { ok: false, error: 'not found' }), consultant.firstName);
+    const res = jsonResponse(404, { ok: false, error: 'not found' });
+    await captureResponseBody(res, span);
+    return logged(tool, t0, res, consultant.firstName);
   }
   const res = await handler({ env, ctx, body, consultant });
+  // Stamp outcome attributes derived from the response body — quick to
+  // query without parsing the captured body string each time. Best-effort:
+  // only peeks at the cloned response.
+  if (span) {
+    try {
+      const peek = await res.clone().json();
+      if (peek && typeof peek === 'object') {
+        if (peek.ok === false && typeof peek.kind === 'string') {
+          span.setAttribute('mcp.outcome.kind', peek.kind);
+        } else if (peek.needs_disambiguation === true) {
+          span.setAttribute('mcp.outcome.kind', 'needs_disambiguation');
+        } else if (peek.ok === true) {
+          span.setAttribute('mcp.outcome.kind', 'ok');
+        }
+      }
+    } catch { /* response isn't JSON — skip */ }
+  }
+  await captureResponseBody(res, span);
   return logged(tool, t0, res, consultant.firstName);
 }
