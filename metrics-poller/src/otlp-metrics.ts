@@ -11,12 +11,21 @@ export async function pushOTelMetrics(config: OTLPMetricsConfig, metrics: CFMetr
 	if (!config.CF_ACCOUNT_ID) throw new Error('CF_ACCOUNT_ID is required for metrics-poller');
 	const accountId = config.CF_ACCOUNT_ID;
 
+	// OTLP gauge data points encode numeric values as EITHER asInt (string-form
+	// int64) or asDouble (JSON number). LD's ingester rejects asInt with a
+	// ReadInt64 parse error if the string contains a decimal point, so any
+	// non-integer (e.g. CF's totalNeurons = 12082.193518913959) MUST go through
+	// asDouble. Integers stay on asInt to preserve int64 precision on the wire.
 	const buildDataPoints = (kvPairs: { value: number; dims: Record<string, string> }[]) =>
-		kvPairs.map((p) => ({
-			attributes: Object.entries(p.dims).map(([key, value]) => ({ key, value: { stringValue: value } })),
-			timeUnixNano: String(now),
-			asInt: String(p.value),
-		}));
+		kvPairs.map((p) => {
+			const attributes = Object.entries(p.dims).map(([key, value]) => ({ key, value: { stringValue: value } }));
+			const isInt = Number.isInteger(p.value);
+			return {
+				attributes,
+				timeUnixNano: String(now),
+				...(isInt ? { asInt: String(p.value) } : { asDouble: p.value }),
+			};
+		});
 
 	const d1Points = metrics.d1Storage.map((d) => ({
 		value: d.sizeBytes,
