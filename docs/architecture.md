@@ -1,17 +1,17 @@
 # Architecture & Data Flow
 
-> **Status note (2026-05-11):** Auth migration Phase 1 has shipped — the MCP path (claude.ai connector) is now fronted by Cloudflare Access OAuth (Spec A). The extension API still sits behind the legacy `X-Extension-Token` header until Spec B lands; new user-facing endpoints must NOT add new shared-secret headers (see `docs/security.md`).
+> **Architectural state.** Three points of standing context for the rest of this doc:
 >
-> **Thin-immutable cache redesign — cutover step 5 complete (2026-05-12):** `RF_MCP_CACHE` runs on the thin-immutable schema. `candidates_v2`, `jobs_v2`, `calls` are live and seeded (27,526 candidates, 925 jobs, 9587 calls as of 2026-05-12 17:00 UTC). The legacy `candidates`, `candidate_jobs`, `jobs`, and `job_pipelines` tables coexist but are NO LONGER WRITTEN — `CRON_LEGACY_ENABLED='false'` keeps the legacy `tailSync` inert. Pipeline reads are live RF pass-through — the `job_pipelines` table is no longer the source of truth. `tailSyncThin` is THE active cron path (`CRON_THIN_ENABLED='true'`, set 2026-05-12). It runs three parallel additive subtasks via `Promise.allSettled` on every 15-min tick. `CacheSeedWorkflow` (one-shot per-table backfill) and `FullRebuildWorkflow` (legacy) remain callable on demand. Webhook-driven `calls` writes are live via the Dialpad hangup → main worker → service-binding → cache-worker `/internal/calls/upsert` path; the cron tail-sync is the org-wide backstop. Cutover step 6 — drop legacy tables via `0004_drop_legacy.sql` (currently staged in `cache-worker/migrations-pending/`) and remove the dual-write code — is still pending.
->
-> Call-state architecture has settled on **webhook-driven Durable Object** storage. Per-user `ExtCallState` DO holds the active Dialpad `call_id` with strong consistency. The Dialpad `calling`+`hangup` webhook (`/webhook/dialpad/extension-calls`) is the only writer; `/dialpad-call`, `/dialpad-hangup`, and `/extension-call-status` are read-only.
+> - **Auth.** All user-facing endpoints are fronted by Cloudflare Access OAuth. The MCP path is fully migrated; the extension/PWA path runs a dual-auth helper (`src/auth-extension.js`) that accepts both an Access JWT and the legacy `X-Extension-Token` header during rollout. New user-facing endpoints MUST go through `authExtensionRequest` — see `docs/security.md` for the convention.
+> - **Read cache.** `RF_MCP_CACHE` (D1) is mid-migration from a heavyweight legacy schema to a "thin-immutable" one (`candidates_v2`, `jobs_v2`, `calls`). The thin tables are the active write path; a small set of legacy tables are still read by a few code paths and are dropped at the final cutover step. The thin redesign exists to eliminate a write-amplification problem the legacy full-rewrite cron caused — see § Cache worker.
+> - **Call state.** The active Dialpad `call_id` per user lives in a per-user `ExtCallState` Durable Object (strong consistency). The Dialpad `calling`+`hangup` webhook (`/webhook/dialpad/extension-calls`) is the only writer; `/dialpad-call`, `/dialpad-hangup`, and `/extension-call-status` are read-only.
 
 ## System Overview
 
-Three Cloudflare Workers cooperating around a small set of D1 + KV bindings:
+Three core Cloudflare Workers cooperate around a shared set of D1 + KV bindings (two more sit alongside the core and are covered elsewhere: `rf-cf-metrics-poller`, an independent hourly observability sidecar — see § Observability; and `rf-music-remote`, the isolated music-control plane bridging the team's extensions to the office-TV kiosk — see [`docs/music-worker.md`](music-worker.md)):
 
 - **`rf-dialpad-sync-dev`** (main worker, this repo's root) — the integration hub. Receives webhooks from RecruiterFlow (RF), Dialpad, Google Calendar, Krisp, and the LinkedIn extension; writes to RF + Dialpad APIs; serves the extension and PWA routes; also serves the internal `/mcp/*` API consumed only over a service binding from the MCP worker. Owns `USERS_DB` (D1) and `SYNC_STATE` (KV) writes; reads `RF_MCP_CACHE` (D1).
-- **`rf-mcp-cache-sync`** (cache worker, `cache-worker/` subtree) — the **sole writer** of `RF_MCP_CACHE` (D1). Runs a 15-min cron with two parallel paths: the legacy `tailSync` (gated behind `CRON_LEGACY_ENABLED='false'` default; intentionally inert during the dual-write window — see `cache-worker/src/index.js` § `getCacheCronLegacyFlag`) and the new additive-only `tailSyncThin` (gated by `CRON_THIN_ENABLED='false'` default). On-demand Workflows: `FullRebuildWorkflow` (legacy repopulation), `CacheSeedWorkflow` (per-table thin-schema seed); `PipelineRebuildWorkflow` (legacy per-job pipeline refresh) still exists in `cache-worker/src/pipeline-workflow.js` but is no longer instantiated from `scheduled()`. Also accepts `POST /admin/cache-rebuild?table=` for the new seed path and `POST /internal/calls/upsert` (service-binding-only, from main worker) for live call-cache writes.
+- **`rf-mcp-cache-sync`** (cache worker, `cache-worker/` subtree) — the **sole writer** of `RF_MCP_CACHE` (D1). Runs a 15-min cron with two parallel paths: the legacy `tailSync` (gated behind `CRON_LEGACY_ENABLED='false'` default; intentionally inert during the dual-write window — see `cache-worker/src/index.js` § `getCacheCronLegacyFlag`) and the new additive-only `tailSyncThin` (active — gated by `CRON_THIN_ENABLED='true'`, set 2026-05-12 as cutover step 5; the code-level fallback is `'false'` when the var is unset). On-demand Workflows: `FullRebuildWorkflow` (legacy repopulation), `CacheSeedWorkflow` (per-table thin-schema seed); `PipelineRebuildWorkflow` (legacy per-job pipeline refresh) still exists in `cache-worker/src/pipeline-workflow.js` but is no longer instantiated from `scheduled()`. Also accepts `POST /admin/cache-rebuild?table=` for the new seed path and `POST /internal/calls/upsert` (service-binding-only, from main worker) for live call-cache writes.
 - **`rf-mcp-remote`** (MCP worker, `mcp-remote/` subtree) — the public Streamable-HTTP MCP server consumed by claude.ai. Stateless TypeScript Worker; validates the Cloudflare Access JWT, then service-binds into the main worker's `/mcp/*` surface. Owns no storage; never reads RF directly.
 
 RF is the source of truth for candidate records. The KV `SYNC_STATE` cache provides fast lookups for integrations that don't have an RF candidate ID, and short-TTL snapshot caches make the extension's sidepanel responsive when recruiters walk through bulk-added candidate queues.
@@ -198,19 +198,20 @@ Every worker emits OTel traces + logs to LaunchDarkly Observability. The pipelin
 | `/webhook/dialpad/calls` | POST | JWT Bearer (HS256) | Dialpad call transcription/voicemail webhooks |
 | `/webhook/dialpad/extension-calls` | POST | JWT Bearer (HS256) | Dialpad call-state (`calling`/`hangup`) webhook driving the extension button |
 | `/webhook/apollo` | POST | `?token=` query param (`APOLLO_WEBHOOK_SECRET`) | Async phone reveal delivery from Apollo |
-| `/candidates` | POST | `X-Extension-Token` header | LinkedIn extension batch upsert (sets `lead_owner_id`) |
-| `/candidates/add-to-job` | POST | `X-Extension-Token` header | Add candidates to a job + write `consultant_id` custom field |
-| `/candidate-details` | POST | `X-Extension-Token` header | Sidepanel data: rfId, phone (E.164), picked job, cold-call activities |
-| `/candidate-mark-invalid` | POST | `X-Extension-Token` header | Tag candidate `"Number Invalid"` (idempotent) |
-| `/dialpad-user-context` | POST | `X-Extension-Token` header | Caller-ID picker data (opaque aliases, no raw E.164) |
-| `/dialpad-call` | POST | `X-Extension-Token` header | Initiate call via Dialpad `initiate_call` |
-| `/dialpad-sms` | POST | `X-Extension-Token` header | Send a single SMS via Dialpad `/sms` |
-| `/dialpad-hangup` | POST | `X-Extension-Token` header | Terminate the consultant's active call |
-| `/extension-call-status` | POST | `X-Extension-Token` header | Polled ~every 500ms by extension after a `/dialpad-call` |
-| `/my-sourcing-jobs` | POST | `X-Extension-Token` header | Mobile PWA home screen — open Sourcing-status jobs the consultant is on |
-| `/job-pipeline` | POST | `X-Extension-Token` header | Mobile PWA pipeline view — Sourced-stage candidates for a job |
+| `/candidates` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | LinkedIn extension batch upsert (sets `lead_owner_id`) |
+| `/candidates/add-to-job` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Add candidates to a job + write `consultant_id` custom field |
+| `/candidate-details` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Sidepanel data: rfId, phone (E.164), picked job, cold-call activities |
+| `/candidate-mark-invalid` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Tag candidate `"Number Invalid"` (idempotent) |
+| `/dialpad-user-context` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Caller-ID picker data (opaque aliases, no raw E.164) |
+| `/dialpad-call` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Initiate call via Dialpad `initiate_call` |
+| `/dialpad-sms` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Send a single SMS via Dialpad `/sms` |
+| `/dialpad-hangup` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Terminate the consultant's active call |
+| `/extension-call-status` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Polled ~every 500ms by extension after a `/dialpad-call` |
+| `/call-stats` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Daily call counter for the consultant — pure KV read from `callstats:daily:{rfUserId}:{YYYY-MM-DD}`. Body `{consultantFirstName}` (legacy) or none (JWT). Returns `{ daily }`. |
+| `/my-sourcing-jobs` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Mobile PWA home screen — open Sourcing-status jobs the consultant is on |
+| `/job-pipeline` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Mobile PWA pipeline view — Sourced-stage candidates for a job |
 
-> **Auth migration in flight (Spec B):** the `X-Extension-Token` + `consultantFirstName`-in-body shape on the extension routes is being replaced by Cloudflare Access OAuth + `consultantEmail` from the verified JWT. Same rules apply to any new user-facing endpoint added during the migration — see `docs/security.md`.
+> **Auth migration in flight (Phase 2 code live, operator-controlled rollout):** the `X-Extension-Token` + `consultantFirstName`-in-body shape is being replaced in two phases. Phase 2 (this branch): middleware accepts both Cloudflare Access JWTs and the legacy header; the operator builds the new extension and rolls it out while the legacy path keeps working. Phase 3 (future): drop the legacy header + front the worker with Access edge mode (path filter excludes `/webhook/*` and `/test/coldcall`).
 
 ### Service-binding-only routes — main worker
 
