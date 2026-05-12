@@ -43,6 +43,7 @@ import { processCallEvent, parseColdCallActivity, mergeTag } from './cold-call.j
 import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enrichment.js';
 import { enrichPerson } from './apollo-client.js';
 import { resolveRFUserId, getUserByFirstName } from './users.js';
+import { authExtensionRequest, setAuthSpanSuccess, setAuthSpanFailure } from './auth-extension.js';
 
 const handler = {
   async fetch(request, env, ctx) {
@@ -124,110 +125,170 @@ const handler = {
 
       if (url.pathname === '/candidates' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_ADD_CANDIDATE);
-        const extAuth = request.headers.get('X-Extension-Token');
-        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
-        return await handleCandidatesEndpoint(request, env, corsHeaders);
+        setAuthSpanSuccess(auth);
+        return await handleCandidatesEndpoint(request, env, corsHeaders, auth);
       }
 
       if (url.pathname === '/candidates/add-to-job' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_ADD_TO_JOB);
-        const extAuth = request.headers.get('X-Extension-Token');
-        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
-        return await handleAddToJobEndpoint(request, env, ctx, corsHeaders);
+        setAuthSpanSuccess(auth);
+        return await handleAddToJobEndpoint(request, env, ctx, corsHeaders, auth);
       }
 
       if (url.pathname === '/candidate-mark-invalid' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_MARK_INVALID);
-        const extAuth = request.headers.get('X-Extension-Token');
-        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
-        return await handleMarkInvalidEndpoint(request, env, corsHeaders);
+        setAuthSpanSuccess(auth);
+        return await handleMarkInvalidEndpoint(request, env, corsHeaders, auth);
       }
 
       if (url.pathname === '/candidate-details' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_FETCH_DETAILS);
-        const extAuth = request.headers.get('X-Extension-Token');
-        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
-        return await handleCandidateDetailsEndpoint(request, env, ctx, corsHeaders);
+        setAuthSpanSuccess(auth);
+        return await handleCandidateDetailsEndpoint(request, env, ctx, corsHeaders, auth);
       }
 
       if (url.pathname === '/dialpad-user-context' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_DIALPAD_USER_CONTEXT);
-        const extAuth = request.headers.get('X-Extension-Token');
-        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
-          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ ok: false, error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
-        return await handleDialpadUserContextEndpoint(request, env, corsHeaders);
+        setAuthSpanSuccess(auth);
+        return await handleDialpadUserContextEndpoint(request, env, corsHeaders, auth);
       }
 
       if (url.pathname === '/dialpad-call' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_CALL_REQUEST);
-        const extAuth = request.headers.get('X-Extension-Token');
-        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
-          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ ok: false, error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
-        return await handleDialpadCallEndpoint(request, env, corsHeaders);
+        setAuthSpanSuccess(auth);
+        return await handleDialpadCallEndpoint(request, env, corsHeaders, auth);
       }
 
       if (url.pathname === '/dialpad-sms' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_DIALPAD_SMS);
-        const extAuth = request.headers.get('X-Extension-Token');
-        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
-          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ ok: false, error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
-        return await handleDialpadSmsEndpoint(request, env, corsHeaders);
+        setAuthSpanSuccess(auth);
+        return await handleDialpadSmsEndpoint(request, env, corsHeaders, auth);
       }
 
       if (url.pathname === '/dialpad-hangup' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_DIALPAD_HANGUP);
-        const extAuth = request.headers.get('X-Extension-Token');
-        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
-          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ ok: false, error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
-        return await handleDialpadHangupEndpoint(request, env, corsHeaders);
+        setAuthSpanSuccess(auth);
+        return await handleDialpadHangupEndpoint(request, env, corsHeaders, auth);
       }
 
       if (url.pathname === '/extension-call-status' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_CALL_STATE_POLL);
-        const extAuth = request.headers.get('X-Extension-Token');
-        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
-          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ ok: false, error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
-        return await handleExtensionCallStatusEndpoint(request, env, corsHeaders);
+        setAuthSpanSuccess(auth);
+        return await handleExtensionCallStatusEndpoint(request, env, corsHeaders, auth);
       }
 
       if (url.pathname === '/my-sourcing-jobs' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.MOBILE_MY_SOURCING_JOBS);
-        const extAuth = request.headers.get('X-Extension-Token');
-        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
-          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ ok: false, error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
-        return await handleMySourcingJobsEndpoint(request, env, corsHeaders);
+        setAuthSpanSuccess(auth);
+        return await handleMySourcingJobsEndpoint(request, env, corsHeaders, auth);
       }
 
       if (url.pathname === '/job-pipeline' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.MOBILE_JOB_PIPELINE);
-        const extAuth = request.headers.get('X-Extension-Token');
-        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
-          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ ok: false, error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
-        return await handleJobPipelineEndpoint(request, env, corsHeaders);
+        setAuthSpanSuccess(auth);
+        return await handleJobPipelineEndpoint(request, env, corsHeaders, auth);
       }
 
       if (url.pathname === '/call-stats' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_CALL_STATS);
-        const extAuth = request.headers.get('X-Extension-Token');
-        if (!env.LINKEDIN_EXTENSION_SECRET || extAuth !== env.LINKEDIN_EXTENSION_SECRET) {
-          return new Response(JSON.stringify({ ok: false, error: 'Authentication failed' }), { status: 401, headers: corsHeaders });
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ ok: false, error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
-        return await handleCallStatsEndpoint(request, env, corsHeaders);
+        setAuthSpanSuccess(auth);
+        return await handleCallStatsEndpoint(request, env, corsHeaders, auth);
       }
 
       return new Response('Not Found', {
@@ -1337,7 +1398,7 @@ async function processOneCandidate(ext, i, total, env, consultantRfUserId) {
   }
 }
 
-async function handleCandidatesEndpoint(request, env, corsHeaders) {
+async function handleCandidatesEndpoint(request, env, corsHeaders, auth) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
@@ -1350,14 +1411,24 @@ async function handleCandidatesEndpoint(request, env, corsHeaders) {
       });
     }
 
-    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
-    const consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
-    if (consultantFirstName && consultantRfUserId === null) {
-      console.warn({
-        message: `[Candidates] unknown consultantFirstName="${consultantFirstName}", attribution will be skipped`,
-        source: 'candidates-endpoint',
-      });
+    let consultantFirstName;
+    let consultantRfUserId;
+    if (auth?.user) {
+      // JWT path: identity is authoritative; ignore body firstName.
+      consultantFirstName = auth.user.firstName;
+      consultantRfUserId = auth.user.rfUserId;
+    } else {
+      // Legacy path: preserve today's tolerance for missing/unknown firstName.
+      consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
+      consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
+      if (consultantFirstName && consultantRfUserId === null) {
+        console.warn({
+          message: `[Candidates] unknown consultantFirstName="${consultantFirstName}", attribution will be skipped`,
+          source: 'candidates-endpoint',
+        });
+      }
     }
+    trace.getActiveSpan()?.setAttribute('consultant.first_name', consultantFirstName || '');
 
     const total = payload.candidates.length;
     console.log({
@@ -1462,7 +1533,7 @@ function mapExtensionToRFCandidate(ext, consultantRfUserId) {
   return rfCandidate;
 }
 
-async function handleAddToJobEndpoint(request, env, ctx, corsHeaders) {
+async function handleAddToJobEndpoint(request, env, ctx, corsHeaders, auth) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
@@ -1480,14 +1551,24 @@ async function handleAddToJobEndpoint(request, env, ctx, corsHeaders) {
       });
     }
 
-    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
-    const consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
-    if (consultantFirstName && consultantRfUserId === null) {
-      console.warn({
-        message: `[AddToJob] unknown consultantFirstName="${consultantFirstName}", consultant_id will not be written`,
-        source: 'add-to-job',
-      });
+    let consultantFirstName;
+    let consultantRfUserId;
+    if (auth?.user) {
+      // JWT path: identity is authoritative; ignore body firstName.
+      consultantFirstName = auth.user.firstName;
+      consultantRfUserId = auth.user.rfUserId;
+    } else {
+      // Legacy path: preserve today's tolerance for missing/unknown firstName.
+      consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
+      consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
+      if (consultantFirstName && consultantRfUserId === null) {
+        console.warn({
+          message: `[AddToJob] unknown consultantFirstName="${consultantFirstName}", consultant_id will not be written`,
+          source: 'add-to-job',
+        });
+      }
     }
+    trace.getActiveSpan()?.setAttribute('consultant.first_name', consultantFirstName || '');
 
     console.log({
       message: `[AddToJob] Adding ${rfIds.length} candidates to job ${jobId} (consultant=${consultantFirstName || 'none'})`,
@@ -1587,13 +1668,21 @@ async function handleAddToJobEndpoint(request, env, ctx, corsHeaders) {
   }
 }
 
-async function handleMarkInvalidEndpoint(request, env, corsHeaders) {
+async function handleMarkInvalidEndpoint(request, env, corsHeaders, auth) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
     const payload = await request.json();
     const rfId = payload.rfId;
-    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
+    let consultantFirstName;
+    if (auth?.user) {
+      // JWT path: identity is authoritative; ignore body firstName.
+      consultantFirstName = auth.user.firstName;
+    } else {
+      // Legacy path: firstName is log-only — preserve tolerance for missing/unknown.
+      consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
+    }
+    trace.getActiveSpan()?.setAttribute('consultant.first_name', consultantFirstName || '');
 
     if (!rfId) {
       return new Response(JSON.stringify({ error: 'Missing "rfId"' }), {
@@ -1646,21 +1735,30 @@ async function handleMarkInvalidEndpoint(request, env, corsHeaders) {
   }
 }
 
-async function handleCandidateDetailsEndpoint(request, env, ctx, corsHeaders) {
+async function handleCandidateDetailsEndpoint(request, env, ctx, corsHeaders, auth) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
     const payload = await request.json();
     const profileUrl = typeof payload.profileUrl === 'string' ? payload.profileUrl.trim() : '';
-    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
+    let consultantFirstName;
+    let consultantRfUserId;
+    if (auth?.user) {
+      // JWT path: identity is authoritative; ignore body firstName.
+      consultantFirstName = auth.user.firstName;
+      consultantRfUserId = auth.user.rfUserId;
+    } else {
+      // Legacy path: preserve today's tolerance (best-effort consultant resolution).
+      consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName : '';
+      consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
+    }
+    trace.getActiveSpan()?.setAttribute('consultant.first_name', consultantFirstName || '');
 
     if (!profileUrl) {
       return new Response(JSON.stringify({ error: 'Missing "profileUrl"' }), {
         status: 400, headers: responseHeaders,
       });
     }
-
-    const consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
 
     // Resolve rfId — KV linkedin index first, RF search fallback.
     let rfId = await lookupByLinkedIn(profileUrl, env);
@@ -1902,30 +2000,39 @@ async function handleNeighborPrewarm(rfId, jobId, recruiterRfUserId, env) {
 // to ring the consultant's eligible devices via initiate_call.
 // ---------------------------------------------------------------------------
 
-async function handleDialpadUserContextEndpoint(request, env, corsHeaders) {
+async function handleDialpadUserContextEndpoint(request, env, corsHeaders, auth) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
     const payload = await request.json();
-    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName.trim() : '';
+    let user = auth?.user ?? null;
+    let consultantFirstName;
+    if (user) {
+      // JWT path: identity is authoritative; ignore body firstName.
+      consultantFirstName = user.firstName;
+    } else {
+      // Legacy path: preserve today's 400 on missing, 403 on unknown.
+      consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName.trim() : '';
 
-    if (!consultantFirstName) {
-      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
-        status: 400, headers: responseHeaders,
-      });
-    }
+      if (!consultantFirstName) {
+        return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+          status: 400, headers: responseHeaders,
+        });
+      }
 
-    const user = await getUserByFirstName(env, consultantFirstName);
-    if (!user) {
-      console.warn({
-        message: `[DialpadUserContext] unknown consultantFirstName="${consultantFirstName}"`,
-        source: 'dialpad-user-context',
-        consultantFirstName,
-      });
-      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
-        status: 403, headers: responseHeaders,
-      });
+      user = await getUserByFirstName(env, consultantFirstName);
+      if (!user) {
+        console.warn({
+          message: `[DialpadUserContext] unknown consultantFirstName="${consultantFirstName}"`,
+          source: 'dialpad-user-context',
+          consultantFirstName,
+        });
+        return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+          status: 403, headers: responseHeaders,
+        });
+      }
     }
+    trace.getActiveSpan()?.setAttribute('consultant.first_name', consultantFirstName);
 
     let dpCallerId;
     try {
@@ -1971,27 +2078,37 @@ async function handleDialpadUserContextEndpoint(request, env, corsHeaders) {
   }
 }
 
-async function handleDialpadCallEndpoint(request, env, corsHeaders) {
+async function handleDialpadCallEndpoint(request, env, corsHeaders, auth) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
     const payload = await request.json();
-    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName.trim() : '';
     const phoneNumber = typeof payload.phoneNumber === 'string' ? payload.phoneNumber.trim() : '';
     const callerAliasId = typeof payload.callerAliasId === 'string' ? payload.callerAliasId.trim() : '';
 
-    if (!consultantFirstName) {
-      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
-        status: 400, headers: responseHeaders,
-      });
-    }
+    let user = auth?.user ?? null;
+    let consultantFirstName;
+    if (user) {
+      // JWT path: identity is authoritative; ignore body firstName.
+      consultantFirstName = user.firstName;
+    } else {
+      // Legacy path: preserve today's 400 on missing, 403 on unknown.
+      consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName.trim() : '';
 
-    const user = await getUserByFirstName(env, consultantFirstName);
-    if (!user) {
-      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
-        status: 403, headers: responseHeaders,
-      });
+      if (!consultantFirstName) {
+        return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+          status: 400, headers: responseHeaders,
+        });
+      }
+
+      user = await getUserByFirstName(env, consultantFirstName);
+      if (!user) {
+        return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+          status: 403, headers: responseHeaders,
+        });
+      }
     }
+    trace.getActiveSpan()?.setAttribute('consultant.first_name', consultantFirstName);
 
     if (!phoneNumber) {
       return new Response(JSON.stringify({ ok: false, error: 'Missing phone number' }), {
@@ -2110,12 +2227,11 @@ async function handleDialpadCallEndpoint(request, env, corsHeaders) {
 // revisit when production candidate-mode lights up).
 // ---------------------------------------------------------------------------
 
-async function handleDialpadSmsEndpoint(request, env, corsHeaders) {
+async function handleDialpadSmsEndpoint(request, env, corsHeaders, auth) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
     const payload = await request.json();
-    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName.trim() : '';
     const phoneNumber = typeof payload.phoneNumber === 'string' ? payload.phoneNumber.trim() : '';
     // Do NOT trim text — recruiters typed it deliberately, including any
     // leading/trailing whitespace. Only reject if it's empty after trim.
@@ -2123,18 +2239,29 @@ async function handleDialpadSmsEndpoint(request, env, corsHeaders) {
     // callerAliasId is optional — empty/missing means "use Dialpad default".
     const callerAliasId = typeof payload.callerAliasId === 'string' ? payload.callerAliasId.trim() : '';
 
-    if (!consultantFirstName) {
-      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
-        status: 400, headers: responseHeaders,
-      });
-    }
+    let user = auth?.user ?? null;
+    let consultantFirstName;
+    if (user) {
+      // JWT path: identity is authoritative; ignore body firstName.
+      consultantFirstName = user.firstName;
+    } else {
+      // Legacy path: preserve today's 400 on missing, 403 on unknown.
+      consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName.trim() : '';
 
-    const user = await getUserByFirstName(env, consultantFirstName);
-    if (!user) {
-      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
-        status: 403, headers: responseHeaders,
-      });
+      if (!consultantFirstName) {
+        return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+          status: 400, headers: responseHeaders,
+        });
+      }
+
+      user = await getUserByFirstName(env, consultantFirstName);
+      if (!user) {
+        return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+          status: 403, headers: responseHeaders,
+        });
+      }
     }
+    trace.getActiveSpan()?.setAttribute('consultant.first_name', consultantFirstName);
 
     if (!phoneNumber) {
       return new Response(JSON.stringify({ ok: false, error: 'Missing phone number' }), {
@@ -2226,25 +2353,34 @@ async function handleDialpadSmsEndpoint(request, env, corsHeaders) {
 // for clearing.
 // ---------------------------------------------------------------------------
 
-async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
+async function handleDialpadHangupEndpoint(request, env, corsHeaders, auth) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
     const payload = await request.json();
-    const consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName.trim() : '';
+    let user = auth?.user ?? null;
+    let consultantFirstName;
+    if (user) {
+      // JWT path: identity is authoritative; ignore body firstName.
+      consultantFirstName = user.firstName;
+    } else {
+      // Legacy path: preserve today's 400 on missing, 403 on unknown.
+      consultantFirstName = typeof payload.consultantFirstName === 'string' ? payload.consultantFirstName.trim() : '';
 
-    if (!consultantFirstName) {
-      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
-        status: 400, headers: responseHeaders,
-      });
-    }
+      if (!consultantFirstName) {
+        return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+          status: 400, headers: responseHeaders,
+        });
+      }
 
-    const user = await getUserByFirstName(env, consultantFirstName);
-    if (!user) {
-      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
-        status: 403, headers: responseHeaders,
-      });
+      user = await getUserByFirstName(env, consultantFirstName);
+      if (!user) {
+        return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+          status: 403, headers: responseHeaders,
+        });
+      }
     }
+    trace.getActiveSpan()?.setAttribute('consultant.first_name', consultantFirstName);
 
     const stub = env.EXT_CALL_STATE.get(env.EXT_CALL_STATE.idFromName(user.dialpadId));
     const callId = await stub.getCallId();
@@ -2323,27 +2459,36 @@ async function handleDialpadHangupEndpoint(request, env, corsHeaders) {
 // the right side of the decision).
 // ---------------------------------------------------------------------------
 
-async function handleExtensionCallStatusEndpoint(request, env, corsHeaders) {
+async function handleExtensionCallStatusEndpoint(request, env, corsHeaders, auth) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
     const payload = await request.json();
-    const consultantFirstName = typeof payload.consultantFirstName === 'string'
-      ? payload.consultantFirstName.trim()
-      : '';
+    let user = auth?.user ?? null;
+    let consultantFirstName;
+    if (user) {
+      // JWT path: identity is authoritative; ignore body firstName.
+      consultantFirstName = user.firstName;
+    } else {
+      // Legacy path: preserve today's 400 on missing, 403 on unknown.
+      consultantFirstName = typeof payload.consultantFirstName === 'string'
+        ? payload.consultantFirstName.trim()
+        : '';
 
-    if (!consultantFirstName) {
-      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
-        status: 400, headers: responseHeaders,
-      });
-    }
+      if (!consultantFirstName) {
+        return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+          status: 400, headers: responseHeaders,
+        });
+      }
 
-    const user = await getUserByFirstName(env, consultantFirstName);
-    if (!user) {
-      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
-        status: 403, headers: responseHeaders,
-      });
+      user = await getUserByFirstName(env, consultantFirstName);
+      if (!user) {
+        return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+          status: 403, headers: responseHeaders,
+        });
+      }
     }
+    trace.getActiveSpan()?.setAttribute('consultant.first_name', consultantFirstName);
 
     // Strongly-consistent read via the per-user Durable Object. The
     // webhook is the only thing that sets/clears the stored call_id;
@@ -2460,27 +2605,37 @@ async function handleDialpadExtensionCallsWebhook(request, env, ctx) {
 // the mobile PWA's home screen.
 // ---------------------------------------------------------------------------
 
-async function handleMySourcingJobsEndpoint(request, env, corsHeaders) {
+async function handleMySourcingJobsEndpoint(request, env, corsHeaders, auth) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
     const payload = await request.json();
-    const consultantFirstName = typeof payload.consultantFirstName === 'string'
-      ? payload.consultantFirstName.trim()
-      : '';
+    let consultantFirstName;
+    let consultantRfUserId;
+    if (auth?.user) {
+      // JWT path: identity is authoritative; ignore body firstName.
+      consultantFirstName = auth.user.firstName;
+      consultantRfUserId = auth.user.rfUserId;
+    } else {
+      // Legacy path: preserve today's 400 on missing, 403 on unknown.
+      consultantFirstName = typeof payload.consultantFirstName === 'string'
+        ? payload.consultantFirstName.trim()
+        : '';
 
-    if (!consultantFirstName) {
-      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
-        status: 400, headers: responseHeaders,
-      });
-    }
+      if (!consultantFirstName) {
+        return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+          status: 400, headers: responseHeaders,
+        });
+      }
 
-    const consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
-    if (!consultantRfUserId) {
-      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
-        status: 403, headers: responseHeaders,
-      });
+      consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
+      if (!consultantRfUserId) {
+        return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+          status: 403, headers: responseHeaders,
+        });
+      }
     }
+    trace.getActiveSpan()?.setAttribute('consultant.first_name', consultantFirstName);
 
     const allJobs = await listOpenJobs(env);
     const filtered = allJobs.filter(job => {
@@ -2534,34 +2689,53 @@ async function handleMySourcingJobsEndpoint(request, env, corsHeaders) {
 // traverses prev/next.
 // ---------------------------------------------------------------------------
 
-async function handleJobPipelineEndpoint(request, env, corsHeaders) {
+async function handleJobPipelineEndpoint(request, env, corsHeaders, auth) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
     const payload = await request.json();
-    const consultantFirstName = typeof payload.consultantFirstName === 'string'
-      ? payload.consultantFirstName.trim()
-      : '';
     const jobIdRaw = payload.jobId;
     const jobId = typeof jobIdRaw === 'number'
       ? jobIdRaw
       : (typeof jobIdRaw === 'string' && /^\d+$/.test(jobIdRaw.trim()) ? parseInt(jobIdRaw.trim(), 10) : null);
 
-    if (!consultantFirstName) {
-      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
-        status: 400, headers: responseHeaders,
-      });
+    let consultantFirstName;
+    let consultantRfUserId;
+    if (auth?.user) {
+      // JWT path: identity is authoritative; ignore body firstName.
+      consultantFirstName = auth.user.firstName;
+      consultantRfUserId = auth.user.rfUserId;
+    } else {
+      // Legacy path: preserve today's 400-on-missing-firstName, then 400-on-missing-jobId,
+      // then 403-on-unknown ordering.
+      consultantFirstName = typeof payload.consultantFirstName === 'string'
+        ? payload.consultantFirstName.trim()
+        : '';
+
+      if (!consultantFirstName) {
+        return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+          status: 400, headers: responseHeaders,
+        });
+      }
+      if (!jobId) {
+        return new Response(JSON.stringify({ ok: false, error: 'Missing or invalid "jobId"' }), {
+          status: 400, headers: responseHeaders,
+        });
+      }
+
+      consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
+      if (!consultantRfUserId) {
+        return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+          status: 403, headers: responseHeaders,
+        });
+      }
     }
+    trace.getActiveSpan()?.setAttribute('consultant.first_name', consultantFirstName);
+
+    // jobId validation must run on the JWT path too; the legacy path enforced it inline.
     if (!jobId) {
       return new Response(JSON.stringify({ ok: false, error: 'Missing or invalid "jobId"' }), {
         status: 400, headers: responseHeaders,
-      });
-    }
-
-    const consultantRfUserId = await resolveRFUserId(env, consultantFirstName);
-    if (!consultantRfUserId) {
-      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
-        status: 403, headers: responseHeaders,
       });
     }
 
@@ -2654,27 +2828,36 @@ async function handleJobPipelineEndpoint(request, env, corsHeaders) {
 // `hangup` event. Body: { consultantFirstName }. Returns { daily }.
 // ---------------------------------------------------------------------------
 
-async function handleCallStatsEndpoint(request, env, corsHeaders) {
+async function handleCallStatsEndpoint(request, env, corsHeaders, auth) {
   const responseHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   try {
     const payload = await request.json();
-    const consultantFirstName = typeof payload.consultantFirstName === 'string'
-      ? payload.consultantFirstName.trim()
-      : '';
+    let user = auth?.user ?? null;
+    let consultantFirstName;
+    if (user) {
+      // JWT path: identity is authoritative; ignore body firstName.
+      consultantFirstName = user.firstName;
+    } else {
+      // Legacy path: preserve today's 400 on missing, 403 on unknown.
+      consultantFirstName = typeof payload.consultantFirstName === 'string'
+        ? payload.consultantFirstName.trim()
+        : '';
 
-    if (!consultantFirstName) {
-      return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
-        status: 400, headers: responseHeaders,
-      });
-    }
+      if (!consultantFirstName) {
+        return new Response(JSON.stringify({ ok: false, error: 'Missing "consultantFirstName"' }), {
+          status: 400, headers: responseHeaders,
+        });
+      }
 
-    const user = await getUserByFirstName(env, consultantFirstName);
-    if (!user) {
-      return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
-        status: 403, headers: responseHeaders,
-      });
+      user = await getUserByFirstName(env, consultantFirstName);
+      if (!user) {
+        return new Response(JSON.stringify({ ok: false, error: 'Consultant not found' }), {
+          status: 403, headers: responseHeaders,
+        });
+      }
     }
+    trace.getActiveSpan()?.setAttribute('consultant.first_name', consultantFirstName);
 
     const daily = await getDailyCallCount(user.rfUserId, env);
 
