@@ -124,3 +124,170 @@ describe('makeLdResourceInjector — url attribute redaction', () => {
     expect(out.attributes['url.full']).not.toContain('SECRET');
   });
 });
+
+describe('makeLdResourceInjector — noise attribute pruning', () => {
+  it('drops NOISE_KEYS from span.attributes', () => {
+    const injector = makeLdResourceInjector('key');
+    const baseResource = resourceFromAttributes({ 'service.name': 'test' });
+    const span = {
+      name: 'fetch',
+      resource: baseResource,
+      attributes: {
+        'cloud.platform': 'cloudflare.workers',
+        'cloud.provider': 'cloudflare',
+        'cloud.region': 'earth',
+        'faas.invocation_id': 'abc',
+        'faas.trigger': 'timer',
+        'faas.max_memory': 134217728,
+        'net.asn': 396982,
+        'net.colo': 'IAD',
+        'net.country': 'US',
+        'net.tcp_rtt': 9,
+        'net.tls_cipher': 'AEAD-AES256-GCM-SHA384',
+        'net.tls_version': 'TLSv1.3',
+        'network.protocol.name': 'http',
+        'network.protocol.version': 'HTTP/1.1',
+        'http.accept_encoding': 'gzip',
+        'http.accepts': 'application/json',
+        'telemetry.sdk.language': 'js',
+        'telemetry.sdk.name': '@microlabs/otel-cf-workers',
+        'telemetry.sdk.version': '1.0.0-rc.52',
+        'telemetry.sdk.build.node_version': 'v22.x.x',
+        'url.domain': 'example.com',
+        'url.scheme': 'https:',
+        'feature_flag.set.id': 'xyz',
+        'flow.name': 'CronMetricsTick',
+        'http.url.full': 'https://api.cloudflare.com/client/v4/graphql',
+        'http.url.path': '/client/v4/graphql',
+        'http.request.method': 'POST',
+        'http.response.status_code': 200,
+        'faas.coldstart': true,
+        'server.address': 'api.cloudflare.com',
+      },
+    };
+    const [out] = injector([span]);
+    for (const dropped of [
+      'cloud.platform', 'cloud.provider', 'cloud.region',
+      'faas.invocation_id', 'faas.trigger', 'faas.max_memory',
+      'net.asn', 'net.colo', 'net.country', 'net.tcp_rtt', 'net.tls_cipher', 'net.tls_version',
+      'network.protocol.name', 'network.protocol.version',
+      'http.accept_encoding', 'http.accepts',
+      'telemetry.sdk.language', 'telemetry.sdk.name', 'telemetry.sdk.version', 'telemetry.sdk.build.node_version',
+      'url.domain', 'url.scheme',
+      'feature_flag.set.id',
+    ]) {
+      expect(out.attributes[dropped]).toBeUndefined();
+    }
+    expect(out.attributes['flow.name']).toBe('CronMetricsTick');
+    expect(out.attributes['http.url.full']).toBe('https://api.cloudflare.com/client/v4/graphql');
+    expect(out.attributes['http.url.path']).toBe('/client/v4/graphql');
+    expect(out.attributes['http.request.method']).toBe('POST');
+    expect(out.attributes['http.response.status_code']).toBe(200);
+    expect(out.attributes['faas.coldstart']).toBe(true);
+    expect(out.attributes['server.address']).toBe('api.cloudflare.com');
+  });
+
+  it('drops NOISE_KEYS from resource.attributes (and keeps service.name + adds launchdarkly.project_id)', () => {
+    const injector = makeLdResourceInjector('key');
+    const baseResource = resourceFromAttributes({
+      'service.name': 'rf-cf-metrics-poller',
+      'cloud.platform': 'cloudflare.workers',
+      'cloud.provider': 'cloudflare',
+      'cloud.region': 'earth',
+      'faas.max_memory': 134217728,
+      'telemetry.sdk.name': '@microlabs/otel-cf-workers',
+      'telemetry.sdk.version': '1.0.0-rc.52',
+      'telemetry.sdk.language': 'js',
+      'telemetry.sdk.build.node_version': 'v22.x.x',
+    });
+    const span = { name: 's', resource: baseResource, attributes: {} };
+    const [out] = injector([span]);
+    expect(out.resource.attributes['cloud.platform']).toBeUndefined();
+    expect(out.resource.attributes['cloud.provider']).toBeUndefined();
+    expect(out.resource.attributes['cloud.region']).toBeUndefined();
+    expect(out.resource.attributes['faas.max_memory']).toBeUndefined();
+    expect(out.resource.attributes['telemetry.sdk.name']).toBeUndefined();
+    expect(out.resource.attributes['telemetry.sdk.version']).toBeUndefined();
+    expect(out.resource.attributes['telemetry.sdk.language']).toBeUndefined();
+    expect(out.resource.attributes['telemetry.sdk.build.node_version']).toBeUndefined();
+    expect(out.resource.attributes['service.name']).toBe('rf-cf-metrics-poller');
+    expect(out.resource.attributes['launchdarkly.project_id']).toBe('key');
+  });
+
+  it('handles a span whose attributes contain only noise (resource enrichment still applies)', () => {
+    const injector = makeLdResourceInjector('key');
+    const baseResource = resourceFromAttributes({ 'service.name': 'test' });
+    const span = {
+      name: 's',
+      resource: baseResource,
+      attributes: { 'cloud.platform': 'cloudflare.workers' },
+    };
+    const [out] = injector([span]);
+    expect(out.attributes['cloud.platform']).toBeUndefined();
+    expect(out.resource.attributes['launchdarkly.project_id']).toBe('key');
+  });
+});
+
+describe('makeLdResourceInjector — flow.name promotion to span.name', () => {
+  it('overrides span.name with flow.name attribute when present', () => {
+    const injector = makeLdResourceInjector('key');
+    const baseResource = resourceFromAttributes({ 'service.name': 'test' });
+    const span = {
+      name: 'scheduledHandler 0 * * * *',
+      resource: baseResource,
+      attributes: { 'flow.name': 'CronMetricsTick' },
+    };
+    const [out] = injector([span]);
+    expect(out.name).toBe('CronMetricsTick');
+    expect(out.attributes['flow.name']).toBe('CronMetricsTick');
+  });
+
+  it('preserves original span.name when flow.name is not set', () => {
+    const injector = makeLdResourceInjector('key');
+    const baseResource = resourceFromAttributes({ 'service.name': 'test' });
+    const span = {
+      name: 'fetch POST api.cloudflare.com',
+      resource: baseResource,
+      attributes: { 'http.method': 'POST' },
+    };
+    const [out] = injector([span]);
+    expect(out.name).toBe('fetch POST api.cloudflare.com');
+  });
+
+  it('overrides span.name on a frozen span via wrapper path', () => {
+    const injector = makeLdResourceInjector('key');
+    const baseResource = resourceFromAttributes({ 'service.name': 'test' });
+    const frozenSpan = Object.freeze({
+      name: 'scheduledHandler 0 * * * *',
+      resource: baseResource,
+      attributes: { 'flow.name': 'CronMetricsTick' },
+    });
+    const [out] = injector([frozenSpan]);
+    expect(out.name).toBe('CronMetricsTick');
+    expect(out.attributes['flow.name']).toBe('CronMetricsTick');
+  });
+
+  it('ignores empty-string flow.name (preserves original span.name)', () => {
+    const injector = makeLdResourceInjector('key');
+    const baseResource = resourceFromAttributes({ 'service.name': 'test' });
+    const span = {
+      name: 'fetch /foo',
+      resource: baseResource,
+      attributes: { 'flow.name': '' },
+    };
+    const [out] = injector([span]);
+    expect(out.name).toBe('fetch /foo');
+  });
+
+  it('ignores non-string flow.name (preserves original span.name)', () => {
+    const injector = makeLdResourceInjector('key');
+    const baseResource = resourceFromAttributes({ 'service.name': 'test' });
+    const span = {
+      name: 'fetch /foo',
+      resource: baseResource,
+      attributes: { 'flow.name': 123 },
+    };
+    const [out] = injector([span]);
+    expect(out.name).toBe('fetch /foo');
+  });
+});

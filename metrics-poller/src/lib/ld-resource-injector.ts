@@ -3,6 +3,50 @@ import { resourceFromAttributes } from '@opentelemetry/resources';
 const REDACT_QUERY_PARAM = /secret|token|api[_-]?key|apikey/i;
 const URL_ATTR_KEYS = ['url.full', 'url.query'];
 
+// Attributes the SDKs auto-stamp but contribute zero debugging value for our
+// single-account / single-runtime / single-region deployment. Pruned from both
+// resource attributes (set once per export) and per-span attributes (set per
+// request/span) before forwarding to LD. Adjust this set rather than per-call
+// to avoid noise re-creep.
+//
+// faas.coldstart is intentionally KEPT — useful for cold-start latency
+// debugging. server.address is KEPT — distinguishes outbound destinations.
+// user_agent.original is KEPT — useful for identifying webhook sources.
+const NOISE_KEYS = new Set([
+  // @microlabs createResource resource attrs (always
+  // cloudflare/cloudflare.workers/earth on this stack)
+  'cloud.provider',
+  'cloud.platform',
+  'cloud.region',
+  'faas.max_memory',
+  'telemetry.sdk.language',
+  'telemetry.sdk.name',
+  'telemetry.sdk.version',
+  'telemetry.sdk.build.node_version',
+  // Per-span FaaS attrs that don't aid debugging
+  'faas.invocation_id',
+  'faas.trigger',
+  // OTel HTTP semantic-conv noise — duplicates url.full or never useful
+  'http.accepts',
+  'http.accept_encoding',
+  'http.accept-encoding',
+  'network.protocol.name',
+  'network.protocol.version',
+  // CF request-origin metadata — interesting for traffic-pattern dashboards
+  // but not for per-trace debugging
+  'net.asn',
+  'net.colo',
+  'net.country',
+  'net.tcp_rtt',
+  'net.tls_cipher',
+  'net.tls_version',
+  // Sub-fields of url.full that don't add information
+  'url.domain',
+  'url.scheme',
+  // LD-internal feature_flag stamp (not OUR feature flags — LD's own)
+  'feature_flag.set.id',
+]);
+
 export function makeLdResourceInjector(sdkKey: string) {
   if (!sdkKey || typeof sdkKey !== 'string') {
     throw new Error('makeLdResourceInjector: LD_SDK_KEY is required (got: ' + typeof sdkKey + ')');
@@ -14,26 +58,57 @@ export function makeLdResourceInjector(sdkKey: string) {
 
     if (!cachedResource) {
       const base = spans[0].resource;
+      const filteredBase = pruneResourceNoise(base);
       const ldExtra = resourceFromAttributes({ 'launchdarkly.project_id': sdkKey });
-      cachedResource = base && typeof base.merge === 'function' ? base.merge(ldExtra) : ldExtra;
+      cachedResource = filteredBase && typeof filteredBase.merge === 'function' ? filteredBase.merge(ldExtra) : ldExtra;
     }
 
     return spans.map((span: any) => {
-      const redactedAttrs = computeRedactedAttributes(span.attributes);
-      return wrapSpanWithReplacements(span, {
+      const spanAttrs = span.attributes || {};
+      const flowName = spanAttrs['flow.name'];
+      const cleanedAttrs = computeCleanedAttributes(spanAttrs);
+      const replacements: Record<string, any> = {
         resource: cachedResource,
-        attributes: redactedAttrs,
-      });
+        attributes: cleanedAttrs,
+      };
+      // Promote flow.name to the display name. LD groups its trace-tree view
+      // by span.name; the @microlabs handler proxy stamps generic names like
+      // "fetchHandler POST" or "scheduledHandler */15 * * * *". flow.name is
+      // the human-readable identity we set on every entry handler — promote
+      // it so the trace list reads as "WebhookDialpadExtensionCall" /
+      // "CronTailSync" / etc. flow.name remains in attributes for filter
+      // and groupBy queries.
+      if (typeof flowName === 'string' && flowName.length > 0) {
+        replacements.name = flowName;
+      }
+      return wrapSpanWithReplacements(span, replacements);
     });
   };
 }
 
-function computeRedactedAttributes(attrs: any): any {
+function pruneResourceNoise(resource: any): any {
+  if (!resource || !resource.attributes) return resource;
+  let dropped = false;
+  const filtered: Record<string, any> = {};
+  for (const [k, v] of Object.entries(resource.attributes)) {
+    if (NOISE_KEYS.has(k)) { dropped = true; continue; }
+    filtered[k] = v;
+  }
+  return dropped ? resourceFromAttributes(filtered) : resource;
+}
+
+function computeCleanedAttributes(attrs: any): any {
   if (!attrs || typeof attrs !== 'object') return null;
   let changed = false;
-  const next: any = { ...attrs };
+  const next: any = {};
+  // Prune noise keys; carry through everything else.
+  for (const [k, v] of Object.entries(attrs)) {
+    if (NOISE_KEYS.has(k)) { changed = true; continue; }
+    next[k] = v;
+  }
+  // Apply URL query-param redaction on whitelisted URL keys.
   for (const key of URL_ATTR_KEYS) {
-    const raw = attrs[key];
+    const raw = next[key];
     if (typeof raw !== 'string') continue;
     const redacted = redactQueryParamsInString(raw, key);
     if (redacted !== raw) {
