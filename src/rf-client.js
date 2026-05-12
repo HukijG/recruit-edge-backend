@@ -8,6 +8,7 @@ import {
   cacheCandidateActivities, getCachedCandidateActivities,
 } from './cache.js';
 import { getUserByFirstName } from './users.js';
+import { canonicalizeRFCandidate } from './rf-canonical.js';
 
 /**
  * Typed errors thrown by RF helpers so callers (MCP handlers) can distinguish
@@ -277,7 +278,7 @@ export async function getRFCandidate(candidateId, env) {
 
     if (response.ok) {
       const result = await response.json();
-      return result.candidate || result;
+      return canonicalizeRFCandidate(result.candidate || result);
     }
 
     const errorText = await response.text();
@@ -1033,7 +1034,11 @@ async function searchCandidatesByFilters({ filters, maxPages = 10 }, env) {
           : [];
     if (typeof result?.total_items === 'number') totalItems = result.total_items;
 
-    allCandidates.push(...candidates);
+    // Canonicalise per-row at the integration boundary so every downstream
+    // MCP consumer reads `primary_email` / `phone_numbers` / `current_title`
+    // / `jobs[].job_name` regardless of RF's wire-shape drift. Additive;
+    // raw fields are preserved untouched.
+    allCandidates.push(...candidates.map(canonicalizeRFCandidate));
 
     if (candidates.length < perPage) break;
   }

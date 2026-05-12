@@ -195,7 +195,14 @@ export function scoreString(query, target) {
     // qualifier word ("manager", "lead") in the query.
     const extraTargetTokens = Math.max(0, tTokens.length - qTokens.length);
     const extraPenalty = 0.05 * extraTargetTokens;
-    return Math.max(0, 0.7 + 0.25 * coverage - extraPenalty);
+    // Floor of 0.85 puts prefix-exact matches comfortably above the
+    // per-token Levenshtein ceiling (0.65) — even after the max recency
+    // boost (×1.2) a Lev near-miss tops out around 0.78, so a stale
+    // prefix-exact match still wins. Prior 0.7 floor was too close to
+    // Lev max (0.75) and let recency tip the balance toward false
+    // first-name look-alikes (e.g. "Bill Ferry" beating actual Jerrys
+    // for query "jerry" — observed in the 2026-05-12 smoke test).
+    return Math.max(0, 0.85 + 0.10 * coverage - extraPenalty);
   }
 
   if (tNorm.includes(q)) return 0.5 + 0.25 * (q.length / tNorm.length);
@@ -218,7 +225,12 @@ export function scoreString(query, target) {
     levSum += 1 - bestRatio;
   }
   if (allTokenLev) {
-    return 0.55 + 0.2 * (levSum / qTokens.length); // 0.55..0.75
+    // Lev max pulled from 0.75 → 0.65 so it sits cleanly below the
+    // prefix-exact floor (0.85). Paired with the prefix-floor bump above,
+    // this guarantees an exact first-name token match outranks a "one edit
+    // away" name look-alike regardless of recency boost. See § Fuzzy fix
+    // in `docs/mcp-middleware.md` for the worked example.
+    return 0.55 + 0.10 * (levSum / qTokens.length); // 0.55..0.65 (was 0.55..0.75)
   }
 
   const dist = levenshtein(q, tNorm);

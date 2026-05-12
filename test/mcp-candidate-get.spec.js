@@ -251,4 +251,37 @@ describe('/mcp/candidate-get', () => {
     expect(body.candidate.primary_email).toBe('jerry@x.com');
     expect(body.candidate.name).toBe('Jerry Smith');
   });
+
+  it('raw RF wire shape (email[], phone_number[], current_designation, jobs[].name) is canonicalised end-to-end', async () => {
+    // Mirrors the live RF /candidate/get response observed in LD trace
+    // 6374ff8a0fd93cb7d2844cb4b6322851 for Jane Doe. The integration
+    // boundary (rf-client.js) folds RF's actual field names into the
+    // canonical names DEFAULT_FIELDS asks for, so the response surfaces
+    // primary_email / phone_numbers / current_title / jobs[].job_name even
+    // though RF doesn't use those names on the wire.
+    const rawRfJerry = {
+      id: 42,
+      first_name: 'Jerry',
+      last_name: 'Smith',
+      name: 'Jerry Smith',
+      email: ['jerry@x.com'],                          // not primary_email
+      phone_number: ['+15551234567'],                  // not phone_numbers
+      current_organization: 'Acme Corp',
+      current_designation: 'Staff Engineer',           // not current_title
+      linkedin_profile: 'jerry-smith',
+      jobs: [{ name: 'Eng', client_company_name: 'Acme', stage_name: 'Sourced' }], // not job_name
+    };
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ candidate: rawRfJerry }), { status: 200 }),
+    );
+    const r = await call({ consultantFirstName: 'Joel', id: 42 });
+    expect(r.status).toBe(200);
+    const body = await r.json();
+    expect(body.candidate.primary_email).toBe('jerry@x.com');
+    expect(body.candidate.phone_numbers).toEqual(['+15551234567']);
+    expect(body.candidate.current_title).toBe('Staff Engineer');
+    expect(body.candidate.jobs[0].job_name).toBe('Eng');
+    expect(body.candidate.jobs[0].client_company_name).toBe('Acme');
+    expect(body.candidate.jobs[0].stage_name).toBe('Sourced');
+  });
 });

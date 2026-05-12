@@ -172,6 +172,30 @@ When a `*_id` field is present, the corresponding fuzzy-name field (`candidate`,
 
 `recencyBoost` in `fuzzy.js` decays linearly over a **30-day window** (down from the original 180). Within UNIQUE_GAP, a candidate active today wins outright over the same-name twin from two months ago. Recruiters typing first names almost always mean someone they've spoken to in the last week or two; the tighter window matches that expectation.
 
+### Score floors (prefix-exact ≫ Levenshtein)
+
+The score formula has two floors load-bearing for first-name matching:
+
+- **Prefix-exact**: `0.85 + 0.10 * coverage - extraPenalty`. Floor 0.85 (was 0.7).
+- **Levenshtein per-token fallback**: `0.55 + 0.10 * (levSum / qTokens.length)`. Ceiling 0.65 (was 0.75).
+
+The gap is intentional. The prior values let a Levenshtein near-miss like "Ferry" (one edit from "Jerry") reach ~0.75; combined with the max recency boost (×1.2) it could top ~0.9 and beat a prefix-exact "Jane Doe" stuck at ~0.775. A recruiter typing "jerry" got name-look-alikes ranked above actual Jerrys whenever the look-alikes happened to be more recent (observed in the 2026-05-12 smoke test). The rebalancing guarantees a stale prefix-exact match still outranks the freshest Levenshtein near-miss.
+
+### RF canonicalisation (live-fetch field names)
+
+RF's `/candidate/get` and `/candidate/search` return field names that don't match the canonical MCP projection vocabulary:
+
+| RF wire field         | Canonical name used by MCP defaults / projection |
+|-----------------------|--------------------------------------------------|
+| `email: [...]`        | `primary_email` (first), `emails` (preserved)    |
+| `phone_number: [...]` | `phone_numbers`                                  |
+| `current_designation` | `current_title`                                  |
+| `jobs[].name`         | `jobs[].job_name`                                |
+
+`src/rf-canonical.js` exports `canonicalizeRFCandidate(rf)` — an **additive** transform that sets the canonical names when they're missing and never overwrites existing keys. It runs at the `src/rf-client.js` integration boundary inside `getRFCandidate` and `searchCandidatesByFilters`, so every MCP consumer (candidate-get, candidate-search tier-2, job-pipeline + job-candidates-filter expanded-hydration, and the per-tool `getRFCandidate` fan-outs in candidate-log-interview / candidate-add-note / candidate-move-stage) reads canonical names regardless of RF's wire shape drift. Raw RF fields stay in the body verbatim — non-MCP consumers (`src/cold-call.js`, `src/index.js` extension flow) that still read `email` / `phone_number` continue to work.
+
+The cache-worker's `cache-worker/src/normalize.js` `toCandidateRow` / `toCandidateThinRow` builders do the same shape mapping before writing to D1; the canonicaliser is the parallel transform for the live-fetch path that bypasses D1.
+
 ### Post-narrow disambiguation on writes
 
 `candidate-move-stage`, `candidate-log-interview`, and `candidate-add-note` enumerate every valid candidate (and `(candidate, job, stage)` tuple where relevant) and only ambiguate when ≥2 valid options remain.

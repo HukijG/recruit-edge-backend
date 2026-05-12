@@ -35,4 +35,21 @@ describe('fuzzy', () => {
     // 60 days → 0 (long out of window).
     expect(recencyBoost({ last_activity_at: day(60) }, now)).toBe(0);
   });
+
+  it('prefix-exact first-name match beats Levenshtein near-miss even with max recency', () => {
+    // Smoke-test regression: query="jerry" was returning "Bill Ferry" /
+    // "Chris Perry" / "Devlin Berry" (Levenshtein "one edit away" names)
+    // above actual Jerrys when those look-alikes happened to be more
+    // recent. The prefix-exact floor / Lev ceiling rebalancing guarantees
+    // a stale Jerry still outranks a recently-active Ferry / Perry / Berry.
+    const now = new Date('2026-05-12T12:00:00Z');
+    const day = (n) => new Date(now.getTime() - n * 86400_000).toISOString();
+
+    const jerryStaleScore = scoreString('jerry', 'jerry kara');
+    const billRecentScore = scoreString('jerry', 'bill ferry');
+    // Recency on the look-alike (max boost) ; nothing on the real match.
+    const jerryBoosted = jerryStaleScore * (1 + recencyBoost({ last_activity_at: day(45) }, now));
+    const billBoosted = billRecentScore * (1 + recencyBoost({ last_activity_at: day(0) }, now));
+    expect(jerryBoosted).toBeGreaterThan(billBoosted);
+  });
 });
