@@ -18,6 +18,7 @@ import {
 } from '../src/workflow.js';
 import * as rfClient from '../src/rf-list-client.js';
 import * as bootstrapOtel from '../src/lib/bootstrap-otel.js';
+import * as logsBridge from '../src/lib/logs-bridge.js';
 import { readSyncState, writeSyncState } from '../src/sync-state.js';
 
 const stepShim = {
@@ -498,5 +499,67 @@ describe('Workflow class — flushWorkflowSpans on completion', () => {
       stepShim,
     );
     expect(flushSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workflow class `run()` body — flushLogs called alongside flushWorkflowSpans.
+//
+// Workflow.run() bodies can't go through `withLogsFlush` (no ctx), so each
+// run() finally block must explicitly call `await flushLogs()` to drain the
+// LoggerProvider's BatchLogRecordProcessor queue before the run context tears
+// down. Without this, console.log records emitted inside the Workflow body
+// never reach LaunchDarkly.
+// ---------------------------------------------------------------------------
+
+describe('Workflow class — flushLogs on completion', () => {
+  beforeEach(async () => {
+    await applyMigration(env.RF_MCP_CACHE);
+  });
+
+  it('FullRebuildWorkflow.run awaits flushLogs after successful body', async () => {
+    vi.spyOn(bootstrapOtel, 'flushWorkflowSpans').mockResolvedValue();
+    const flushLogsSpy = vi.spyOn(logsBridge, 'flushLogs').mockResolvedValue();
+    vi.spyOn(rfClient, 'fetchCandidateListPage').mockResolvedValueOnce({ rows: [], total: null });
+    vi.spyOn(rfClient, 'fetchAllJobs').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchUsers').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchActivityTypes').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchCustomFieldSchema').mockResolvedValue([]);
+    vi.spyOn(rfClient, 'fetchJobPipeline').mockResolvedValue({ summary: [], detail: [] });
+
+    const fakeThis = { env };
+    await FullRebuildWorkflow.prototype.run.call(fakeThis, { instanceId: 'inst-3', payload: {} }, stepShim);
+
+    expect(flushLogsSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('FullRebuildWorkflow.run awaits flushLogs even on failure path', async () => {
+    vi.spyOn(bootstrapOtel, 'flushWorkflowSpans').mockResolvedValue();
+    const flushLogsSpy = vi.spyOn(logsBridge, 'flushLogs').mockResolvedValue();
+    vi.spyOn(rfClient, 'fetchCandidateListPage').mockResolvedValueOnce({ rows: [], total: null });
+    vi.spyOn(rfClient, 'fetchAllJobs').mockRejectedValue(new Error('boom-logs-flush'));
+
+    const fakeThis = { env };
+    await expect(
+      FullRebuildWorkflow.prototype.run.call(fakeThis, { instanceId: 'inst-4', payload: {} }, stepShim),
+    ).rejects.toThrow('boom-logs-flush');
+
+    expect(flushLogsSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('CacheSeedWorkflow.run awaits flushLogs after successful body', async () => {
+    vi.spyOn(bootstrapOtel, 'flushWorkflowSpans').mockResolvedValue();
+    const flushLogsSpy = vi.spyOn(logsBridge, 'flushLogs').mockResolvedValue();
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true, status: 200, headers: new Map(), text: async () => '',
+      json: async () => [],
+    }));
+    const fakeThis = { env };
+    await CacheSeedWorkflow.prototype.run.call(
+      fakeThis,
+      { instanceId: 'seed-2', payload: { table: 'candidates' } },
+      stepShim,
+    );
+    expect(flushLogsSpy).toHaveBeenCalledTimes(1);
   });
 });

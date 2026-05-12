@@ -1,6 +1,6 @@
 import { env as workerEnv } from "cloudflare:workers";
 import { installBodyCapture } from "./lib/body-capture.js";
-import { installLogsBridge } from "./lib/logs-bridge.js";
+import { installLogsBridge, withLogsFlush } from "./lib/logs-bridge.js";
 
 installBodyCapture();
 installLogsBridge("rf-mcp-remote");
@@ -79,12 +79,19 @@ const handler = {
 // missing key; this mirrors that semantic at the handler layer. Same pattern as
 // main + cache workers.
 //
+// `withLogsFlush` is the INNER wrap: it proxies ctx.waitUntil so we can await all
+// handler-side promises before force-flushing the OTel LoggerProvider. Without it,
+// the BatchLogRecordProcessor's 1s scheduled flush never fires before fast
+// handlers terminate and queued log records are dropped. @microlabs's instrument()
+// does the same for spans on its outer wrap.
+//
 // `as typeof handler` retains the literal handler type for downstream consumers
 // (tests import worker.fetch and call it with a DOM Request — the widened
 // `ExportedHandler<Env>` type would over-constrain `request` to
 // `IncomingRequestCfProperties` which test fixtures don't satisfy).
+const wrappedHandler = withLogsFlush(handler);
 const exportedHandler = (workerEnv as unknown as { LD_SDK_KEY?: string }).LD_SDK_KEY
-  ? (instrument(handler, resolveOtelConfig) as typeof handler)
-  : handler;
+  ? (instrument(wrappedHandler, resolveOtelConfig) as typeof handler)
+  : wrappedHandler;
 
 export default exportedHandler;

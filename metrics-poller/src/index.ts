@@ -1,6 +1,6 @@
 import { env as workerEnv } from 'cloudflare:workers';
 import { installBodyCapture } from './lib/body-capture.js';
-import { installLogsBridge } from './lib/logs-bridge.js';
+import { installLogsBridge, withLogsFlush } from './lib/logs-bridge.js';
 
 installBodyCapture();
 installLogsBridge('rf-cf-metrics-poller');
@@ -90,6 +90,15 @@ const handler = {
 // never touches the OTLP exporters. The lib `installLogsBridge` already
 // self-skips on missing key; this mirrors that semantic at the handler layer.
 // Same pattern as main + sync + mcp workers.
+//
+// `withLogsFlush` is the INNER wrap: it proxies ctx.waitUntil so we can await all
+// handler-side promises before force-flushing the OTel LoggerProvider. Without it,
+// the BatchLogRecordProcessor's 1s scheduled flush never fires before fast
+// handlers terminate and queued log records are dropped. @microlabs's instrument()
+// does the same for spans on its outer wrap. (This worker's scheduled handler is
+// slow enough that the 1s timer DOES fire — but we wrap for consistency and to
+// guard against future fast handlers / fetch endpoints.)
+const wrappedHandler = withLogsFlush(handler);
 export default (workerEnv as unknown as { LD_SDK_KEY?: string }).LD_SDK_KEY
-  ? instrument(handler, resolveOtelConfig)
-  : handler;
+  ? instrument(wrappedHandler, resolveOtelConfig)
+  : wrappedHandler;

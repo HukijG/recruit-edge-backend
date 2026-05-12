@@ -22,6 +22,7 @@ import { normalizePipelineDetail } from './pipeline-normalize.js';
 import { FLOWS } from './lib/flow-names.js';
 import { instrumentedStep } from './lib/instrumented-step.js';
 import { getWorkflowTracer, flushWorkflowSpans } from './lib/bootstrap-otel.js';
+import { flushLogs } from './lib/logs-bridge.js';
 
 const { WorkflowEntrypoint } = cfWorkers;
 // `NonRetryableError` is only present on newer compatibility dates. The test
@@ -105,6 +106,7 @@ export class PipelineRebuildWorkflow extends WorkflowEntrypoint {
         } finally {
           span.end();
           await flushWorkflowSpans();
+          await flushLogs();
         }
       }
     );

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 const emitMock = vi.fn();
 const setProviderMock = vi.fn();
+const forceFlushMock = vi.fn(() => Promise.resolve());
 
 vi.mock('@opentelemetry/api-logs', () => ({
   logs: {
@@ -12,7 +13,10 @@ vi.mock('@opentelemetry/api-logs', () => ({
 }));
 
 vi.mock('@opentelemetry/sdk-logs', () => ({
-  LoggerProvider: vi.fn().mockImplementation(function (opts) { this.opts = opts; }),
+  LoggerProvider: vi.fn().mockImplementation(function (opts) {
+    this.opts = opts;
+    this.forceFlush = forceFlushMock;
+  }),
   BatchLogRecordProcessor: vi.fn().mockImplementation(function (exporter, opts) { this.exporter = exporter; this.opts = opts; }),
 }));
 
@@ -29,17 +33,25 @@ vi.mock('cloudflare:workers', () => ({
 }));
 
 let installLogsBridge;
+let flushLogs;
+let withLogsFlush;
 let originalConsoleLog;
 let originalConsoleError;
 
 describe('logs-bridge', () => {
   beforeEach(async () => {
     vi.resetModules();
+    // Re-establish the canonical cloudflare:workers mock — earlier tests that
+    // use vi.doMock to flip OTEL_DISABLED / drop LD_SDK_KEY leave a sticky
+    // override behind that would otherwise poison subsequent tests.
+    vi.doMock('cloudflare:workers', () => ({ env: { LD_SDK_KEY: 'test-sdk-key' } }));
     emitMock.mockClear();
     setProviderMock.mockClear();
+    forceFlushMock.mockClear();
+    forceFlushMock.mockImplementation(() => Promise.resolve());
     originalConsoleLog = console.log;
     originalConsoleError = console.error;
-    ({ installLogsBridge } = await import('../../src/lib/logs-bridge.js'));
+    ({ installLogsBridge, flushLogs, withLogsFlush } = await import('../../src/lib/logs-bridge.js'));
   });
 
   afterEach(() => {
@@ -121,5 +133,126 @@ describe('logs-bridge', () => {
     console.log('would normally emit');
     console.error('would normally emit error');
     expect(emitMock).not.toHaveBeenCalled();
+  });
+
+  // -------------------------------------------------------------------------
+  // flushLogs / withLogsFlush — flush-before-worker-termination guard
+  //
+  // BatchLogRecordProcessor's 1s scheduled flush doesn't fire before fast
+  // handlers terminate; without an explicit forceFlush, queued log records
+  // never reach LaunchDarkly. flushLogs() exposes the provider's forceFlush,
+  // and withLogsFlush() wraps the handler so the flush is queued in
+  // ctx.waitUntil after handler-side waitUntils complete.
+  // -------------------------------------------------------------------------
+
+  it('flushLogs() — with provider installed, calls provider.forceFlush', async () => {
+    installLogsBridge('test-service');
+    await flushLogs();
+    expect(forceFlushMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('flushLogs() — never throws if forceFlush itself throws (telemetry safety)', async () => {
+    installLogsBridge('test-service');
+    forceFlushMock.mockImplementationOnce(() => { throw new Error('export network down'); });
+    await expect(flushLogs()).resolves.toBeUndefined();
+  });
+
+  it('withLogsFlush returns an object with fetch when input has fetch', () => {
+    const wrapped = withLogsFlush({ fetch: async () => new Response('ok') });
+    expect(typeof wrapped.fetch).toBe('function');
+    expect(wrapped.scheduled).toBeUndefined();
+    expect(wrapped.queue).toBeUndefined();
+  });
+
+  it('withLogsFlush returns scheduled when input has scheduled', () => {
+    const wrapped = withLogsFlush({ scheduled: async () => {} });
+    expect(typeof wrapped.scheduled).toBe('function');
+    expect(wrapped.fetch).toBeUndefined();
+  });
+
+  it('withLogsFlush returns queue when input has queue', () => {
+    const wrapped = withLogsFlush({ queue: async () => {} });
+    expect(typeof wrapped.queue).toBe('function');
+  });
+
+  it('withLogsFlush(handler).fetch registers ctx.waitUntil for the flush', async () => {
+    installLogsBridge('test-service');
+    forceFlushMock.mockClear();
+    const handler = { fetch: async () => new Response('ok') };
+    const wrapped = withLogsFlush(handler);
+    const waitUntilCalls = [];
+    const ctx = { waitUntil: vi.fn((p) => { waitUntilCalls.push(p); }) };
+    const res = await wrapped.fetch(new Request('https://x'), {}, ctx);
+    expect(res).toBeInstanceOf(Response);
+    expect(ctx.waitUntil).toHaveBeenCalledTimes(1);
+    // Awaiting the queued promise ensures the inner flushLogs() has resolved.
+    await Promise.all(waitUntilCalls);
+    expect(forceFlushMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('withLogsFlush ctx proxy tracks inner ctx.waitUntil promises before flushing', async () => {
+    installLogsBridge('test-service');
+    let innerResolved = false;
+    const innerPromise = new Promise((r) => setTimeout(() => { innerResolved = true; r(); }, 25));
+    const handler = {
+      fetch: async (_req, _env, ctx) => {
+        ctx.waitUntil(innerPromise);
+        return new Response('ok');
+      },
+    };
+    const wrapped = withLogsFlush(handler);
+    const waitUntilCalls = [];
+    const realCtx = { waitUntil: vi.fn((p) => { waitUntilCalls.push(p); }) };
+    forceFlushMock.mockImplementation(() => {
+      // When forceFlush is called, the tracked inner promise must already be settled.
+      expect(innerResolved).toBe(true);
+      return Promise.resolve();
+    });
+    await wrapped.fetch(new Request('https://x'), {}, realCtx);
+    // Two waitUntil registrations: the inner promise + the flush-after-tracker promise.
+    expect(realCtx.waitUntil).toHaveBeenCalledTimes(2);
+    await Promise.all(waitUntilCalls);
+    expect(forceFlushMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('withLogsFlush still flushes if the handler throws (finally semantics)', async () => {
+    installLogsBridge('test-service');
+    const handler = {
+      fetch: async () => { throw new Error('handler boom'); },
+    };
+    const wrapped = withLogsFlush(handler);
+    const waitUntilCalls = [];
+    const ctx = { waitUntil: vi.fn((p) => { waitUntilCalls.push(p); }) };
+    forceFlushMock.mockClear();
+    await expect(wrapped.fetch(new Request('https://x'), {}, ctx)).rejects.toThrow('handler boom');
+    expect(ctx.waitUntil).toHaveBeenCalledTimes(1);
+    await Promise.all(waitUntilCalls);
+    expect(forceFlushMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('withLogsFlush.scheduled also flushes via ctx.waitUntil', async () => {
+    installLogsBridge('test-service');
+    const handler = { scheduled: async () => {} };
+    const wrapped = withLogsFlush(handler);
+    const waitUntilCalls = [];
+    const ctx = { waitUntil: vi.fn((p) => { waitUntilCalls.push(p); }) };
+    forceFlushMock.mockClear();
+    await wrapped.scheduled({ cron: '* * * * *' }, {}, ctx);
+    expect(ctx.waitUntil).toHaveBeenCalledTimes(1);
+    await Promise.all(waitUntilCalls);
+    expect(forceFlushMock).toHaveBeenCalledTimes(1);
+  });
+
+  // NOTE: keep this LAST — uses vi.doMock to override cloudflare:workers, which
+  // persists across imports. The beforeEach above resets the canonical mock for
+  // each test, so this ordering is for clarity rather than necessity.
+  it('flushLogs() — no provider (LD_SDK_KEY missing) returns resolved Promise', async () => {
+    vi.resetModules();
+    vi.doMock('cloudflare:workers', () => ({ env: {} }));
+    forceFlushMock.mockClear();
+    const mod = await import('../../src/lib/logs-bridge.js');
+    mod.installLogsBridge('test-service');
+    await expect(mod.flushLogs()).resolves.toBeUndefined();
+    expect(forceFlushMock).not.toHaveBeenCalled();
   });
 });

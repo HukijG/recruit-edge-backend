@@ -22,6 +22,7 @@
 import * as cfWorkers from 'cloudflare:workers';
 import { SpanStatusCode } from '@opentelemetry/api';
 import { getWorkflowTracer, flushWorkflowSpans } from './lib/bootstrap-otel.js';
+import { flushLogs } from './lib/logs-bridge.js';
 
 const { WorkflowEntrypoint } = cfWorkers;
 // `NonRetryableError` is only present on newer compatibility dates. The test
@@ -178,6 +179,7 @@ export class FullRebuildWorkflow extends WorkflowEntrypoint {
         } finally {
           span.end();
           await flushWorkflowSpans();
+          await flushLogs();
         }
       }
     );
@@ -303,6 +305,7 @@ export class CacheSeedWorkflow extends WorkflowEntrypoint {
         } finally {
           span.end();
           await flushWorkflowSpans();
+          await flushLogs();
         }
       }
     );

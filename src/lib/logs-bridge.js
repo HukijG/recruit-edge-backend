@@ -7,6 +7,7 @@ import { resourceFromAttributes } from '@opentelemetry/resources';
 const DEFAULT_LD_OTLP_LOGS_URL = 'https://otel.observability.app.launchdarkly.com/v1/logs';
 
 let installed = false;
+let _provider = null;
 
 export function installLogsBridge(serviceName) {
   // Emergency kill switch — wholesale disables the console.* wrap so no OTel log records are emitted.
@@ -42,6 +43,7 @@ export function installLogsBridge(serviceName) {
     ],
   });
   logs.setGlobalLoggerProvider(provider);
+  _provider = provider;
 
   const logger = logs.getLogger('worker-console', '1.0.0');
 
@@ -93,4 +95,112 @@ function emit(logger, severityNumber, severityText, args) {
 function safeStringify(o) {
   try { return JSON.stringify(o); }
   catch { return String(o); }
+}
+
+/**
+ * Force-flush the queued OTel log records through the LoggerProvider.
+ * Returns a Promise that resolves once all batched records have been
+ * exported (or rejected). Safe to call when LD_SDK_KEY is missing or
+ * OTEL_DISABLED=1 — returns a resolved Promise (no-op).
+ */
+export function flushLogs() {
+  if (!_provider) return Promise.resolve();
+  try {
+    const p = _provider.forceFlush();
+    return p && typeof p.then === 'function' ? p : Promise.resolve();
+  } catch {
+    return Promise.resolve();
+  }
+}
+
+/**
+ * Wrap an ExportedHandler so that after each fetch / scheduled / queue
+ * invocation, all handler-side ctx.waitUntil promises are awaited and
+ * then the OTel LoggerProvider is force-flushed. Without this wrap, the
+ * BatchLogRecordProcessor's 1s scheduled flush will not fire before fast
+ * handlers terminate, and queued logs are dropped.
+ *
+ * Mirrors the @microlabs trace-flush pattern (vendor sdk.ts:158, exportSpans
+ * awaits tracker.wait() before forceFlush). The two flush paths run as
+ * separate ctx.waitUntil promises and resolve independently.
+ *
+ * Order matters at the export site: wrap the user handler with
+ * withLogsFlush FIRST, then wrap that with @microlabs instrument(). The
+ * instrument() outer wrap proxies ctx itself; our proxy nests inside.
+ */
+export function withLogsFlush(handler) {
+  const wrapped = {};
+  if (typeof handler.fetch === 'function') {
+    const original = handler.fetch;
+    wrapped.fetch = async function (request, env, ctx) {
+      const tracked = [];
+      const proxyCtx = makeTrackingCtxProxy(ctx, tracked);
+      try {
+        return await original.call(handler, request, env, proxyCtx);
+      } finally {
+        // Real CF runtime always provides ctx.waitUntil; tests sometimes pass {}.
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          ctx.waitUntil((async () => {
+            try { await Promise.allSettled(tracked); } catch { /* swallow */ }
+            try { await flushLogs(); } catch { /* swallow */ }
+          })());
+        }
+      }
+    };
+  }
+  if (typeof handler.scheduled === 'function') {
+    const original = handler.scheduled;
+    wrapped.scheduled = async function (event, env, ctx) {
+      const tracked = [];
+      const proxyCtx = makeTrackingCtxProxy(ctx, tracked);
+      try {
+        return await original.call(handler, event, env, proxyCtx);
+      } finally {
+        // Real CF runtime always provides ctx.waitUntil; tests sometimes pass {}.
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          ctx.waitUntil((async () => {
+            try { await Promise.allSettled(tracked); } catch { /* swallow */ }
+            try { await flushLogs(); } catch { /* swallow */ }
+          })());
+        }
+      }
+    };
+  }
+  if (typeof handler.queue === 'function') {
+    const original = handler.queue;
+    wrapped.queue = async function (batch, env, ctx) {
+      const tracked = [];
+      const proxyCtx = makeTrackingCtxProxy(ctx, tracked);
+      try {
+        return await original.call(handler, batch, env, proxyCtx);
+      } finally {
+        // Real CF runtime always provides ctx.waitUntil; tests sometimes pass {}.
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          ctx.waitUntil((async () => {
+            try { await Promise.allSettled(tracked); } catch { /* swallow */ }
+            try { await flushLogs(); } catch { /* swallow */ }
+          })());
+        }
+      }
+    };
+  }
+  if (typeof handler.email === 'function') {
+    wrapped.email = handler.email;
+  }
+  return wrapped;
+}
+
+function makeTrackingCtxProxy(ctx, tracked) {
+  return {
+    waitUntil(promise) {
+      tracked.push(Promise.resolve(promise).catch(() => {}));
+      if (ctx && typeof ctx.waitUntil === 'function') {
+        return ctx.waitUntil(promise);
+      }
+      return undefined;
+    },
+    passThroughOnException: ctx && typeof ctx.passThroughOnException === 'function'
+      ? ctx.passThroughOnException.bind(ctx)
+      : undefined,
+  };
 }

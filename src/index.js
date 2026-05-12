@@ -1,6 +1,6 @@
 import { env as workerEnv } from 'cloudflare:workers';
 import { installBodyCapture } from './lib/body-capture.js';
-import { installLogsBridge } from './lib/logs-bridge.js';
+import { installLogsBridge, withLogsFlush } from './lib/logs-bridge.js';
 
 installBodyCapture();
 installLogsBridge('rf-dialpad-sync-dev');
@@ -249,9 +249,16 @@ const handler = {
 // absent (e.g. the vitest harness — see vitest.config.js for why), we export the
 // raw handler so requests never touch the OTLP exporters. The lib `installLogsBridge`
 // already self-skips on missing key; this mirrors that semantic at the handler layer.
+//
+// `withLogsFlush` is the INNER wrap: it proxies ctx.waitUntil so we can await all
+// handler-side promises before force-flushing the OTel LoggerProvider. Without it,
+// the BatchLogRecordProcessor's 1s scheduled flush never fires before fast
+// handlers terminate and queued log records are dropped. @microlabs's instrument()
+// does the same for spans on its outer wrap.
+const wrappedHandler = withLogsFlush(handler);
 export default workerEnv.LD_SDK_KEY
-  ? instrument(handler, resolveOtelConfig)
-  : handler;
+  ? instrument(wrappedHandler, resolveOtelConfig)
+  : wrappedHandler;
 
 async function handleRecruiterflowWebhook(request, env) {
   try {

@@ -1,6 +1,6 @@
 import { env as workerEnv } from 'cloudflare:workers';
 import { installBodyCapture } from './lib/body-capture.js';
-import { installLogsBridge } from './lib/logs-bridge.js';
+import { installLogsBridge, withLogsFlush } from './lib/logs-bridge.js';
 
 installBodyCapture();
 installLogsBridge('rf-mcp-cache-sync');
@@ -529,9 +529,17 @@ const handler = {
 // and the Workflow tracer (see `lib/bootstrap-otel.js` — `getWorkflowTracer`)
 // already self-skip on missing key; this mirrors that semantic at the handler
 // layer. Same pattern as main worker's src/index.js.
+//
+// `withLogsFlush` is the INNER wrap: it proxies ctx.waitUntil so we can await all
+// handler-side promises before force-flushing the OTel LoggerProvider. Without it,
+// the BatchLogRecordProcessor's 1s scheduled flush never fires before fast
+// handlers terminate and queued log records are dropped. @microlabs's instrument()
+// does the same for spans on its outer wrap. Workflow.run() bodies bypass this
+// wrap — they call `flushLogs()` directly in their finally blocks.
+const wrappedHandler = withLogsFlush(handler);
 export default workerEnv.LD_SDK_KEY
-  ? instrument(handler, resolveOtelConfig)
-  : handler;
+  ? instrument(wrappedHandler, resolveOtelConfig)
+  : wrappedHandler;
 
 export { FullRebuildWorkflow } from './workflow.js';
 export { CacheSeedWorkflow } from './workflow.js';
