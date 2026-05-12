@@ -227,10 +227,21 @@ Dashboards are LD-UI configured (not in code). The handover at `docs/handovers/2
 
 - **Metrics-poller stale (no new metrics arriving).** See Alert 6 in `docs/observability-runbooks.md`. Common cause: expired `CF_API_TOKEN` secret.
 
+## Known gaps (instrumentation work pending)
+
+These were identified during the 2026-05-12 production smoke test. Full context + remediation plan: `docs/handovers/2026-05-12-deploy-and-observability-gaps.md`.
+
+- **Inbound request body is NOT captured on the root fetchHandler span.** Body-capture wrapper only patches `globalThis.fetch` (outbound). Inbound MCP / webhook bodies are invisible in LD. Fix: small patch to read `request.clone().text()` at entry and stamp `http.request.body` on the root span. Sibling-copy across all 4 workers' `lib/body-capture.{js,ts}`.
+
+- **MCP handler internal flow is NOT spanned.** A `/mcp/candidate-get` trace shows the inbound span + auto-instrumented D1 lookup + outbound RF fetch — but NOT the decisions in between (snapshot load, tier-1 fuzzy match, tier-2 RF routing, predicate build, response shaping). These have structured `console.log` lines (which DO appear in LD's Logs tab, correlated by `trace_id`) but no spans. Fix: add `tracer.startActiveSpan` calls at decision points inside `src/mcp/{candidate-search,candidate-get,job-pipeline,job-candidates-filter,candidate-call-notes,snapshot,resolvers,fuzzy}.js`. Estimated 2–4 h of work.
+
+- **LD dashboards not yet built.** Without per-`flow.name`-grouped dashboards, the LD UI defaults to a raw span firehose, which is not actually useful for debugging. Phase I work — see `docs/handovers/2026-05-11-observability-merge-prep.md` § 6.5 for the SQL query bodies, and add a "per-flow.name request health" panel beyond the original 4 (groups by `attribute_flow_name`, surfaces count + p50/p95/p99 + error rate per flow — the UX a flow-driven team actually wants).
+
 ## Reference
 
 - Runbooks: `docs/observability-runbooks.md`
 - Spec: `docs/archive/specs/2026-05-10-observability-launchdarkly-design.md` (will archive on confirmed-shipped)
 - Plan: `docs/archive/plans/2026-05-10-observability-launchdarkly.md` (same)
 - Handover (parallel thin-cache branch merge prep): `docs/handovers/2026-05-11-observability-merge-prep.md` (will archive after merge)
+- Handover (deploy outcome + legibility gaps from 2026-05-12 smoke test): `docs/handovers/2026-05-12-deploy-and-observability-gaps.md`
 - Vendor patch: `vendor/otel-cf-workers/VENDOR.md`
