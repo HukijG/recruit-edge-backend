@@ -302,48 +302,57 @@ export async function getRFCandidate(candidateId, env) {
 }
 
 /**
- * GET /job/get?id=… — full job body for a single id. Used by the MCP
- * Phase 2 live-rerank path to read mutable fields (`is_open`, etc.) that
- * intentionally aren't in the thin v2 cache.
+ * GET /job?job_id=… — full job body for a single id. Used by the MCP
+ * Phase 2 live-rerank path to read mutable fields (`is_open`, `job_status`,
+ * etc.) that intentionally aren't in the thin v2 cache.
  *
- * Returns the unwrapped job body. RF wraps as `{job: {...}}` in some
- * deployments and as the bare body in others — accept both.
+ * Endpoint shape: `GET /api/external/job?job_id=X&include_stages=1`
+ * (NOT `/job/get` — that doesn't exist and returns RF's marketing-site
+ * HTML fallback; learned 2026-05-12). Returns the bare job body with
+ * `is_open: true|false` at the top level.
  *
  * One-shot retry on 5xx transient; propagates RFRateLimitedError on 429
  * so the caller can degrade (Phase 2 callers absorb individual fan-out
  * failures rather than aborting the whole rerank).
+ *
+ * @param {number|string} jobId
+ * @param {object} env
+ * @param {object} [opts]
+ * @param {boolean} [opts.includeStages=false] — append &include_stages=1 to fetch the stages[] array (heavier; only request when needed)
  */
-export async function getRFJob(jobId, env) {
+export async function getRFJob(jobId, env, opts = {}) {
   const rfApiKey = env.RF_API_KEY;
   const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
   if (!rfApiKey) throw new Error('RF_API_KEY environment variable is required');
-  const url = `${rfBaseUrl}/job/get?id=${encodeURIComponent(jobId)}`;
+  const stagesParam = opts.includeStages ? '&include_stages=1' : '';
+  const url = `${rfBaseUrl}/job?job_id=${encodeURIComponent(jobId)}${stagesParam}`;
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     const response = await fetch(url, { method: 'GET', headers: { 'RF-Api-Key': rfApiKey } });
     if (response.ok) {
       const result = await response.json();
-      return result.job || result;
+      // Defensive: RF returns the bare body, but some deployments wrap it.
+      return result?.job || result;
     }
     const errorText = await response.text();
     const err = classifyRFResponse(response, errorText);
     if (err instanceof RFTransientError && attempt === 1) {
       console.warn({
-        message: `[RF job/get] ${response.status} for job=${jobId}, retrying once`,
+        message: `[RF job] ${response.status} for job=${jobId}, retrying once`,
         source: 'rf-job-get',
         jobId,
       });
       continue;
     }
     console.error({
-      message: `RF /job/get error job=${jobId} status=${response.status} body=${errorText}`,
+      message: `RF /job error job=${jobId} status=${response.status} body=${errorText}`,
       source: 'rf-job-get',
       jobId,
     });
     throw err;
   }
   // Unreachable — the loop either returns or throws on every iteration
-  throw new RFError('RF /job/get unreachable');
+  throw new RFError('RF /job unreachable');
 }
 
 /**

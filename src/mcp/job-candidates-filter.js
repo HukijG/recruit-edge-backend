@@ -139,7 +139,10 @@ async function resolveJobOrRespond(env, body) {
     return { ok: true, jobMeta: meta };
   }
   if (body.job != null) {
-    const r = await resolveJob(env, body.job, { validateNumeric: true });
+    const r = await resolveJob(env, body.job, {
+      validateNumeric: true,
+      includeClosed: body.include_closed === true,
+    });
     if (!r.ok) {
       if (r.reason === 'ambiguous') {
         return { response: jsonResponse(200, disambiguationPayload(r)) };

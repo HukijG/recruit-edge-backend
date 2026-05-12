@@ -46,6 +46,7 @@ import { projectWithLinkedIn } from './linkedin.js';
 import { getSnapshot } from './snapshot.js';
 import { scoreString, normalize } from './fuzzy.js';
 import { liveRerankCandidates } from './live-rerank.js';
+import { widenTiedPool } from './resolvers.js';
 import {
   resolveJob, resolveOwner, resolveStage, disambiguationPayload,
 } from './resolvers.js';
@@ -63,11 +64,12 @@ const DEFAULT_FIELDS = ['id', 'name', 'current_title', 'linkedin_profile'];
 const FUZZY_THRESHOLD = 0.35;
 const TIER1_FUZZY_LIMIT = 200;  // tier-1 pool size before tier-2 narrowing
 const HYDRATION_CONCURRENCY = 8;
-// Phase 2 (live-rerank) fan-out cap on the pure-fuzzy candidate-search
-// path. Bounded so large `limit` values don't trigger a 50-call RF storm;
-// top-5 by Phase 1 score get the live stage-recency rerank, the tail
-// keeps Phase 1 ordering.
-const PHASE2_FANOUT = 5;
+// Phase 1 pool-widening cap (mirrors resolvers.js PHASE1_WIDE_CAP).
+// When the user's `limit` cutoff lands inside a flat-score tie, extend
+// the pool up to PHASE1_WIDE_CAP to let Phase 2 see all tied candidates.
+// Live-rerank concurrency (5) lives inside live-rerank.js's pMapLimit
+// call — bounded fan-out cost is enforced there, not here.
+const PHASE1_WIDE_CAP = 25;
 
 // ─── In-memory caches ─────────────────────────────────────────────────────
 
@@ -356,6 +358,15 @@ function buildImmutableSnapshotFilter(body) {
  * recency (`stage_moved` on a non-Sourced / non-Disqualified job)
  * replaces it on the pure-fuzzy path via `liveRerankCandidates` below.
  *
+ * Pool-widening at the slice: when the cutoff falls inside a flat-score
+ * tie (e.g. every "Jerry X" candidate scoring exactly 0.85), include
+ * EVERY candidate sharing that score up to PHASE1_WIDE_CAP. Without
+ * this, the deterministic cache order decides who reaches Phase 2 and a
+ * real target at position N>limit never gets a recency boost. Operator-
+ * confirmed pattern from the 2026-05-12 smoke test where Jane Doe
+ * (recently re-engaged) was absent from the top-5 because five other
+ * Jerrys held the same Phase 1 score.
+ *
  * Returns rows shaped as `{id, name, score, _thinRow}` where `_thinRow`
  * carries the snapshot's thin fields (id, name, linkedin_profile,
  * added_time_ms).
@@ -369,7 +380,11 @@ async function tier1Fuzzy(env, query, limit, immutablePredicate = null) {
     .map((r) => ({ id: r.id, name: r.name, score: scoreString(q, r.prepared), _thinRow: r }))
     .filter((r) => r.score >= FUZZY_THRESHOLD)
     .sort((a, b) => b.score - a.score);
-  return scored.slice(0, limit);
+  // Pool widening uses the shared `widenTiedPool` helper from resolvers.js —
+  // single source of truth for the "extend the slice through any flat tie
+  // at the cutoff" rule. Search's `limit` is the equivalent of the
+  // resolver's `fanout`; the cap is `PHASE1_WIDE_CAP` either way.
+  return widenTiedPool(scored, limit, PHASE1_WIDE_CAP);
 }
 
 /**
@@ -622,17 +637,22 @@ export async function handleCandidateSearch({ env, body }) {
   //            "Jerry" returns N look-alikes all scoring 0.85+ with no
   //            way for the right Jerry to surface — see operator brief
   //            for the worked example.
-  // Phase 2 fan-out is bounded at PHASE2_FANOUT (5); requests with larger
-  // limits get Phase 2 rerank on the top 5 only, the tail keeps Phase 1
-  // ordering. Trade-off: protects against a 50-fan-out latency cliff
-  // while still answering the common "type a first name" intent right.
+  // Phase 2 fan-out spans the WIDENED tier-1 pool (capped at
+  // PHASE1_WIDE_CAP=25) so a real target hiding behind a Phase-1 score
+  // tie can surface via stage-recency. Live-rerank concurrency is
+  // throttled at pMapLimit=5 inside live-rerank.js, so 25 candidates ≈
+  // 5 batches ≈ 750 ms worst-case — acceptable for the operator's
+  // "type a first name and find the right person" intent.
   if (hasQuery && !hasMutableFilters) {
+    // tier1 is widened past `limit` when the cutoff lands inside a flat-
+    // tie cluster (capped at PHASE1_WIDE_CAP) — feed the FULL widened
+    // pool to Phase 2 so a real target hiding behind a Phase-1 tie can
+    // surface via stage-recency.
     const tier1 = await tier1Fuzzy(env, body.query, limit, immutablePredicate);
     let ordered = tier1;
     if (tier1.length > 0) {
-      const reranked = await liveRerankCandidates(env, tier1.slice(0, PHASE2_FANOUT));
-      // Splice the reranked top-K back over the original order; tail (any
-      // overflow beyond PHASE2_FANOUT) keeps Phase 1 score / position.
+      const reranked = await liveRerankCandidates(env, tier1);
+      // Splice the reranked scores back over the original order.
       const byId = new Map(reranked.map((r) => [r.id, r]));
       ordered = tier1
         .map((m) => {
@@ -640,7 +660,8 @@ export async function handleCandidateSearch({ env, body }) {
           if (!r) return m;
           return { ...m, score: r.score, _body: r._body ? JSON.stringify(r._body) : undefined };
         })
-        .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+        .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+        .slice(0, limit);  // Trim back to caller-requested limit after Phase 2 reorders.
     }
     const dbRows = ordered.length ? await getCandidatesByIds(env, ordered.map((m) => m.id)) : [];
     const dbById = new Map(dbRows.map((r) => [r.id, r]));

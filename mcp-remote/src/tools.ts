@@ -283,6 +283,8 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
         "",
         "Default excludes disqualified candidates; pass include_disqualified: true to include.",
         "",
+        "Default to open jobs only when fuzzy-resolving `job`. Closed jobs reach this tool either by explicit numeric id or by passing include_closed: true.",
+        "",
         "Capped at `limit` (default 100, max 500). Response includes `truncated: true` when total exceeds.",
         "",
         "On RF unavailable, returns `{ok: false, recoverable: true, kind: 'pipeline_unavailable'}`; on RF 429, returns `{ok: false, kind: 'rate_limited', retry_after_ms}`. Both at HTTP 200.",
@@ -296,6 +298,10 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
           .boolean()
           .optional()
           .describe("Default false; pass true to include disqualified candidates."),
+        include_closed: z
+          .boolean()
+          .optional()
+          .describe("Default false; pass true to allow closed jobs through fuzzy resolution. Most queries should stay default — closed jobs are typically reachable via numeric id."),
         fields: z.array(z.string()).optional(),
         limit: z.number().int().min(1).max(500).optional(),
       },
@@ -332,7 +338,7 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
         "",
         "Pipeline reads are live to RF (~300-800 ms baseline). No pre-warm needed. On RF unavailable, returns `{ok: false, recoverable: true, kind: 'pipeline_unavailable'}`; on RF 429, returns `{ok: false, kind: 'rate_limited', retry_after_ms}`. Both at HTTP 200.",
         "",
-        "Default excludes disqualified; pass `include_disqualified: true` to include. Open jobs only (closed jobs reachable via explicit numeric `job` id).",
+        "Default excludes disqualified; pass `include_disqualified: true` to include. Open jobs only (closed jobs reachable via explicit numeric `job` id, or by passing `include_closed: true`).",
       ].join("\n"),
       inputSchema: {
         job: ref,
@@ -347,6 +353,10 @@ export function registerTools(server: McpServer, ctx: RequestCtx) {
           .boolean()
           .optional()
           .describe("Default false; pass true to include DQ'd candidates."),
+        include_closed: z
+          .boolean()
+          .optional()
+          .describe("Default false; pass true to allow closed jobs through fuzzy resolution. Most queries should stay default — closed jobs are typically reachable via numeric id."),
         fields: z.array(z.string()).optional(),
       },
       annotations: { readOnlyHint: true, destructiveHint: false },

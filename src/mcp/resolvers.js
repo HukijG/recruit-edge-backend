@@ -43,6 +43,23 @@ const AUTO_RESOLVE_GAP = UNIQUE_GAP;
 // at concurrency 5 (handled inside liveRerank*); larger fan-outs trade
 // latency for marginal accuracy gains on the long tail.
 const PHASE2_FANOUT = 5;
+// Phase 1 pool widening: when scoreString produces flat-tied scores at
+// the boundary of the top-K (operator-confirmed pattern for single-token
+// first-name queries — every "Jerry X" candidate scores exactly 0.85 via
+// prefixCoverage/denom = 1.0/2 = 0.5 regardless of last name), the
+// deterministic cache order picks which 5 get returned, and a real target
+// at position 6+ never reaches Phase 2. Widen the top-K to include every
+// candidate that ties with the cutoff score, capped at PHASE1_WIDE_CAP
+// to bound the Phase 2 fan-out cost.
+const PHASE1_WIDE_CAP = 25;
+// Long-tail truncation in disambiguation envelopes: drop options scoring
+// proportionally below the top match. Operator-observed (2026-05-12):
+// when "Eon SE" disambiguates [SE @ 0.87, SEM @ 0.70, SSE @ 0.63], the
+// 0.70/0.63 entries waste prompt tokens — they're clearly not real
+// competitors. Threshold is RATIO-based (not absolute) so it scales
+// with Phase 2 boosts that push scores past 1.0 (e.g. exact-match +
+// stage-recency → 1.25). Keep options where score >= top * 0.85.
+const TRUNCATION_RATIO = 0.85;
 
 /**
  * Coerce a raw `candidate|job|stage|owner` body field to a numeric id when it
@@ -69,6 +86,10 @@ function coerceInput(input) {
  * Decide unique vs ambiguous from a sorted-DESC scored list.
  * - threshold-filter has already been applied by the caller
  * - returns { kind: 'unique', winner } | { kind: 'ambiguous', options }
+ *
+ * Ambiguous options are passed through `truncateLongTail` so the response
+ * envelope doesn't carry options that are clearly not real competitors
+ * (drop anything below `top * TRUNCATION_RATIO`).
  */
 function pickWinner(scored) {
   if (scored.length === 0) return { kind: 'none' };
@@ -77,7 +98,54 @@ function pickWinner(scored) {
   if (a.score - b.score >= UNIQUE_GAP) {
     return { kind: 'unique', winner: a };
   }
-  return { kind: 'ambiguous', options: scored.slice(0, MAX_OPTIONS) };
+  return { kind: 'ambiguous', options: truncateLongTail(scored).slice(0, MAX_OPTIONS) };
+}
+
+/**
+ * Drop options scoring proportionally below the top match. Operator's
+ * 2026-05-12 spec: a disambiguation envelope showing "Sales Engineer @
+ * 0.87, Sales Engineering Manager @ 0.70, Senior Support Engineer @
+ * 0.63" wastes prompt tokens — the 0.70 / 0.63 entries aren't real
+ * contenders. Ratio-based (not absolute delta) so the threshold scales
+ * with Phase 2 boosts that can push the top past 1.0.
+ *
+ * `scored` is sorted DESC; cutoff fires once.
+ */
+function truncateLongTail(scored) {
+  if (scored.length <= 1) return scored;
+  const top = scored[0].score;
+  const cutoff = top * TRUNCATION_RATIO;
+  // Keep at least the top option even if cutoff math evicts everything
+  // (top * RATIO is always < top, so this never trims position 0).
+  return scored.filter((s) => s.score >= cutoff);
+}
+
+/**
+ * Widen a sorted-DESC scored list to include every option that ties with
+ * the cutoff score. The Phase 1 cache scorer routinely produces flat-
+ * tied scores when a query token matches the same target token across
+ * many candidates (e.g. "Jerry" against every "Jerry X" candidate scores
+ * exactly 0.85 — coverage=0.5, no extra-token penalty, identical math).
+ * Without widening, the top-K is whichever rows the cache iteration
+ * happened to surface; a real target at position 6+ never reaches Phase
+ * 2's stage-recency rerank.
+ *
+ * `wideCap` bounds the widened pool against pathological query patterns
+ * (e.g. someone typing a hyper-common first name). Default
+ * PHASE1_WIDE_CAP = 25.
+ *
+ * Exported so candidate-search.js can use the same logic on its tier-1
+ * pool — single source of truth keeps the widening contract aligned
+ * between the resolver and the search endpoint.
+ */
+export function widenTiedPool(scored, fanout = PHASE2_FANOUT, wideCap = PHASE1_WIDE_CAP) {
+  if (scored.length <= fanout) return scored.slice();
+  const cutoffScore = scored[fanout - 1].score;
+  let end = fanout;
+  while (end < scored.length && end < wideCap && scored[end].score === cutoffScore) {
+    end++;
+  }
+  return scored.slice(0, end);
 }
 
 // ─────────────────────── Candidate ───────────────────────
@@ -125,7 +193,7 @@ export async function resolveCandidateThin(env, input) {
     && decision.winner.score >= AUTO_RESOLVE_FLOOR
     && (scored.length < 2 || decision.winner.score - scored[1].score >= AUTO_RESOLVE_GAP);
   if (!auto) {
-    const topK = scored.slice(0, PHASE2_FANOUT);
+    const topK = widenTiedPool(scored);
     const reranked = await liveRerankCandidates(env, topK);
     const rerankedDecision = pickWinner(reranked);
     if (rerankedDecision.kind === 'unique') {
@@ -219,7 +287,7 @@ export async function resolveCandidate(env, input) {
     && decision.winner.score >= AUTO_RESOLVE_FLOOR
     && (scored.length < 2 || decision.winner.score - scored[1].score >= AUTO_RESOLVE_GAP);
   if (!auto) {
-    const topK = scored.slice(0, PHASE2_FANOUT);
+    const topK = widenTiedPool(scored);
     const reranked = await liveRerankCandidates(env, topK);
     const rerankedDecision = pickWinner(reranked);
     if (rerankedDecision.kind === 'unique') {
@@ -283,7 +351,7 @@ async function loadJobs(env) {
  * "no rows for this job" handling — and for which the sync_state.jobs table
  * may legitimately lag the candidate_jobs table by one tick.
  */
-export async function resolveJob(env, input, { restrictTo, onlyOpen = true, validateNumeric = true } = {}) {
+export async function resolveJob(env, input, { restrictTo, onlyOpen = true, validateNumeric = true, includeClosed = false } = {}) {
   const coerced = coerceInput(input);
   if (!coerced) return { ok: false, reason: 'not_found', input };
 
@@ -359,7 +427,7 @@ export async function resolveJob(env, input, { restrictTo, onlyOpen = true, vali
     && (scored.length < 2 || decision.winner.score - scored[1].score >= AUTO_RESOLVE_GAP);
   if (!skipPhase2 && !auto) {
     const topK = scored.slice(0, PHASE2_FANOUT);
-    const reranked = await liveRerankJobs(env, topK);
+    const reranked = await liveRerankJobs(env, topK, { keepClosed: includeClosed });
     const rerankedDecision = pickWinner(reranked);
     if (rerankedDecision.kind === 'unique') {
       const winner = rerankedDecision.winner;

@@ -102,17 +102,23 @@ export function stageRecencyBoost(candidate, now = new Date()) {
  * Re-score a Phase 1 top-K list of jobs against live RF data.
  *
  * Input:  `[{id, name, client_company_name, score}, ...]` from resolveJob.
- * Output: same shape, filtered (drop is_open=false) and re-sorted by
- *         original score (closed-job filter is the only signal here —
- *         job rerank doesn't apply a recency boost; the cache name match
- *         is already authoritative for open jobs).
+ * Output: same shape, filtered (drop is_open=false unless `keepClosed`)
+ *         and re-sorted by original score (closed-job filter is the only
+ *         signal here — job rerank doesn't apply a recency boost; the
+ *         cache name match is already authoritative for open jobs).
+ *
+ * `opts.keepClosed` (default false) bypasses the closed-job filter.
+ * Mirrors the `include_closed` request flag plumbed through tools.ts +
+ * the middleware handler. Use sparingly — closed jobs almost always
+ * belong on the explicit-numeric-id path.
  *
  * Per-id RF failures keep the row at its Phase 1 score (with a `_phase2`
  * note in case the caller wants to surface the partial state). Empty
  * input → empty output.
  */
-export async function liveRerankJobs(env, topK) {
+export async function liveRerankJobs(env, topK, opts = {}) {
   if (!Array.isArray(topK) || topK.length === 0) return [];
+  const keepClosed = opts.keepClosed === true;
   return tracedRerank('mcp.phase2.rerank.jobs', topK, async (span) => {
     const ids = topK.map((j) => j.id);
     const results = await pMapLimit(ids, FANOUT_CONCURRENCY, async (id) =>
@@ -133,7 +139,7 @@ export async function liveRerankJobs(env, topK) {
       const live = r.value;
       // RF returns is_open as boolean; defensively coerce common alternatives.
       const isOpen = live?.is_open === true || live?.is_open === 1 || live?.is_open === 'true';
-      if (live?.is_open != null && !isOpen) {
+      if (!keepClosed && live?.is_open != null && !isOpen) {
         droppedClosed++;
         continue;
       }
@@ -154,6 +160,7 @@ export async function liveRerankJobs(env, topK) {
       span.setAttribute('mcp.phase2.dropped_closed', droppedClosed);
       span.setAttribute('mcp.phase2.fetch_failed', fetchFailed);
       span.setAttribute('mcp.phase2.survivors', out.length);
+      span.setAttribute('mcp.phase2.keep_closed', keepClosed);
     }
     return out;
   });

@@ -331,22 +331,27 @@ describe('resolveJob', () => {
 function mockRFJobGet(jobsById) {
   globalThis.fetch = vi.fn(async (url) => {
     const u = String(url);
-    if (u.includes('/job/get')) {
-      const m = u.match(/[?&]id=(\d+)/);
+    // RF's actual endpoint is /job?job_id=X — NOT /job/get (which returns
+    // RF's marketing-site HTML). Matching on /job? (the question mark
+    // anchors to the query-string boundary so we don't also catch
+    // /job/pipeline or /job/list).
+    if (/\/job\?/.test(u)) {
+      const m = u.match(/[?&]job_id=(\d+)/);
       const id = m ? Number(m[1]) : NaN;
       const body = jobsById.get(id);
       if (!body) return new Response('not found', { status: 404 });
-      return new Response(JSON.stringify({ job: body }), { status: 200 });
+      // RF returns the bare body (no wrapper); some deployments wrap as {job: ...}
+      return new Response(JSON.stringify(body), { status: 200 });
     }
     throw new Error('unexpected fetch: ' + u);
   });
 }
 
 describe('Phase 2 live-rerank integration — operator headline scenarios', () => {
-  it('"Eon Sales Engineer" → 984 auto-resolves; closed-sibling siblings dropped via /job/get is_open', async () => {
+  it('"Eon Sales Engineer" → 984 auto-resolves; closed-sibling siblings dropped via /job?job_id is_open', async () => {
     // Cache has three Eon roles. Phase 1 produces an ambiguous top-K
     // (Sales Engineer + Sales Engineering Manager + Sales Engineer - US).
-    // Phase 2 fetches /job/get for each; the closed siblings (US +
+    // Phase 2 fetches /job?job_id=X for each; the closed siblings (US +
     // Manager) get is_open=false and drop out, leaving 984 alone.
     await insertJob(984, 'Sales Engineer', 'Eon.io');
     await insertJob(983, 'Sales Engineer - US', 'Eon.io');
@@ -410,6 +415,120 @@ describe('Phase 2 live-rerank integration — operator headline scenarios', () =
       expect(r.reason).toBe('ambiguous');
       expect(r.options[0].id).toBe(49243);
     }
+  });
+
+  // ─── 2026-05-12 third-round smoke-test follow-ups ──────────────────
+  it('Phase 1 pool widening: Jerry Doe at position 6+ in the cache still reaches Phase 2', async () => {
+    // Operator's actual production case: more than PHASE2_FANOUT Jerrys
+    // exist, all tied at exactly 0.85 (one-token prefix-exact on
+    // "jerry"). Before pool widening, the deterministic cache order
+    // picked the first 5 and Jerry Doe at position 6+ never saw Phase
+    // 2. Now `widenTiedPool` extends the slice to include ALL tied
+    // candidates up to PHASE1_WIDE_CAP, so a Phase 2 stage-recency boost
+    // can surface a target hidden behind the tie.
+    for (let i = 1; i <= 8; i++) {
+      await insertCandidate(50000 + i, `Jerry Person${i}`);
+    }
+    await insertCandidate(50999, 'Jerry Doe');  // Last inserted → cache returns last.
+    resetSnapshot();
+    const today = new Date().toISOString();
+    const noStage = (id, name) => [id, { id, name, jobs: [{ stage_name: 'Sourced', stage_moved: today }] }];
+    const map = new Map(Array.from({ length: 8 }, (_, i) =>
+      noStage(50001 + i, `Jerry Person${i + 1}`),
+    ));
+    map.set(50999, {
+      id: 50999,
+      name: 'Jerry Doe',
+      jobs: [{ stage_name: '1st Interview', stage_moved: today }],
+    });
+    mockRFCandidateGet(map);
+    const r = await resolveCandidate(env, 'Jerry');
+    // With 9 Phase-1-tied Jerrys, pool widening pulls them all into
+    // Phase 2. Jerry Doe is the only one with a non-inert stage, so he
+    // wins.
+    if (r.ok) {
+      expect(r.value.id).toBe(50999);
+    } else {
+      expect(r.reason).toBe('ambiguous');
+      expect(r.options[0].id).toBe(50999);
+    }
+  });
+
+  it('Long-tail truncation: disambiguation envelope drops options below top * 0.85', async () => {
+    // Operator's complaint: when Sales Engineer @ 0.87 is in the result,
+    // Sales Engineering Manager @ 0.70 and Senior Support Engineer @
+    // 0.63 shouldn't show up — score gaps say they aren't real
+    // competitors. Cutoff = top * 0.85 ≈ 0.74, so 0.70 / 0.63 drop.
+    await insertJob(900, 'Sales Engineer', 'Eon.io');
+    await insertJob(901, 'Sales Engineer - US', 'Eon.io');  // ~0.80 — stays
+    await insertJob(902, 'Sales Engineering Manager', 'Eon.io');  // ~0.70 — drops
+    await insertJob(903, 'Senior Support Engineer', 'Eon.io');  // ~0.63 — drops
+    mockRFJobGet(new Map([
+      // Both top scorers open → Phase 2 keeps both → ambiguous + truncated.
+      [900, { id: 900, name: 'Sales Engineer', client_company_name: 'Eon.io', is_open: true }],
+      [901, { id: 901, name: 'Sales Engineer - US', client_company_name: 'Eon.io', is_open: true }],
+      [902, { id: 902, name: 'Sales Engineering Manager', client_company_name: 'Eon.io', is_open: true }],
+      [903, { id: 903, name: 'Senior Support Engineer', client_company_name: 'Eon.io', is_open: true }],
+    ]));
+    const r = await resolveJob(env, 'Eon Sales Engineer');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('ambiguous');
+    // Cutoff drops the qualifier roles; only the two SE variants remain.
+    const ids = r.options.map((o) => o.id).sort();
+    expect(ids).toEqual([900, 901]);
+  });
+
+  it('long-tail truncation: "Sales Engineer" no-company never surfaces VP Marketing in disambiguation', async () => {
+    // Operator's smoke-test pattern: a bare "Sales Engineer" query should
+    // disambiguate ONLY across SE-shaped roles, never include VP Marketing
+    // / Engineering Manager-shaped tails that scored ~0.56 against the
+    // company-mixed combinedTarget. Truncation cutoff (top * 0.85) keeps
+    // SE variants but drops the unrelated leadership/marketing tails.
+    await insertJob(920, 'Sales Engineer', 'Acme');         // top match
+    await insertJob(921, 'Sales Engineer', 'Globex');       // second top match (genuine peer)
+    await insertJob(922, 'Senior Sales Engineering Manager', 'Initech'); // extension-penalised + qualifier
+    await insertJob(923, 'VP Marketing', 'Neon Security');  // unrelated; old bug surfaced this at ~0.56
+    mockRFJobGet(new Map([
+      [920, { id: 920, name: 'Sales Engineer', client_company_name: 'Acme', is_open: true }],
+      [921, { id: 921, name: 'Sales Engineer', client_company_name: 'Globex', is_open: true }],
+      [922, { id: 922, name: 'Senior Sales Engineering Manager', client_company_name: 'Initech', is_open: true }],
+      [923, { id: 923, name: 'VP Marketing', client_company_name: 'Neon Security', is_open: true }],
+    ]));
+    const r = await resolveJob(env, 'Sales Engineer');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('ambiguous');
+    // Truncation drops everything below top * 0.85.
+    const ids = r.options.map((o) => o.id).sort();
+    expect(ids).toContain(920);
+    expect(ids).toContain(921);
+    expect(ids).not.toContain(923); // VP Marketing never surfaces
+    // SEM with extension penalty + senior qualifier may also drop;
+    // either way, the disambiguation envelope must NOT carry the
+    // unrelated VP Marketing tail.
+  });
+
+  it('include_closed: true bypasses Phase 2 closed-job filter', async () => {
+    // Operator-requested escape hatch: explicit closed-job query.
+    await insertJob(910, 'Sales Engineer', 'Eon.io');
+    await insertJob(911, 'Sales Engineer - US', 'Eon.io');
+    mockRFJobGet(new Map([
+      [910, { id: 910, name: 'Sales Engineer', client_company_name: 'Eon.io', is_open: true }],
+      [911, { id: 911, name: 'Sales Engineer - US', client_company_name: 'Eon.io', is_open: false }],
+    ]));
+    // Default (no include_closed): closed sibling drops.
+    const rDefault = await resolveJob(env, 'Eon Sales Engineer');
+    expect(rDefault.ok).toBe(true);
+    expect(rDefault.value.id).toBe(910);
+    // With include_closed: both surface → ambiguous (both score high enough to survive truncation).
+    mockRFJobGet(new Map([
+      [910, { id: 910, name: 'Sales Engineer', client_company_name: 'Eon.io', is_open: true }],
+      [911, { id: 911, name: 'Sales Engineer - US', client_company_name: 'Eon.io', is_open: false }],
+    ]));
+    const rIncl = await resolveJob(env, 'Eon Sales Engineer', { includeClosed: true });
+    expect(rIncl.ok).toBe(false);
+    expect(rIncl.reason).toBe('ambiguous');
+    const ids = rIncl.options.map((o) => o.id).sort();
+    expect(ids).toEqual([910, 911]);
   });
 });
 
