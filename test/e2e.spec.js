@@ -9,11 +9,16 @@
  */
 
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import { SignJWT } from 'jose';
 import { applyUsersMigration } from './helpers/users-migrate.js';
+import { ensureAccessJwksFixture, mintAccessJwt } from './helpers/access-jwt-mint.js';
 import { _resetCacheForTests } from '../src/users.js';
 import worker from '../src';
+
+beforeAll(async () => {
+	await ensureAccessJwksFixture();
+});
 
 beforeEach(async () => {
 	await applyUsersMigration(env);
@@ -1665,6 +1670,51 @@ describe('E2E: /candidates with consultantFirstName', () => {
 	});
 });
 
+describe('E2E: /candidates — JWT auth', () => {
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	it('routes lead_owner_id to the JWT email, ignoring body consultantFirstName', async () => {
+		// Sabotage: body asks for Alice (rfUserId=900002), JWT identifies Joel
+		// (rfUserId=900001). Worker MUST attribute the create to Joel per the
+		// JWT, NOT Alice per the body.
+		const calls = mockFetch([
+			{ match: '/candidate/search', response: [] }, // RF search returns no match → create
+			{ match: '/candidate/add', response: { data: { id: 99100 } } },
+			{ match: 'dialpad.com/api/v2/contacts', response: { id: 'shared_contact_pool_Company:0000000000000000_uid_RF99100' } },
+			{ match: 'apollo.io/api/v1/people/match', response: { person: null } },
+			{ match: '/job/list', response: [] },
+		]);
+
+		const jwt = await mintAccessJwt(env, { email: 'joel@test.local' });
+		const request = new Request('http://example.com/candidates', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'Authorization': `Bearer ${jwt}`,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Alice', // sabotage attempt — MUST be ignored
+				candidates: [{
+					linkedinUrl: 'https://www.linkedin.com/in/jwt-test-person-99100',
+					fullName: 'JWT Test Person',
+					experience: [{ title: 'Engineer', company: 'Acme', startYear: 2020, isCurrent: true }],
+				}],
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		const addCalls = findCalls(calls, '/candidate/add');
+		expect(addCalls).toHaveLength(1);
+		const addBody = JSON.parse(addCalls[0].opts.body);
+		// 900001 = Joel's rfUserId (from JWT); 900002 = Alice's (from body).
+		// Asserting 900001 proves the JWT identity won over the body field.
+		expect(addBody.lead_owner_id).toBe(900001);
+	});
+});
+
 describe('E2E: /candidates/add-to-job with consultantFirstName', () => {
 	afterEach(() => { globalThis.fetch = originalFetch; });
 
@@ -2064,6 +2114,54 @@ describe('E2E: /candidate-details', () => {
 		const json = await response.json();
 		expect(json.phoneNumber).toBeNull();
 		expect(json.job).toBeNull();
+		expect(json.activities).toEqual([]);
+	});
+});
+
+describe('E2E: /candidate-details — JWT auth', () => {
+	afterEach(() => { globalThis.fetch = originalFetch; });
+
+	it('returns 200 with full details under JWT, ignoring body consultantFirstName', async () => {
+		// JWT identifies Joel; body sabotages with 'Alice'. Worker MUST use
+		// the JWT identity and return the same shape the legacy path returns.
+		const fullCandidate = buildFullRFCandidate({
+			id: 80100,
+			linkedin_profile: 'https://www.linkedin.com/in/jwt-details-person',
+			first_name: 'JWT',
+			last_name: 'Details',
+			name: 'JWT Details',
+			phone_number: [{ phone_number: '5559876543', type: 1 }],
+			jobs: [],
+		});
+
+		mockFetch([
+			rfSearchRoute([fullCandidate]),
+			rfGetCandidateRoute(fullCandidate),
+			{ match: '/candidate/activity/list', response: { data: [], total_items: 0 } },
+		]);
+
+		const jwt = await mintAccessJwt(env, { email: 'joel@test.local' });
+		const request = new Request('http://example.com/candidate-details', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'Authorization': `Bearer ${jwt}`,
+			},
+			body: JSON.stringify({
+				consultantFirstName: 'Alice', // sabotage — MUST be ignored
+				profileUrl: 'https://www.linkedin.com/in/jwt-details-person',
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		const json = await response.json();
+		// Response shape matches legacy path.
+		expect(json.rfId).toBe(80100);
+		expect(json.fullName).toBe('JWT Details');
+		expect(json.phoneNumber).toBe('+15559876543');
 		expect(json.activities).toEqual([]);
 	});
 });

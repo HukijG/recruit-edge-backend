@@ -7,10 +7,15 @@
  */
 
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
-import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeAll, beforeEach } from 'vitest';
 import { applyUsersMigration } from './helpers/users-migrate.js';
+import { ensureAccessJwksFixture, mintAccessJwt } from './helpers/access-jwt-mint.js';
 import { _resetCacheForTests } from '../src/users.js';
 import worker from '../src';
+
+beforeAll(async () => {
+  await ensureAccessJwksFixture();
+});
 
 beforeEach(async () => {
   await applyUsersMigration(env);
@@ -188,6 +193,38 @@ describe('/my-sourcing-jobs', () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ jobs: [] });
+  });
+});
+
+describe('/my-sourcing-jobs — JWT auth', () => {
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it('filters hiring_team by the JWT identity\'s rfUserId, ignoring body consultantFirstName', async () => {
+    // Joel-team job and Alice-team job. JWT identifies Joel, body sabotages
+    // with 'Alice'. Worker MUST return only Joel-team jobs, proving the
+    // JWT rfUserId (not Alice's) was used to filter hiring_team.
+    mockFetch([
+      {
+        match: '/job/list',
+        response: [
+          buildJob({ id: 11, name: 'Joel team job',  hiring_team: [{ user_id: JOEL_RF_USER_ID,  role: 'Recruiter', name: 'Joel' }] }),
+          buildJob({ id: 22, name: 'Alice team job', hiring_team: [{ user_id: ALICE_RF_USER_ID, role: 'Recruiter', name: 'Alice' }] }),
+        ],
+      },
+    ]);
+
+    const jwt = await mintAccessJwt(env, { email: 'joel@test.local' });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new Request('http://example.com/my-sourcing-jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
+      body: JSON.stringify({ consultantFirstName: 'Alice' }), // sabotage — MUST be ignored
+    }), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
+    const json = await response.json();
+    expect(json.jobs.map(j => j.id)).toEqual([11]);
   });
 });
 
@@ -446,5 +483,45 @@ describe('/job-pipeline', () => {
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(500);
+  });
+});
+
+describe('/job-pipeline — JWT auth', () => {
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it('returns 200 with response shape under JWT, no body consultantFirstName required', async () => {
+    // The legacy path 400s on missing consultantFirstName. Under JWT, the
+    // body field is unnecessary — JWT identity supplies the consultant.
+    // Send body with only jobId (no firstName) + Authorization: Bearer JWT,
+    // assert 200 and same response shape as the legacy happy path.
+    mockFetch([
+      {
+        match: '/candidate/search',
+        response: {
+          data: [
+            buildCandidate({ id: 555, linkedin_profile: 'jwt-test-profile' }),
+          ],
+          total_items: 1,
+        },
+      },
+    ]);
+
+    const jwt = await mintAccessJwt(env, { email: 'joel@test.local' });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new Request('http://example.com/job-pipeline', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
+      body: JSON.stringify({ jobId: 980 }), // no consultantFirstName — JWT supplies it
+    }), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
+    const json = await response.json();
+    expect(json.jobId).toBe(980);
+    expect(json.stage).toBe('Sourced');
+    expect(json.total).toBe(1);
+    expect(json.candidates).toEqual([
+      { rfId: 555, linkedinUrl: 'https://www.linkedin.com/in/jwt-test-profile' },
+    ]);
   });
 });

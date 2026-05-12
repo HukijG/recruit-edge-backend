@@ -10,9 +10,10 @@
  */
 
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
-import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeAll, beforeEach, vi } from 'vitest';
 import { SignJWT } from 'jose';
 import { applyUsersMigration } from './helpers/users-migrate.js';
+import { ensureAccessJwksFixture, mintAccessJwt } from './helpers/access-jwt-mint.js';
 import { _resetCacheForTests } from '../src/users.js';
 import { processExtensionCallEvent } from '../src/extension-calls.js';
 import worker from '../src';
@@ -74,6 +75,10 @@ async function readDO() {
   return await getDOStub().getCallId();
 }
 
+beforeAll(async () => {
+  await ensureAccessJwksFixture();
+});
+
 beforeEach(async () => {
   await applyUsersMigration(env);
   _resetCacheForTests();
@@ -106,6 +111,44 @@ describe('/dialpad-call does not write call-state directly', () => {
 
     expect(response.status).toBe(200);
     expect(await readDO()).toBeNull();
+  });
+});
+
+describe('/dialpad-call — JWT auth', () => {
+  beforeEach(async () => { await clearDO(); });
+  afterEach(async () => {
+    globalThis.fetch = originalFetch;
+    await clearDO();
+  });
+
+  it('initiates the call under the JWT identity, ignoring body consultantFirstName', async () => {
+    // JWT for Joel (dialpadId=8000000000000001) + body firstName 'Alice'
+    // (dialpadId=8000000000000002). Worker MUST call Joel's initiate_call
+    // URL, not Alice's — proves the JWT identity wins.
+    const alias = await makeAlias('+14155551212');
+    const calls = mockFetch([
+      { match: '/users/8000000000000001/initiate_call', response: { device: { id: 'native-1' } } },
+      { match: '/users/8000000000000002/initiate_call', response: { device: { id: 'native-2' } } },
+    ]);
+
+    const jwt = await mintAccessJwt(env, { email: 'joel@test.local' });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new Request('http://example.com/dialpad-call', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
+      body: JSON.stringify({
+        consultantFirstName: 'Alice', // sabotage — MUST be ignored
+        phoneNumber: '+447700900123',
+        callerAliasId: alias,
+      }),
+    }), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
+    const joelCalls = findCalls(calls, '/users/8000000000000001/initiate_call');
+    const aliceCalls = findCalls(calls, '/users/8000000000000002/initiate_call');
+    expect(joelCalls).toHaveLength(1);
+    expect(aliceCalls).toHaveLength(0);
   });
 });
 
@@ -184,6 +227,33 @@ describe('/extension-call-status', () => {
     await waitOnExecutionContext(ctx2);
 
     expect(findCalls(calls, 'dialpad.com')).toHaveLength(0);
+  });
+});
+
+describe('/extension-call-status — JWT auth', () => {
+  beforeEach(async () => { await clearDO(); });
+  afterEach(async () => {
+    globalThis.fetch = originalFetch;
+    await clearDO();
+  });
+
+  it('reads the JWT identity\'s DO, ignoring body consultantFirstName', async () => {
+    // Seed Joel's DO with a call_id. JWT identifies Joel, body sabotages
+    // with 'Alice' (whose DO is empty). Worker MUST read Joel's DO and
+    // return in_progress, not Alice's empty DO returning ended.
+    await seedDO('99999');
+
+    const jwt = await mintAccessJwt(env, { email: 'joel@test.local' });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new Request('http://example.com/extension-call-status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
+      body: JSON.stringify({ consultantFirstName: 'Alice' }), // sabotage — MUST be ignored
+    }), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ state: 'in_progress' });
   });
 });
 
@@ -509,6 +579,45 @@ describe('/call-stats', () => {
     const response = await worker.fetch(statsReq(), env, ctx);
     await waitOnExecutionContext(ctx);
     expect(await response.json()).toEqual({ daily: 0 });
+  });
+});
+
+describe('/call-stats — JWT auth', () => {
+  const JOEL_RF_USER_ID = 900001;
+  const ALICE_RF_USER_ID = 900002;
+
+  function todayKeyFor(rfUserId) {
+    const today = new Date().toISOString().slice(0, 10);
+    return `callstats:daily:${rfUserId}:${today}`;
+  }
+
+  beforeEach(async () => {
+    await env.SYNC_STATE.delete(todayKeyFor(JOEL_RF_USER_ID));
+    await env.SYNC_STATE.delete(todayKeyFor(ALICE_RF_USER_ID));
+  });
+  afterEach(async () => {
+    await env.SYNC_STATE.delete(todayKeyFor(JOEL_RF_USER_ID));
+    await env.SYNC_STATE.delete(todayKeyFor(ALICE_RF_USER_ID));
+  });
+
+  it('reads the JWT identity\'s counter, ignoring body consultantFirstName', async () => {
+    // Seed distinct counters for Joel (12) and Alice (99). JWT identifies
+    // Joel; body sabotages with 'Alice'. Worker MUST return Joel's 12, not
+    // Alice's 99 — proves the JWT identity wins.
+    await env.SYNC_STATE.put(todayKeyFor(JOEL_RF_USER_ID), '12');
+    await env.SYNC_STATE.put(todayKeyFor(ALICE_RF_USER_ID), '99');
+
+    const jwt = await mintAccessJwt(env, { email: 'joel@test.local' });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new Request('http://example.com/call-stats', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
+      body: JSON.stringify({ consultantFirstName: 'Alice' }), // sabotage — MUST be ignored
+    }), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ daily: 12 });
   });
 });
 
