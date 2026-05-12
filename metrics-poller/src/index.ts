@@ -20,24 +20,52 @@ interface Env {
   LD_OTLP_METRICS_URL: string;
 }
 
-async function runTick(env: Env): Promise<{ ok: boolean; durationMs: number; d1Count: number; kvCount: number; aiNeurons: number | null; error?: string }> {
+interface TickResult {
+  ok: boolean;
+  durationMs: number;
+  d1Count: number;
+  kvCount: number;
+  aiNeurons: number | null;
+  aiInferenceSteps: number | null;
+  aiInputTokens: number | null;
+  aiOutputTokens: number | null;
+  aiRequests: number | null;
+  error?: string;
+}
+
+async function runTick(env: Env): Promise<TickResult> {
   console.log({ source: 'metrics-poller', message: 'tick start' });
   const t0 = Date.now();
   try {
     const metrics = await fetchCFMetrics(env);
     await pushOTelMetrics(env, metrics);
-    const result = {
+    const result: TickResult = {
       ok: true,
       durationMs: Date.now() - t0,
       d1Count: metrics.d1Storage.length,
       kvCount: metrics.kvStorage.length,
       aiNeurons: metrics.aiUsage?.neurons ?? null,
+      aiInferenceSteps: metrics.aiUsage?.inferenceSteps ?? null,
+      aiInputTokens: metrics.aiUsage?.inputTokens ?? null,
+      aiOutputTokens: metrics.aiUsage?.outputTokens ?? null,
+      aiRequests: metrics.aiUsage?.requests ?? null,
     };
     console.log({ source: 'metrics-poller', message: 'tick ok', ...result });
     return result;
   } catch (err) {
     console.error({ source: 'metrics-poller', message: 'tick failed', error: String(err) });
-    return { ok: false, durationMs: Date.now() - t0, d1Count: 0, kvCount: 0, aiNeurons: null, error: String(err) };
+    return {
+      ok: false,
+      durationMs: Date.now() - t0,
+      d1Count: 0,
+      kvCount: 0,
+      aiNeurons: null,
+      aiInferenceSteps: null,
+      aiInputTokens: null,
+      aiOutputTokens: null,
+      aiRequests: null,
+      error: String(err),
+    };
   }
 }
 

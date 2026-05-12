@@ -26,8 +26,26 @@ export async function pushOTelMetrics(config: OTLPMetricsConfig, metrics: CFMetr
 		value: k.byteCount,
 		dims: { 'cf.binding_name': k.namespaceId, 'cf.account_id': accountId },
 	}));
-	const aiPoints = metrics.aiUsage
+	// AI metric naming reflects CF's published billing/usage semantics
+	// (https://developers.cloudflare.com/workers-ai/platform/pricing/):
+	//   - Neurons = authoritative monetization unit
+	//   - Requests / inference-steps / tokens = operational signal alongside cost
+	// The old `cf.ai.usage` was a vague stand-in built before the schema was
+	// verified; it's renamed here to match the actual measured quantity.
+	const aiNeuronPoints = metrics.aiUsage
 		? [{ value: metrics.aiUsage.neurons, dims: { 'cf.account_id': accountId } }]
+		: [];
+	const aiInferenceStepPoints = metrics.aiUsage
+		? [{ value: metrics.aiUsage.inferenceSteps, dims: { 'cf.account_id': accountId } }]
+		: [];
+	const aiInputTokenPoints = metrics.aiUsage
+		? [{ value: metrics.aiUsage.inputTokens, dims: { 'cf.account_id': accountId } }]
+		: [];
+	const aiOutputTokenPoints = metrics.aiUsage
+		? [{ value: metrics.aiUsage.outputTokens, dims: { 'cf.account_id': accountId } }]
+		: [];
+	const aiRequestPoints = metrics.aiUsage
+		? [{ value: metrics.aiUsage.requests, dims: { 'cf.account_id': accountId } }]
 		: [];
 
 	const payload = {
@@ -47,7 +65,11 @@ export async function pushOTelMetrics(config: OTLPMetricsConfig, metrics: CFMetr
 						metrics: [
 							{ name: 'cf.d1.storage_bytes', unit: 'By', gauge: { dataPoints: buildDataPoints(d1Points) } },
 							{ name: 'cf.kv.stored_bytes', unit: 'By', gauge: { dataPoints: buildDataPoints(kvPoints) } },
-							{ name: 'cf.ai.usage', unit: '{units}', gauge: { dataPoints: buildDataPoints(aiPoints) } },
+							{ name: 'cf.ai.neurons', unit: '{neuron}', gauge: { dataPoints: buildDataPoints(aiNeuronPoints) } },
+							{ name: 'cf.ai.inference_steps', unit: '{step}', gauge: { dataPoints: buildDataPoints(aiInferenceStepPoints) } },
+							{ name: 'cf.ai.input_tokens', unit: '{token}', gauge: { dataPoints: buildDataPoints(aiInputTokenPoints) } },
+							{ name: 'cf.ai.output_tokens', unit: '{token}', gauge: { dataPoints: buildDataPoints(aiOutputTokenPoints) } },
+							{ name: 'cf.ai.requests', unit: '{request}', gauge: { dataPoints: buildDataPoints(aiRequestPoints) } },
 						],
 					},
 				],
