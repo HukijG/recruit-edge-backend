@@ -202,18 +202,26 @@ const CALLS_SQL   = `INSERT OR IGNORE INTO calls (${CALLS_COLS.join(', ')}) VALU
  * Chunks at D1_BATCH_CAP (100) — no atomicity requirement here since each row
  * is self-contained.
  *
+ * Emits one structured `console.log({ source: 'd1-write', table, op: 'insert',
+ * row_count })` line per batch flush so LD's Alert 1 (D1 write storm) can
+ * attribute writes by table. Mirrors the legacy `writeCandidatesAndLinks` /
+ * `writeJobs` shape with `op: 'insert'` instead of `'replace'` (additive-only).
+ *
  * @param {object} env
  * @param {string} sql - prepared INSERT OR IGNORE SQL
  * @param {Array<object>} rows - already-normalised row objects
  * @param {string[]} cols - ordered column names matching SQL placeholders
+ * @param {string} table - target table name (for the structured log)
  */
-async function batchInsert(env, sql, rows, cols) {
+async function batchInsert(env, sql, rows, cols, table) {
   if (!rows?.length) return;
   const stmts = rows.map(row =>
     env.RF_MCP_CACHE.prepare(sql).bind(...cols.map(c => row[c] ?? null))
   );
   for (let i = 0; i < stmts.length; i += D1_BATCH_CAP) {
-    await env.RF_MCP_CACHE.batch(stmts.slice(i, i + D1_BATCH_CAP));
+    const chunk = stmts.slice(i, i + D1_BATCH_CAP);
+    await env.RF_MCP_CACHE.batch(chunk);
+    console.log({ source: 'd1-write', table, op: 'insert', row_count: chunk.length });
   }
 }
 
@@ -263,7 +271,7 @@ function buildRowsResilient(rfRows, builderFn, fn) {
  */
 export async function writeCandidatesThin(env, rfCandidates) {
   const rows = buildRowsResilient(rfCandidates, toCandidateThinRow, 'toCandidateThinRow');
-  await batchInsert(env, CAND_V2_SQL, rows, CAND_V2_COLS);
+  await batchInsert(env, CAND_V2_SQL, rows, CAND_V2_COLS, 'candidates_v2');
 }
 
 /**
@@ -291,7 +299,7 @@ export async function writeJobsThin(env, rfJobs, opts = {}) {
     return row;
   };
   const rows = buildRowsResilient(rfJobs, builder, 'toJobThinRow');
-  await batchInsert(env, JOBS_V2_SQL, rows, JOBS_V2_COLS);
+  await batchInsert(env, JOBS_V2_SQL, rows, JOBS_V2_COLS, 'jobs_v2');
 }
 
 /**
@@ -307,5 +315,5 @@ export async function writeJobsThin(env, rfJobs, opts = {}) {
  */
 export async function writeCalls(env, dialpadCalls) {
   const rows = buildRowsResilient(dialpadCalls, toCallRow, 'toCallRow');
-  await batchInsert(env, CALLS_SQL, rows, CALLS_COLS);
+  await batchInsert(env, CALLS_SQL, rows, CALLS_COLS, 'calls');
 }
