@@ -8,7 +8,7 @@ Canonical reference for the auth layer across the workers + the convention all n
 
 - Any route a teammate hits via browser, AI client (claude.ai connector, claude desktop), or Chrome extension is "user-facing" and must be Access-protected.
 - Identity is the verified `email` claim from the Access JWT. Resolve it server-side via `getUserByEmail(env, email)`; never accept identity claims from request bodies.
-- Don't add new shared-secret headers, IdP-of-the-week integrations, body-field identity ("consultantFirstName"-style), or any parallel auth mechanism. They will fragment trust and not survive Spec B's cutover.
+- Don't add new shared-secret headers, IdP-of-the-week integrations, body-field identity ("consultantFirstName"-style), or any parallel auth mechanism. They will fragment trust and not survive Phase 3's cutover.
 - Webhook endpoints (Dialpad / RF / Krisp / calendar) are NOT user-facing. They keep their existing auth (Dialpad JWT signature, RF URL-secret, Krisp signature, calendar webhook secrets).
 - Service-binding traffic between workers is implicitly trusted within the Cloudflare account boundary. The upstream (Access-protected) worker validates the JWT once and forwards a body field with the verified identity to the downstream worker.
 - The **one exception** to pure trust-within-account: the cache-worker's `/internal/*` routes add a shared-secret gate (`X-Internal-Token`) on top of service-binding trust as defense-in-depth. See below.
@@ -68,7 +68,7 @@ App 2's OAuth client is consumed by the operator's separate extension workstream
 - **Env vars**:
   - `ACCESS_TEAM_DOMAIN` — non-secret, set as `vars` in `wrangler.jsonc` + `wrangler.mcp.jsonc`. Currently `https://example-team.cloudflareaccess.com`.
   - `ACCESS_AUD_MCP` — secret, set on `rf-mcp-remote` via `wrangler secret put`. 64-char hex tag from the App 1 dashboard.
-  - `ACCESS_AUD_MIDDLEWARE` — secret, set on `rf-dialpad-sync-dev` when Spec B lands.
+  - `ACCESS_AUD_MIDDLEWARE` — secret, set on `rf-dialpad-sync-dev` by the operator when creating Access App 2 (see handoff doc; Phase 2 code is live but the secret is operator-pending).
 
 - **Implementation hardening — `ACCESS_AUD_MIDDLEWARE`-unset fail-safe** (see `src/auth-extension.js`):
   - When `env.ACCESS_AUD_MIDDLEWARE` is unset or empty, the JWT branch in `authExtensionRequest` is skipped entirely — the helper falls through to the legacy `X-Extension-Token` path.
@@ -153,8 +153,8 @@ App 2's OAuth client is consumed by the operator's separate extension workstream
 
 - [Spec A — Cloudflare Access for MCP](archived/specs/2026-05-10-cloudflare-access-mcp-design.md) (shipped, archived)
 - [Plan A — implementation step list (manual + code)](archived/plans/2026-05-10-cloudflare-access-mcp.md) (shipped, archived)
-- [Spec B — Cloudflare Access for the extension API](archive/specs/2026-05-10-cloudflare-access-extension-design.md) (pending)
-- [Plan B — implementation step list](archive/plans/2026-05-10-cloudflare-access-extension.md) (pending)
+- [Spec B — Cloudflare Access for the extension API (dual-auth design)](archive/specs/2026-05-12-extension-access-dual-auth-design.md) (Phase 2 code live; Phase 3 pending)
+- [Plan B — implementation step list](archive/plans/2026-05-12-extension-access-dual-auth.md) (Phase 2 code live; Phase 3 pending)
 
 ## Tangentially-related open work
 

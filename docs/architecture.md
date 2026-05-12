@@ -23,7 +23,7 @@ RF is the source of truth for candidate records. The KV `SYNC_STATE` cache provi
 │              │  │              │  │              │  │  + Reclaim   │  │              │  │ (Chrome) +   │
 │              │  │              │  │              │  │              │  │              │  │ Mobile PWA   │
 └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-       │ webhook         │ webhook         │ webhook         │ Apps Script      │ webhook         │ POST (X-Extension-Token)
+       │ webhook         │ webhook         │ webhook         │ Apps Script      │ webhook         │ POST (Bearer JWT or X-Extension-Token)
        ▼                 ▼                 ▼                 ▼                  ▼                 ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                          Cloudflare Worker: rf-dialpad-sync-dev (main worker)                             │
@@ -81,7 +81,7 @@ RF is the source of truth for candidate records. The KV `SYNC_STATE` cache provi
 │  Identity: Cloudflare Access (Zero Trust Free, team example-team.cloudflareaccess.com)                  │
 │  - App "rf-mcp-remote" — Managed OAuth + DCR + redirect https://claude.ai/api/mcp/auth_callback          │
 │    AUD lives in env.ACCESS_AUD_MCP (rf-mcp-remote secret)                                                 │
-│  - App for extension API — pending (Spec B)                                                              │
+│  - App 2 (extension API) — Phase 2 live; App 2 + both secrets set, extension on OAuth                    │
 │  - Login: Email OTP. Reusable policy `rf-team` (Allow if email ends @<your-team-domain>)                 │
 │  → Full auth detail in docs/security.md                                                                   │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -91,9 +91,9 @@ RF is the source of truth for candidate records. The KV `SYNC_STATE` cache provi
 
 ## Security
 
-All user-facing endpoints (browser, AI client, extension) are converging on Cloudflare Access OAuth — App 1 (`rf-mcp-remote`) is live; App 2 (extension API) is pending Spec B. Webhook endpoints keep their existing per-source signed-token auth. Service-binding traffic between workers is implicitly trusted within the account boundary; the upstream worker validates the JWT once and forwards a body field with the verified identity.
+All user-facing endpoints (browser, AI client, extension) are converging on Cloudflare Access OAuth — App 1 (`rf-mcp-remote`) is live; App 2 (extension API) is also live — App 2 created, both `ACCESS_AUD_MIDDLEWARE` + `ACCESS_CLIENT_ID_MIDDLEWARE` secrets set, and the extension ships on OAuth (the dual-auth helper still accepts the legacy `X-Extension-Token` until the rollout drain completes — Phase 3 removes it). Webhook endpoints keep their existing per-source signed-token auth. Service-binding traffic between workers is implicitly trusted within the account boundary; the upstream worker validates the JWT once and forwards a body field with the verified identity.
 
-**Read [`docs/security.md`](security.md)** before adding/touching any user-accessible endpoint, header, or anything tied to identity. That doc is canonical for: provider config (team domain, OTP login, reusable `rf-team` policy), application registrations, the JWT validation helper API (`verifyAccessJwt` — same shape in `src/access-auth.js` and `mcp-remote/src/access-auth.ts`), env vars (`ACCESS_TEAM_DOMAIN`, `ACCESS_AUD_MCP`, future `ACCESS_AUD_MIDDLEWARE`), and the identity flow end-to-end.
+**Read [`docs/security.md`](security.md)** before adding/touching any user-accessible endpoint, header, or anything tied to identity. That doc is canonical for: provider config (team domain, OTP login, reusable `rf-team` policy), application registrations, the JWT validation helper API (`verifyAccessJwt` — same shape in `src/access-auth.js` and `mcp-remote/src/access-auth.ts`), env vars (`ACCESS_TEAM_DOMAIN`, `ACCESS_AUD_MCP`, `ACCESS_AUD_MIDDLEWARE`, `ACCESS_CLIENT_ID_MIDDLEWARE`), and the identity flow end-to-end.
 
 This file does NOT duplicate that material. References below use the Access auth model as a given.
 
@@ -477,7 +477,7 @@ Dialpad call event (call_transcription or transcription state)
 
 Every request body includes `consultantFirstName: string`, resolved through `src/users.js:resolveRFUserId` (async) to an RF user ID for attribution.
 
-> **Auth model is mid-rework (Spec B).** The `X-Extension-Token` + `consultantFirstName`-in-body shape will be replaced with Cloudflare Access OAuth + `consultantEmail` from the verified JWT. The MCP path already shipped this transition (Spec A, 2026-05-10). See [`docs/security.md`](security.md) for the convention all new user-facing endpoints must follow.
+> **Auth model is mid-rework (Phase 2/3).** Phase 2 dual-auth helper is live in `src/auth-extension.js` — extension routes accept both Cloudflare Access JWTs and the legacy `X-Extension-Token` header. The `X-Extension-Token` + `consultantFirstName`-in-body shape is removed in Phase 3 (once the operator confirms a 24-hour drain of `auth.source=legacy` after extension rollout). See [`docs/security.md`](security.md) for the convention all new user-facing endpoints must follow.
 
 ### `POST /candidates` — batch upsert
 
@@ -1093,8 +1093,9 @@ The previous KV-backed `extcall:callid:*` design was eventually consistent acros
 | `KRISP_WEBHOOK_SECRET` | Shared secret verification for Krisp webhooks |
 | `APOLLO_API_KEY` | Apollo API (Bearer auth) |
 | `APOLLO_WEBHOOK_SECRET` | Token query param verification for Apollo phone webhooks |
-| `LINKEDIN_EXTENSION_SECRET` | Shared secret for `X-Extension-Token` on extension routes; also used as the HMAC key for opaque caller-ID aliases on `/dialpad-user-context` and `/dialpad-call` (domain-separated by JWT audience). Retired when Spec B Phase 3 lands. |
-| `ACCESS_AUD_MIDDLEWARE` | Cloudflare Access AUD for the extension-API app — **not yet set**; provisioned during Spec B |
+| `LINKEDIN_EXTENSION_SECRET` | Shared secret for `X-Extension-Token` on extension routes; also used as the HMAC key for opaque caller-ID aliases on `/dialpad-user-context` and `/dialpad-call` (domain-separated by JWT audience). Retired when Phase 3 lands. |
+| `ACCESS_AUD_MIDDLEWARE` | Cloudflare Access App 2 (extension API) audience — the registered redirect URI(s) for App 2's SaaS-OIDC client (comma-separated), **not** an AUD tag (SaaS-OIDC apps have none). Set (live). When unset, the JWT path in `src/auth-extension.js` fails closed — only the legacy `X-Extension-Token` path authenticates. See `docs/security.md` § Application registrations. |
+| `ACCESS_CLIENT_ID_MIDDLEWARE` | App 2's SaaS-OIDC `client_id` — used to construct the per-app issuer URL (`${ACCESS_TEAM_DOMAIN}/cdn-cgi/access/sso/oidc/${ACCESS_CLIENT_ID_MIDDLEWARE}`) during JWT validation. Set (live); must be present alongside `ACCESS_AUD_MIDDLEWARE` or the JWT path falls back to legacy. |
 | `INTERNAL_SECRET` | Shared secret for service-binding `POST /internal/calls/upsert` on cache-worker (main worker sends this as `X-Internal-Token`; must match the value set on cache-worker) |
 
 #### MCP worker — `rf-mcp-remote`
