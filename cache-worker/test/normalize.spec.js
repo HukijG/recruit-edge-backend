@@ -328,22 +328,39 @@ describe('toJobThinRow', () => {
     expect(row.added_time_ms).toBe(Date.parse('2024-03-10T11:00:00+0000'));
   });
 
-  it('prefers rf.created_time over the other two when multiple are present', () => {
+  it('accepts rf.created_at (the actual RF /job/list field name)', () => {
+    // RF's /job/list returns "created_at", verified against live D1 legacy
+    // body (job 511: "created_at":"2022-03-23T04:00:00+0000"). The original
+    // implementation only checked created_time/added_time/date_created,
+    // which silently dropped every row from the seed.
+    const row = toJobThinRow({
+      id: 511,
+      title: 'Account Executive',
+      company: { id: 2925, name: 'Otorio' },
+      created_at: '2022-03-23T04:00:00+0000',
+    });
+    expect(row.added_time_ms).toBe(Date.parse('2022-03-23T04:00:00+0000'));
+    expect(row.client_company_name).toBe('Otorio');
+    expect(row.name).toBe('Account Executive');
+  });
+
+  it('prefers rf.created_at when multiple timestamp fields are present', () => {
     const row = toJobThinRow({
       id: 9,
       name: 'X',
+      created_at:   '2024-01-01T00:00:00+0000',
       created_time: '2024-01-15T09:00:00+0000',
       added_time:   '2024-02-20T10:30:00+0000',
       date_created: '2024-03-10T11:00:00+0000',
     });
-    expect(row.added_time_ms).toBe(Date.parse('2024-01-15T09:00:00+0000'));
+    expect(row.added_time_ms).toBe(Date.parse('2024-01-01T00:00:00+0000'));
   });
 
   it('throws a specific error when all creation timestamp fields are missing', () => {
-    // The thrown error name-checks all three accepted field names so the
+    // The thrown error name-checks all four accepted field names so the
     // per-row resilience log in d1-write.js surfaces the right hint.
     expect(() => toJobThinRow({ id: 99, name: 'X' }))
-      .toThrow(/missing creation timestamp field.*created_time.*added_time.*date_created/);
+      .toThrow(/missing creation timestamp field.*created_at.*created_time.*added_time.*date_created/);
     expect(() => toJobThinRow({ id: 99, name: 'X' }))
       .toThrow(/job 99/);
   });

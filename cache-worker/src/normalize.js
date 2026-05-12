@@ -199,22 +199,24 @@ export function toCandidateThinRow(rf) {
  * Build a thin jobs_v2 row. Accepts both /job/list shape (company.name) and
  * /candidate/get's jobs[] shape (client_company_name flat).
  *
- * RF's /job/list field name for "creation timestamp" was never spec-verified
- * in the rev-5 doc — we've seen `created_time` in test fixtures but RF's docs
- * are inconsistent across endpoints (some surfaces use `added_time`,
- * `date_created`, etc.). Accept all three; throw a specific error if none is
- * present so the per-row resilience in `d1-write.js` can skip the row + log
- * the offending RF id without crashing the whole batch.
+ * RF's /job/list response actually uses `created_at` (verified against live
+ * D1 legacy body, e.g. job 511: "created_at":"2022-03-23T04:00:00+0000").
+ * The rev-5 spec/test fixtures incorrectly assumed `created_time` / `added_time`
+ * / `date_created`, which caused the entire jobs seed to skip every row.
+ * Accept all four for forward-compat with /candidate/get's jobs[] shape and
+ * any other RF surfaces that drift; throw a specific error if none is present
+ * so the per-row resilience in `d1-write.js` can skip the row + log the
+ * offending RF id without crashing the whole batch.
  *
  * canonical_pipeline_json is set ONLY by the new-job-discovery path in cron;
  * pure normalization here leaves it null.
  */
 export function toJobThinRow(rf) {
-  const createdTime = rf?.created_time ?? rf?.added_time ?? rf?.date_created;
+  const createdTime = rf?.created_at ?? rf?.created_time ?? rf?.added_time ?? rf?.date_created;
   if (!createdTime) {
     throw new Error(
       `toJobThinRow: missing creation timestamp field on job ${rf?.id}: ` +
-      `expected one of created_time / added_time / date_created`
+      `expected one of created_at / created_time / added_time / date_created`
     );
   }
   return {
