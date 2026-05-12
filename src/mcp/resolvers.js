@@ -24,15 +24,25 @@ import { session, getThinCandidateById, getCandidatesByIds, getFullCandidateById
 import { getSnapshot } from './snapshot.js';
 import {
   scoreString,
-  recencyBoost,
   prepareTarget,
   canonicalizeJobPhrase,
 } from './fuzzy.js';
 import { getUserByFirstName } from '../users.js';
+import { liveRerankCandidates, liveRerankJobs } from './live-rerank.js';
 
 const FUZZY_THRESHOLD = 0.35;
 const UNIQUE_GAP = 0.08;
 const MAX_OPTIONS = 5;
+// Phase 2 (live rerank) fires whenever Phase 1 scoring can't auto-resolve.
+// AUTO_RESOLVE_FLOOR and AUTO_RESOLVE_GAP are the dual-test for "Phase 1 is
+// confident": top score must be at least the floor AND the next option must
+// be at least GAP points behind. Anything else fans out to live RF.
+const AUTO_RESOLVE_FLOOR = 0.92;
+const AUTO_RESOLVE_GAP = UNIQUE_GAP;
+// Cap how many candidates the Phase 2 fan-out fetches. 5 ≈ 150-300ms total
+// at concurrency 5 (handled inside liveRerank*); larger fan-outs trade
+// latency for marginal accuracy gains on the long tail.
+const PHASE2_FANOUT = 5;
 
 /**
  * Coerce a raw `candidate|job|stage|owner` body field to a numeric id when it
@@ -93,40 +103,70 @@ export async function resolveCandidateThin(env, input) {
 
   const snap = await getSnapshot(env);
   const q = coerced.value;
+  // Phase 1: pure name score, no recency boost. Cache-side `added_time_ms`
+  // recency was actively hurting — hundreds of candidates added weekly all
+  // enter Sourced, so the boost just floods top results with stale Sourced
+  // rows and deranks re-engaged candidates already in the CRM. The right
+  // recency signal lives in Phase 2 (stage_moved on a non-Sourced /
+  // non-Disqualified job — see liveRerankCandidates).
   const scored = snap.rows
-    .map((r) => {
-      const base = scoreString(q, r.prepared);
-      const boost = recencyBoost({ added_time_ms: r.added_time_ms });
-      return { id: r.id, name: r.name, score: base * (1 + boost) };
-    })
+    .map((r) => ({ id: r.id, name: r.name, score: scoreString(q, r.prepared) }))
     .filter((r) => r.score >= FUZZY_THRESHOLD)
     .sort((a, b) => b.score - a.score);
 
   const decision = pickWinner(scored);
   if (decision.kind === 'none') return { ok: false, reason: 'not_found', input };
-  if (decision.kind === 'ambiguous') {
-    // Same disambiguation envelope as resolveCandidate (single source of
-    // truth for the wire shape).
-    const ids = decision.options.map((o) => o.id);
-    const rows = await getCandidatesByIds(env, ids);
-    const meta = new Map(rows.map((r) => [r.id, r]));
-    return {
-      ok: false,
-      reason: 'ambiguous',
-      kind: 'candidate',
-      options: decision.options.map((o) => ({
-        id: o.id,
-        name: o.name,
-        score: o.score,
-        current_organization: meta.get(o.id)?.current_company_at_cache_time ?? null,
-        current_title: meta.get(o.id)?.current_title_at_cache_time ?? null,
-      })),
-      hint: `Multiple candidates match "${q}" — please be more specific.`,
-    };
+
+  // Phase 2 — live rerank with stage-based recency. Fires when Phase 1
+  // couldn't decide confidently (ambiguous decision OR top score below the
+  // floor / gap below threshold). Bounded fan-out to PHASE2_FANOUT live
+  // /candidate/get calls; cheap enough to be sub-second at our scale.
+  const auto = decision.kind === 'unique'
+    && decision.winner.score >= AUTO_RESOLVE_FLOOR
+    && (scored.length < 2 || decision.winner.score - scored[1].score >= AUTO_RESOLVE_GAP);
+  if (!auto) {
+    const topK = scored.slice(0, PHASE2_FANOUT);
+    const reranked = await liveRerankCandidates(env, topK);
+    const rerankedDecision = pickWinner(reranked);
+    if (rerankedDecision.kind === 'unique') {
+      const row = await getThinCandidateById(env, rerankedDecision.winner.id);
+      if (!row) return { ok: false, reason: 'not_found', input };
+      return { ok: true, value: row };
+    }
+    if (rerankedDecision.kind === 'ambiguous') {
+      return ambiguousCandidatePayload(env, q, rerankedDecision.options);
+    }
+    return { ok: false, reason: 'not_found', input };
   }
+
   const row = await getThinCandidateById(env, decision.winner.id);
   if (!row) return { ok: false, reason: 'not_found', input };
   return { ok: true, value: row };
+}
+
+/**
+ * Shared disambiguation-envelope builder for candidate paths. Hydrates the
+ * top-K with cached title/org snapshots so Claude has enough context to pick.
+ * Defined once here so resolveCandidate and resolveCandidateThin emit the
+ * exact same wire shape (single source of truth).
+ */
+async function ambiguousCandidatePayload(env, q, options) {
+  const ids = options.map((o) => o.id);
+  const rows = await getCandidatesByIds(env, ids);
+  const meta = new Map(rows.map((r) => [r.id, r]));
+  return {
+    ok: false,
+    reason: 'ambiguous',
+    kind: 'candidate',
+    options: options.map((o) => ({
+      id: o.id,
+      name: o.name,
+      score: o.score,
+      current_organization: meta.get(o.id)?.current_company_at_cache_time ?? null,
+      current_title: meta.get(o.id)?.current_title_at_cache_time ?? null,
+    })),
+    hint: `Multiple candidates match "${q}" — please be more specific.`,
+  };
 }
 
 /**
@@ -157,15 +197,12 @@ export async function resolveCandidate(env, input) {
     return { ok: true, value: res.value };
   }
 
-  // Fuzzy path — score every snapshot row, recency-boost, threshold, sort.
+  // Phase 1 — pure name score, no recency boost. See resolveCandidateThin
+  // for the rationale on dropping cache-side `added_time_ms` recency.
   const snap = await getSnapshot(env);
   const q = coerced.value;
   const scored = snap.rows
-    .map((r) => {
-      const base = scoreString(q, r.prepared);
-      const boost = recencyBoost({ added_time_ms: r.added_time_ms });
-      return { id: r.id, name: r.name, score: base * (1 + boost) };
-    })
+    .map((r) => ({ id: r.id, name: r.name, score: scoreString(q, r.prepared) }))
     .filter((r) => r.score >= FUZZY_THRESHOLD)
     .sort((a, b) => b.score - a.score);
 
@@ -173,29 +210,32 @@ export async function resolveCandidate(env, input) {
   if (decision.kind === 'none') {
     return { ok: false, reason: 'not_found', input };
   }
-  if (decision.kind === 'ambiguous') {
-    // Hydrate organisation + title for each option from the thin cache's
-    // snapshot columns (display hints). They reflect "at first-sight" values
-    // and are intentionally not live — keeping the caller round-trip free.
-    const ids = decision.options.map((o) => o.id);
-    const rows = await getCandidatesByIds(env, ids);
-    const meta = new Map(rows.map((r) => [r.id, r]));
-    const options = decision.options.map((o) => ({
-      id: o.id,
-      name: o.name,
-      score: o.score,
-      current_organization: meta.get(o.id)?.current_company_at_cache_time ?? null,
-      current_title: meta.get(o.id)?.current_title_at_cache_time ?? null,
-    }));
-    return {
-      ok: false,
-      reason: 'ambiguous',
-      kind: 'candidate',
-      options,
-      hint: `Multiple candidates match "${q}" — please be more specific.`,
-    };
+
+  // Phase 2 — live rerank with stage-based recency, identical to
+  // resolveCandidateThin. The fan-out reads /candidate/get bodies; if the
+  // winner is unique we reuse the body the rerank already fetched rather
+  // than calling getFullCandidateById a second time.
+  const auto = decision.kind === 'unique'
+    && decision.winner.score >= AUTO_RESOLVE_FLOOR
+    && (scored.length < 2 || decision.winner.score - scored[1].score >= AUTO_RESOLVE_GAP);
+  if (!auto) {
+    const topK = scored.slice(0, PHASE2_FANOUT);
+    const reranked = await liveRerankCandidates(env, topK);
+    const rerankedDecision = pickWinner(reranked);
+    if (rerankedDecision.kind === 'unique') {
+      const winner = rerankedDecision.winner;
+      if (winner._body) return { ok: true, value: winner._body };
+      const res = await getFullCandidateById(env, winner.id);
+      if (!res.ok) return { ok: false, reason: 'not_found', input };
+      return { ok: true, value: res.value };
+    }
+    if (rerankedDecision.kind === 'ambiguous') {
+      return ambiguousCandidatePayload(env, q, rerankedDecision.options);
+    }
+    return { ok: false, reason: 'not_found', input };
   }
-  // Unique fuzzy winner → live-fetch from RF.
+
+  // Unique fuzzy winner with Phase 1 confidence → live-fetch from RF.
   const res = await getFullCandidateById(env, decision.winner.id);
   if (!res.ok) return { ok: false, reason: 'not_found', input };
   return { ok: true, value: res.value };
@@ -208,15 +248,13 @@ export async function resolveCandidate(env, input) {
  * Job count is small (~1k). At that size SELECT-all + score-in-JS on every
  * call is cheap enough (~1ms) that we don't bother with a snapshot module.
  *
- * Per spec rev 5 thin schema, `is_open` lives only on RF — it's mutable and
- * therefore not cached. The `onlyOpen` option is accepted but is currently
- * a no-op for filtering: the canonical pipeline cache holds all known jobs
- * including closed ones, and closed-job suppression now happens via RF's
- * `/job/pipeline` returning empty buckets if the caller follows up.
- * Recruiters who want closed-job access pass an explicit numeric id (the
- * `resolveJob` numeric short-circuit bypasses fuzzy entirely).
+ * `is_open` is NOT a column on `jobs_v2` (intentional — mutable field, kept
+ * out of the cache to avoid write storms). The closed-job filter is applied
+ * by Phase 2 `liveRerankJobs`, which reads `is_open` from live RF on the
+ * top-K candidates returned here. See `docs/mcp-middleware.md` § Two-phase
+ * resolver.
  */
-async function loadJobs(env /*, { onlyOpen = false } = {} */) {
+async function loadJobs(env) {
   const { results } = await session(env)
     .prepare('SELECT id, name, client_company_name FROM jobs_v2')
     .all();
@@ -278,7 +316,7 @@ export async function resolveJob(env, input, { restrictTo, onlyOpen = true, vali
       _link: j,
     }));
   } else {
-    candidates = await loadJobs(env, { onlyOpen });
+    candidates = await loadJobs(env);
   }
 
   const qCanonical = canonicalizeJobPhrase(coerced.value);
@@ -310,6 +348,47 @@ export async function resolveJob(env, input, { restrictTo, onlyOpen = true, vali
   if (decision.kind === 'none') {
     return { ok: false, reason: 'not_found', input };
   }
+
+  // Phase 2 fires for the unrestricted path only. `restrictTo` already
+  // narrows to a candidate's own jobs[] (a closed list of ≤ ~10 jobs,
+  // open/closed irrelevant — the candidate is on those jobs by definition),
+  // so a live RF fan-out adds latency without changing the answer.
+  const skipPhase2 = !!restrictTo;
+  const auto = decision.kind === 'unique'
+    && decision.winner.score >= AUTO_RESOLVE_FLOOR
+    && (scored.length < 2 || decision.winner.score - scored[1].score >= AUTO_RESOLVE_GAP);
+  if (!skipPhase2 && !auto) {
+    const topK = scored.slice(0, PHASE2_FANOUT);
+    const reranked = await liveRerankJobs(env, topK);
+    const rerankedDecision = pickWinner(reranked);
+    if (rerankedDecision.kind === 'unique') {
+      const winner = rerankedDecision.winner;
+      return {
+        ok: true,
+        value: {
+          id: winner.id,
+          name: winner.name,
+          client_company_name: winner.client_company_name ?? null,
+        },
+      };
+    }
+    if (rerankedDecision.kind === 'ambiguous') {
+      return {
+        ok: false,
+        reason: 'ambiguous',
+        kind: 'job',
+        options: rerankedDecision.options.map((o) => ({
+          id: o.id,
+          name: o.name,
+          client_company_name: o.client_company_name ?? null,
+          score: o.score,
+        })),
+        hint: `Multiple jobs match "${coerced.value}" — please be more specific.`,
+      };
+    }
+    return { ok: false, reason: 'not_found', input };
+  }
+
   if (decision.kind === 'ambiguous') {
     return {
       ok: false,

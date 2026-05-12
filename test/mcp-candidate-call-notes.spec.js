@@ -220,7 +220,7 @@ describe('/mcp/candidate-call-notes step=list_calls', () => {
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
-  it('ambiguous fuzzy → needs_disambiguation', async () => {
+  it('ambiguous fuzzy → needs_disambiguation (Phase 2 may call /candidate/get)', async () => {
     await env.RF_MCP_CACHE.prepare(
       'INSERT INTO candidates (id, body, name, current_organization, current_title, cached_at) VALUES (?, ?, ?, ?, ?, ?)',
     ).bind(60001, JSON.stringify({ id: 60001, name: 'Priya Patel' }), 'Priya Patel', 'Acme', 'AE', new Date().toISOString()).run();
@@ -231,14 +231,28 @@ describe('/mcp/candidate-call-notes step=list_calls', () => {
       'UPDATE candidates SET current_organization = ?, current_title = ? WHERE id = 50976',
     ).bind('Globex', 'CSM').run();
     resetSnapshot();
-    globalThis.fetch = vi.fn();
+    // Phase 2 fan-out fires when the top-K is genuinely ambiguous — stub
+    // /candidate/get so the rerank reads valid bodies. Neither Priya has
+    // stage progression, so ambiguity survives the rerank.
+    globalThis.fetch = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/get')) {
+        const m = u.match(/id=(\d+)/);
+        const id = m ? Number(m[1]) : 0;
+        return new Response(JSON.stringify({ candidate: { id, name: `Priya ${id}`, jobs: [] } }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    });
     const r = await call({
-      consultantFirstName: 'Joel', step: 'list_calls', candidate: 'Sarah', time_query: 'today',
+      consultantFirstName: 'Joel', step: 'list_calls', candidate: 'Priya', time_query: 'today',
     });
     const b = await r.json();
     expect(b.needs_disambiguation).toBe(true);
     expect(b.kind).toBe('candidate');
-    expect(globalThis.fetch).not.toHaveBeenCalled();
+    for (const [url] of globalThis.fetch.mock.calls) {
+      const u = typeof url === 'string' ? url : url.url;
+      expect(u).not.toMatch(/\/candidate\/search/);
+    }
   });
 
   it('boundary: duration_ms of exactly 119_999 dropped; 120_000 kept (D1 integer filter)', async () => {

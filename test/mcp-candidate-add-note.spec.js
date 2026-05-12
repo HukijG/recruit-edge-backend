@@ -179,7 +179,7 @@ describe('/mcp/candidate-add-note', () => {
     expect(r.status).toBe(200);
   });
 
-  it('ambiguous fuzzy candidate name → needs_disambiguation kind=candidate, no RF call', async () => {
+  it('ambiguous fuzzy candidate name → needs_disambiguation kind=candidate (Phase 2 may call /candidate/get)', async () => {
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates');
     await env.RF_MCP_CACHE.exec('DELETE FROM candidates_v2');
     // Disambiguation envelope hydrates current_title / current_organization
@@ -195,7 +195,19 @@ describe('/mcp/candidate-add-note', () => {
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     ).bind(43, 'Jordan Patel', null, Date.now(), 'CSM', 'Globex', Date.now()).run();
     resetSnapshot();
-    globalThis.fetch = vi.fn();
+    // Phase 2 fan-out fires when the top-K is genuinely ambiguous — stub
+    // /candidate/get so the rerank reads valid bodies. Neither candidate
+    // has stage progression beyond Sourced, so neither gets a recency
+    // boost and the ambiguity survives.
+    globalThis.fetch = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/get')) {
+        const m = u.match(/id=(\d+)/);
+        const id = m ? Number(m[1]) : 0;
+        return new Response(JSON.stringify({ candidate: { id, name: `Jordan ${id}`, jobs: [] } }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    });
     const r = await call({
       consultantFirstName: 'Joel',
       candidate: 'Jordan',
@@ -213,7 +225,12 @@ describe('/mcp/candidate-add-note', () => {
     const chen = b.options.find((o) => o.id === 42);
     expect(chen.current_organization).toBe('Acme');
     expect(chen.current_title).toBe('AE');
-    expect(globalThis.fetch).not.toHaveBeenCalled();
+    // Phase 2 fan-out may hit /candidate/get — load-bearing invariant is
+    // that we never hit /candidate/search on this path.
+    for (const [url] of globalThis.fetch.mock.calls) {
+      const u = typeof url === 'string' ? url : url.url;
+      expect(u).not.toMatch(/\/candidate\/search/);
+    }
   });
 
   it('ambiguous candidate + job auto-narrows to single survivor → commits', async () => {

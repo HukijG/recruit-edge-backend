@@ -205,7 +205,18 @@ describe('/mcp/candidate-log-interview', () => {
     await env.RF_MCP_CACHE.prepare(
       'INSERT OR IGNORE INTO candidates_v2 (id, name, linkedin_profile, added_time_ms, cached_at_ms) VALUES (?, ?, ?, ?, ?)'
     ).bind(43, 'Jordan Patel', null, Date.now(), Date.now()).run();
-    globalThis.fetch = vi.fn();
+    // Phase 2 fan-out fires on ambiguous fuzzy — stub /candidate/get so
+    // the rerank reads valid bodies. Neither candidate has stage
+    // progression beyond Sourced, so the ambiguity survives.
+    globalThis.fetch = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/candidate/get')) {
+        const m = u.match(/id=(\d+)/);
+        const id = m ? Number(m[1]) : 0;
+        return new Response(JSON.stringify({ candidate: { id, name: `Jordan ${id}`, jobs: [] } }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    });
     const r = await call({
       consultantFirstName: 'Joel',
       candidate: 'Jordan',
@@ -216,7 +227,12 @@ describe('/mcp/candidate-log-interview', () => {
     const b = await r.json();
     expect(b.needs_disambiguation).toBe(true);
     expect(b.kind).toBe('candidate');
-    expect(globalThis.fetch).not.toHaveBeenCalled();
+    // Phase 2 may hit /candidate/get — load-bearing invariant is no
+    // /candidate/search call on this path.
+    for (const [url] of globalThis.fetch.mock.calls) {
+      const u = typeof url === 'string' ? url : url.url;
+      expect(u).not.toMatch(/\/candidate\/search/);
+    }
   });
 
   it('post-narrow: two Jordans, only one is on the specified job → auto-commits', async () => {

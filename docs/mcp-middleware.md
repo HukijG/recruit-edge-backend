@@ -168,9 +168,19 @@ When a `*_id` field is present, the corresponding fuzzy-name field (`candidate`,
 
 `resolveJob` defaults to **open jobs only** (`is_open=1`). Closed jobs are excluded from fuzzy scoring entirely; recruiters reach a closed job only by passing an explicit numeric id. The `restrictTo` path (move-stage / log-interview against a candidate's own jobs[]) ignores `onlyOpen` since the universe is already constrained.
 
-### Recency boost
+### Two-phase resolver — Phase 1 (cache) + Phase 2 (live RF)
 
-`recencyBoost` in `fuzzy.js` decays linearly over a **30-day window** (down from the original 180). Within UNIQUE_GAP, a candidate active today wins outright over the same-name twin from two months ago. Recruiters typing first names almost always mean someone they've spoken to in the last week or two; the tighter window matches that expectation.
+The candidate/job resolvers run in two phases. **Phase 1** scores against the thin in-memory snapshot (`candidates_v2` / `jobs_v2`) using `scoreString` (prefix-exact, word-boundary substring, per-token Levenshtein on tokens ≥ 4 chars, extension-word penalty, equal-length bonus). **Phase 2** fans out to live RF (`/candidate/get` or `/job/get`) for the Phase 1 top-K to read mutable fields — `is_open` for jobs, `jobs[].stage_moved` (filtered to non-Sourced / non-Disqualified stages) for candidates — that intentionally aren't cached.
+
+Phase 2 fires whenever Phase 1 can't auto-resolve confidently. Auto-resolve requires `top.score >= 0.92` AND `top.score - second.score >= 0.08`. Anything else fans out the top 5 via `pMapLimit` concurrency 5 (~150–300 ms total). Per-id fan-out failures degrade gracefully — the row keeps its Phase 1 score with a `_phase2: 'fetch_failed'` marker, so a transient RF blip doesn't drop a real match.
+
+The recency signal lives entirely in Phase 2. The previous `added_time_ms` recency boost on the cache path was actively harmful — hundreds of candidates added weekly all enter Sourced, so the boost flooded top results with newly-sourced rows and deranked re-engaged candidates already in the CRM. `stageRecencyBoost` in `live-rerank.js` reads `jobs[].stage_moved` for non-inert stages (Sourced and Disqualified are inert), decays linearly over a 60-day window, caps at +0.25. When no eligible stage exists the candidate gets 0 boost — that's the correct answer for a candidate who hasn't been touched beyond auto-sourcing.
+
+`resolveJob` skips Phase 2 when `restrictTo` is set (candidate's own jobs[] is already a closed list — a live RF fan-out adds latency without changing the answer).
+
+`candidate-search` runs the same Phase 1 + Phase 2 split on the pure-fuzzy path (`hasQuery && !hasMutableFilters`). Phase 2 fan-out is capped at PHASE2_FANOUT (5) regardless of caller-supplied `limit`; larger limits get Phase 2 rerank on the top 5 and the tail keeps Phase 1 ordering. Tier-2 paths (mutable filter present) skip Phase 2 — RF's own filter narrowing is the source of truth.
+
+**Cache invariant.** The whole point of Phase 2 is to keep `is_open` / `stage_moved` OUT of the thin D1 cache. Adding either to `candidates_v2` / `jobs_v2` is a regression — the cron write-storm fix exists exactly because those fields update too often to cache cheaply. Phase 2 reads them live at disambiguation time, paid only when Phase 1 can't decide alone.
 
 ### Score floors (prefix-exact ≫ Levenshtein)
 

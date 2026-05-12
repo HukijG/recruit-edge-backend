@@ -44,7 +44,8 @@ import { session, getCandidatesByIds } from './d1-read.js';
 import { resolveFieldsWithDefaults } from './projection.js';
 import { projectWithLinkedIn } from './linkedin.js';
 import { getSnapshot } from './snapshot.js';
-import { scoreString, recencyBoost, normalize } from './fuzzy.js';
+import { scoreString, normalize } from './fuzzy.js';
+import { liveRerankCandidates } from './live-rerank.js';
 import {
   resolveJob, resolveOwner, resolveStage, disambiguationPayload,
 } from './resolvers.js';
@@ -62,6 +63,11 @@ const DEFAULT_FIELDS = ['id', 'name', 'current_title', 'linkedin_profile'];
 const FUZZY_THRESHOLD = 0.35;
 const TIER1_FUZZY_LIMIT = 200;  // tier-1 pool size before tier-2 narrowing
 const HYDRATION_CONCURRENCY = 8;
+// Phase 2 (live-rerank) fan-out cap on the pure-fuzzy candidate-search
+// path. Bounded so large `limit` values don't trigger a 50-call RF storm;
+// top-5 by Phase 1 score get the live stage-recency rerank, the tail
+// keeps Phase 1 ordering.
+const PHASE2_FANOUT = 5;
 
 // ─── In-memory caches ─────────────────────────────────────────────────────
 
@@ -339,10 +345,16 @@ function buildImmutableSnapshotFilter(body) {
 }
 
 /**
- * Tier-1 fuzzy: score every snapshot row against `query`, apply recency
- * boost, threshold, sort by score, take top-`limit`. No D1 read here — the
- * snapshot is cached in memory and version-checked against the cron cursor
- * stamp.
+ * Tier-1 fuzzy: score every snapshot row against `query`, threshold, sort by
+ * score, take top-`limit`. No D1 read here — the snapshot is cached in memory
+ * and version-checked against the cron cursor stamp.
+ *
+ * Pure name score, no recency boost. The previous `added_time_ms` boost
+ * was actively harmful — hundreds of candidates added weekly all enter
+ * Sourced, so the boost just floods top results with newly-sourced rows
+ * and deranks re-engaged candidates already in the CRM. Stage-based
+ * recency (`stage_moved` on a non-Sourced / non-Disqualified job)
+ * replaces it on the pure-fuzzy path via `liveRerankCandidates` below.
  *
  * Returns rows shaped as `{id, name, score, _thinRow}` where `_thinRow`
  * carries the snapshot's thin fields (id, name, linkedin_profile,
@@ -354,11 +366,7 @@ async function tier1Fuzzy(env, query, limit, immutablePredicate = null) {
   if (!q) return [];
   const scored = snap.rows
     .filter((r) => immutablePredicate == null || immutablePredicate(r))
-    .map((r) => {
-      const base = scoreString(q, r.prepared);
-      const boost = recencyBoost({ added_time_ms: r.added_time_ms });
-      return { id: r.id, name: r.name, score: base * (1 + boost), _thinRow: r };
-    })
+    .map((r) => ({ id: r.id, name: r.name, score: scoreString(q, r.prepared), _thinRow: r }))
     .filter((r) => r.score >= FUZZY_THRESHOLD)
     .sort((a, b) => b.score - a.score);
   return scored.slice(0, limit);
@@ -608,15 +616,35 @@ export async function handleCandidateSearch({ env, body }) {
   }
 
   // ─── Pure-fuzzy short-circuit (no mutable filter) ──────────────
-  // Enriches each match with the v2 snapshot columns (current_title /
-  // current_organization at cache time) via a single D1 batch so the
-  // default-field projection works without an RF round-trip. The cost is
-  // one extra D1 read for the top-N matches; negligible at our scale.
+  // Two-phase rerank for the pure-fuzzy path:
+  //   Phase 1: name score (`tier1Fuzzy`) — no recency, fixed in 2026-05-12.
+  //   Phase 2: live RF stage-recency rerank on the top-K. Without this,
+  //            "Jerry" returns N look-alikes all scoring 0.85+ with no
+  //            way for the right Jerry to surface — see operator brief
+  //            for the worked example.
+  // Phase 2 fan-out is bounded at PHASE2_FANOUT (5); requests with larger
+  // limits get Phase 2 rerank on the top 5 only, the tail keeps Phase 1
+  // ordering. Trade-off: protects against a 50-fan-out latency cliff
+  // while still answering the common "type a first name" intent right.
   if (hasQuery && !hasMutableFilters) {
     const tier1 = await tier1Fuzzy(env, body.query, limit, immutablePredicate);
-    const dbRows = tier1.length ? await getCandidatesByIds(env, tier1.map((m) => m.id)) : [];
+    let ordered = tier1;
+    if (tier1.length > 0) {
+      const reranked = await liveRerankCandidates(env, tier1.slice(0, PHASE2_FANOUT));
+      // Splice the reranked top-K back over the original order; tail (any
+      // overflow beyond PHASE2_FANOUT) keeps Phase 1 score / position.
+      const byId = new Map(reranked.map((r) => [r.id, r]));
+      ordered = tier1
+        .map((m) => {
+          const r = byId.get(m.id);
+          if (!r) return m;
+          return { ...m, score: r.score, _body: r._body ? JSON.stringify(r._body) : undefined };
+        })
+        .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    }
+    const dbRows = ordered.length ? await getCandidatesByIds(env, ordered.map((m) => m.id)) : [];
     const dbById = new Map(dbRows.map((r) => [r.id, r]));
-    const enriched = tier1.map((m) => ({ ...m, _thinDbRow: dbById.get(m.id) ?? null }));
+    const enriched = ordered.map((m) => ({ ...m, _thinDbRow: dbById.get(m.id) ?? null }));
     const projected = projectMatches(enriched, body.fields);
     return jsonResponse(200, successResponse(projected));
   }

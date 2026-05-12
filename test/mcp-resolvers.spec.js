@@ -323,6 +323,96 @@ describe('resolveJob', () => {
   });
 });
 
+// ─── Operator-spec headline scenarios (2026-05-12) ──────────────────
+// These three test cases come directly from the operator's brief —
+// they're the smoke-test failures Phase 1 tightening + Phase 2 live
+// rerank exist to fix. Lock them in as regression anchors so future
+// tweaks to scoring constants can't quietly break them.
+function mockRFJobGet(jobsById) {
+  globalThis.fetch = vi.fn(async (url) => {
+    const u = String(url);
+    if (u.includes('/job/get')) {
+      const m = u.match(/[?&]id=(\d+)/);
+      const id = m ? Number(m[1]) : NaN;
+      const body = jobsById.get(id);
+      if (!body) return new Response('not found', { status: 404 });
+      return new Response(JSON.stringify({ job: body }), { status: 200 });
+    }
+    throw new Error('unexpected fetch: ' + u);
+  });
+}
+
+describe('Phase 2 live-rerank integration — operator headline scenarios', () => {
+  it('"Eon Sales Engineer" → 984 auto-resolves; closed-sibling siblings dropped via /job/get is_open', async () => {
+    // Cache has three Eon roles. Phase 1 produces an ambiguous top-K
+    // (Sales Engineer + Sales Engineering Manager + Sales Engineer - US).
+    // Phase 2 fetches /job/get for each; the closed siblings (US +
+    // Manager) get is_open=false and drop out, leaving 984 alone.
+    await insertJob(984, 'Sales Engineer', 'Eon.io');
+    await insertJob(983, 'Sales Engineer - US', 'Eon.io');
+    await insertJob(982, 'Sales Engineering Manager', 'Eon.io');
+    mockRFJobGet(new Map([
+      [984, { id: 984, name: 'Sales Engineer', client_company_name: 'Eon.io', is_open: true }],
+      [983, { id: 983, name: 'Sales Engineer - US', client_company_name: 'Eon.io', is_open: false }],
+      [982, { id: 982, name: 'Sales Engineering Manager', client_company_name: 'Eon.io', is_open: false }],
+    ]));
+    const r = await resolveJob(env, 'Eon Sales Engineer');
+    expect(r.ok).toBe(true);
+    expect(r.value.id).toBe(984);
+  });
+
+  it('"Eon SE Manager" → Sales Engineering Manager wins when qualifier is in the query', async () => {
+    // Recruiter explicitly types the qualifier. Extension penalty
+    // doesn't fire (manager appears in BOTH query and target). The
+    // longer target ("Sales Engineering Manager") matches better than
+    // the bare IC role.
+    await insertJob(984, 'Sales Engineer', 'Eon.io');
+    await insertJob(982, 'Sales Engineering Manager', 'Eon.io');
+    mockRFJobGet(new Map([
+      [984, { id: 984, name: 'Sales Engineer', client_company_name: 'Eon.io', is_open: true }],
+      [982, { id: 982, name: 'Sales Engineering Manager', client_company_name: 'Eon.io', is_open: true }],
+    ]));
+    const r = await resolveJob(env, 'Eon SE Manager');
+    expect(r.ok).toBe(true);
+    expect(r.value.id).toBe(982);
+  });
+
+  it('"Jerry" → Jerry Doe surfaces via Phase 2 stage_moved recency over flood of stale Jerrys', async () => {
+    // Five Jerrys in cache — all sourced 30 days ago. Jerry Doe
+    // (id 49243) is the only one with a non-Sourced stage_moved
+    // recently. Phase 1 ranks them all equally (prefix-exact on
+    // "jerry"). Phase 2 fan-out reads /candidate/get for each; only
+    // Jerry Doe gets the stage-recency boost, so he surfaces at #1.
+    await insertCandidate(49241, 'Jerry Park');
+    await insertCandidate(49242, 'Jerry Mumford');
+    await insertCandidate(49243, 'Jerry Doe');
+    await insertCandidate(49244, 'Jerry Sun');
+    await insertCandidate(49245, 'Jerry Wooder');
+    resetSnapshot();
+    const today = new Date().toISOString();
+    mockRFCandidateGet(new Map([
+      // Inert (Sourced or DQ) — get 0 boost
+      [49241, { id: 49241, name: 'Jerry Park', jobs: [{ stage_name: 'Sourced', stage_moved: today }] }],
+      [49242, { id: 49242, name: 'Jerry Mumford', jobs: [{ stage_name: 'Disqualified', stage_moved: today }] }],
+      [49244, { id: 49244, name: 'Jerry Sun', jobs: [{ stage_name: 'Sourced', stage_moved: today }] }],
+      [49245, { id: 49245, name: 'Jerry Wooder', jobs: [] }],
+      // Jerry Doe — re-engaged today on a real stage (1st Interview)
+      [49243, { id: 49243, name: 'Jerry Doe', jobs: [{ stage_name: '1st Interview', stage_moved: today }] }],
+    ]));
+    const r = await resolveCandidate(env, 'Jerry');
+    // Five Phase-1-equal Jerrys → Phase 2 fires → Jerry Doe wins outright.
+    // Whether the result is unique-winner or ambiguous-with-him-on-top
+    // depends on how decisively the boost separates him from his stale
+    // peers; assert he's the top either way.
+    if (r.ok) {
+      expect(r.value.id).toBe(49243);
+    } else {
+      expect(r.reason).toBe('ambiguous');
+      expect(r.options[0].id).toBe(49243);
+    }
+  });
+});
+
 describe('resolveStage', () => {
   const stages = [
     { id: 1, name: 'Sourced' },

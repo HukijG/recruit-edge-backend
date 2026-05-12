@@ -113,19 +113,33 @@ const call = (b) =>
   );
 
 describe('/mcp/candidate-search', () => {
-  // ─── Pure-fuzzy short-circuit (no RF call) ──────────────────────
-  it('pure-fuzzy: matches by query alone', async () => {
+  // ─── Pure-fuzzy + Phase 2 live rerank ──────────────────────────
+  // Pure-fuzzy is no longer a "skip RF entirely" path — Phase 2
+  // (live-rerank) fans out /candidate/get to apply stage-based recency.
+  // Phase 1 narrows on the snapshot; Phase 2 reads jobs[].stage_moved to
+  // surface re-engaged candidates above fresh-Sourced look-alikes.
+  it('pure-fuzzy: matches by query alone (Phase 2 rerank applied)', async () => {
     await insert(1, 'Jerry Smith');
     await insert(2, 'Bob Smith');
     await insert(3, 'Alice Jones');
-    const fetchMock = vi.fn();
-    globalThis.fetch = fetchMock;
+    // Pre-stub /candidate/get so Phase 2's stage-recency rerank has data
+    // to read. Without staging info Phase 2 contributes no boost — Phase 1
+    // ordering wins by default.
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ candidate: { id: 1, name: 'Jerry Smith', jobs: [] } }), { status: 200 }),
+    );
     const r = await call({ consultantFirstName: 'Joel', query: 'jerry' });
     expect(r.status).toBe(200);
     const b = await r.json();
     expect(b.matches[0].id).toBe(1);
-    // Pure-fuzzy never calls RF.
-    expect(fetchMock).not.toHaveBeenCalled();
+    // Phase 2 hits /candidate/get for the top match. NOT /candidate/search.
+    const calls = globalThis.fetch.mock.calls;
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    for (const [url] of calls) {
+      const u = typeof url === 'string' ? url : url.url;
+      expect(u).toMatch(/\/candidate\/get/);
+      expect(u).not.toMatch(/\/candidate\/search/);
+    }
   });
 
   it('returns 400 when neither query nor filter provided', async () => {
@@ -532,16 +546,23 @@ describe('rf_candidate_search — tier-1+RF-search single round-trip', () => {
     ]));
   });
 
-  it('skips RF entirely when no mutable filters', async () => {
+  it('skips /candidate/search when no mutable filters (Phase 2 may still call /candidate/get for stage-recency)', async () => {
     await seedThin([
       { id: 1, name: 'Jane', added_time_ms: 1 },
     ]);
-    const rfFetch = vi.fn();
-    globalThis.fetch = rfFetch;
+    // Phase 2 fan-out hits /candidate/get for the top-K — pre-stub so the
+    // rerank has a body to read; the assertion below confirms no
+    // /candidate/search call (that's the load-bearing invariant).
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ candidate: { id: 1, name: 'Jane', jobs: [] } }), { status: 200 }),
+    );
     const r = await call({ consultantFirstName: 'Joel', query: 'jane' });
     const res = await r.json();
-    expect(rfFetch).not.toHaveBeenCalled();
     expect(res.matches.map((m) => m.id)).toEqual([1]);
+    for (const [url] of globalThis.fetch.mock.calls) {
+      const u = typeof url === 'string' ? url : url.url;
+      expect(u).not.toMatch(/\/candidate\/search/);
+    }
   });
 
   it('on RF failure, degrades to tier-1 with filter_unverified warning', async () => {
@@ -628,17 +649,24 @@ describe('rf_candidate_search — tier-1+RF-search single round-trip', () => {
   });
 
   // ─── Fix 3: linkedin_profile dual-handled ─────────────────────────
+  // Note: linkedin_profile snapshot-side filtering is unchanged — Phase 2
+  // still runs on the pure-fuzzy path (so /candidate/get may fire), but
+  // /candidate/search is skipped.
   it('linkedin_profile exact-slug filters tier-1 snapshot on pure-fuzzy path', async () => {
     await seedThin([
       { id: 1, name: 'Jane Doe',   linkedin_profile: 'jane-doe',   added_time_ms: 1 },
       { id: 2, name: 'Jane Smith', linkedin_profile: 'jane-smith', added_time_ms: 2 },
     ]);
-    const rfFetch = vi.fn();
-    globalThis.fetch = rfFetch;
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ candidate: { id: 1, name: 'Jane Doe', jobs: [] } }), { status: 200 }),
+    );
     // Pure-fuzzy path (no mutable filter): snapshot exact-slug match narrows.
     const r = await call({ consultantFirstName: 'Joel', query: 'jane', linkedin_profile: 'jane-doe' });
     const res = await r.json();
-    expect(rfFetch).not.toHaveBeenCalled();
+    for (const [url] of globalThis.fetch.mock.calls) {
+      const u = typeof url === 'string' ? url : url.url;
+      expect(u).not.toMatch(/\/candidate\/search/);
+    }
     expect(res.matches.map((m) => m.id)).toEqual([1]);
   });
 
@@ -647,15 +675,19 @@ describe('rf_candidate_search — tier-1+RF-search single round-trip', () => {
       { id: 1, name: 'Jane Doe', linkedin_profile: 'jane-doe', added_time_ms: 1 },
       { id: 2, name: 'Jane Smith', linkedin_profile: 'jane-smith', added_time_ms: 2 },
     ]);
-    const rfFetch = vi.fn();
-    globalThis.fetch = rfFetch;
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ candidate: { id: 1, name: 'Jane Doe', jobs: [] } }), { status: 200 }),
+    );
     const r = await call({
       consultantFirstName: 'Joel',
       query: 'jane',
       linkedin_profile: 'https://www.linkedin.com/in/Jane-Doe/',
     });
     const res = await r.json();
-    expect(rfFetch).not.toHaveBeenCalled();
+    for (const [url] of globalThis.fetch.mock.calls) {
+      const u = typeof url === 'string' ? url : url.url;
+      expect(u).not.toMatch(/\/candidate\/search/);
+    }
     expect(res.matches.map((m) => m.id)).toEqual([1]);
   });
 
