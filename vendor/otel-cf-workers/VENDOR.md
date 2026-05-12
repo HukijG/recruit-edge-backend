@@ -60,3 +60,5 @@ We do **not** track upstream. If a future upstream release is worth pulling in:
 4. Rebuild `dist/`, run all three worker test suites, commit.
 
 The reverse — sending our fixes upstream — should be considered for the postProcessor patch specifically. It's a clear bug, the fix is small, and the maintainer might accept the PR. If sent upstream and merged, future re-syncs become merge-fast-forwards.
+
+<!-- ci-trigger: 2026-05-12 -->
