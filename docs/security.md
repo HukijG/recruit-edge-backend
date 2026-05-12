@@ -127,29 +127,25 @@ If you're unsure whether a new endpoint needs Access:
 
 ## References
 
-- [Spec A — Cloudflare Access for MCP](archive/specs/2026-05-10-cloudflare-access-mcp-design.md)
-- [Spec B — Cloudflare Access for the extension API](archive/specs/2026-05-10-cloudflare-access-extension-design.md)
-- [Plan A — implementation step list (manual + code)](archive/plans/2026-05-10-cloudflare-access-mcp.md)
-- [Plan B — implementation step list](archive/plans/2026-05-10-cloudflare-access-extension.md)
+- [Spec A — Cloudflare Access for MCP](archived/specs/2026-05-10-cloudflare-access-mcp-design.md) (shipped, archived)
+- [Plan A — implementation step list (manual + code)](archived/plans/2026-05-10-cloudflare-access-mcp.md) (shipped, archived)
+- [Spec B — Cloudflare Access for the extension API](archive/specs/2026-05-10-cloudflare-access-extension-design.md) (pending)
+- [Plan B — implementation step list](archive/plans/2026-05-10-cloudflare-access-extension.md) (pending)
 
 ## Tangentially-related open work
 
-### Cron re-enable scope
+### Cron re-enable scope (current state)
 
-The cache-worker cron trigger remains commented out in `cache-worker/wrangler.cache.jsonc` as of this branch (the `"triggers"` block is present but commented). Re-enable is cutover step 2 (operator-driven, after migration `0003_v2_tables.sql` is applied and the new cache-worker code is deployed).
+The cache-worker cron is live (`*/15 * * * *`) since 2026-05-12. Two env-var gates on cache-worker control which write path runs:
 
-**Two paths exist side-by-side during the dual-write phase, both gated by env vars on cache-worker:**
+- **`CRON_THIN_ENABLED='true'`** (default, set 2026-05-12 as cutover step 5) — runs `tailSyncThin`: additive INSERT-OR-IGNORE into `candidates_v2`, `jobs_v2`, `calls`. The active and only writing path.
+- **`CRON_LEGACY_ENABLED='false'`** (default, unchanged) — keeps the legacy `tailSync` inert. The legacy writers caused the ~1M D1 writes/day storm the redesign exists to fix; only flip to `'true'` for emergency rollback during cutover.
 
-- **Legacy `tailSync`** — fires only when `CRON_LEGACY_ENABLED='true'` (or `'1'`) is set as a Worker secret/var on cache-worker. Default `'false'`. Writes to the legacy `candidates`, `candidate_jobs`, `jobs`, `job_pipelines` tables (REPLACE-everything semantics, same as before). Intentionally inert during the dual-write window because it drives the ~1M D1 writes/day storm the redesign exists to fix — only set to `'true'` if the operator needs to fall back to legacy writes during a cutover emergency.
-- **New `tailSyncThin`** — fires only when `CRON_THIN_ENABLED='true'` (or `'1'`) is set as a Worker secret/var on cache-worker. Default `'false'`. Additive-only INSERT-OR-IGNORE into `candidates_v2`, `jobs_v2`, `calls`. Operator sets this to `'true'` at cutover step 5, after verifying the new tables were seeded by `/admin/cache-rebuild` and the main worker is reading from the thin tables without errors.
+After cutover step 6 drops the legacy tables (`candidates`, `candidate_jobs`, `jobs`, `job_pipelines`) via `0004_drop_legacy.sql`, the legacy `tailSync` function is removed and both env-var gates become redundant (they're removed alongside the dual-path cleanup).
 
-Both gates default to `'false'` so re-enabling the cron trigger at step 2 does not automatically activate either write path. The operator opts in explicitly — `CRON_THIN_ENABLED='true'` at step 5; `CRON_LEGACY_ENABLED` stays `'false'` throughout normal cutover (the legacy path is functionally gone from step 2 onward).
+The cron bypasses Access entirely — it writes nothing through user-facing routes. Tracked here so future auth changes don't surface its traffic as unexpected unauthenticated load.
 
-Both paths write to disjoint table sets until cutover step 6 drops the legacy tables. After step 6, the legacy `tailSync` function is removed and both env-var gates become redundant (they're removed alongside the dual-path cleanup). The cron bypasses Access entirely — it writes nothing through user-facing routes.
-
-Not auth-related per se, but tracked here so re-enabling cron during auth work doesn't surface as unexpected unauthenticated traffic.
-
-**Cross-reference:** Full cutover sequence (steps 1–6) in the thin-immutable-cache implementation plan, Tasks 20–25.
+**Cross-reference:** Cutover sequence (steps 1–6) in the thin-immutable-cache implementation plan, Tasks 20–25.
 
 ### D1 PITR rollback plan
 

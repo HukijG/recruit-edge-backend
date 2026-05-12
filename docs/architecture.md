@@ -2,7 +2,7 @@
 
 > **Status note (2026-05-11):** Auth migration Phase 1 has shipped — the MCP path (claude.ai connector) is now fronted by Cloudflare Access OAuth (Spec A). The extension API still sits behind the legacy `X-Extension-Token` header until Spec B lands; new user-facing endpoints must NOT add new shared-secret headers (see `docs/security.md`).
 >
-> **Thin-immutable cache redesign (Tasks 1–19, 2026-05-11):** `RF_MCP_CACHE` is being migrated to a thin-immutable schema. New tables `candidates_v2`, `jobs_v2`, and `calls` are live; the legacy `candidates`, `candidate_jobs`, `jobs`, and `job_pipelines` tables coexist during dual-write cutover (steps 2–5). Pipeline reads are now live RF pass-through — the `job_pipelines` table is no longer the source of truth. The new `tailSyncThin` cron path writes only INSERT-OR-IGNORE (no rewrites of unchanged rows); it is gated by `CRON_THIN_ENABLED='true'` (default `'false'`) until cutover completes. The legacy `tailSync` call is gated behind `CRON_LEGACY_ENABLED='false'` (default) and is intentionally inert during the dual-write window; only `tailSyncThin` runs when `CRON_THIN_ENABLED='true'`. The full rebuild and cache-seed Workflows remain callable on demand. Webhook-driven cache writes for the `calls` table are live via the hangup webhook → service-binding → cache-worker path.
+> **Thin-immutable cache redesign — cutover step 5 complete (2026-05-12):** `RF_MCP_CACHE` runs on the thin-immutable schema. `candidates_v2`, `jobs_v2`, `calls` are live and seeded (27,526 candidates, 925 jobs, 9587 calls as of 2026-05-12 17:00 UTC). The legacy `candidates`, `candidate_jobs`, `jobs`, and `job_pipelines` tables coexist but are NO LONGER WRITTEN — `CRON_LEGACY_ENABLED='false'` keeps the legacy `tailSync` inert. Pipeline reads are live RF pass-through — the `job_pipelines` table is no longer the source of truth. `tailSyncThin` is THE active cron path (`CRON_THIN_ENABLED='true'`, set 2026-05-12). It runs three parallel additive subtasks via `Promise.allSettled` on every 15-min tick. `CacheSeedWorkflow` (one-shot per-table backfill) and `FullRebuildWorkflow` (legacy) remain callable on demand. Webhook-driven `calls` writes are live via the Dialpad hangup → main worker → service-binding → cache-worker `/internal/calls/upsert` path; the cron tail-sync is the org-wide backstop. Cutover step 6 — drop legacy tables via `0004_drop_legacy.sql` (currently staged in `cache-worker/migrations-pending/`) and remove the dual-write code — is still pending.
 >
 > Call-state architecture has settled on **webhook-driven Durable Object** storage. Per-user `ExtCallState` DO holds the active Dialpad `call_id` with strong consistency. The Dialpad `calling`+`hangup` webhook (`/webhook/dialpad/extension-calls`) is the only writer; `/dialpad-call`, `/dialpad-hangup`, and `/extension-call-status` are read-only.
 
@@ -142,7 +142,7 @@ This file does NOT duplicate that material. References below use the Access auth
 | `cache-worker/src/normalize.js` | RF payload → D1 row builders. Legacy: `toCandidateRow`, `toCandidateJobRows`. New thin: `toCandidateThinRow` (id, name, linkedin_profile, added_time_ms, title/company at-cache-time snapshots, cached_at_ms), `toJobThinRow` (id, name, client_company_name, added_time_ms, canonical_pipeline_json, cached_at_ms), `toCallRow` (call_id, target_dialpad_id, dialpad_contact_id, rf_candidate_id, date_started_ms, duration_ms, direction, cached_at_ms). |
 | `cache-worker/src/pipeline-normalize.js` | Legacy RF `/job/pipeline` → D1 pipeline row normalization (used by `PipelineRebuildWorkflow`). |
 | `cache-worker/src/rf-list-client.js` | Cache-worker's RF API client. Existing paginated endpoints (`/candidate/list`, `/job/list`, etc.). New: `fetchCandidatesAddedSince(env, cursor)` — RF `/candidate/search` with `added_on` date filter; cap-aware MIN-advance cursor (capped → MIN `added_time` across batch; not-capped → MAX `added_time`). |
-| `cache-worker/src/dialpad-list-client.js` | `fetchCallsForConsultant(env, dialpadId, sinceMs)` — paginates Dialpad `/v2/call?target_id=…&target_type=user&started_after=…`. Returns raw call objects. Used by `tailSyncCallsThin` and `CacheSeedWorkflow` calls path. |
+| `cache-worker/src/dialpad-list-client.js` | `listDialpadCallsPage(opts, env)` (single page → `{items, cursor}`) and `listDialpadCalls(opts, env)` (internal loop with `maxPages` cap, default 25). All Dialpad query params optional; omitting `targetId`/`targetType` lists org-wide. Per-page structured `console.log` per request. Seed paginates externally via `step.do` per page; cron uses the looping form for a bounded recency window. |
 | `cache-worker/src/users-d1-read.js` | `listConsultants(env)` — read-only enumeration of `USERS_DB.users` from cache-worker. Returns `[{email, dialpadId, rfUserId, firstName}]`. Used by cron calls subtask and seed Workflow for per-consultant fan-out. Column is `dialpad_id` (not `dialpad_user_id`). |
 | `cache-worker/src/sync-state.js` | Read/write/delete helpers over the `sync_state` D1 table. Tracks: `last_full_rebuild_at`, `last_tail_sync_at`, `in_flight`, `last_candidates_added_cursor` (thin cron cursor), plus RF user/activity-type/custom-field caches. |
 | `cache-worker/src/users.js` | Cache-worker-internal copy of team registry. Used during legacy user enrichment; does NOT replace the main worker's `src/users.js`. |
@@ -248,7 +248,7 @@ The MCP worker validates the JWT, builds a fresh per-request `McpServer` (mandat
 | `/admin/cache-rebuild?table=<candidates\|jobs\|calls>&since=<iso>` | POST | `X-Admin-Token` (`ADMIN_SECRET`, timing-safe) | Kicks off `CacheSeedWorkflow` for the specified thin-schema table. `since` is optional (calls only — defaults to 2 years). Returns `{ ok, workflow_id }` HTTP 202. |
 | `/internal/calls/upsert` | POST | `X-Internal-Token` (`INTERNAL_SECRET`, timing-safe) | Service-binding-only endpoint. Accepts a Dialpad hangup payload and INSERT-OR-IGNORE into `calls`. Validates `call_id`, `target.id`, `date_started` fields. The workers.dev subdomain is disabled (`workers_dev: false`), so this is only reachable via service binding from the main worker. |
 
-The 15-min `scheduled()` handler runs `tailSync` (legacy, gated behind `CRON_LEGACY_ENABLED='false'` default) and `tailSyncThin` (new, gated by `CRON_THIN_ENABLED='false'` default). Re-enable the cron block in `wrangler.cache.jsonc` at cutover step 2 (dual-write monitoring phase): both gates default `'false'` so cron runs but both paths no-op. At step 5 set `CRON_THIN_ENABLED='true'` to activate the additive write path. At step 6, drop the legacy `tailSync` function + both env-var gates entirely.
+The 15-min `scheduled()` handler runs `tailSyncThin` (active, `CRON_THIN_ENABLED='true'` since 2026-05-12) and the legacy `tailSync` (inert, `CRON_LEGACY_ENABLED='false'` default — logs `skip_legacy_tail_sync` and returns). At cutover step 6 the legacy `tailSync` function + both env-var gates are dropped entirely.
 
 ---
 
@@ -873,12 +873,12 @@ Sole writer of `RF_MCP_CACHE` (D1). Deployed independently from the same monorep
 
 ### What it does
 
-- **Scheduled cron (`*/15 * * * *`, cron block currently commented out in `wrangler.cache.jsonc`):** `scheduled()` runs two parallel paths inside `ctx.waitUntil`:
-  1. **Legacy `tailSync`** (gated behind `CRON_LEGACY_ENABLED='false'` default; intentionally inert during dual-write — `getCacheCronLegacyFlag(env)` in `cache-worker/src/index.js` short-circuits with a structured `op:'skip_legacy_tail_sync'` log when the gate is OFF) — when re-enabled, `INSERT-OR-REPLACE`s into the legacy `candidates`, `candidate_jobs`, `jobs` tables using `fetchCandidatesUpdatedSince` + `writeCandidatesAndLinks` / `writeJobs`. No longer instantiates `PipelineRebuildWorkflow` (the class still exists in `cache-worker/src/pipeline-workflow.js` but is not invoked from cron).
-  2. **New `tailSyncThin`** (gated by `CRON_THIN_ENABLED='true'` env var; default `'false'` during dual-write monitoring) — three parallel INSERT-OR-IGNORE subtasks via `Promise.allSettled` (one failure doesn't block others):
+- **Scheduled cron (`*/15 * * * *`, ACTIVE):** `scheduled()` runs:
+  1. **Legacy `tailSync`** — gated behind `CRON_LEGACY_ENABLED='false'` default; intentionally inert. `getCacheCronLegacyFlag(env)` short-circuits with `op:'skip_legacy_tail_sync'` log every tick. Will be deleted entirely at cutover step 6.
+  2. **`tailSyncThin`** (gated by `CRON_THIN_ENABLED='true'`, set 2026-05-12) — three parallel INSERT-OR-IGNORE subtasks via `Promise.allSettled` (one failure doesn't block others):
      - `tailSyncCandidatesThin`: RF `/candidate/search` with `added_on` date filter → `writeCandidatesThin` → `candidates_v2`. Cursor stored as `last_candidates_added_cursor`. Cap-aware: capped → MIN `added_time` across batch; not-capped → MAX `added_time`.
      - `tailSyncJobsThin`: full re-scan of RF `/job/list` → `writeJobsThin` → `jobs_v2`. For each newly-seen job id, fetches `/job/pipeline` once to seed `canonical_pipeline_json`. (~100 jobs total; one full re-scan per tick.)
-     - `tailSyncCallsThin`: per-consultant fan-out via `listConsultants(env)` (reads `USERS_DB.users`); for each consultant queries `MAX(date_started_ms) - 6h` as the `started_after` window → `fetchCallsForConsultant` → `writeCalls` → `calls`. 6-hour overlap absorbs the strict-`>` semantics of `started_after` (DP-2 verified).
+     - `tailSyncCallsThin`: ONE org-wide `/v2/call` via `listDialpadCalls` (no `target_id` filter — per-call attribution on `item.target.id`). `started_after = MAX(date_started_ms) - 6h` from the `calls` table acts as the global watermark; the 6-hour overlap absorbs the strict-`>` semantics of `started_after`. INSERT-OR-IGNORE on `call_id` PK dedups against live `/internal/calls/upsert` writes.
 
 - **`POST /admin/full-rebuild`**: legacy. Kicks off `FullRebuildWorkflow`. Returns `{ ok, workflow_id }` HTTP 202.
 
@@ -892,11 +892,9 @@ Sole writer of `RF_MCP_CACHE` (D1). Deployed independently from the same monorep
 
 - **`CacheSeedWorkflow`** (`cache-worker/src/workflow.js`): new per-table thin-schema seed. Uses `step.do` + retry semantics. Batches 200 rows per `RF_MCP_CACHE.batch(...)`. Resumable on partial failure.
 
-### Why the cron block is commented out
+### Cron history
 
-The legacy `tailSync` path (`INSERT-OR-REPLACE`-everything semantics) was driving ~1M D1 writes/day with zero active consumers. The new `tailSyncThin` path eliminates the write-storm by using INSERT-OR-IGNORE-on-PK and an `added_on` cursor that only processes new candidates.
-
-**Re-enable the cron block at cutover step 2** (the dual-write monitoring phase). The legacy `tailSync` path is now inert during dual-write — gated behind `CRON_LEGACY_ENABLED='false'` default; only `tailSyncThin` runs once `CRON_THIN_ENABLED='true'` is set at step 5. After cutover step 6 drops the legacy tables, the `CRON_LEGACY_ENABLED` gate (and the legacy `tailSync` function itself) is removed; `CRON_THIN_ENABLED` likewise becomes redundant and is removed alongside it.
+The legacy `tailSync` path (`INSERT-OR-REPLACE`-everything semantics) was driving ~1M D1 writes/day with zero active consumers — the cron was disabled on 2026-05-10 to stop the storm. The thin-immutable redesign (2026-05-11) introduced `tailSyncThin` with INSERT-OR-IGNORE-on-PK semantics; the cron block was uncommented during the deploy (2026-05-12) and `CRON_THIN_ENABLED` flipped to `'true'` later that day after seed validation. At that point only `tailSyncThin` runs — `CRON_LEGACY_ENABLED='false'` keeps the legacy writers off. Cutover step 6 (drop legacy tables via `0004_drop_legacy.sql` + remove dual-write code) is still pending; the two env-var gates become redundant once it lands.
 
 ### Additive tail-sync cursor semantics (`fetchCandidatesAddedSince`)
 
@@ -910,7 +908,9 @@ Two complementary write paths keep the `calls` table fresh:
 
 1. **Dialpad hangup webhook (live, ~10–50/day):** `processExtensionCallEvent` on `hangup` → `ctx.waitUntil(forwardHangupToSyncWorker(payload, env))` → service binding `POST /internal/calls/upsert`. Fails silently on 5xx (deploy race or transient); cron backstop catches the miss.
 
-2. **Cron `tailSyncCallsThin` (every 15 min, backstop):** per-consultant fan-out with a 6-hour `MAX(date_started_ms) - 6h` overlap window. INSERT-OR-IGNORE on `call_id` PK ensures idempotency across both write paths.
+2. **Cron `tailSyncCallsThin` (every 15 min, backstop):** ONE org-wide `/v2/call` request (no `target_id` filter — per-call attribution comes from `item.target.id`) with a 6-hour `MAX(date_started_ms) - 6h` overlap window. NO per-consultant fan-out. `listDialpadCalls` from `cache-worker/src/dialpad-list-client.js` paginates with a 25-page cap (cron volume comfortably fits). INSERT-OR-IGNORE on `call_id` PK dedups across both write paths.
+
+3. **CacheSeedWorkflow (one-shot, per-table):** invoked via `POST /admin/cache-rebuild?table=calls[&since=<iso>]` or `wrangler workflows trigger rf-mcp-cache-seed '{"table":"calls"}'`. Paginates `/v2/call` ORG-WIDE via `step.do` per page (one fetch + one D1 write per step) so each step stays well under the CF Workflows 10-min per-step timeout. The cursor checkpoints in each step's persisted output; a workflow restart resumes from the last cached step deterministically. `params.since` (ISO) bounds the lookback; omit for full target history (Dialpad returns every concluded call).
 
 ---
 
@@ -1107,7 +1107,7 @@ The previous KV-backed `extcall:callid:*` design was eventually consistent acros
 | Secret | Used by |
 |--------|---------|
 | `RF_API_KEY` | RF API (`RF-Api-Key` header) — independent secret from the main worker's |
-| `DIALPAD_API_KEY` | Dialpad API (`Authorization: Bearer`) — for `fetchCallsForConsultant` in `dialpad-list-client.js` |
+| `DIALPAD_API_KEY` | Dialpad API (`Authorization: Bearer`) — for `listDialpadCalls` / `listDialpadCallsPage` in `dialpad-list-client.js` |
 | `ADMIN_SECRET` | `X-Admin-Token` for `POST /admin/full-rebuild` and `POST /admin/cache-rebuild` (timing-safe compare) |
 | `INTERNAL_SECRET` | `X-Internal-Token` for `POST /internal/calls/upsert` (service-binding endpoint; same value must be set on both main worker and cache worker) |
 

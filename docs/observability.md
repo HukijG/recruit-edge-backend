@@ -176,7 +176,14 @@ Use `runAI(env, modelName, input, options?)` from `src/lib/ai-instrument.js`. Di
 
 ## Sampling, kill switches, cost
 
-**Head sampling.** Ratio `1.0` (100% of traces are sampled at the worker) to LD, with parent-based sampling (`acceptRemote: true`) so trace context propagates cleanly cross-worker. The tail sampler `[isHeadSampled, isRootErrorSpan]` retains all head-sampled traces and additionally retains error-root spans regardless of head decision — error spans never get dropped.
+**Head sampling.** Path-conditional via `PathRatioSampler` wrapped in `ParentBasedSampler` (see `src/lib/otel-config.js`). High-volume polling routes drop at root-span time so child spans are never created; everything else stays at ratio `1.0`. Current rules in `PATH_SAMPLING_RULES`:
+
+| Path | Ratio | Why |
+|---|---|---|
+| `/extension-call-status` | `0.1` | Extension polls every ~500ms during an active Dialpad call. A 5-min call ≈ 600 polls × 3 spans + log records = 2000 telemetry records that would drown out everything else in LD. 10% keeps a sanity signal. |
+| (default) | `1.0` | Everything else — 100% to LD. |
+
+Cross-worker traces honour upstream head decisions via `ParentBasedSampler` (service-binding inbound). The tail sampler `[isHeadSampled, isRootErrorSpan]` retains all head-sampled traces and additionally retains error-root spans regardless of head decision — error spans never get dropped. **Add new high-volume routes to `PATH_SAMPLING_RULES` rather than per-call overrides.**
 
 **CF native observability.** Set at `head_sampling_rate: 0.1` (10%) in every worker's `wrangler.*.jsonc`. Acts as an always-on no-cost dashboard fallback for cases where LD is unreachable or you want to cross-check via the Cloudflare dashboard.
 
@@ -207,12 +214,23 @@ Resource attributes include `cf.account_id` so LD can pivot by account.
 
 ## Dashboards
 
-Dashboards are LD-UI configured (not in code). The handover at `docs/handovers/2026-05-11-observability-merge-prep.md` (until archived) carries draft queries for each panel. Four dashboards exist or are intended:
+Dashboards are LD-UI configured (not in code). Draft queries for each panel are preserved in `docs/archived/handoffs/2026-05-11-observability-merge-prep.md` § 6.5 if needed. Four dashboards exist in the `rf-dialpad-sync` LD project as of 2026-05-12:
 
-1. **Live firehose** — fast trace stream filtered/grouped by `flow.name`. Use to spot traffic in real-time, drill into a specific flow's spans, or watch a deploy for regressions.
-2. **CF binding usage** — D1 / KV / AI / Worker request rates derived from span aggregations (`db.system`, `db.name`, `cache.operation`, `ai.run` span names, etc.). Cross-references the hourly metrics-poller metrics for storage trend.
-3. **Per-worker request health** — error rate, latency p50 / p95 / p99 per service, grouped by `service.name`. First port of call for Alert 3 (worker error rate).
-4. **Webhook + integration health** — RF / Dialpad / Apollo / Krisp inbound webhook rates + Apollo enrichment outcomes. Consumes the `rf.event_type` and `dialpad.event_type` span attributes set in webhook handlers for per-event-type breakdowns.
+| Name | ID | Path |
+|---|---|---|
+| Flow Health (by flow.name) | `10015443` | `/dashboards/10015443` |
+| Per-worker Health | `10015444` | `/dashboards/10015444` |
+| Webhook + Integration Health | `10015445` | `/dashboards/10015445` |
+| CF Binding Usage | `10015446` | `/dashboards/10015446` |
+
+What each one covers:
+
+1. **Live firehose / Flow Health** — fast trace stream filtered/grouped by `flow.name`. Use to spot traffic in real-time, drill into a specific flow's spans, or watch a deploy for regressions.
+2. **CF Binding Usage** — D1 / KV / AI / Worker request rates derived from span aggregations (`db.system`, `db.name`, `cache.operation`, `ai.run` span names, etc.). Cross-references the hourly metrics-poller metrics for storage trend.
+3. **Per-worker Health** — error rate, latency p50 / p95 / p99 per service, grouped by `service.name`. First port of call for Alert 3 (worker error rate, once alerts land).
+4. **Webhook + Integration Health** — RF / Dialpad / Apollo / Krisp inbound webhook rates + Apollo enrichment outcomes. Consumes the `rf.event_type` and `dialpad.event_type` span attributes set in webhook handlers for per-event-type breakdowns.
+
+(Plus an auto-generated `User Insights` dashboard the LD project ships with — frontend-RUM template, not used by our backend setup.)
 
 ## Pipeline failures (diagnostic recipes)
 
@@ -224,25 +242,21 @@ Dashboards are LD-UI configured (not in code). The handover at `docs/handovers/2
 
 - **`http.response.body` missing on a fetch span.** Check `LOG_NO_BODY` / `OTEL_DISABLED` env vars (if either is set, body content is suppressed). Check the response `content-type` — non-text/JSON content-types (binary, images) are skipped. Check the response size — if `…[truncated, original >${MAX_BODY_BYTES} bytes]` appears at the end of `http.response.body`, the body was oversized and truncated.
 
+- **Body-capture attributes empty on Workflow inner fetches.** Known limitation: body-capture stamps via `trace.getActiveSpan()` which reads from the global `ContextManager`. @microlabs's `instrument()` wraps fetch/scheduled handlers and registers the CF runtime's AsyncLocalStorage context manager, but Workflow `run()` bodies run OUTSIDE that wrap. The cache-worker's `bootstrap-otel.js` provides a Workflow-local `BasicTracerProvider` (intentionally NOT registered globally — would collide with @microlabs's WorkerTracerProvider), so `trace.getActiveSpan()` from inside an auto-instrumented fetch returns NoOp in Workflow context. Workaround: instrument Workflow-internal fetches with explicit structured `console.log` records (see `cache-worker/src/dialpad-list-client.js` for the per-page log shape). Logs land in LD's Logs tab without trace correlation (`spanID` empty) but are queryable by `service_name` + custom attributes.
+
 - **Cross-worker traces don't link.** Verify the upstream worker's outbound fetch went through `@microlabs` — i.e., `instrument()` was active on the upstream's default export and the upstream worker has `LD_SDK_KEY` set. The upstream sets `traceparent` on the outbound request; the downstream's `acceptRemote: true` parent-based sampler picks it up. If the upstream has `LD_SDK_KEY` unset (test-isolation conditional fell to the bare handler), no `traceparent` is emitted and traces will appear as two unrelated trees.
 
 - **Metrics-poller stale (no new metrics arriving).** See Alert 6 in `docs/observability-runbooks.md`. Common cause: expired `CF_API_TOKEN` secret.
 
 ## Known gaps (instrumentation work pending)
 
-These were identified during the 2026-05-12 production smoke test. Full context + remediation plan: `docs/handovers/2026-05-12-deploy-and-observability-gaps.md`.
-
 - **Inbound request body is NOT captured on the root fetchHandler span.** Body-capture wrapper only patches `globalThis.fetch` (outbound). Inbound MCP / webhook bodies are invisible in LD. Fix: small patch to read `request.clone().text()` at entry and stamp `http.request.body` on the root span. Sibling-copy across all 4 workers' `lib/body-capture.{js,ts}`.
 
 - **MCP handler internal flow is NOT spanned.** A `/mcp/candidate-get` trace shows the inbound span + auto-instrumented D1 lookup + outbound RF fetch — but NOT the decisions in between (snapshot load, tier-1 fuzzy match, tier-2 RF routing, predicate build, response shaping). These have structured `console.log` lines (which DO appear in LD's Logs tab, correlated by `trace_id`) but no spans. Fix: add `tracer.startActiveSpan` calls at decision points inside `src/mcp/{candidate-search,candidate-get,job-pipeline,job-candidates-filter,candidate-call-notes,snapshot,resolvers,fuzzy}.js`. Estimated 2–4 h of work.
 
-- **LD dashboards not yet built.** Without per-`flow.name`-grouped dashboards, the LD UI defaults to a raw span firehose, which is not actually useful for debugging. Phase I work — see `docs/handovers/2026-05-11-observability-merge-prep.md` § 6.5 for the SQL query bodies, and add a "per-flow.name request health" panel beyond the original 4 (groups by `attribute_flow_name`, surfaces count + p50/p95/p99 + error rate per flow — the UX a flow-driven team actually wants).
+- **LD alerts not yet built.** Five alerts originally planned (D1 write storm, AI usage, per-worker error rate ×4, ingest near ceiling, cron stall). Dashboards above are live; alerts pending. SQL query bodies preserved in `docs/archived/handoffs/2026-05-11-observability-merge-prep.md` § 6.5.
 
 ## Reference
 
 - Runbooks: `docs/observability-runbooks.md`
-- Spec: `docs/archive/specs/2026-05-10-observability-launchdarkly-design.md` (will archive on confirmed-shipped)
-- Plan: `docs/archive/plans/2026-05-10-observability-launchdarkly.md` (same)
-- Handover (parallel thin-cache branch merge prep): `docs/handovers/2026-05-11-observability-merge-prep.md` (will archive after merge)
-- Handover (deploy outcome + legibility gaps from 2026-05-12 smoke test): `docs/handovers/2026-05-12-deploy-and-observability-gaps.md`
 - Vendor patch: `vendor/otel-cf-workers/VENDOR.md`
