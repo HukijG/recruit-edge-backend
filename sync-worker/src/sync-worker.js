@@ -9,7 +9,7 @@ bootstrapOtelForWorkflows('rf-mcp-cache-sync');
 
 import { instrument } from '@microlabs/otel-cf-workers';
 import { resolveOtelConfig } from './lib/otel-config.js';
-import { trace } from '@opentelemetry/api';
+import { trace, SpanStatusCode } from '@opentelemetry/api';
 import { FLOWS } from './lib/flow-names.js';
 import * as rfClient from './rf-list-client.js';
 import {
@@ -55,6 +55,7 @@ async function handleAdmin(request, env, ctx) {
   }
 
   if (url.pathname === '/admin/cache-rebuild' && request.method === 'POST') {
+    trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.ADMIN_TRIGGER_CACHE_REBUILD);
     const table = url.searchParams.get('table');  // 'candidates' | 'jobs' | 'calls'
     const since = url.searchParams.get('since');  // optional ISO date (calls only)
     if (!['candidates', 'jobs', 'calls'].includes(table)) {
@@ -224,150 +225,192 @@ export async function tailSyncThin(env) {
 }
 
 async function tailSyncCandidatesThin(env) {
-  const t0 = Date.now();
-  // Watchdog first: if a prior tick crashed without releasing the lease,
-  // clear it after WATCHDOG_HOURS so we don't block forever.
-  await watchdogSubtask(env, 'thin_candidates_in_flight', 'thin_candidates_done_at', 'candidates');
-  if (await readSyncState(env, 'thin_candidates_in_flight')) {
-    console.log({
-      message: '[sync] candidates subtask already in flight, skipping',
-      source: 'sync-worker', subtask: 'candidates', op: 'skip_in_flight',
-    });
-    return;
-  }
-  await writeSyncState(env, 'thin_candidates_in_flight', new Date().toISOString());
-  try {
-    // Cold-start default: 2-year lookback (mirrors `runCacheSeed`'s seed
-    // default). The previous 1-day default meant a fresh deployment without
-    // a prior admin seed silently lost anything older than a day.
-    const cursor = (await readSyncState(env, 'last_candidates_added_cursor'))
-      ?? new Date(Date.now() - TWO_YEARS_MS).toISOString();
-    const { rows, suggestedCursor, capped } = await rfClient.fetchCandidatesAddedSince(env, cursor);
-    // writeCandidatesThin is per-row resilient: a single malformed RF row
-    // emits a structured `skip_row` log line and is omitted from the batch;
-    // the rest of the page still lands. The cursor still advances because
-    // RF returned a valid page.
-    await writeCandidatesThin(env, rows);
-    await writeSyncState(env, 'last_candidates_added_cursor', suggestedCursor);
-    await writeSyncState(env, 'thin_candidates_done_at', new Date().toISOString());
-    console.log({
-      message: `[sync] candidates tick rows=${rows.length} capped=${capped} took=${Date.now() - t0}ms`,
-      source: 'sync-worker', subtask: 'candidates',
-      rows: rows.length, capped, durationMs: Date.now() - t0,
-    });
-  } catch (err) {
-    console.error({
-      message: `[sync] candidates tick failed: ${err.message}`,
-      source: 'sync-worker', subtask: 'candidates',
-      error: err.message, stack: err.stack,
-    });
-  } finally {
-    await deleteSyncState(env, 'thin_candidates_in_flight');
-  }
+  const tracer = trace.getTracer('rf-mcp-cache-sync');
+  return tracer.startActiveSpan(
+    'cache.cron.tick',
+    { attributes: { 'flow.name': FLOWS.CRON_CANDIDATES_TICK, 'table': 'candidates_v2' } },
+    async (span) => {
+      const t0 = Date.now();
+      // Watchdog first: if a prior tick crashed without releasing the lease,
+      // clear it after WATCHDOG_HOURS so we don't block forever.
+      await watchdogSubtask(env, 'thin_candidates_in_flight', 'thin_candidates_done_at', 'candidates');
+      if (await readSyncState(env, 'thin_candidates_in_flight')) {
+        span.setAttribute('skipped', 'in_flight');
+        console.log({
+          message: '[sync] candidates subtask already in flight, skipping',
+          source: 'sync-worker', subtask: 'candidates', op: 'skip_in_flight',
+        });
+        span.end();
+        return;
+      }
+      await writeSyncState(env, 'thin_candidates_in_flight', new Date().toISOString());
+      try {
+        // Cold-start default: 2-year lookback (mirrors `runCacheSeed`'s seed
+        // default). The previous 1-day default meant a fresh deployment without
+        // a prior admin seed silently lost anything older than a day.
+        const cursor = (await readSyncState(env, 'last_candidates_added_cursor'))
+          ?? new Date(Date.now() - TWO_YEARS_MS).toISOString();
+        const { rows, suggestedCursor, capped } = await rfClient.fetchCandidatesAddedSince(env, cursor);
+        // writeCandidatesThin is per-row resilient: a single malformed RF row
+        // emits a structured `skip_row` log line and is omitted from the batch;
+        // the rest of the page still lands. The cursor still advances because
+        // RF returned a valid page.
+        await writeCandidatesThin(env, rows);
+        await writeSyncState(env, 'last_candidates_added_cursor', suggestedCursor);
+        await writeSyncState(env, 'thin_candidates_done_at', new Date().toISOString());
+        span.setAttribute('rows_inserted', rows.length);
+        span.setAttribute('capped', capped);
+        console.log({
+          message: `[sync] candidates tick rows=${rows.length} capped=${capped} took=${Date.now() - t0}ms`,
+          source: 'sync-worker', subtask: 'candidates',
+          rows: rows.length, capped, durationMs: Date.now() - t0,
+        });
+      } catch (err) {
+        span.recordException(err);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message || err) });
+        console.error({
+          message: `[sync] candidates tick failed: ${err.message}`,
+          source: 'sync-worker', subtask: 'candidates',
+          error: err.message, stack: err.stack,
+        });
+      } finally {
+        await deleteSyncState(env, 'thin_candidates_in_flight');
+        span.end();
+      }
+    },
+  );
 }
 
 async function tailSyncJobsThin(env) {
-  const t0 = Date.now();
-  await watchdogSubtask(env, 'thin_jobs_in_flight', 'thin_jobs_done_at', 'jobs');
-  if (await readSyncState(env, 'thin_jobs_in_flight')) {
-    console.log({
-      message: '[sync] jobs subtask already in flight, skipping',
-      source: 'sync-worker', subtask: 'jobs', op: 'skip_in_flight',
-    });
-    return;
-  }
-  await writeSyncState(env, 'thin_jobs_in_flight', new Date().toISOString());
-  try {
-    const allJobs = await rfClient.fetchAllJobs(env);
-    const knownIds = new Set(
-      ((await env.RF_MCP_CACHE.prepare('SELECT id FROM jobs_v2').all()).results ?? [])
-        .map(r => r.id)
-    );
-    const newJobs = allJobs.filter(j => !knownIds.has(j.id));
-    const pipelineByJobId = new Map();
-    for (const job of newJobs) {
-      try {
-        const pipeline = await rfClient.fetchJobPipeline(env, job.id);
-        pipelineByJobId.set(job.id, pipeline?.summary ?? []);
-      } catch (err) {
-        console.warn({
-          message: `[sync] /job/pipeline fetch failed job=${job.id}: ${err.message}`,
-          source: 'sync-worker', subtask: 'jobs',
+  const tracer = trace.getTracer('rf-mcp-cache-sync');
+  return tracer.startActiveSpan(
+    'cache.cron.tick',
+    { attributes: { 'flow.name': FLOWS.CRON_JOBS_TICK, 'table': 'jobs_v2' } },
+    async (span) => {
+      const t0 = Date.now();
+      await watchdogSubtask(env, 'thin_jobs_in_flight', 'thin_jobs_done_at', 'jobs');
+      if (await readSyncState(env, 'thin_jobs_in_flight')) {
+        span.setAttribute('skipped', 'in_flight');
+        console.log({
+          message: '[sync] jobs subtask already in flight, skipping',
+          source: 'sync-worker', subtask: 'jobs', op: 'skip_in_flight',
         });
+        span.end();
+        return;
       }
-    }
-    await writeJobsThin(env, allJobs, { pipelineByJobId });
-    await writeSyncState(env, 'thin_jobs_done_at', new Date().toISOString());
-    console.log({
-      message: `[sync] jobs tick total=${allJobs.length} new=${newJobs.length} took=${Date.now() - t0}ms`,
-      source: 'sync-worker', subtask: 'jobs',
-      total: allJobs.length, new: newJobs.length, durationMs: Date.now() - t0,
-    });
-  } catch (err) {
-    console.error({
-      message: `[sync] jobs tick failed: ${err.message}`,
-      source: 'sync-worker', subtask: 'jobs',
-      error: err.message, stack: err.stack,
-    });
-  } finally {
-    await deleteSyncState(env, 'thin_jobs_in_flight');
-  }
+      await writeSyncState(env, 'thin_jobs_in_flight', new Date().toISOString());
+      try {
+        const allJobs = await rfClient.fetchAllJobs(env);
+        const knownIds = new Set(
+          ((await env.RF_MCP_CACHE.prepare('SELECT id FROM jobs_v2').all()).results ?? [])
+            .map(r => r.id)
+        );
+        const newJobs = allJobs.filter(j => !knownIds.has(j.id));
+        const pipelineByJobId = new Map();
+        for (const job of newJobs) {
+          try {
+            const pipeline = await rfClient.fetchJobPipeline(env, job.id);
+            pipelineByJobId.set(job.id, pipeline?.summary ?? []);
+          } catch (err) {
+            console.warn({
+              message: `[sync] /job/pipeline fetch failed job=${job.id}: ${err.message}`,
+              source: 'sync-worker', subtask: 'jobs',
+            });
+          }
+        }
+        await writeJobsThin(env, allJobs, { pipelineByJobId });
+        await writeSyncState(env, 'thin_jobs_done_at', new Date().toISOString());
+        span.setAttribute('rows_inserted', newJobs.length);
+        span.setAttribute('total_jobs', allJobs.length);
+        console.log({
+          message: `[sync] jobs tick total=${allJobs.length} new=${newJobs.length} took=${Date.now() - t0}ms`,
+          source: 'sync-worker', subtask: 'jobs',
+          total: allJobs.length, new: newJobs.length, durationMs: Date.now() - t0,
+        });
+      } catch (err) {
+        span.recordException(err);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message || err) });
+        console.error({
+          message: `[sync] jobs tick failed: ${err.message}`,
+          source: 'sync-worker', subtask: 'jobs',
+          error: err.message, stack: err.stack,
+        });
+      } finally {
+        await deleteSyncState(env, 'thin_jobs_in_flight');
+        span.end();
+      }
+    },
+  );
 }
 
 async function tailSyncCallsThin(env) {
-  const t0 = Date.now();
-  await watchdogSubtask(env, 'thin_calls_in_flight', 'thin_calls_done_at', 'calls');
-  if (await readSyncState(env, 'thin_calls_in_flight')) {
-    console.log({
-      message: '[sync] calls subtask already in flight, skipping',
-      source: 'sync-worker', subtask: 'calls', op: 'skip_in_flight',
-    });
-    return;
-  }
-  await writeSyncState(env, 'thin_calls_in_flight', new Date().toISOString());
-  try {
-    const consultants = await listConsultants(env);
-    let totalRows = 0;
-    for (const c of consultants) {
-      try {
-        const lastSeenRow = await env.RF_MCP_CACHE
-          .prepare('SELECT MAX(date_started_ms) AS max FROM calls WHERE target_dialpad_id = ?')
-          .bind(c.dialpadId).first();
-        // Cold-start default: 2-year lookback per consultant. Decision: the
-        // seed default is 2 years (`runCacheSeed`), and the operating envelope
-        // (Dialpad call history across consultants) does fit a 2-year window
-        // without overwhelming the MAX_PAGES=25 cap (call volume per consultant
-        // is at most a few thousand per year). Picking the seed-symmetric
-        // default avoids the same "fresh deploy silently loses old calls" trap
-        // as the candidates cursor (#5).
-        const lastSeenMs = (lastSeenRow?.max != null) ? lastSeenRow.max : (Date.now() - TWO_YEARS_MS);
-        const startedAfterMs = Math.max(0, lastSeenMs - SIX_HOURS_MS);
-        const calls = await fetchCallsForConsultant(env, c.dialpadId, startedAfterMs);
-        await writeCalls(env, calls);
-        totalRows += calls.length;
-      } catch (err) {
-        console.error({
-          message: `[sync] calls tick consultant=${c.dialpadId} failed: ${err.message}`,
-          source: 'sync-worker', subtask: 'calls',
-          consultantDialpadId: c.dialpadId, error: err.message,
+  const tracer = trace.getTracer('rf-mcp-cache-sync');
+  return tracer.startActiveSpan(
+    'cache.cron.tick',
+    { attributes: { 'flow.name': FLOWS.CRON_CALLS_TICK, 'table': 'calls' } },
+    async (span) => {
+      const t0 = Date.now();
+      await watchdogSubtask(env, 'thin_calls_in_flight', 'thin_calls_done_at', 'calls');
+      if (await readSyncState(env, 'thin_calls_in_flight')) {
+        span.setAttribute('skipped', 'in_flight');
+        console.log({
+          message: '[sync] calls subtask already in flight, skipping',
+          source: 'sync-worker', subtask: 'calls', op: 'skip_in_flight',
         });
+        span.end();
+        return;
       }
-    }
-    await writeSyncState(env, 'thin_calls_done_at', new Date().toISOString());
-    console.log({
-      message: `[sync] calls tick consultants=${consultants.length} rows=${totalRows} took=${Date.now() - t0}ms`,
-      source: 'sync-worker', subtask: 'calls',
-      consultants: consultants.length, rows: totalRows, durationMs: Date.now() - t0,
-    });
-  } catch (err) {
-    console.error({
-      message: `[sync] calls tick failed: ${err.message}`,
-      source: 'sync-worker', subtask: 'calls',
-      error: err.message, stack: err.stack,
-    });
-  } finally {
-    await deleteSyncState(env, 'thin_calls_in_flight');
-  }
+      await writeSyncState(env, 'thin_calls_in_flight', new Date().toISOString());
+      try {
+        const consultants = await listConsultants(env);
+        let totalRows = 0;
+        for (const c of consultants) {
+          try {
+            const lastSeenRow = await env.RF_MCP_CACHE
+              .prepare('SELECT MAX(date_started_ms) AS max FROM calls WHERE target_dialpad_id = ?')
+              .bind(c.dialpadId).first();
+            // Cold-start default: 2-year lookback per consultant. Decision: the
+            // seed default is 2 years (`runCacheSeed`), and the operating envelope
+            // (Dialpad call history across consultants) does fit a 2-year window
+            // without overwhelming the MAX_PAGES=25 cap (call volume per consultant
+            // is at most a few thousand per year). Picking the seed-symmetric
+            // default avoids the same "fresh deploy silently loses old calls" trap
+            // as the candidates cursor (#5).
+            const lastSeenMs = (lastSeenRow?.max != null) ? lastSeenRow.max : (Date.now() - TWO_YEARS_MS);
+            const startedAfterMs = Math.max(0, lastSeenMs - SIX_HOURS_MS);
+            const calls = await fetchCallsForConsultant(env, c.dialpadId, startedAfterMs);
+            await writeCalls(env, calls);
+            totalRows += calls.length;
+          } catch (err) {
+            console.error({
+              message: `[sync] calls tick consultant=${c.dialpadId} failed: ${err.message}`,
+              source: 'sync-worker', subtask: 'calls',
+              consultantDialpadId: c.dialpadId, error: err.message,
+            });
+          }
+        }
+        await writeSyncState(env, 'thin_calls_done_at', new Date().toISOString());
+        span.setAttribute('rows_inserted', totalRows);
+        span.setAttribute('consultants', consultants.length);
+        console.log({
+          message: `[sync] calls tick consultants=${consultants.length} rows=${totalRows} took=${Date.now() - t0}ms`,
+          source: 'sync-worker', subtask: 'calls',
+          consultants: consultants.length, rows: totalRows, durationMs: Date.now() - t0,
+        });
+      } catch (err) {
+        span.recordException(err);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message || err) });
+        console.error({
+          message: `[sync] calls tick failed: ${err.message}`,
+          source: 'sync-worker', subtask: 'calls',
+          error: err.message, stack: err.stack,
+        });
+      } finally {
+        await deleteSyncState(env, 'thin_calls_in_flight');
+        span.end();
+      }
+    },
+  );
 }
 
 async function handleInternal(request, env, ctx) {
@@ -382,6 +425,7 @@ async function handleInternal(request, env, ctx) {
   const url = new URL(request.url);
 
   if (url.pathname === '/internal/calls/upsert') {
+    trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.INTERNAL_CALLS_UPSERT);
     if (request.method !== 'POST') {
       return new Response('method not allowed', { status: 405 });
     }

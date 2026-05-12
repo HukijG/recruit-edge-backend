@@ -10,8 +10,14 @@ describe('FLOWS registry', () => {
     const expected = [
       'WORKFLOW_FULL_REBUILD',
       'WORKFLOW_PIPELINE_REBUILD',
+      'WORKFLOW_CACHE_SEED',
       'CRON_TAIL_SYNC',
+      'CRON_CANDIDATES_TICK',
+      'CRON_JOBS_TICK',
+      'CRON_CALLS_TICK',
       'ADMIN_TRIGGER_FULL_REBUILD',
+      'ADMIN_TRIGGER_CACHE_REBUILD',
+      'INTERNAL_CALLS_UPSERT',
     ];
     for (const key of expected) {
       expect(FLOWS[key], `FLOWS.${key} should be defined`).toBeDefined();

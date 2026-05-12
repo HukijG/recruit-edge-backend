@@ -282,6 +282,26 @@ export async function runCacheSeed(env, step, instanceId, params = {}) {
 
 export class CacheSeedWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
-    return runCacheSeed(this.env, step, event.instanceId, event.payload);
+    const tracer = trace.getTracer('rf-mcp-cache-sync');
+    return await tracer.startActiveSpan(
+      'WorkflowCacheSeed',
+      { attributes: { 'flow.name': FLOWS.WORKFLOW_CACHE_SEED, 'workflow.id': event.instanceId } },
+      async (span) => {
+        try {
+          return await runCacheSeed(
+            this.env,
+            instrumentedStep(step, 'rf-mcp-cache-sync', event.instanceId),
+            event.instanceId,
+            event.payload,
+          );
+        } catch (err) {
+          span.recordException(err);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message || err) });
+          throw err;
+        } finally {
+          span.end();
+        }
+      }
+    );
   }
 }
