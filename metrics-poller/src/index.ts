@@ -20,25 +20,68 @@ interface Env {
   LD_OTLP_METRICS_URL: string;
 }
 
+async function runTick(env: Env): Promise<{ ok: boolean; durationMs: number; d1Count: number; kvCount: number; aiNeurons: number | null; error?: string }> {
+  console.log({ source: 'metrics-poller', message: 'tick start' });
+  const t0 = Date.now();
+  try {
+    const metrics = await fetchCFMetrics(env);
+    await pushOTelMetrics(env, metrics);
+    const result = {
+      ok: true,
+      durationMs: Date.now() - t0,
+      d1Count: metrics.d1Storage.length,
+      kvCount: metrics.kvStorage.length,
+      aiNeurons: metrics.aiUsage?.neurons ?? null,
+    };
+    console.log({ source: 'metrics-poller', message: 'tick ok', ...result });
+    return result;
+  } catch (err) {
+    console.error({ source: 'metrics-poller', message: 'tick failed', error: String(err) });
+    return { ok: false, durationMs: Date.now() - t0, d1Count: 0, kvCount: 0, aiNeurons: null, error: String(err) };
+  }
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  const ea = new TextEncoder().encode(a);
+  const eb = new TextEncoder().encode(b);
+  if (ea.length !== eb.length) {
+    let dummy = 0;
+    for (let i = 0; i < ea.length; i++) dummy |= ea[i];
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < ea.length; i++) diff |= ea[i] ^ eb[i];
+  return diff === 0;
+}
+
 const handler = {
   async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext) {
     trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.CRON_METRICS_TICK);
-    console.log({ source: 'metrics-poller', message: 'tick start' });
-    const t0 = Date.now();
-    try {
-      const metrics = await fetchCFMetrics(env);
-      await pushOTelMetrics(env, metrics);
-      console.log({
-        source: 'metrics-poller',
-        message: 'tick ok',
-        d1_count: metrics.d1Storage.length,
-        kv_count: metrics.kvStorage.length,
-        ai_neurons: metrics.aiUsage?.neurons ?? null,
-        duration_ms: Date.now() - t0,
-      });
-    } catch (err) {
-      console.error({ source: 'metrics-poller', message: 'tick failed', error: String(err) });
+    await runTick(env);
+  },
+
+  /**
+   * Manual-trigger endpoint for smoke-testing the cron path without waiting
+   * for the next top-of-hour. Auth-gated by X-Test-Token: env.CF_API_TOKEN
+   * (constant-time compare). Returns the same shape `runTick` returns so
+   * the caller can verify GraphQL + OTLP push results inline.
+   *
+   * Same auth secret as the upstream GraphQL call so no extra secret needs
+   * provisioning. The token surface is identical to what's already on the
+   * wire to CF GraphQL — no incremental exposure.
+   */
+  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname !== '/__test-trigger') {
+      return new Response('not found', { status: 404 });
     }
+    const token = request.headers.get('X-Test-Token');
+    if (!env.CF_API_TOKEN || !token || !timingSafeEqual(token, env.CF_API_TOKEN)) {
+      return new Response('unauthorized', { status: 401 });
+    }
+    trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.CRON_METRICS_TICK);
+    const result = await runTick(env);
+    return Response.json(result, { status: result.ok ? 200 : 500 });
   },
 };
 
