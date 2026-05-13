@@ -1,0 +1,42 @@
+{
+  "mcpServers": {
+    "recruiterflow-api-spec": {
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "--network",
+        "host",
+        "-e",
+        "OPENAPI_JSON_DOCS_URL=http://127.0.0.1:38765/recruiterflow_spec.json",
+        "-e",
+        "MCP_API_PREFIX=rf",
+        "-e",
+        "GLOBAL_TOOL_PROMPT=Recruiterflow ATS/CRM raw REST API ??? full OpenAPI spec covering candidates, jobs, contacts, companies, deals, tasks, activities, emails, pipeline data. The /api/external/{candidate,contact,job,client,deal}/search endpoints have INLINE filter syntax + complete system-field documentation in their schema descriptions (conjunctions, filter types, field names, ID-vs-name semantics) ??? use rf_api_request_schema to retrieve them when designing search payloads. Prefer the dedicated Recruiterflow MCP for typical workflows; use this for endpoints not covered there or when you need raw REST.",
+        "buryhuang/mcp-server-any-openapi:latest"
+      ],
+      "env": {}
+    },
+    "dialpad-api-spec": {
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "--network",
+        "host",
+        "-e",
+        "OPENAPI_JSON_DOCS_URL=http://127.0.0.1:38765/dialpad_spec.json",
+        "-e",
+        "MCP_API_PREFIX=voip",
+        "-e",
+        "GLOBAL_TOOL_PROMPT=Dialpad business telephony / VoIP REST API ??? calls, SMS, voicemail, recordings, transcripts, users, offices, departments, contact centers, ring groups. Use for any Dialpad operation.",
+        "buryhuang/mcp-server-any-openapi:latest"
+      ],
+      "env": {}
+    }
+  }
+}

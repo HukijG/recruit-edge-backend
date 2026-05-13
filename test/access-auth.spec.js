@@ -110,6 +110,48 @@ describe('verifyAccessJwt', () => {
     ).toBeNull();
   });
 
+  it('accepts opts.issuer override (SaaS-OIDC shape)', async () => {
+    // Production App 2 issues access_tokens with iss = team_domain/cdn-cgi/access/sso/oidc/<client_id>
+    // and aud = the registered redirect URI. Verifier must accept that shape when caller passes
+    // opts.issuer; the default (no opts) still validates against the bare team domain.
+    const ssoIssuer = `${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/sso/oidc/${'c'.repeat(64)}`;
+    const redirectUri = 'https://test-ext-primary.chromiumapp.org/oauth-callback';
+    const jwt = await makeJwt({ email: 'joel@test.local', sub: 'user-1' }, { iss: ssoIssuer, aud: redirectUri });
+
+    // Default issuer rejects the SaaS-OIDC token (team-domain mismatch).
+    const defaultClaims = await verifyAccessJwt(
+      reqWith({ 'Cf-Access-Jwt-Assertion': jwt }),
+      env,
+      redirectUri,
+    );
+    expect(defaultClaims).toBeNull();
+
+    // With opts.issuer override, the same token validates.
+    const overrideClaims = await verifyAccessJwt(
+      reqWith({ 'Cf-Access-Jwt-Assertion': jwt }),
+      env,
+      redirectUri,
+      { issuer: ssoIssuer },
+    );
+    expect(overrideClaims).toEqual({ email: 'joel@test.local', sub: 'user-1' });
+  });
+
+  it('accepts an array of audiences (multi-redirect-URI registration)', async () => {
+    const ssoIssuer = `${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/sso/oidc/${'c'.repeat(64)}`;
+    const acceptedAuds = [
+      'https://ext-a.chromiumapp.org/oauth-callback',
+      'https://ext-b.chromiumapp.org/oauth-callback',
+    ];
+    const jwt = await makeJwt({ email: 'joel@test.local', sub: 'user-1' }, { iss: ssoIssuer, aud: acceptedAuds[1] });
+    const claims = await verifyAccessJwt(
+      reqWith({ 'Cf-Access-Jwt-Assertion': jwt }),
+      env,
+      acceptedAuds,
+      { issuer: ssoIssuer },
+    );
+    expect(claims).toEqual({ email: 'joel@test.local', sub: 'user-1' });
+  });
+
   it('_setJwksForTests(null) resets to remote source', async () => {
     // After resetting, the next call falls through to createRemoteJWKSet(URL),
     // which on the test domain (https://test.cloudflareaccess.com) will fail

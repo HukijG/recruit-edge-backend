@@ -36,24 +36,27 @@ If you're unsure whether a new endpoint needs Access:
 | App | Status | Worker | URL | AUD env var | Notes |
 |---|---|---|---|---|---|
 | **App 1** | ✅ Live | `rf-mcp-remote` | `rf-mcp-remote.<account>.workers.dev` (hostname-only — Managed OAuth requires no path) | `ACCESS_AUD_MCP` (secret) | Self-hosted, Managed OAuth ON, DCR enabled, allowed redirect URI `https://claude.ai/api/mcp/auth_callback` |
-| **App 2** | ✅ Phase 2 (code live; dashboard config + secret operator-pending) | `rf-dialpad-sync-dev` (extension API) | TBD | `ACCESS_AUD_MIDDLEWARE` (secret, operator-pending) | Phase 2 dual-auth helper shipped in `src/auth-extension.js`. Cloudflare Access App 2 dashboard creation, `ACCESS_AUD_MIDDLEWARE` secret set, and the operator's separate extension build remain. Phase 3 (legacy header removal + edge gating) is future work. |
+| **App 2** | ✅ Phase 2 (code live; dashboard config + secrets operator-pending) | `rf-dialpad-sync-dev` (extension API) | TBD | `ACCESS_AUD_MIDDLEWARE` (secret, operator-pending) + `ACCESS_CLIENT_ID_MIDDLEWARE` (secret, operator-pending) | SaaS-OIDC, public PKCE client. Phase 2 dual-auth helper at `src/auth-extension.js`. Cloudflare Access App 2 dashboard creation, both `ACCESS_*_MIDDLEWARE` secrets set, and the operator's separate extension build remain. Phase 3 (legacy header removal + edge gating) is future work. |
 
 ### Extension OAuth client contract (App 2)
 
-App 2's OAuth client is consumed by the operator's separate extension workstream. This is the frozen contract — values are captured at App 2 creation and don't change across Phase 2 → Phase 3.
+App 2's OAuth client is consumed by the operator's separate extension workstream. The extension uses OIDC discovery against the issuer, so the only frozen contract values are the issuer URL, client_id, and redirect URI(s).
 
 | Property | Value |
 |---|---|
-| Authorization endpoint | `https://example-team.cloudflareaccess.com/cdn-cgi/access/sso/oauth2/<client_id>/authorize` |
-| Token endpoint | `https://example-team.cloudflareaccess.com/cdn-cgi/access/sso/oauth2/<client_id>/token` |
+| Discovery URL | `https://example-team.cloudflareaccess.com/cdn-cgi/access/sso/oidc/<client_id>/.well-known/openid-configuration` |
+| Issuer | `https://example-team.cloudflareaccess.com/cdn-cgi/access/sso/oidc/<client_id>` |
+| Authorization endpoint | Discovered from `authorization_endpoint` in the discovery doc |
+| Token endpoint | Discovered from `token_endpoint` in the discovery doc |
 | Grant type | `authorization_code` + `refresh_token` |
 | PKCE | Required (`code_challenge_method=S256`, verifier ≥ 256 bits randomness) |
-| Client type | Public (no `client_secret`) |
-| Client ID | Captured at App 2 creation |
-| Redirect URI | `https://<chrome-extension-id>.chromiumapp.org/oauth-callback` (multiple allowed) |
-| Audience | `<ACCESS_AUD_MIDDLEWARE>` |
+| Client type | Public; the dashboard issues a `client_secret` but the extension does NOT use it (`token_endpoint_auth_method = none`) |
+| Client ID | Captured at App 2 creation. Also stored on the worker as `ACCESS_CLIENT_ID_MIDDLEWARE` for issuer construction during JWT validation |
+| Redirect URI | `https://<chrome-extension-id>.chromiumapp.org/oauth-callback` (multiple allowed; the worker accepts any registered URI via comma-separated `ACCESS_AUD_MIDDLEWARE`) |
+| `aud` claim on access_token | **The registered redirect URI** — not the `client_id`, not an Application Audience (AUD) tag. (Cloudflare's SaaS-OIDC mode does not surface an AUD tag in the dashboard; the AUD tag is a self-hosted concept.) The worker validates against the value(s) in `ACCESS_AUD_MIDDLEWARE`. |
+| `aud` claim on id_token | `client_id` (standard OIDC). The extension validates this client-side via `oauth4webapi.processAuthorizationCodeResponse`. The worker does NOT consume the id_token. |
 | Scopes | `openid email profile` |
-| Token storage | Operator's choice; refresh on 401, "needs reconnect" on refresh failure |
+| Token storage | Operator's choice; refresh on 401 `auth_jwt_invalid`, "needs reconnect" on refresh failure |
 | Outbound header | `Authorization: Bearer <access_token>` |
 
 ### Code surface
@@ -61,19 +64,20 @@ App 2's OAuth client is consumed by the operator's separate extension workstream
 - **JWT validation helper** — same shape, two languages:
   - `src/access-auth.js` (main worker, JS)
   - `mcp-remote/src/access-auth.ts` (MCP worker, TS)
-  - Public API: `verifyAccessJwt(request, env, expectedAud) → Promise<{ email, sub } | null>`. Reads `Cf-Access-Jwt-Assertion` header first, falls back to `Authorization: Bearer`. Validates RS256 signature against Access JWKS, issuer = `env.ACCESS_TEAM_DOMAIN`, audience = `expectedAud`. Empty-string defense on email/sub. Returns lowercased email.
+  - Public API: `verifyAccessJwt(request, env, expectedAud, opts?) → Promise<{ email, sub } | null>`. Reads `Cf-Access-Jwt-Assertion` header first, falls back to `Authorization: Bearer`. Validates RS256 signature against the team-wide Access JWKS (`${ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs` — Cloudflare signs all apps in a tenant with the same keypair). `expectedAud` accepts string or string[]. `opts.issuer` overrides the expected `iss` claim — defaults to `env.ACCESS_TEAM_DOMAIN` (App 1 / MCP self-hosted shape). App 2 / extension callers pass `opts.issuer = \`\${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/sso/oidc/\${env.ACCESS_CLIENT_ID_MIDDLEWARE}\`` (SaaS-OIDC shape). Empty-string defense on email/sub. Returns lowercased email.
   - Test fixture (mcp-remote side): `mcp-remote/test/jwt-fixture.ts` — RSA keypair, JWKS injection via `_setJwksForTests`, signed-JWT minting with optional `aud` / `iss` overrides.
   - The mcp-remote file has an exported `_MODULE_ID = "mcp-remote/access-auth"` sentinel; the test asserts it in `beforeAll` to guard against vite resolving the import to the main worker's file via relative-path fallback.
 
 - **Env vars**:
   - `ACCESS_TEAM_DOMAIN` — non-secret, set as `vars` in `wrangler.jsonc` + `wrangler.mcp.jsonc`. Currently `https://example-team.cloudflareaccess.com`.
-  - `ACCESS_AUD_MCP` — secret, set on `rf-mcp-remote` via `wrangler secret put`. 64-char hex tag from the App 1 dashboard.
-  - `ACCESS_AUD_MIDDLEWARE` — secret, set on `rf-dialpad-sync-dev` by the operator when creating Access App 2 (see handoff doc; Phase 2 code is live but the secret is operator-pending).
+  - `ACCESS_AUD_MCP` — secret, set on `rf-mcp-remote` via `wrangler secret put`. 64-char hex Application Audience (AUD) Tag from the App 1 dashboard (self-hosted Managed OAuth — has an AUD tag).
+  - `ACCESS_AUD_MIDDLEWARE` — secret, set on `rf-dialpad-sync-dev` by the operator. Value is the **registered redirect URI(s)** for App 2's OAuth client (e.g., `https://<chrome-extension-id>.chromiumapp.org/oauth-callback`). Supports comma-separated values to accept multiple registered redirect URIs without code changes. **Not** the client_id; **not** an AUD tag (Cloudflare SaaS-OIDC apps don't have one).
+  - `ACCESS_CLIENT_ID_MIDDLEWARE` — secret, set on `rf-dialpad-sync-dev` by the operator. Value is App 2's OAuth client_id (64-char hex). The middleware constructs the SaaS-OIDC issuer URL as `${ACCESS_TEAM_DOMAIN}/cdn-cgi/access/sso/oidc/${ACCESS_CLIENT_ID_MIDDLEWARE}` and rejects any token whose `iss` claim doesn't match.
 
-- **Implementation hardening — `ACCESS_AUD_MIDDLEWARE`-unset fail-safe** (see `src/auth-extension.js`):
-  - When `env.ACCESS_AUD_MIDDLEWARE` is unset or empty, the JWT branch in `authExtensionRequest` is skipped entirely — the helper falls through to the legacy `X-Extension-Token` path.
-  - This guard is load-bearing: without it, `jose.jwtVerify` called with `audience: undefined` would silently accept any team-domain token, including App 1's MCP tokens (`ACCESS_AUD_MCP`), against the middleware. An operator who sets `ACCESS_AUD_MIDDLEWARE` to an empty string would otherwise open a cross-app token acceptance hole.
-  - When the secret is unset, a one-shot isolate-level `console.warn` fires (`[auth] ACCESS_AUD_MIDDLEWARE not configured — JWT path skipped, falling through to legacy`). This is a diagnostic, not an error; the legacy path keeps working normally.
+- **Implementation hardening — fail-safe when SaaS-OIDC env vars unset** (see `src/auth-extension.js`):
+  - When EITHER `env.ACCESS_AUD_MIDDLEWARE` or `env.ACCESS_CLIENT_ID_MIDDLEWARE` is unset/empty, the JWT branch in `authExtensionRequest` is skipped entirely — the helper falls through to the legacy `X-Extension-Token` path.
+  - This guard is load-bearing on both halves: without the audience check, `jose.jwtVerify` called with `audience: undefined` would silently accept any team-domain token (including App 1 / MCP tokens) against the middleware; without the client_id check, the issuer string would default to the bare team domain, again accepting MCP-shaped tokens.
+  - When either secret is unset, a one-shot isolate-level `console.warn` fires: `[auth] ACCESS_AUD_MIDDLEWARE and/or ACCESS_CLIENT_ID_MIDDLEWARE not configured — JWT path skipped, falling through to legacy`. This is a diagnostic, not an error; the legacy path keeps working normally.
 
 - **Identity flow (MCP path, live)**:
   ```
@@ -145,7 +149,7 @@ App 2's OAuth client is consumed by the operator's separate extension workstream
 ## State — what's done, what's pending
 
 - ✅ **Spec A (MCP path)** — landed 2026-05-10. Plan A all 14 tasks complete. claude.ai connector live via DCR + OTP. `MCP_EXTENSION_SECRET` deleted from both workers.
-- ✅ **Phase 2 code shipped** — branch `worktree-access-extension-phase2` (awaiting operator merge + push). Helper at `src/auth-extension.js` accepts both Cloudflare Access JWTs (`aud=ACCESS_AUD_MIDDLEWARE`) and the legacy `X-Extension-Token` header. Per-route refactor complete at `src/index.js` (all 12 user-facing routes). Dashboard config (Access App 2 creation), `ACCESS_AUD_MIDDLEWARE` secret, and the operator's separate extension build remain pending — see `docs/archive/handoffs/2026-05-12-extension-access-app2-config.md`.
+- ✅ **Phase 2 code shipped** — Helper at `src/auth-extension.js` accepts both SaaS-OIDC access_tokens (`iss=<team>/cdn-cgi/access/sso/oidc/<client_id>`, `aud=<registered redirect URI>`) and the legacy `X-Extension-Token` header. Per-route refactor complete at `src/index.js` (all 12 user-facing routes). The SaaS-OIDC validation path was hardened on 2026-05-13 after the empirical token-shape inspection (initial design assumed an "audience tag" pattern; Cloudflare's actual SaaS-OIDC tokens put the redirect URI in `aud` and use a per-app `iss`). Dashboard config (Access App 2 creation), both `ACCESS_AUD_MIDDLEWARE` + `ACCESS_CLIENT_ID_MIDDLEWARE` secrets, and the operator's separate extension build remain pending — see `docs/archive/handoffs/2026-05-12-extension-access-app2-config.md`.
 - ⏳ **Phase 3 (legacy header removal + edge gating)** — future work. Triggered by operator-confirmed 24-hour drain of `auth.source=legacy` in LD after extension rollout completes. Phase 3 drops the legacy `X-Extension-Token` branch, deletes `LINKEDIN_EXTENSION_SECRET`, and switches App 2 to fronted self-hosted mode with path filter excluding `/webhook/*` and `/test/coldcall`.
 - ⏳ **Drop transitional `consultantFirstName` body fallback** in `src/mcp/router.js` — when Phase 3 confirms zero `[mcp] legacy consultantFirstName fallback` log lines.
 

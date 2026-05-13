@@ -21,8 +21,12 @@ export default defineWorkersConfig({
 						KRISP_WEBHOOK_SECRET: 'test-krisp-webhook-secret',
 						APOLLO_WEBHOOK_SECRET: 'test-apollo-webhook-secret',
 						ACCESS_TEAM_DOMAIN: 'https://test.cloudflareaccess.com',
-						ACCESS_AUD_MCP: 'a'.repeat(64),  // 64-char hex shape matches production Access AUD format
-						ACCESS_AUD_MIDDLEWARE: 'b'.repeat(64),  // distinct from ACCESS_AUD_MCP so audience-mismatch tests are not no-ops
+						ACCESS_AUD_MCP: 'a'.repeat(64),  // 64-char hex shape matches production Access AUD format (App 1 / MCP)
+						// SaaS-OIDC App 2 tokens carry the redirect URI as the aud claim (not the client_id, not an AUD tag).
+						// Comma-separated to exercise the multi-redirect-URI path.
+						ACCESS_AUD_MIDDLEWARE:
+							'https://test-ext-primary.chromiumapp.org/oauth-callback,https://test-ext-secondary.chromiumapp.org/oauth-callback',
+						ACCESS_CLIENT_ID_MIDDLEWARE: 'c'.repeat(64),  // 64-char hex shape matches production SaaS-OIDC client_id
 						INTERNAL_SECRET: 'test-internal-secret',
 						// LD_SDK_KEY intentionally omitted — its absence is the signal that src/index.js uses
 						// to skip the @microlabs `instrument()` wrap (and logs-bridge to skip its install). In

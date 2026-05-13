@@ -8,10 +8,11 @@ let audUnsetWarned = false;
  * Dual-auth gate for every user-facing route on the main worker.
  *
  * Order:
- *   1. If ACCESS_AUD_MIDDLEWARE is configured AND the request carries Authorization: Bearer
- *      or Cf-Access-Jwt-Assertion → attempt JWT verification. A valid JWT with an unknown
- *      email returns 403 (not 401) so the extension can distinguish "you're authenticated
- *      but not in the team registry" from "your token expired".
+ *   1. If both ACCESS_AUD_MIDDLEWARE and ACCESS_CLIENT_ID_MIDDLEWARE are configured AND the
+ *      request carries Authorization: Bearer or Cf-Access-Jwt-Assertion → attempt JWT
+ *      verification. A valid JWT with an unknown email returns 403 (not 401) so the
+ *      extension can distinguish "you're authenticated but not in the team registry" from
+ *      "your token expired".
  *   2. A present-but-INVALID JWT returns 401 auth_jwt_invalid; we do NOT fall through to
  *      legacy. Presence of Authorization: Bearer is intent to use the JWT path.
  *   3. Otherwise read X-Extension-Token. Match against env.LINKEDIN_EXTENSION_SECRET; on
@@ -19,12 +20,19 @@ let audUnsetWarned = false;
  *      body.consultantFirstName itself.
  *   4. No headers → 401 auth_missing.
  *
- * Fail-safe: if env.ACCESS_AUD_MIDDLEWARE is unset/empty, the JWT branch is skipped
- * entirely. Without this, jose.jwtVerify with `audience: undefined` would not validate
- * audience — letting an App 1 (MCP) token authenticate against the middleware.
+ * SaaS-OIDC token shape (App 2): Cloudflare Access SaaS-OIDC apps issue access_tokens
+ * with `iss = <team_domain>/cdn-cgi/access/sso/oidc/<client_id>` and `aud = <redirect URI>`
+ * (the registered chromiumapp.org callback — not an AUD tag, not the client_id). Both
+ * env vars are required to construct the issuer URL and the accepted audience set;
+ * ACCESS_AUD_MIDDLEWARE supports comma-separated values so multiple Chrome profiles /
+ * dev builds can register additional redirect URIs without code changes.
+ *
+ * Fail-safe: if EITHER env var is unset/empty, the JWT branch is skipped entirely.
+ * Without this, jose.jwtVerify with `audience: undefined` would not validate audience —
+ * letting an App 1 (MCP) token authenticate against the middleware.
  *
  * @param {Request} request
- * @param {{ ACCESS_TEAM_DOMAIN: string, ACCESS_AUD_MIDDLEWARE?: string, LINKEDIN_EXTENSION_SECRET?: string }} env
+ * @param {{ ACCESS_TEAM_DOMAIN: string, ACCESS_AUD_MIDDLEWARE?: string, ACCESS_CLIENT_ID_MIDDLEWARE?: string, LINKEDIN_EXTENSION_SECRET?: string }} env
  * @returns {Promise<
  *   | { ok: true, source: 'jwt', user: object, email: string }
  *   | { ok: true, source: 'legacy', user: null }
@@ -32,12 +40,18 @@ let audUnsetWarned = false;
  * >}
  */
 export async function authExtensionRequest(request, env) {
-  const aud = typeof env.ACCESS_AUD_MIDDLEWARE === 'string' ? env.ACCESS_AUD_MIDDLEWARE.trim() : '';
+  const audRaw = typeof env.ACCESS_AUD_MIDDLEWARE === 'string' ? env.ACCESS_AUD_MIDDLEWARE.trim() : '';
+  const clientId =
+    typeof env.ACCESS_CLIENT_ID_MIDDLEWARE === 'string' ? env.ACCESS_CLIENT_ID_MIDDLEWARE.trim() : '';
+  const audList = audRaw ? audRaw.split(',').map((s) => s.trim()).filter(Boolean) : [];
+  const jwtPathReady = audList.length > 0 && clientId.length > 0;
   const hasJwtHeader =
     !!request.headers.get('Authorization') || !!request.headers.get('Cf-Access-Jwt-Assertion');
 
-  if (aud && hasJwtHeader) {
-    const claims = await verifyAccessJwt(request, env, aud);
+  if (jwtPathReady && hasJwtHeader) {
+    const issuer = `${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/sso/oidc/${clientId}`;
+    const expectedAud = audList.length === 1 ? audList[0] : audList;
+    const claims = await verifyAccessJwt(request, env, expectedAud, { issuer });
     if (!claims) {
       return {
         ok: false,
@@ -58,11 +72,12 @@ export async function authExtensionRequest(request, env) {
     return { ok: true, source: 'jwt', user, email: claims.email };
   }
 
-  if (!aud && hasJwtHeader && !audUnsetWarned) {
+  if (!jwtPathReady && hasJwtHeader && !audUnsetWarned) {
     audUnsetWarned = true;
     console.warn({
       source: 'auth',
-      message: '[auth] ACCESS_AUD_MIDDLEWARE not configured — JWT path skipped, falling through to legacy',
+      message:
+        '[auth] ACCESS_AUD_MIDDLEWARE and/or ACCESS_CLIENT_ID_MIDDLEWARE not configured — JWT path skipped, falling through to legacy',
     });
   }
 

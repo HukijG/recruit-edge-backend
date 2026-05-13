@@ -25,11 +25,18 @@ beforeEach(async () => {
   _resetAudUnsetWarnForTests();
 });
 
+// Default to the SaaS-OIDC shape that production App 2 actually issues:
+//   iss = <team_domain>/cdn-cgi/access/sso/oidc/<client_id>
+//   aud = registered redirect URI (first value in the comma-separated ACCESS_AUD_MIDDLEWARE)
+// Callers can override iss / aud explicitly to exercise mismatch paths.
+const DEFAULT_AUD = env.ACCESS_AUD_MIDDLEWARE.split(',')[0].trim();
+const DEFAULT_ISS = `${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/sso/oidc/${env.ACCESS_CLIENT_ID_MIDDLEWARE}`;
+
 async function mintJwt({ email = 'joel@test.local', sub = 'oidc-1', aud, iss, exp } = {}) {
   const jwt = new SignJWT({ email, sub })
     .setProtectedHeader({ alg: 'RS256', kid: 'test-key' })
-    .setIssuer(iss ?? env.ACCESS_TEAM_DOMAIN)
-    .setAudience(aud ?? env.ACCESS_AUD_MIDDLEWARE)
+    .setIssuer(iss ?? DEFAULT_ISS)
+    .setAudience(aud ?? DEFAULT_AUD)
     .setIssuedAt();
   if (exp !== undefined) {
     jwt.setExpirationTime(exp);
@@ -159,18 +166,44 @@ describe('authExtensionRequest — dual-header precedence', () => {
   });
 });
 
-describe('authExtensionRequest — fail-safe when ACCESS_AUD_MIDDLEWARE unset', () => {
-  it('AUD unset + valid JWT for the team domain → falls through to legacy (does NOT accept the JWT)', async () => {
-    // Mint a JWT with the team-domain issuer but a *different* audience (simulates
-    // an MCP-app token reaching the middleware). Then strip ACCESS_AUD_MIDDLEWARE
-    // and assert the JWT is NOT silently accepted.
-    const jwt = await mintJwt({ aud: env.ACCESS_AUD_MCP });
+describe('authExtensionRequest — multi-redirect-URI accept', () => {
+  it('JWT with secondary registered redirect URI as aud → ok=true, source=jwt', async () => {
+    // ACCESS_AUD_MIDDLEWARE in vitest.config.js is comma-separated; both URIs must validate.
+    const secondaryAud = env.ACCESS_AUD_MIDDLEWARE.split(',')[1].trim();
+    const jwt = await mintJwt({ email: 'joel@test.local', aud: secondaryAud });
+    const r = await authExtensionRequest(reqWith({ Authorization: `Bearer ${jwt}` }), env);
+    expect(r.ok).toBe(true);
+    expect(r.source).toBe('jwt');
+    expect(r.email).toBe('joel@test.local');
+  });
+});
+
+describe('authExtensionRequest — fail-safe when SaaS-OIDC env vars unset', () => {
+  it('AUD unset + MCP-shaped JWT → falls through to legacy (does NOT accept the JWT)', async () => {
+    // Mint a JWT that looks like an App 1 (MCP) token: team-domain issuer + MCP AUD tag.
+    // Strip ACCESS_AUD_MIDDLEWARE and assert the JWT is NOT silently accepted by the
+    // middleware (defense against cross-app token reuse if the secret is misconfigured).
+    const jwt = await mintJwt({ iss: env.ACCESS_TEAM_DOMAIN, aud: env.ACCESS_AUD_MCP });
     const envWithoutAud = { ...env, ACCESS_AUD_MIDDLEWARE: '' };
     const r = await authExtensionRequest(
       reqWith({ Authorization: `Bearer ${jwt}` }),
       envWithoutAud,
     );
     // No legacy header → falls through to auth_missing. JWT was NOT accepted.
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('auth_missing');
+  });
+
+  it('CLIENT_ID unset + valid SaaS-OIDC JWT → falls through to legacy (JWT path disabled)', async () => {
+    // The second half of the fail-safe: even with the right audience, missing the client_id
+    // means we can't construct the issuer URL — so the JWT path must skip rather than
+    // accept tokens with a known-good aud but unchecked issuer.
+    const jwt = await mintJwt();
+    const envWithoutClientId = { ...env, ACCESS_CLIENT_ID_MIDDLEWARE: '' };
+    const r = await authExtensionRequest(
+      reqWith({ Authorization: `Bearer ${jwt}` }),
+      envWithoutClientId,
+    );
     expect(r.ok).toBe(false);
     expect(r.code).toBe('auth_missing');
   });
