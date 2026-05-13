@@ -8,6 +8,7 @@
 
 import schema from '../../migrations/0001_create_users.sql?raw';
 import seedRaw from '../../migrations/0002_seed_users.sql?raw';
+import smsTemplatesSchema from '../../migrations/0003_create_sms_templates.sql?raw';
 
 // TEST_EMAILS substitutes <TODO_EMAIL_*> placeholders so the test seed is
 // self-contained and passes the CHECK (email LIKE '%@%.%') constraint.
@@ -29,7 +30,7 @@ const seed = Object.entries(TEST_EMAILS).reduce(
   seedRaw,
 );
 
-const SCHEMA = [schema, seed].join('\n');
+const SCHEMA = [schema, seed, smsTemplatesSchema].join('\n');
 
 /**
  * Apply the users schema + seed to env.USERS_DB.  Drops the users table first
@@ -46,8 +47,9 @@ const SCHEMA = [schema, seed].join('\n');
 export async function applyUsersMigration(env) {
   const db = env.USERS_DB;
 
-  // Drop the users table (also drops its indexes in SQLite).
+  // Drop tables this helper recreates (also drops their indexes in SQLite).
   await db.prepare('DROP TABLE IF EXISTS users').run();
+  await db.prepare('DROP TABLE IF EXISTS sms_templates').run();
 
   const stmts = SCHEMA.split(/;\s*\n/)
     .map((s) => s.trim())

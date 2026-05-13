@@ -44,6 +44,9 @@ import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enric
 import { enrichPerson } from './apollo-client.js';
 import { resolveRFUserId, getUserByFirstName } from './users.js';
 import { authExtensionRequest, setAuthSpanSuccess, setAuthSpanFailure } from './auth-extension.js';
+import {
+  handleSmsTemplatesList, handleSmsTemplateUpsert, handleSmsTemplateDelete,
+} from './sms-templates.js';
 
 const handler = {
   async fetch(request, env, ctx) {
@@ -52,7 +55,7 @@ const handler = {
     // CORS headers
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+      'Access-Control-Allow-Methods': 'POST, GET, PUT, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, X-RF-Webhook-Token, X-Calendar-Webhook-Token, X-Krisp-Webhook-Token, X-Extension-Token, RF-Event-Type, Authorization',
     };
 
@@ -289,6 +292,52 @@ const handler = {
         }
         setAuthSpanSuccess(auth);
         return await handleCallStatsEndpoint(request, env, corsHeaders, auth);
+      }
+
+      if (url.pathname === '/sms-templates' && request.method === 'GET') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_SMS_TEMPLATES_LIST);
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ ok: false, error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        setAuthSpanSuccess(auth);
+        return await handleSmsTemplatesList(request, env, corsHeaders, auth);
+      }
+
+      // PUT and DELETE share the path shape /sms-templates/:id ; regex pins
+      // the segment so /sms-templates and /sms-templates/foo/bar can't hit it.
+      const smsTemplateIdMatch = url.pathname.match(/^\/sms-templates\/([^/]+)$/);
+      if (smsTemplateIdMatch && request.method === 'PUT') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_SMS_TEMPLATES_UPSERT);
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ ok: false, error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        setAuthSpanSuccess(auth);
+        const idFromPath = decodeURIComponent(smsTemplateIdMatch[1]);
+        return await handleSmsTemplateUpsert(request, env, corsHeaders, auth, idFromPath);
+      }
+      if (smsTemplateIdMatch && request.method === 'DELETE') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.EXTENSION_SMS_TEMPLATES_DELETE);
+        const auth = await authExtensionRequest(request, env);
+        if (!auth.ok) {
+          setAuthSpanFailure(auth);
+          return new Response(JSON.stringify({ ok: false, error: auth.message }), {
+            status: auth.status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        setAuthSpanSuccess(auth);
+        const idFromPath = decodeURIComponent(smsTemplateIdMatch[1]);
+        return await handleSmsTemplateDelete(request, env, corsHeaders, auth, idFromPath);
       }
 
       return new Response('Not Found', {

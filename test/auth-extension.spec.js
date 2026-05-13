@@ -59,6 +59,7 @@ describe('authExtensionRequest — JWT path', () => {
     expect(r.email).toBe('joel@test.local');
     expect(r.user).toBeTruthy();
     expect(r.user.firstName.toLowerCase()).toBe('joel');
+    expect(r.sub).toBe('oidc-1');
   });
 
   it('valid JWT + unknown email → ok=false, status=403, code=auth_jwt_unknown_email', async () => {

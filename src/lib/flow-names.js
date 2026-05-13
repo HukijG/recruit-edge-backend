@@ -9,6 +9,9 @@ export const FLOWS = Object.freeze({
   EXTENSION_CALL_STATE_POLL: 'ExtensionCallStatePoll',
   EXTENSION_DIALPAD_HANGUP: 'ExtensionDialpadHangup',
   EXTENSION_CALL_STATS: 'ExtensionCallStats',
+  EXTENSION_SMS_TEMPLATES_LIST: 'ExtensionSmsTemplatesList',
+  EXTENSION_SMS_TEMPLATES_UPSERT: 'ExtensionSmsTemplatesUpsert',
+  EXTENSION_SMS_TEMPLATES_DELETE: 'ExtensionSmsTemplatesDelete',
 
   MOBILE_MY_SOURCING_JOBS: 'MobileMySourcingJobs',
   MOBILE_JOB_PIPELINE: 'MobileJobPipeline',

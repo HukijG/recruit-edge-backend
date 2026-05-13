@@ -37,7 +37,7 @@ let audUnsetWarned = false;
  * @param {Request} request
  * @param {{ ACCESS_TEAM_DOMAIN: string, ACCESS_AUD_MIDDLEWARE?: string, ACCESS_CLIENT_ID_MIDDLEWARE?: string, LINKEDIN_EXTENSION_SECRET?: string }} env
  * @returns {Promise<
- *   | { ok: true, source: 'jwt', user: object, email: string }
+ *   | { ok: true, source: 'jwt', user: object, email: string, sub: string }
  *   | { ok: true, source: 'legacy', user: null }
  *   | { ok: false, status: 401 | 403, code: 'auth_missing' | 'auth_legacy_invalid' | 'auth_jwt_invalid' | 'auth_jwt_unknown_email', message: string }
  * >}
@@ -73,7 +73,7 @@ export async function authExtensionRequest(request, env) {
         message: 'Authenticated user is not registered in the team',
       };
     }
-    return { ok: true, source: 'jwt', user, email: claims.email };
+    return { ok: true, source: 'jwt', user, email: claims.email, sub: claims.sub };
   }
 
   if (!jwtPathReady && hasJwtHeader && !audUnsetWarned) {
