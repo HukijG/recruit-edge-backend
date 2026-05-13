@@ -157,8 +157,9 @@ App 2's OAuth client is consumed by the operator's separate extension workstream
 
 - [Spec A — Cloudflare Access for MCP](archived/specs/2026-05-10-cloudflare-access-mcp-design.md) (shipped, archived)
 - [Plan A — implementation step list (manual + code)](archived/plans/2026-05-10-cloudflare-access-mcp.md) (shipped, archived)
-- [Spec B — Cloudflare Access for the extension API (dual-auth design)](archive/specs/2026-05-12-extension-access-dual-auth-design.md) (Phase 2 code live; Phase 3 pending)
-- [Plan B — implementation step list](archive/plans/2026-05-12-extension-access-dual-auth.md) (Phase 2 code live; Phase 3 pending)
+- [Spec B — Cloudflare Access for the extension API (dual-auth design)](archived/specs/2026-05-12-extension-access-dual-auth-design.md) (Phase 2 shipped 2026-05-13, archived. Phase 3 is future work and will be a separate spec.)
+- [Plan B — implementation step list](archived/plans/2026-05-12-extension-access-dual-auth.md) (Phase 2 shipped, archived.)
+- [Operator handoff — Access App 2 + extension contract](archived/handoffs/2026-05-12-extension-access-app2-config.md) (Phase 2 setup completed 2026-05-13, archived.)
 
 ## Tangentially-related open work
 
