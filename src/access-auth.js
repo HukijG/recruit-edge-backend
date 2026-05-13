@@ -1,6 +1,20 @@
 import { jwtVerify, createRemoteJWKSet, createLocalJWKSet } from 'jose';
 
-let jwks = null;
+// Test override: when set, `verifyAccessJwt` uses this JWKS regardless of `opts.jwksUrl`.
+// Production cache: per-URL JWKS sources (App 1 / MCP uses the team-wide endpoint;
+// App 2 / SaaS-OIDC uses a per-app `/sso/oidc/<client_id>/jwks`).
+let testJwks = null;
+const jwksByUrl = new Map();
+
+function getJwks(jwksUrl) {
+  if (testJwks) return testJwks;
+  let entry = jwksByUrl.get(jwksUrl);
+  if (!entry) {
+    entry = createRemoteJWKSet(new URL(jwksUrl));
+    jwksByUrl.set(jwksUrl, entry);
+  }
+  return entry;
+}
 
 /**
  * verifyAccessJwt — validate a Cloudflare Access-issued JWT.
@@ -17,18 +31,19 @@ let jwks = null;
  *   - **Self-hosted + Managed OAuth** (App 1 / MCP — default): `iss` = team domain,
  *     `aud` = 64-char hex Application Audience (AUD) tag from the Access dashboard.
  *   - **SaaS-OIDC** (App 2 / extension): caller passes
- *     `opts.issuer = "<team_domain>/cdn-cgi/access/sso/oidc/<client_id>"` and
+ *     `opts.issuer = "<team_domain>/cdn-cgi/access/sso/oidc/<client_id>"`,
+ *     `opts.jwksUrl = "<team_domain>/cdn-cgi/access/sso/oidc/<client_id>/jwks"`, and
  *     `expectedAud` = the registered redirect URI(s) (Cloudflare puts the redirect
  *     URI in the access_token's `aud` claim — not the client_id, not an AUD tag).
- *     Cloudflare signs all apps in a tenant with the same keypair, so the team-wide
- *     JWKS at `/cdn-cgi/access/certs` validates both shapes.
+ *     Cloudflare uses PER-APP signing keys for SaaS-OIDC, so the team-wide JWKS
+ *     does NOT contain the App 2 keys — the per-app JWKS endpoint is required.
  *
  * @param {Request} request
  * @param {{ ACCESS_TEAM_DOMAIN: string }} env
  * @param {string | string[]} expectedAud - audience to require. Pass an array to
  *   accept any of several values (e.g., multiple registered redirect URIs).
- * @param {{ issuer?: string }} [opts] - issuer override. Defaults to
- *   `env.ACCESS_TEAM_DOMAIN` (App 1 / MCP shape).
+ * @param {{ issuer?: string, jwksUrl?: string }} [opts] - issuer + JWKS-source
+ *   overrides. Defaults match App 1 / MCP shape (team-wide endpoint).
  * @returns {Promise<{ email: string, sub: string } | null>}
  */
 export async function verifyAccessJwt(request, env, expectedAud, opts = {}) {
@@ -37,9 +52,8 @@ export async function verifyAccessJwt(request, env, expectedAud, opts = {}) {
   const token = assertion ?? bearer;
   if (!token) return null;
 
-  if (!jwks) {
-    jwks = createRemoteJWKSet(new URL(`${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs`));
-  }
+  const jwksUrl = opts.jwksUrl ?? `${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs`;
+  const jwks = getJwks(jwksUrl);
 
   try {
     const { payload } = await jwtVerify(token, jwks, {
@@ -57,9 +71,11 @@ export async function verifyAccessJwt(request, env, expectedAud, opts = {}) {
 
 /**
  * Test-only: replace the JWKS source with a static key set, or pass `null`
- * to reset back to the remote JWKS lookup. Tests that stub the JWKS should
- * reset in `afterAll` if other suites in the same run depend on the real
- * remote source.
+ * to reset back to per-URL remote JWKS lookup. While set, the test override
+ * is returned regardless of `opts.jwksUrl` — so a single fixture key validates
+ * both App 1 (default URL) and App 2 (per-app URL) tokens in tests. Tests
+ * that stub the JWKS should reset in `afterAll` if other suites in the same
+ * run depend on the real remote source.
  *
  * @param {{ keys: object[] } | null} jwkSet
  */
@@ -67,5 +83,5 @@ export function _setJwksForTests(jwkSet) {
   // == null catches both null and undefined — defensive against an accidental
   // _setJwksForTests() with no args, which would otherwise crash inside
   // createLocalJWKSet(undefined) with a confusing "JWK Set malformed" error.
-  jwks = jwkSet == null ? null : createLocalJWKSet(jwkSet);
+  testJwks = jwkSet == null ? null : createLocalJWKSet(jwkSet);
 }

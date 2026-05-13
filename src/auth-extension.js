@@ -22,10 +22,13 @@ let audUnsetWarned = false;
  *
  * SaaS-OIDC token shape (App 2): Cloudflare Access SaaS-OIDC apps issue access_tokens
  * with `iss = <team_domain>/cdn-cgi/access/sso/oidc/<client_id>` and `aud = <redirect URI>`
- * (the registered chromiumapp.org callback — not an AUD tag, not the client_id). Both
- * env vars are required to construct the issuer URL and the accepted audience set;
- * ACCESS_AUD_MIDDLEWARE supports comma-separated values so multiple Chrome profiles /
- * dev builds can register additional redirect URIs without code changes.
+ * (the registered chromiumapp.org callback — not an AUD tag, not the client_id). Tokens
+ * are signed with PER-APP keys; the team-wide JWKS at `/cdn-cgi/access/certs` does NOT
+ * contain App 2's signing key, so the validator must use the per-app endpoint at
+ * `<issuer>/jwks`. Both env vars are required to construct the issuer + JWKS URLs and
+ * the accepted audience set; ACCESS_AUD_MIDDLEWARE supports comma-separated values so
+ * multiple Chrome profiles / dev builds can register additional redirect URIs without
+ * code changes.
  *
  * Fail-safe: if EITHER env var is unset/empty, the JWT branch is skipped entirely.
  * Without this, jose.jwtVerify with `audience: undefined` would not validate audience —
@@ -50,8 +53,9 @@ export async function authExtensionRequest(request, env) {
 
   if (jwtPathReady && hasJwtHeader) {
     const issuer = `${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/sso/oidc/${clientId}`;
+    const jwksUrl = `${issuer}/jwks`;
     const expectedAud = audList.length === 1 ? audList[0] : audList;
-    const claims = await verifyAccessJwt(request, env, expectedAud, { issuer });
+    const claims = await verifyAccessJwt(request, env, expectedAud, { issuer, jwksUrl });
     if (!claims) {
       return {
         ok: false,
