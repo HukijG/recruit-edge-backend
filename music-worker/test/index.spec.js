@@ -1,6 +1,5 @@
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { SELF, fetchMock } from 'cloudflare:test';
-import { API_REMOTE_PATH } from '../src/route-map.js';
 
 // Integration tests for the entry router (src/index.js) — the seam where auth +
 // route-map + proxy meet. The unit pieces are covered elsewhere; this file proves
@@ -68,7 +67,7 @@ describe('entry router — unauthenticated + liveness + WS pre-auth branch', () 
   });
 });
 
-describe('entry router — routing, method, and placeholder mapping (authed)', () => {
+describe('entry router — routing + method mapping (authed)', () => {
   it('unknown /music/<x> -> 404 (after auth passes)', async () => {
     const res = await SELF.fetch(`${BASE}/music/frobnicate`, {
       method: 'POST',
@@ -94,26 +93,27 @@ describe('entry router — routing, method, and placeholder mapping (authed)', (
     expect(res.status).toBe(405);
   });
 
-  it('a known route whose dashboard sub-path is an unset placeholder -> 501 (escalation 1)', async () => {
-    // /music/pause is a valid POST transport route, but API_REMOTE_PATH.pause is
-    // a throw-if-unset placeholder, so the proxy step throws and maps to 501.
+  it('a confirmed route reaches the proxy (escalation 1 resolved): unreachable dashboard -> 502, NOT 501', async () => {
+    // API_REMOTE_PATH.pause is now a CONFIRMED sub-path (/api/remote/pause), so the
+    // throwIfUnset 501 placeholder branch no longer fires. With no fetchMock active
+    // in this block the outbound fetch to the (non-existent) dashboard rejects, so
+    // the router returns the structured 502 dashboard_unreachable — proving the
+    // request now flows to the proxy seam instead of short-circuiting at 501.
     const res = await SELF.fetch(`${BASE}/music/pause`, {
       method: 'POST',
       headers: authedHeaders(),
     });
-    expect(res.status).toBe(501);
-    expect((await res.json()).error).toMatch(/escalation 1/);
+    expect(res.status).toBe(502);
+    expect((await res.json()).code).toBe('dashboard_unreachable');
   });
 });
 
 // Inbound-request validation is this worker's OWN contract and runs BEFORE the
-// outbound dashboard sub-path is resolved. So a malformed client request returns
-// a 400 describing the client's error — NOT the 501 "escalation 1 / dashboard
-// path unset" placeholder error, which is about the unfrozen outbound wiring and
-// would mislead the client. These tests pin that ordering even while the
-// dashboard sub-paths remain throw-if-unset placeholders.
+// outbound dashboard sub-path is resolved + proxied. So a malformed client request
+// returns a 400 describing the client's error and never reaches the outbound fetch
+// at all. These tests pin that ordering.
 describe('entry router — per-kind body/query validation (authed, runs before outbound-path resolution)', () => {
-  it('volume with a missing/bad direction -> 400 (validation precedes the placeholder throw)', async () => {
+  it('volume with a missing/bad direction -> 400 (validation precedes any outbound call)', async () => {
     const res = await SELF.fetch(`${BASE}/music/volume`, {
       method: 'POST',
       headers: authedHeaders({ 'Content-Type': 'application/json' }),
@@ -162,17 +162,17 @@ describe('entry router — per-kind body/query validation (authed, runs before o
   });
 });
 
-// The proxy seam — exercised by TEMPORARILY wiring a real (non-placeholder)
-// dashboard sub-path into the otherwise-frozen API_REMOTE_PATH, mocking the
-// OUTBOUND fetch with `fetchMock` (the supported undici MockAgent — its
-// responses are built inside the worker's request context, avoiding the
-// cross-request-I/O error that a `vi.spyOn(globalThis,'fetch')` Response would
-// hit under SELF.fetch), and restoring the placeholder afterward. This proves
-// the router composes the correct dashboard request body + headers AND streams
-// the dashboard Response status+body back verbatim — the half the unit tests
-// (proxy.spec.js / route-map.spec.js) cannot cover.
+// The proxy seam — exercised against the CONFIRMED dashboard sub-paths
+// (escalation 1 resolved) in API_REMOTE_PATH, mocking the OUTBOUND fetch with
+// `fetchMock` (the supported undici MockAgent — its responses are built inside the
+// worker's request context, avoiding the cross-request-I/O error that a
+// `vi.spyOn(globalThis,'fetch')` Response would hit under SELF.fetch). This proves
+// the router composes the correct dashboard request body + headers AND streams the
+// dashboard Response status+body back verbatim — the half the unit tests
+// (proxy.spec.js / route-map.spec.js) cannot cover. Each interceptor uses the real
+// confirmed sub-path, so no API_REMOTE_PATH mutation/restore is needed.
 describe('entry router — proxy composition + verbatim pass-through', () => {
-  const DASH_ORIGIN = 'https://dashboard.test.local';
+  const DASH_ORIGIN = 'https://dashboard.test.invalid';
 
   beforeEach(() => {
     fetchMock.activate();
@@ -180,15 +180,11 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
   });
 
   afterEach(() => {
-    // Assert every queued interceptor was consumed, then reset frozen placeholders.
+    // Assert every queued interceptor was consumed.
     fetchMock.assertNoPendingInterceptors();
-    API_REMOTE_PATH.volume = '__UNSET_volume__';
-    API_REMOTE_PATH.play = '__UNSET_play__';
-    API_REMOTE_PATH.search = '__UNSET_search__';
   });
 
   it('volume up -> proxies POST {delta:10} with X-Remote-Key, streams the dashboard 200 body verbatim', async () => {
-    API_REMOTE_PATH.volume = '/api/remote/volume';
     let seen;
     fetchMock
       .get(DASH_ORIGIN)
@@ -211,7 +207,6 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
   });
 
   it('volume down -> proxies POST {delta:-10}', async () => {
-    API_REMOTE_PATH.volume = '/api/remote/volume';
     let seen;
     fetchMock
       .get(DASH_ORIGIN)
@@ -231,11 +226,10 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
   });
 
   it('play with a numeric-string id -> proxies POST {id:<number>} (coerced)', async () => {
-    API_REMOTE_PATH.play = '/api/remote/play';
     let seen;
     fetchMock
       .get(DASH_ORIGIN)
-      .intercept({ path: '/api/remote/play', method: 'POST' })
+      .intercept({ path: '/api/remote/songs/play', method: 'POST' })
       .reply((opts) => {
         seen = opts;
         return { statusCode: 200, data: {} };
@@ -251,10 +245,9 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
   });
 
   it('search -> GETs the dashboard with q encoded into the path, status + body passed through verbatim', async () => {
-    API_REMOTE_PATH.search = '/api/remote/search';
     fetchMock
       .get(DASH_ORIGIN)
-      .intercept({ path: '/api/remote/search?q=daft%20punk', method: 'GET' })
+      .intercept({ path: '/api/remote/songs/results?q=daft%20punk', method: 'GET' })
       .reply(200, [], { headers: { 'Content-Type': 'application/json' } });
 
     const res = await SELF.fetch(`${BASE}/music/search?q=daft%20punk`, {
@@ -266,10 +259,9 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
   });
 
   it('a non-200 dashboard response is streamed back verbatim (status + body)', async () => {
-    API_REMOTE_PATH.play = '/api/remote/play';
     fetchMock
       .get(DASH_ORIGIN)
-      .intercept({ path: '/api/remote/play', method: 'POST' })
+      .intercept({ path: '/api/remote/songs/play', method: 'POST' })
       .reply(503, { ok: false, error: 'deezer down' });
 
     const res = await SELF.fetch(`${BASE}/music/play`, {
@@ -282,10 +274,9 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
   });
 
   it('a dashboard fetch rejection -> 502 dashboard_unreachable (structured, not an opaque 500)', async () => {
-    API_REMOTE_PATH.play = '/api/remote/play';
     fetchMock
       .get(DASH_ORIGIN)
-      .intercept({ path: '/api/remote/play', method: 'POST' })
+      .intercept({ path: '/api/remote/songs/play', method: 'POST' })
       .replyWithError(new TypeError('Network connection lost'));
 
     const res = await SELF.fetch(`${BASE}/music/play`, {

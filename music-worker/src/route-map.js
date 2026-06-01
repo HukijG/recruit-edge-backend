@@ -9,14 +9,13 @@
  *    docs/music-worker.md. Volume magnitude is server-fixed (+/-10 percentage
  *    points); Deezer ids are numeric.
  *
- *  - OUTBOUND (the FROZEN cross-repo contract, escalation 1): this worker proxies
- *    to the dashboard at ${DASHBOARD_REMOTE_BASE}${path} with header
- *    X-Remote-Key. The dashboard sub-path STRINGS are NOT in the frozen contract
- *    and no spec exists in the worktree, so they ship as compile-clean
- *    placeholders guarded by throwIfUnset(): the build/dry-run stays green
- *    (strings, never undefined) while any accidental LIVE call fails loudly.
- *    Frozen+hard-coded bits (X-Remote-Key, DASHBOARD_REMOTE_BASE, volume +/-10,
- *    Deezer numeric ids) are NOT placeholders.
+ *  - OUTBOUND (the FROZEN cross-repo contract): this worker proxies to the
+ *    dashboard at ${DASHBOARD_REMOTE_BASE}${path} with header X-Remote-Key. The
+ *    dashboard sub-path STRINGS are now CONFIRMED against the dashboard's actual
+ *    /api/remote/* routes (escalation 1 resolved). throwIfUnset() is retained as a
+ *    safety net but never fires now that every value is real. Frozen+hard-coded
+ *    bits (X-Remote-Key, DASHBOARD_REMOTE_BASE, volume +/-10, Deezer numeric ids)
+ *    are part of the same contract.
  */
 
 // Server-fixed volume delta, in percentage points. FROZEN by the cross-repo
@@ -31,24 +30,24 @@ const UNSET_PREFIX = '__UNSET_';
 /**
  * Dashboard /api/remote/* sub-paths, keyed by inbound /music/* route name.
  *
- * ESCALATION 1: these 11 strings are genuinely unfrozen (no music-remote spec
- * exists). They are compile-clean placeholders so `wrangler deploy --dry-run`
- * passes; throwIfUnset() makes any accidental live proxy call fail loudly with a
- * pointer to the escalation. Replace each value with the operator-confirmed
- * sub-path; leave the keys as-is.
+ * ESCALATION 1 (RESOLVED): these 11 sub-paths are now CONFIRMED against the
+ * dashboard's actual /api/remote/* routes (orchestrator-verified). The 'search' /
+ * 'playlist-search' routes forward ?q= and 'playlist-contents' forwards ?id=, per
+ * the MUSIC_ROUTES kinds — that query-forwarding mechanism is unchanged.
+ * throwIfUnset() is retained for safety but, with every value real, never fires.
  */
 export const API_REMOTE_PATH = {
-  pause: `${UNSET_PREFIX}pause__`,
-  resume: `${UNSET_PREFIX}resume__`,
-  next: `${UNSET_PREFIX}next__`,
-  prev: `${UNSET_PREFIX}prev__`,
-  volume: `${UNSET_PREFIX}volume__`,
-  search: `${UNSET_PREFIX}search__`,
-  play: `${UNSET_PREFIX}play__`,
-  enqueue: `${UNSET_PREFIX}enqueue__`,
-  'playlist-play': `${UNSET_PREFIX}playlist_play__`,
-  'playlist-search': `${UNSET_PREFIX}playlist_search__`,
-  'playlist-contents': `${UNSET_PREFIX}playlist_contents__`,
+  pause: '/api/remote/pause',
+  resume: '/api/remote/resume',
+  next: '/api/remote/next',
+  prev: '/api/remote/prev',
+  volume: '/api/remote/volume',
+  search: '/api/remote/songs/results',
+  play: '/api/remote/songs/play',
+  enqueue: '/api/remote/songs/enqueue',
+  'playlist-play': '/api/remote/playlists/play',
+  'playlist-search': '/api/remote/playlists/search',
+  'playlist-contents': '/api/remote/playlists/contents',
 };
 
 /**

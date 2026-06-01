@@ -27,12 +27,21 @@ describe('route-map', () => {
     );
   });
 
-  it('throwIfUnset throws on an unset placeholder (escalation 1)', () => {
-    expect(() => throwIfUnset('pause', API_REMOTE_PATH.pause)).toThrowError(/escalation 1/);
+  it('throwIfUnset throws on an unset placeholder (safety net retained)', () => {
+    // The shipped API_REMOTE_PATH values are now CONFIRMED (escalation 1 resolved),
+    // so feed a synthetic placeholder to prove the guard still fires if one ever
+    // reaches a live proxy call.
+    expect(() => throwIfUnset('pause', '__UNSET_pause__')).toThrowError(/path unset/);
   });
 
-  it('throwIfUnset returns a real, operator-set path unchanged', () => {
-    expect(throwIfUnset('pause', '/api/remote/pause')).toBe('/api/remote/pause');
+  it('throwIfUnset returns every confirmed API_REMOTE_PATH value unchanged', () => {
+    for (const [route, path] of Object.entries(API_REMOTE_PATH)) {
+      expect(throwIfUnset(route, path)).toBe(path);
+    }
+    // spot-check the exact confirmed strings
+    expect(API_REMOTE_PATH.pause).toBe('/api/remote/pause');
+    expect(API_REMOTE_PATH.search).toBe('/api/remote/songs/results');
+    expect(API_REMOTE_PATH['playlist-contents']).toBe('/api/remote/playlists/contents');
   });
 
   it('every API_REMOTE_PATH key matches a MUSIC_ROUTES key (no orphans)', () => {

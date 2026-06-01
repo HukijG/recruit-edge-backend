@@ -58,14 +58,26 @@ Every route runs `authMusicRequest` first (see Auth). Request shapes are frozen 
 **`X-Remote-Key: ${DASHBOARD_REMOTE_KEY}`**. The dashboard response is streamed
 back to the extension verbatim.
 
-`src/route-map.js` maps each `/music/*` route to its dashboard sub-path. **The 11
-sub-path strings are not in the frozen contract and no spec exists** — they ship as
-compile-clean placeholders (`__UNSET_*__`) guarded by `throwIfUnset()`. The build /
-`wrangler deploy --dry-run` stays green; any accidental **live** proxy call throws
-`music api-remote path unset for route '…', see escalation 1`. Wire the operator
-sub-paths into `API_REMOTE_PATH` to go live. The frozen bits (X-Remote-Key,
-`DASHBOARD_REMOTE_BASE`, volume ±10, Deezer numeric ids) are hard-coded, not
-placeholders.
+`src/route-map.js` maps each `/music/*` route to its dashboard sub-path. The 11
+sub-paths are confirmed against the dashboard's actual `/api/remote/*` routes:
+
+| `/music/*` route | dashboard sub-path |
+| --- | --- |
+| `pause` | `/api/remote/pause` |
+| `resume` | `/api/remote/resume` |
+| `next` | `/api/remote/next` |
+| `prev` | `/api/remote/prev` |
+| `volume` | `/api/remote/volume` |
+| `search` | `/api/remote/songs/results` (forwards `?q=`) |
+| `play` | `/api/remote/songs/play` |
+| `enqueue` | `/api/remote/songs/enqueue` |
+| `playlist-play` | `/api/remote/playlists/play` |
+| `playlist-search` | `/api/remote/playlists/search` (forwards `?q=`) |
+| `playlist-contents` | `/api/remote/playlists/contents` (forwards `?id=`) |
+
+`throwIfUnset()` is retained as a safety net but, with every value real, never
+fires. The frozen bits (X-Remote-Key, `DASHBOARD_REMOTE_BASE`, volume ±10, Deezer
+numeric ids) are hard-coded.
 
 **Validation ordering.** The router validates the **inbound** request shape (this
 worker's own contract: direction, numeric Deezer id, `q` present, well-formed JSON)
@@ -284,8 +296,9 @@ npx wrangler deploy --dry-run -c music-worker/wrangler.music.jsonc
 
 ## Open operator items (escalations)
 
-1. **Dashboard `/api/remote/*` sub-paths** — provide the 11 exact sub-path strings
-   + query keys; they currently ship as throw-if-unset placeholders.
+1. ~~**Dashboard `/api/remote/*` sub-paths**~~ — **RESOLVED.** The 11 sub-paths are
+   confirmed against the dashboard's actual routes (see the Outbound table above)
+   and wired into `API_REMOTE_PATH`. `throwIfUnset()` is retained as a safety net.
 2. ~~**Identity gate**~~ — **RESOLVED: JWT-only per operator.** The identity gate
    is dropped: a valid Cloudflare Access JWT is the authorization (Access already
    restricts issuance to the team). No `USERS_DB` binding, no email registry, no
