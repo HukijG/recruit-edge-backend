@@ -3,7 +3,6 @@ import { env } from 'cloudflare:test';
 import { authMusicRequest, _resetAudUnsetWarnForTests } from '../src/auth-music.js';
 import { _setJwksForTests } from '../src/access-auth.js';
 import { setupJwtFixture } from './jwt-fixture.js';
-import { resetUsersDb } from './db-fixture.js';
 
 function bearerReq(token) {
   return new Request('https://music.test/music/pause', {
@@ -26,24 +25,21 @@ describe('authMusicRequest dual-auth matrix', () => {
   afterAll(() => {
     _setJwksForTests(null);
   });
-  beforeEach(async () => {
+  beforeEach(() => {
     _resetAudUnsetWarnForTests();
-    await resetUsersDb([{ email: 'joel@cognatio.test', firstName: 'Joel' }]);
   });
 
-  it('JWT path: valid token + registered email => ok source=jwt with user', async () => {
-    const jwt = await makeJwt({ email: 'joel@cognatio.test', sub: 'u-1' });
+  it('JWT path: valid token => ok source=jwt (JWT-ONLY, no registry lookup, any email authorized)', async () => {
+    // A valid Access JWT is the authorization — there is NO USERS_DB lookup, so an
+    // email that would not appear in any team registry is still authorized.
+    const jwt = await makeJwt({ email: 'stranger@cognatio.test', sub: 'u-9' });
     const res = await authMusicRequest(bearerReq(jwt), env);
     expect(res.ok).toBe(true);
     expect(res.source).toBe('jwt');
-    expect(res.email).toBe('joel@cognatio.test');
-    expect(res.user).toEqual({ email: 'joel@cognatio.test', firstName: 'Joel' });
-  });
-
-  it('JWT path: valid token + UNKNOWN email => 403 auth_jwt_unknown_email', async () => {
-    const jwt = await makeJwt({ email: 'stranger@cognatio.test', sub: 'u-9' });
-    const res = await authMusicRequest(bearerReq(jwt), env);
-    expect(res).toMatchObject({ ok: false, status: 403, code: 'auth_jwt_unknown_email' });
+    expect(res.email).toBe('stranger@cognatio.test');
+    expect(res.sub).toBe('u-9');
+    // No identity gate => no user record on the result.
+    expect(res.user).toBeUndefined();
   });
 
   it('JWT path: present-but-INVALID token => 401 auth_jwt_invalid, NO fall-through to legacy', async () => {
@@ -60,9 +56,9 @@ describe('authMusicRequest dual-auth matrix', () => {
     expect(res).toMatchObject({ ok: false, status: 401, code: 'auth_jwt_invalid' });
   });
 
-  it('legacy path: correct X-Extension-Token => ok source=legacy user=null', async () => {
+  it('legacy path: correct X-Extension-Token => ok source=legacy', async () => {
     const res = await authMusicRequest(legacyReq(env.LINKEDIN_EXTENSION_SECRET), env);
-    expect(res).toMatchObject({ ok: true, source: 'legacy', user: null });
+    expect(res).toMatchObject({ ok: true, source: 'legacy' });
   });
 
   it('legacy path: wrong X-Extension-Token => 401 auth_legacy_invalid', async () => {

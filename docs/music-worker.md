@@ -24,8 +24,8 @@ office TV.
   of the waiver; do not add it.
 - **No service binding** to `rf-dialpad-sync-dev` or any sibling. The worker is
   standalone: it reaches the dashboard via plain outbound `fetch`
-  (`DASHBOARD_REMOTE_BASE`) and reads the team registry via its own **read-only**
-  D1 binding (`USERS_DB`). It cannot affect the live worker.
+  (`DASHBOARD_REMOTE_BASE`). Auth is **JWT-only** — there is **no** D1 / `USERS_DB`
+  binding and no team-registry read. It cannot affect the live worker.
 
 ## Two surfaces, separated by ownership
 
@@ -206,23 +206,20 @@ Cloudflare Access **App 2** (SaaS-OIDC PKCE) JWT, or the legacy
   single aud, no opts) — copying it would reject every real App-2 extension token.
   A `_MODULE_ID = 'music-worker/access-auth'` sentinel guards against resolver
   fallback.
-- `src/auth-music.js` is a trimmed `authExtensionRequest`. It keeps every
-  load-bearing guard — (a) **fail-safe**: if `ACCESS_AUD_MIDDLEWARE` **or**
+- `src/auth-music.js` is a trimmed `authExtensionRequest`. It keeps the
+  load-bearing guards — (a) **fail-safe**: if `ACCESS_AUD_MIDDLEWARE` **or**
   `ACCESS_CLIENT_ID_MIDDLEWARE` is unset/empty, the JWT branch is skipped and the
   request falls through to legacy (without this, `audience: undefined` would
   silently accept any team token, incl. App-1/MCP); (b) **present-but-invalid
-  JWT → 401 `auth_jwt_invalid`**, no fall-through; (c) **identity gate** —
-  valid JWT with an unregistered email → **403 `auth_jwt_unknown_email`**;
-  (d) legacy `X-Extension-Token`. It drops **only** the OTel surface.
-- **Identity gate.** `src/users-d1-read.js` `getUserByEmail(env, email)` is a
-  single-row read against the **read-only `USERS_DB`** binding (the single team
-  registry), modeled on the MAIN worker `src/users.js` (lowercase-normalized,
-  `{email, firstName} | null`). The main worker's module-level cache is dropped on
-  purpose — a per-request single-row read is correct for a low-volume remote and
-  avoids stale-until-cold-start. This **reverses** the original brief's "drop
-  `getUserByEmail`" instruction: dropping the gate would let any valid SaaS-OIDC
-  token control the live music remote, strictly weaker than the scheme the contract
-  says to reuse.
+  JWT → 401 `auth_jwt_invalid`**, no fall-through; (c) legacy
+  `X-Extension-Token`. It drops the OTel surface **and** the identity gate.
+- **JWT-only (no identity gate).** A validly-signed Access JWT (correct issuer +
+  audience) is the authorization — there is **no `USERS_DB` lookup, no
+  email-registry check, no `ACCESS_ALLOWED_EMAILS`**. Cloudflare Access already
+  restricts token issuance to the team, so a valid App-2 JWT IS a teammate. The
+  result is `{ ok: true, source: 'jwt', email, sub }` for any valid token. This is
+  a deliberate design decision for this worker — the music remote carries no
+  per-user authorization, only team membership.
 
 ### WS-upgrade auth (Option B)
 
@@ -251,8 +248,7 @@ path — which adds a third auth surface plus its own hostname and audience.
 - `vars.ACCESS_TEAM_DOMAIN` only (no `LD_OTLP_*`).
 - `durable_objects.bindings: [{ name: MUSIC_REMOTE, class_name: MusicRemoteState }]`,
   `migrations: [{ tag: v1, new_sqlite_classes: ["MusicRemoteState"] }]`.
-- `d1_databases: [{ binding: USERS_DB, database_name: rf-users, database_id: … }]`
-  — **read-only** (no `migrations_dir`; the main worker owns the schema).
+- **No `d1_databases`** — auth is JWT-only; there is no `USERS_DB` identity gate.
 
 ### Secrets (Cloudflare dashboard — never in wrangler config)
 
@@ -264,7 +260,6 @@ path — which adds a third auth surface plus its own hostname and audience.
 | `DASHBOARD_REMOTE_KEY` | outbound `X-Remote-Key` to the dashboard |
 | `DASHBOARD_REMOTE_BASE` | dashboard ingress base URL (recommend secret) |
 | `UPSTREAM_WS_URL` | upstream music-source WebSocket URL — **unfrozen, see escalation 5**; the upgrade carries `X-Remote-Key` (= `DASHBOARD_REMOTE_KEY`) |
-| `ACCESS_ALLOWED_EMAILS` | only if the operator declines the `USERS_DB` binding |
 
 `ACCESS_AUD_MIDDLEWARE` **and** `ACCESS_CLIENT_ID_MIDDLEWARE` must both be set or the
 fail-safe drops the JWT path to legacy-only.
@@ -291,9 +286,10 @@ npx wrangler deploy --dry-run -c music-worker/wrangler.music.jsonc
 
 1. **Dashboard `/api/remote/*` sub-paths** — provide the 11 exact sub-path strings
    + query keys; they currently ship as throw-if-unset placeholders.
-2. **Identity gate = read-only `USERS_DB`** (recommended) — confirm the binding, or
-   explicitly accept `ACCESS_ALLOWED_EMAILS` as a flagged convention deviation.
-   Either way the JWT branch 403s unknown emails.
+2. ~~**Identity gate**~~ — **RESOLVED: JWT-only per operator.** The identity gate
+   is dropped: a valid Cloudflare Access JWT is the authorization (Access already
+   restricts issuance to the team). No `USERS_DB` binding, no email registry, no
+   `ACCESS_ALLOWED_EMAILS`.
 3. **WS-upgrade auth A vs B** — Option B (DO ticket store) is the default; Option A
    (separate Access app fronting the WS path) is the alternative (adds a third auth
    surface + hostname/AUD).

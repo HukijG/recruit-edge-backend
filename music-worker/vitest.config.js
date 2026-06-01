@@ -46,12 +46,9 @@ export default defineWorkersConfig({
 						ACCESS_CLIENT_ID_MIDDLEWARE: 'c'.repeat(64),
 						// Outbound dashboard proxy.
 						DASHBOARD_REMOTE_KEY: 'test-remote-key',
-						DASHBOARD_REMOTE_BASE: 'https://dashboard.test.local',
+						DASHBOARD_REMOTE_BASE: 'https://dashboard.test.invalid',
 					},
-					d1Databases: {
-						// Read-only USERS_DB binding — identity gate source of truth.
-						USERS_DB: 'rf-users-test',
-					},
+					// No d1Databases — auth is JWT-only, no USERS_DB identity gate.
 				},
 			},
 		},

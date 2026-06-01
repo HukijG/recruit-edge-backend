@@ -10,7 +10,7 @@ import { API_REMOTE_PATH } from '../src/route-map.js';
 //
 // Auth: every /music/* route below uses the LEGACY X-Extension-Token path
 // (LINKEDIN_EXTENSION_SECRET = 'test-extension-secret' in vitest.config.js), so
-// the JWT/USERS_DB path is not exercised here (it is covered in auth-music.spec.js).
+// the JWT path is not exercised here (it is covered in auth-music.spec.js).
 
 const LEGACY_TOKEN = 'test-extension-secret';
 

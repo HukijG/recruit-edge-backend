@@ -34,21 +34,12 @@
   // Self-contained migration list for THIS worker only. Tag style mirrors the
   // root wrangler.jsonc migrations chain; this is NOT an edit to the root
   // config — a new worker owns its own migrations.
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MusicRemoteState"] }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MusicRemoteState"] }]
 
-  // Read-only USERS_DB binding — the single team registry. The MAIN worker owns
-  // the schema (NO migrations_dir here => read-only), mirroring the precedent in
-  // cache-worker/wrangler.cache.jsonc. Used by the JWT identity gate to 403
-  // valid-JWT-but-unregistered emails. (Present per escalation 2: operator
-  // confirms this binding; ACCESS_ALLOWED_EMAILS replaces it only on explicit
-  // opt-out.)
-  "d1_databases": [
-    {
-      "binding": "USERS_DB",
-      "database_name": "rf-users",
-      "database_id": "00000000-0000-0000-0000-000000000002"
-    }
-  ]
+  // AUTH IS JWT-ONLY (operator decision, escalation 2 resolved): a valid
+  // Cloudflare Access JWT is the authorization — there is NO identity gate, so NO
+  // USERS_DB binding and NO ACCESS_ALLOWED_EMAILS. Cloudflare Access already
+  // restricts token issuance to the team.
 
   // SECRETS (Cloudflare dashboard, NEVER here):
   //   LINKEDIN_EXTENSION_SECRET      — = main worker value (legacy X-Extension-Token).
@@ -58,5 +49,4 @@
   //                                     fail-safe drops the JWT path to legacy.)
   //   DASHBOARD_REMOTE_KEY           — outbound X-Remote-Key to the dashboard.
   //   DASHBOARD_REMOTE_BASE          — dashboard ingress base URL (recommend secret).
-  //   ACCESS_ALLOWED_EMAILS          — only if the operator declines USERS_DB.
 }
