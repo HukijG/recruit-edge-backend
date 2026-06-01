@@ -40,7 +40,7 @@ Every route runs `authMusicRequest` first (see Auth). Request shapes are frozen 
 | `/music/resume` | POST | `{}` | transport |
 | `/music/next` | POST | `{}` | transport |
 | `/music/prev` | POST | `{}` | transport |
-| `/music/volume` | POST | `{ direction: "up" \| "down" }` | mapped to a **server-fixed ±10 percentage-point** delta; magnitude is never client-supplied |
+| `/music/volume` | POST | `{ direction: "up" \| "down" }` | the worker forwards the bare `{ direction }` **verbatim**; the **dashboard** owns the fixed ±step magnitude (single source of truth) — never client-supplied, never computed by the worker |
 | `/music/play` | POST | `{ id: <numeric Deezer id> }` | id validated numeric → 400 otherwise |
 | `/music/enqueue` | POST | `{ id: <numeric Deezer id> }` | id validated numeric |
 | `/music/playlist-play` | POST | `{ id: <numeric Deezer id> }` | id validated numeric |
@@ -76,8 +76,9 @@ sub-paths are confirmed against the dashboard's actual `/api/remote/*` routes:
 | `playlist-contents` | `/api/remote/playlists/contents` (forwards `?id=`) |
 
 `throwIfUnset()` is retained as a safety net but, with every value real, never
-fires. The frozen bits (X-Remote-Key, `DASHBOARD_REMOTE_BASE`, volume ±10, Deezer
-numeric ids) are hard-coded.
+fires. The frozen bits (X-Remote-Key, `DASHBOARD_REMOTE_BASE`, Deezer numeric ids)
+are hard-coded. The volume ±step magnitude is **not** in this worker — the worker
+forwards the bare `{ direction }` and the **dashboard** owns the magnitude.
 
 **Validation ordering.** The router validates the **inbound** request shape (this
 worker's own contract: direction, numeric Deezer id, `q` present, well-formed JSON)

@@ -23,7 +23,6 @@ import {
   API_REMOTE_PATH,
   throwIfUnset,
   parseDeezerId,
-  volumeDeltaFor,
 } from './route-map.js';
 import { proxyToDashboard } from './proxy.js';
 
@@ -120,9 +119,14 @@ export default {
     } else if (route.kind === 'volume') {
       const body = await readJsonBody(request);
       if (body === null) return json(400, { ok: false, error: 'malformed JSON body' });
-      const v = volumeDeltaFor(body.direction);
-      if (!v.ok) return json(400, { ok: false, error: "direction must be 'up' or 'down'" });
-      init = { method: 'POST', body: JSON.stringify({ delta: v.delta }) };
+      // Forward { direction } VERBATIM. The dashboard's POST /api/remote/volume
+      // deserializes VolumeBody { direction: 'up'|'down' } and owns the ±step
+      // magnitude server-side (single source of truth) — the worker must NOT
+      // pre-compute a delta, or the dashboard 422s on the unexpected shape.
+      if (body.direction !== 'up' && body.direction !== 'down') {
+        return json(400, { ok: false, error: "direction must be 'up' or 'down'" });
+      }
+      init = { method: 'POST', body: JSON.stringify({ direction: body.direction }) };
     } else if (route.kind === 'id') {
       const body = await readJsonBody(request);
       if (body === null) return json(400, { ok: false, error: 'malformed JSON body' });

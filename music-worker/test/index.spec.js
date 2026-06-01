@@ -184,7 +184,7 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
     fetchMock.assertNoPendingInterceptors();
   });
 
-  it('volume up -> proxies POST {delta:10} with X-Remote-Key, streams the dashboard 200 body verbatim', async () => {
+  it('volume up -> forwards POST {direction:"up"} VERBATIM with X-Remote-Key, streams the dashboard 200 body verbatim', async () => {
     let seen;
     fetchMock
       .get(DASH_ORIGIN)
@@ -202,11 +202,13 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, volume: 80 });
-    expect(JSON.parse(seen.body)).toEqual({ delta: 10 });
+    // The worker forwards the bare direction — the dashboard owns the ±step
+    // magnitude (single source of truth). No { delta } shape.
+    expect(JSON.parse(seen.body)).toEqual({ direction: 'up' });
     expect(headerOf(seen.headers, 'X-Remote-Key')).toBe('test-remote-key');
   });
 
-  it('volume down -> proxies POST {delta:-10}', async () => {
+  it('volume down -> forwards POST {direction:"down"} verbatim', async () => {
     let seen;
     fetchMock
       .get(DASH_ORIGIN)
@@ -222,7 +224,7 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
       body: JSON.stringify({ direction: 'down' }),
     });
 
-    expect(JSON.parse(seen.body)).toEqual({ delta: -10 });
+    expect(JSON.parse(seen.body)).toEqual({ direction: 'down' });
   });
 
   it('play with a numeric-string id -> proxies POST {id:<number>} (coerced)', async () => {

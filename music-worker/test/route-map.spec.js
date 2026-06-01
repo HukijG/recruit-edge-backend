@@ -4,8 +4,6 @@ import {
   API_REMOTE_PATH,
   throwIfUnset,
   parseDeezerId,
-  volumeDeltaFor,
-  VOLUME_STEP_POINTS,
 } from '../src/route-map.js';
 
 describe('route-map', () => {
@@ -48,16 +46,8 @@ describe('route-map', () => {
     expect(Object.keys(API_REMOTE_PATH).sort()).toEqual(Object.keys(MUSIC_ROUTES).sort());
   });
 
-  it('volume direction maps to a fixed +/-10 percentage-point delta', () => {
-    expect(VOLUME_STEP_POINTS).toBe(10);
-    expect(volumeDeltaFor('up')).toEqual({ ok: true, delta: 10 });
-    expect(volumeDeltaFor('down')).toEqual({ ok: true, delta: -10 });
-  });
-
-  it('volume rejects any non up/down direction', () => {
-    expect(volumeDeltaFor('UP').ok).toBe(false);
-    expect(volumeDeltaFor(5).ok).toBe(false);
-    expect(volumeDeltaFor(undefined).ok).toBe(false);
+  it('the volume route is a POST of kind volume (direction forwarded verbatim; dashboard owns the step)', () => {
+    expect(MUSIC_ROUTES.volume).toEqual({ method: 'POST', kind: 'volume' });
   });
 
   it('parseDeezerId accepts numbers and numeric strings', () => {

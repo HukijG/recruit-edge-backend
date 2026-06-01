@@ -6,22 +6,20 @@
  *
  *  - INBOUND (this worker's OWN API, fully specified here): the extension calls
  *    the routes in MUSIC_ROUTES below. Shapes are frozen in this module and in
- *    docs/music-worker.md. Volume magnitude is server-fixed (+/-10 percentage
- *    points); Deezer ids are numeric.
+ *    docs/music-worker.md. The client sends only a volume DIRECTION ('up'|'down');
+ *    the DASHBOARD owns the fixed +/-step magnitude (single source of truth) — the
+ *    worker forwards { direction } verbatim and never computes a delta. Deezer ids
+ *    are numeric.
  *
  *  - OUTBOUND (the FROZEN cross-repo contract): this worker proxies to the
  *    dashboard at ${DASHBOARD_REMOTE_BASE}${path} with header X-Remote-Key. The
  *    dashboard sub-path STRINGS are now CONFIRMED against the dashboard's actual
  *    /api/remote/* routes (escalation 1 resolved). throwIfUnset() is retained as a
  *    safety net but never fires now that every value is real. Frozen+hard-coded
- *    bits (X-Remote-Key, DASHBOARD_REMOTE_BASE, volume +/-10, Deezer numeric ids)
- *    are part of the same contract.
+ *    bits (X-Remote-Key, DASHBOARD_REMOTE_BASE, Deezer numeric ids) are part of the
+ *    same contract. The volume +/-step magnitude is NOT in this worker — the
+ *    dashboard owns it; the worker forwards the bare { direction }.
  */
-
-// Server-fixed volume delta, in percentage points. FROZEN by the cross-repo
-// contract — the magnitude is NEVER client-supplied; the client only sends a
-// direction. Named constant, not an inline magic number.
-export const VOLUME_STEP_POINTS = 10;
 
 // Sentinel prefix marking an UNSET dashboard sub-path. A real path will never
 // start with this, so throwIfUnset can detect a placeholder reaching a live call.
@@ -74,8 +72,8 @@ export function throwIfUnset(route, path) {
  *
  * `kind`:
  *   'transport'      — POST, empty {} body (pause/resume/next/prev).
- *   'volume'         — POST { direction: 'up'|'down' }; mapped to a fixed
- *                      +/-VOLUME_STEP_POINTS delta server-side.
+ *   'volume'         — POST { direction: 'up'|'down' }; forwarded VERBATIM to the
+ *                      dashboard, which owns the fixed +/-step magnitude.
  *   'id'             — POST { id: <numeric Deezer id> } (play/enqueue/playlist-play).
  *   'search'         — GET ?q=<free text> (search/playlist-search).
  *   'contents'       — GET ?id=<numeric Deezer id> (playlist-contents).
@@ -112,15 +110,3 @@ export function parseDeezerId(raw) {
   return { ok: false };
 }
 
-/**
- * Map a volume direction to a signed percentage-point delta. Magnitude is fixed
- * server-side; only the sign comes from the client.
- *
- * @param {unknown} direction
- * @returns {{ ok: true, delta: number } | { ok: false }}
- */
-export function volumeDeltaFor(direction) {
-  if (direction === 'up') return { ok: true, delta: VOLUME_STEP_POINTS };
-  if (direction === 'down') return { ok: true, delta: -VOLUME_STEP_POINTS };
-  return { ok: false };
-}
