@@ -174,9 +174,10 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
     });
 
     await runInDurableObject(s, async (instance, state) => {
-      // alarm() re-opens upstream (no UPSTREAM_WS_URL in test => stays null, but
-      // ensureUpstream returns "reopened" so the persisted snapshot is re-fanned),
-      // then re-arms because demand>0.
+      // alarm() re-opens upstream. The derived dashboard WS is unreachable in the
+      // test env, so openUpstream logs + leaves upstream null — but ensureUpstream
+      // still returns "reopened", so the persisted snapshot is re-fanned; then it
+      // re-arms because demand>0.
       await instance.alarm();
       const alarmAt = await state.storage.getAlarm();
       expect(alarmAt).toBeGreaterThan(Date.now());
@@ -185,7 +186,7 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
     expect(JSON.parse(await received)).toEqual(SNAPSHOT);
   });
 
-  it('(4) openUpstream carries the frozen X-Remote-Key on the upstream WS upgrade (mirrors proxy.js — escalation 5)', async () => {
+  it('(4) openUpstream derives the WS URL from DASHBOARD_REMOTE_BASE and carries the frozen X-Remote-Key (escalation 5)', async () => {
     const s = stub();
     await runInDurableObject(s, async (instance) => {
       // A fake upstream WebSocket so openUpstream completes without a real socket.
@@ -197,25 +198,23 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
         .spyOn(globalThis, 'fetch')
         .mockResolvedValue({ webSocket: fakeWs });
 
-      // Point the (otherwise-unset-in-test-env) upstream URL at a value so the
-      // open path actually runs the fetch. DASHBOARD_REMOTE_KEY is set in the
-      // vitest miniflare bindings to 'test-remote-key'.
-      instance.env.UPSTREAM_WS_URL = 'wss://upstream.test.local/now-playing';
+      // The upstream URL is DERIVED from DASHBOARD_REMOTE_BASE
+      // ('https://dashboard.test.local' in vitest miniflare bindings): https->wss
+      // + '/api/remote/nowplaying'. DASHBOARD_REMOTE_KEY = 'test-remote-key'.
+      expect(instance.env.DASHBOARD_REMOTE_BASE).toBe('https://dashboard.test.local');
       expect(instance.env.DASHBOARD_REMOTE_KEY).toBe('test-remote-key');
 
       await instance.openUpstream();
 
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       const [url, init] = fetchSpy.mock.calls[0];
-      expect(url).toBe('wss://upstream.test.local/now-playing');
+      expect(url).toBe('wss://dashboard.test.local/api/remote/nowplaying');
       expect(init.headers.Upgrade).toBe('websocket');
       // The outbound credential is present by default (the contract's
-      // outbound-auth requirement) — NOT silently omitted as before.
+      // outbound-auth requirement) — NOT silently omitted.
       expect(init.headers['X-Remote-Key']).toBe('test-remote-key');
 
       fetchSpy.mockRestore();
-      // Drop the field we set so it doesn't leak into other tests on this shared env.
-      delete instance.env.UPSTREAM_WS_URL;
       instance.upstream = null;
     });
   });
@@ -241,7 +240,8 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
         },
       };
       const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({ webSocket: fakeWs });
-      instance.env.UPSTREAM_WS_URL = 'wss://upstream.test.local/now-playing';
+      // DASHBOARD_REMOTE_BASE is set in the vitest bindings, so openUpstream derives
+      // the URL and runs the (mocked) fetch.
       await instance.openUpstream();
       expect(typeof messageHandler).toBe('function');
 
@@ -253,7 +253,6 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
       expect(await state.storage.get('snapshot')).toEqual(SNAPSHOT);
 
       fetchSpy.mockRestore();
-      delete instance.env.UPSTREAM_WS_URL;
       instance.upstream = null;
     });
 
@@ -279,7 +278,7 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
         },
       };
       const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({ webSocket: fakeWs });
-      instance.env.UPSTREAM_WS_URL = 'wss://upstream.test.local/now-playing';
+      // DASHBOARD_REMOTE_BASE is set in the vitest bindings, so openUpstream runs.
       await instance.openUpstream();
       expect(typeof messageHandler).toBe('function');
 
@@ -297,7 +296,6 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
 
       fetchSpy.mockRestore();
       warnSpy.mockRestore();
-      delete instance.env.UPSTREAM_WS_URL;
       instance.upstream = null;
     });
   });

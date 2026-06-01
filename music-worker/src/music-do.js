@@ -297,36 +297,51 @@ export class MusicRemoteState extends DurableObject {
   }
 
   async openUpstream() {
-    const url = this.env.UPSTREAM_WS_URL;
-    if (typeof url !== 'string' || url.length === 0) {
-      // No upstream configured (e.g. test env). Demand-gate + fan-out still
-      // function; live events simply won't arrive until UPSTREAM_WS_URL is set.
-      // CONTRACT GAP — see escalation 5 in docs/music-worker.md: the upstream
-      // now-playing WS source URL is genuinely unfrozen (the contract specifies
-      // only the extension->worker WS route and the worker->dashboard HTTP
-      // /api/remote/* path). When unset the fan-out delivers only the persisted
-      // snapshot, never live events. This is as load-bearing as escalation 1 and
-      // must be resolved before live now-playing data can flow.
+    const base = this.env.DASHBOARD_REMOTE_BASE;
+    if (typeof base !== 'string' || base.length === 0) {
+      // No dashboard base configured (e.g. test env). Demand-gate + fan-out still
+      // function; live events simply won't arrive until DASHBOARD_REMOTE_BASE is
+      // set. The fan-out then delivers only the persisted snapshot, never live
+      // events.
       this.upstream = null;
       return;
     }
+    // ESCALATION 5 RESOLVED: the upstream now-playing WS IS the dashboard's
+    // /api/remote/nowplaying route over DASHBOARD_REMOTE_BASE — the same ingress
+    // the HTTP proxy (proxy.js) already targets. DERIVE the WS URL from the base:
+    // http -> ws, https -> wss, then append the nowplaying path.
+    const url = base.replace(/^http(s?):\/\//i, (_m, s) => `ws${s}://`) + '/api/remote/nowplaying';
+
     // PLAIN fetch WS upgrade. NO @microlabs wrapper, NO OTel.
     //
-    // OUTBOUND AUTH — see escalation 5: the HTTP proxy path to the dashboard
-    // ingress carries the frozen X-Remote-Key (proxy.js); this upstream WS must
-    // carry the SAME credential by default so that — if the now-playing upstream
-    // IS the dashboard (the most likely source, since it already brokers all
-    // control) — the WS upgrade satisfies the contract's outbound-auth
-    // requirement. Sending it is harmless if the operator points UPSTREAM_WS_URL
-    // at a different source that ignores the header; sending NOTHING would
-    // silently fail against a dashboard that requires it. The key is omitted only
-    // when DASHBOARD_REMOTE_KEY itself is unset (e.g. a test env).
+    // OUTBOUND AUTH (escalation 5): the upstream WS upgrade carries the SAME frozen
+    // X-Remote-Key credential the HTTP proxy uses (proxy.js), since the upstream is
+    // the dashboard. The key is omitted only when DASHBOARD_REMOTE_KEY itself is
+    // unset (e.g. a test env).
     const headers = { Upgrade: 'websocket' };
     if (typeof this.env.DASHBOARD_REMOTE_KEY === 'string' && this.env.DASHBOARD_REMOTE_KEY.length > 0) {
       headers['X-Remote-Key'] = this.env.DASHBOARD_REMOTE_KEY;
     }
-    const resp = await fetch(url, { headers });
-    const ws = resp.webSocket;
+    // The dashboard may be briefly unreachable (DNS failure, cold or absent
+    // ingress) — the same expected steady state the HTTP proxy degrades to a 502
+    // for. A bare fetch rejection here would propagate out of ensureUpstream()
+    // through alarm(), the WS-upgrade lazy re-open, and the constructor's
+    // blockConcurrencyWhile, crashing those paths. Treat it like the no-socket
+    // branch: leave upstream null; the demand-gate keeps the alarm armed and the
+    // next interval (or a reconnecting/message-sending subscriber) retries.
+    let ws;
+    try {
+      const resp = await fetch(url, { headers });
+      ws = resp.webSocket;
+    } catch (err) {
+      console.warn({
+        source: 'music-do',
+        message: '[music-do] upstream WS open failed (dashboard unreachable) — will retry',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.upstream = null;
+      return;
+    }
     if (!ws) {
       this.upstream = null;
       return;
