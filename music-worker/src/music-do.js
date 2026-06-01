@@ -161,8 +161,9 @@ export class MusicRemoteState extends DurableObject {
     // getWebSockets(). This is the demand source of truth on the live side.
     this.ctx.acceptWebSocket(server);
 
-    // Demand changed (0->1 arms the alarm + opens upstream). Recompute from the
-    // live socket set so the count is always authoritative.
+    // Demand changed (0->1 arms the alarm + opens upstream). On the ACCEPT path
+    // the just-accepted socket SHOULD be counted, so no `excluding` arg — the
+    // unfiltered getWebSockets() length is authoritative here.
     await this.recomputeDemandAndReconcile();
 
     // BELT-AND-BRACES lazy re-open: a freshly-connecting subscriber forces
@@ -204,9 +205,13 @@ export class MusicRemoteState extends DurableObject {
     } catch {
       /* already closing */
     }
-    // Demand dropped. Recompute from the (now-smaller) live set; at 0 this closes
-    // upstream + deleteAlarm().
-    await this.recomputeDemandAndReconcile();
+    // Demand dropped. CRITICAL: inside webSocketClose/webSocketError the closing
+    // socket is STILL present in ctx.getWebSockets() — the set is NOT yet smaller.
+    // Pass the closing socket as `excluding` so the demand count reflects the
+    // post-close reality; at 0 this closes upstream + deleteAlarm(). Without the
+    // exclusion the last subscriber leaving would leave demand stuck at 1, the
+    // alarm armed forever, and the upstream WS leaked.
+    await this.recomputeDemandAndReconcile(ws);
   }
 
   async webSocketError(ws) {
@@ -215,7 +220,8 @@ export class MusicRemoteState extends DurableObject {
     } catch {
       /* already closing */
     }
-    await this.recomputeDemandAndReconcile();
+    // Same closing-socket-still-counted hazard as webSocketClose — exclude it.
+    await this.recomputeDemandAndReconcile(ws);
   }
 
   // ---- Demand-gate core ---------------------------------------------------
@@ -223,9 +229,16 @@ export class MusicRemoteState extends DurableObject {
   /**
    * Recompute demand from the authoritative live socket set, persist it, and
    * reconcile upstream + alarm: open+arm when demand>0, close+deleteAlarm when 0.
+   *
+   * @param {WebSocket} [excluding] - a socket to exclude from the count. The
+   *   close/error handlers pass the closing socket here because it is STILL in
+   *   ctx.getWebSockets() during those handlers; the accept path passes nothing
+   *   (the just-accepted socket SHOULD be counted).
    */
-  async recomputeDemandAndReconcile() {
-    const demand = this.ctx.getWebSockets().length;
+  async recomputeDemandAndReconcile(excluding) {
+    const sockets = this.ctx.getWebSockets();
+    const demand =
+      excluding == null ? sockets.length : sockets.filter((s) => s !== excluding).length;
     await this.ctx.storage.put(STORAGE.demand, demand);
     if (demand > 0) {
       await this.ensureUpstream();
@@ -288,11 +301,31 @@ export class MusicRemoteState extends DurableObject {
     if (typeof url !== 'string' || url.length === 0) {
       // No upstream configured (e.g. test env). Demand-gate + fan-out still
       // function; live events simply won't arrive until UPSTREAM_WS_URL is set.
+      // CONTRACT GAP — see escalation 5 in docs/music-worker.md: the upstream
+      // now-playing WS source URL is genuinely unfrozen (the contract specifies
+      // only the extension->worker WS route and the worker->dashboard HTTP
+      // /api/remote/* path). When unset the fan-out delivers only the persisted
+      // snapshot, never live events. This is as load-bearing as escalation 1 and
+      // must be resolved before live now-playing data can flow.
       this.upstream = null;
       return;
     }
     // PLAIN fetch WS upgrade. NO @microlabs wrapper, NO OTel.
-    const resp = await fetch(url, { headers: { Upgrade: 'websocket' } });
+    //
+    // OUTBOUND AUTH — see escalation 5: the HTTP proxy path to the dashboard
+    // ingress carries the frozen X-Remote-Key (proxy.js); this upstream WS must
+    // carry the SAME credential by default so that — if the now-playing upstream
+    // IS the dashboard (the most likely source, since it already brokers all
+    // control) — the WS upgrade satisfies the contract's outbound-auth
+    // requirement. Sending it is harmless if the operator points UPSTREAM_WS_URL
+    // at a different source that ignores the header; sending NOTHING would
+    // silently fail against a dashboard that requires it. The key is omitted only
+    // when DASHBOARD_REMOTE_KEY itself is unset (e.g. a test env).
+    const headers = { Upgrade: 'websocket' };
+    if (typeof this.env.DASHBOARD_REMOTE_KEY === 'string' && this.env.DASHBOARD_REMOTE_KEY.length > 0) {
+      headers['X-Remote-Key'] = this.env.DASHBOARD_REMOTE_KEY;
+    }
+    const resp = await fetch(url, { headers });
     const ws = resp.webSocket;
     if (!ws) {
       this.upstream = null;

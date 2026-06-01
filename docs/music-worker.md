@@ -67,6 +67,22 @@ sub-paths into `API_REMOTE_PATH` to go live. The frozen bits (X-Remote-Key,
 `DASHBOARD_REMOTE_BASE`, volume ±10, Deezer numeric ids) are hard-coded, not
 placeholders.
 
+**Validation ordering.** The router validates the **inbound** request shape (this
+worker's own contract: direction, numeric Deezer id, `q` present, well-formed JSON)
+**before** resolving the outbound dashboard sub-path. A malformed client request
+therefore returns a **400** describing the client's error — not the **501**
+placeholder error, which is about the *unfrozen outbound wiring* and would mislead
+the client into thinking the route is unimplemented when their input was invalid.
+The two concerns are independent.
+
+**Error responses are uniformly structured.** Every failure path returns
+`json(status, { ok:false, code?, error })`: `401` auth, `400` validation, `404`
+unknown route, `405` wrong method, `426` non-Upgrade WS, `501` unset dashboard path,
+and **`502 { code:'dashboard_unreachable' }`** when the outbound
+`fetch` to the dashboard rejects (DNS failure / cold or absent ingress — the
+expected steady state while the dashboard is built in parallel). The extension's
+error handling stays uniform regardless of dashboard availability.
+
 ## NowPlayingSnapshot (fanned verbatim, camelCase — never re-shaped)
 
 ```jsonc
@@ -110,6 +126,23 @@ is entirely new. Only the migration-tag style is mirrored from the root wrangler
   `acceptWebSocket()`'d (it is not a client of this DO). A plain field does **not**
   survive isolate eviction, and a fully-hibernated DO with no in-flight events does
   not wake on its own.
+  - **⚠️ `UPSTREAM_WS_URL` is unfrozen (escalation 5).** Where the now-playing
+    snapshot *originates* is genuinely not in the frozen contract — the contract
+    specifies only the extension→worker WS route and the worker→dashboard HTTP
+    `/api/remote/*` path. It is plausible the stream is meant to originate from the
+    dashboard ingress (which already brokers all control), not a distinct URL.
+    Until escalation 5 is resolved, `openUpstream()` no-ops when the var is unset
+    and the fan-out delivers **only** the persisted snapshot, never live events.
+    This is the single most load-bearing config for the fan-out feature — see
+    escalations.
+  - **Outbound WS auth.** The upstream WS upgrade carries the frozen
+    **`X-Remote-Key`** header (= `DASHBOARD_REMOTE_KEY`), mirroring the HTTP proxy
+    (`proxy.js`), so that — if the upstream IS the dashboard — the upgrade
+    satisfies the contract's outbound-auth requirement by default. The header is
+    omitted only when `DASHBOARD_REMOTE_KEY` is unset. If the operator points
+    `UPSTREAM_WS_URL` at a non-dashboard source that ignores it, the header is
+    harmless; sending nothing would silently fail against a dashboard that
+    requires it. See escalation 5.
 
 ### Demand-gate (the load-bearing mechanism)
 
@@ -230,7 +263,7 @@ path — which adds a third auth surface plus its own hostname and audience.
 | `ACCESS_CLIENT_ID_MIDDLEWARE` | App-2 SaaS-OIDC client_id |
 | `DASHBOARD_REMOTE_KEY` | outbound `X-Remote-Key` to the dashboard |
 | `DASHBOARD_REMOTE_BASE` | dashboard ingress base URL (recommend secret) |
-| `UPSTREAM_WS_URL` | upstream music-source WebSocket URL |
+| `UPSTREAM_WS_URL` | upstream music-source WebSocket URL — **unfrozen, see escalation 5**; the upgrade carries `X-Remote-Key` (= `DASHBOARD_REMOTE_KEY`) |
 | `ACCESS_ALLOWED_EMAILS` | only if the operator declines the `USERS_DB` binding |
 
 `ACCESS_AUD_MIDDLEWARE` **and** `ACCESS_CLIENT_ID_MIDDLEWARE` must both be set or the
@@ -266,3 +299,18 @@ npx wrangler deploy --dry-run -c music-worker/wrangler.music.jsonc
    surface + hostname/AUD).
 4. **Ops / secrets / hostname** — create the `rf-music-remote` worker + hostname,
    set the secrets above, bind `USERS_DB` read-only, set `PLASMO_PUBLIC_MUSIC_URL`.
+5. **Upstream now-playing WS source + its auth** — where does the now-playing
+   stream *originate*? The frozen contract specifies the extension→worker WS
+   route and the worker→dashboard HTTP `/api/remote/*` path, but **never defines a
+   separate upstream WS source**. Resolve two things, both as load-bearing as
+   escalation 1:
+   - **(a) Source URL.** Is it a dedicated `UPSTREAM_WS_URL`, or a route on
+     `DASHBOARD_REMOTE_BASE` (the ingress that already brokers all control)? When
+     unset, `openUpstream()` no-ops and **only** the persisted snapshot is fanned —
+     no live events ever arrive. The whole fan-out feature is inert until this is
+     ratified; it must not sit silently in the secrets table.
+   - **(b) Upgrade auth.** If the upstream IS the dashboard, the WS upgrade must
+     carry `X-Remote-Key` (= `DASHBOARD_REMOTE_KEY`) to satisfy the contract's
+     outbound-auth requirement — exactly as the HTTP proxy does. The worker sends
+     this header by default (see `openUpstream()`); confirm the upstream expects
+     it, or specify the correct credential if the source is non-dashboard.

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import {
   WS_SUBPROTOCOL,
@@ -31,6 +31,10 @@ async function connectClient(s) {
   ws.accept();
   return ws;
 }
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 const SNAPSHOT = {
   isPlaying: true,
@@ -111,7 +115,7 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
     expect(UPSTREAM_ALARM_INTERVAL_MS).toBe(30_000);
   });
 
-  it('(1) 0->1 connect arms an alarm and persists demand; close back to 0 deletes it', async () => {
+  it('(1) 0->1 connect arms an alarm and persists demand; the REAL webSocketClose handler drives demand back to 0 (excludes the closing socket), tears down upstream, and deletes the alarm', async () => {
     const s = stub();
     const ws = await connectClient(s);
 
@@ -122,21 +126,36 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
       void instance;
     });
 
-    // Close the only subscriber; webSocketClose recomputes demand=0 and deletes the alarm.
-    ws.close();
+    // Invoke the REAL handler against the only socket. CRITICAL REGRESSION GUARD:
+    // inside webSocketClose the closing socket is STILL present in
+    // getWebSockets(), so the handler MUST exclude it (recomputeDemandAndReconcile(ws))
+    // to reach demand=0. The prior test bypassed the handler — manually closing
+    // each socket then calling recomputeDemandAndReconcile() with no arg, by which
+    // point the set had already settled to 0 — and so MASKED the bug where the
+    // last subscriber leaving left demand stuck at 1 and the alarm armed forever.
     await runInDurableObject(s, async (instance, state) => {
-      // Drive the close handler deterministically against the live socket set.
-      for (const sock of state.getWebSockets()) {
-        try {
-          sock.close();
-        } catch {
-          /* noop */
-        }
-      }
-      await instance.recomputeDemandAndReconcile();
+      const sockets = state.getWebSockets();
+      expect(sockets.length).toBe(1); // the closing socket is still in the live set
+      const theOnlySocket = sockets[0];
+
+      // Force upstream "live" so we can prove the handler tears it down at 0.
+      let upstreamClosed = false;
+      instance.upstream = {
+        readyState: WebSocket.OPEN,
+        close() {
+          upstreamClosed = true;
+        },
+      };
+
+      await instance.webSocketClose(theOnlySocket);
+
       expect(await state.storage.get('demand')).toBe(0);
       expect(await state.storage.getAlarm()).toBeNull();
+      expect(upstreamClosed).toBe(true);
+      expect(instance.upstream).toBeNull();
     });
+
+    ws.close();
   });
 
   it('(2) alarm() with persisted demand>0 re-fans the persisted snapshot and re-arms', async () => {
@@ -164,6 +183,41 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
     });
 
     expect(JSON.parse(await received)).toEqual(SNAPSHOT);
+  });
+
+  it('(4) openUpstream carries the frozen X-Remote-Key on the upstream WS upgrade (mirrors proxy.js — escalation 5)', async () => {
+    const s = stub();
+    await runInDurableObject(s, async (instance) => {
+      // A fake upstream WebSocket so openUpstream completes without a real socket.
+      // (A real Response can't be constructed with status 101 in workerd, so the
+      // mock returns a minimal object exposing the `.webSocket` field openUpstream
+      // reads — the fetch is what we're asserting on, not the Response shape.)
+      const fakeWs = { accept() {}, addEventListener() {} };
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue({ webSocket: fakeWs });
+
+      // Point the (otherwise-unset-in-test-env) upstream URL at a value so the
+      // open path actually runs the fetch. DASHBOARD_REMOTE_KEY is set in the
+      // vitest miniflare bindings to 'test-remote-key'.
+      instance.env.UPSTREAM_WS_URL = 'wss://upstream.test.local/now-playing';
+      expect(instance.env.DASHBOARD_REMOTE_KEY).toBe('test-remote-key');
+
+      await instance.openUpstream();
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchSpy.mock.calls[0];
+      expect(url).toBe('wss://upstream.test.local/now-playing');
+      expect(init.headers.Upgrade).toBe('websocket');
+      // The outbound credential is present by default (the contract's
+      // outbound-auth requirement) — NOT silently omitted as before.
+      expect(init.headers['X-Remote-Key']).toBe('test-remote-key');
+
+      fetchSpy.mockRestore();
+      // Drop the field we set so it doesn't leak into other tests on this shared env.
+      delete instance.env.UPSTREAM_WS_URL;
+      instance.upstream = null;
+    });
   });
 
   it('(3) lazy re-open: webSocketMessage forces ensureUpstream independent of the alarm', async () => {

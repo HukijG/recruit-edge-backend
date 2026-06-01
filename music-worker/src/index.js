@@ -104,15 +104,17 @@ export default {
     }
 
     // Build the dashboard request per route kind.
-    let mappedPath;
+    //
+    // ORDER MATTERS: validate the INBOUND request shape FIRST (this worker's own
+    // contract — route-map.js fully specifies it), THEN resolve the outbound
+    // dashboard sub-path. A malformed client request (bad direction, non-numeric
+    // id, missing q, malformed JSON) must return a 400 describing the client's
+    // error — NOT a 501 "dashboard path unset (escalation 1)", which is about the
+    // UNFROZEN outbound wiring and would mislead the client into thinking the
+    // route is unimplemented when their own input was invalid. The two concerns
+    // are independent; inbound validation does not depend on outbound wiring.
     let init;
-    try {
-      mappedPath = throwIfUnset(routeName, API_REMOTE_PATH[routeName]);
-    } catch (err) {
-      // Placeholder hit a live call — surface loudly (escalation 1).
-      return json(501, { ok: false, error: err.message });
-    }
-
+    let querySuffix = '';
     if (route.kind === 'transport') {
       init = { method: 'POST', body: JSON.stringify({}) };
     } else if (route.kind === 'volume') {
@@ -130,23 +132,47 @@ export default {
     } else if (route.kind === 'search') {
       const q = url.searchParams.get('q');
       if (q == null || q.length === 0) return json(400, { ok: false, error: 'q is required' });
-      mappedPath = `${mappedPath}?q=${encodeURIComponent(q)}`;
+      querySuffix = `?q=${encodeURIComponent(q)}`;
       init = { method: 'GET' };
     } else if (route.kind === 'contents') {
       const parsed = parseDeezerId(url.searchParams.get('id'));
       if (!parsed.ok) return json(400, { ok: false, error: 'id must be a numeric Deezer id' });
-      mappedPath = `${mappedPath}?id=${parsed.id}`;
+      querySuffix = `?id=${parsed.id}`;
       init = { method: 'GET' };
     } else {
       return new Response('Not Found', { status: 404 });
     }
 
-    const upstream = await proxyToDashboard(env, mappedPath, init);
-    // Stream the dashboard response straight back (status + body), so the
-    // extension sees the dashboard's result verbatim.
-    return new Response(upstream.body, {
-      status: upstream.status,
-      headers: { 'Content-Type': upstream.headers.get('Content-Type') ?? 'application/json' },
-    });
+    // Inbound request is valid. NOW resolve the outbound dashboard sub-path; an
+    // unset placeholder surfaces loudly as 501 (escalation 1).
+    let mappedPath;
+    try {
+      mappedPath = throwIfUnset(routeName, API_REMOTE_PATH[routeName]) + querySuffix;
+    } catch (err) {
+      return json(501, { ok: false, error: err.message });
+    }
+
+    // The dashboard is a parallel-built dependency that may not exist / be
+    // reachable yet (DNS failure, cold ingress, unset DASHBOARD_REMOTE_BASE).
+    // A bare fetch rejection here would surface as an opaque runtime 500 with no
+    // body — inconsistent with every other failure path in this file, which
+    // returns a structured json(...). Catch it and return a uniform 502 so the
+    // extension's error handling stays consistent regardless of dashboard health.
+    let upstream;
+    try {
+      upstream = await proxyToDashboard(env, mappedPath, init);
+      // Stream the dashboard response straight back (status + body), so the
+      // extension sees the dashboard's result verbatim.
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: { 'Content-Type': upstream.headers.get('Content-Type') ?? 'application/json' },
+      });
+    } catch {
+      return json(502, {
+        ok: false,
+        code: 'dashboard_unreachable',
+        error: 'music dashboard upstream unavailable',
+      });
+    }
   },
 };
