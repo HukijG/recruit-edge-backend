@@ -1,0 +1,62 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rf-music-remote",
+  "main": "src/index.js",
+  "compatibility_date": "2026-05-10",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // OBSERVABILITY DELIBERATELY WAIVED for the music remote (frozen contract v2).
+  // There is NO `observability` block, NO @microlabs/otel-cf-workers dependency,
+  // NO LD_OTLP_* URLs, and NO instrument() wrapper in src/index.js. The absence
+  // is the proof of the waiver — do not add OTel to this worker.
+
+  // The extension reaches this worker from the browser over the public internet
+  // (PLASMO_PUBLIC_MUSIC_URL on the extension side), so — UNLIKE cache-worker
+  // (workers_dev:false, binding-only) — the public workers.dev subdomain must
+  // stay enabled. A later custom domain becomes the PLASMO_PUBLIC_MUSIC_URL.
+  "workers_dev": true,
+
+  "vars": {
+    // Cloudflare Access team domain. Matches the root worker + mcp-remote.
+    // The App-2 (SaaS-OIDC) issuer + per-app JWKS URLs are derived from this
+    // plus ACCESS_CLIENT_ID_MIDDLEWARE at request time (see src/auth-music.js).
+    "ACCESS_TEAM_DOMAIN": "https://example-team.cloudflareaccess.com"
+    // NO LD_OTLP_* URLs — OTel waived.
+  },
+
+  // Music now-playing fan-out + upstream-liveness + single-use WS tickets live
+  // in this worker's own Durable Object. SQLite-backed (required for the
+  // WebSocket Hibernation API + ctx.storage alarms).
+  "durable_objects": {
+    "bindings": [{ "name": "MUSIC_REMOTE", "class_name": "MusicRemoteState" }]
+  },
+
+  // Self-contained migration list for THIS worker only. Tag style mirrors the
+  // root wrangler.jsonc migrations chain; this is NOT an edit to the root
+  // config — a new worker owns its own migrations.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MusicRemoteState"] }],
+
+  // Read-only USERS_DB binding — the single team registry. The MAIN worker owns
+  // the schema (NO migrations_dir here => read-only), mirroring the precedent in
+  // cache-worker/wrangler.cache.jsonc. Used by the JWT identity gate to 403
+  // valid-JWT-but-unregistered emails. (Present per escalation 2: operator
+  // confirms this binding; ACCESS_ALLOWED_EMAILS replaces it only on explicit
+  // opt-out.)
+  "d1_databases": [
+    {
+      "binding": "USERS_DB",
+      "database_name": "rf-users",
+      "database_id": "00000000-0000-0000-0000-000000000002"
+    }
+  ]
+
+  // SECRETS (Cloudflare dashboard, NEVER here):
+  //   LINKEDIN_EXTENSION_SECRET      — = main worker value (legacy X-Extension-Token).
+  //   ACCESS_AUD_MIDDLEWARE          — App-2 redirect URI(s), comma-separated.
+  //   ACCESS_CLIENT_ID_MIDDLEWARE    — App-2 SaaS-OIDC client_id.
+  //                                    (Both AUD+CLIENT_ID required, or the
+  //                                     fail-safe drops the JWT path to legacy.)
+  //   DASHBOARD_REMOTE_KEY           — outbound X-Remote-Key to the dashboard.
+  //   DASHBOARD_REMOTE_BASE          — dashboard ingress base URL (recommend secret).
+  //   ACCESS_ALLOWED_EMAILS          — only if the operator declines USERS_DB.
+}

@@ -1,0 +1,20 @@
+{
+  "name": "rf-music-remote",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --config wrangler.music.jsonc",
+    "deploy": "wrangler deploy --config wrangler.music.jsonc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "jose": "^6.2.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.71",
+    "@cloudflare/workers-types": "^4.20250902.0",
+    "vitest": "~3.2.0",
+    "wrangler": "^4.33.1"
+  }
+}
