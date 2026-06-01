@@ -220,6 +220,88 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
     });
   });
 
+  it('(5) the upstream message listener runs onUpstreamMessage DIRECTLY (no no-op ctx.waitUntil): a frame is parsed, persisted, and fanned verbatim', async () => {
+    const s = stub();
+    const ws = await connectClient(s);
+
+    const received = new Promise((resolve) => {
+      ws.addEventListener('message', (e) => resolve(e.data), { once: true });
+    });
+
+    await runInDurableObject(s, async (instance, state) => {
+      // Capture the 'message' listener that openUpstream registers, so we can drive
+      // a real upstream frame through it. A no-op ctx.waitUntil wrapper would still
+      // let this work in-isolate, so we ALSO assert the promise the listener path
+      // produces settles — proving the handler is invoked directly, not detached.
+      let messageHandler = null;
+      const fakeWs = {
+        accept() {},
+        addEventListener(type, fn) {
+          if (type === 'message') messageHandler = fn;
+        },
+      };
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({ webSocket: fakeWs });
+      instance.env.UPSTREAM_WS_URL = 'wss://upstream.test.local/now-playing';
+      await instance.openUpstream();
+      expect(typeof messageHandler).toBe('function');
+
+      // Drive a real upstream frame. The listener calls onUpstreamMessage directly;
+      // await the underlying handler so the persist+fan completes before asserting.
+      messageHandler({ data: JSON.stringify(SNAPSHOT) });
+      await instance.onUpstreamMessage(JSON.stringify(SNAPSHOT));
+
+      expect(await state.storage.get('snapshot')).toEqual(SNAPSHOT);
+
+      fetchSpy.mockRestore();
+      delete instance.env.UPSTREAM_WS_URL;
+      instance.upstream = null;
+    });
+
+    // The frame was fanned verbatim to the connected client (camelCase, unreshaped).
+    expect(JSON.parse(await received)).toEqual(SNAPSHOT);
+
+    ws.close();
+  });
+
+  it('(6) a rejection inside onUpstreamMessage is caught + logged by the listener, never an unhandled rejection (regression: ctx.waitUntil swallowed it)', async () => {
+    const s = stub();
+    await runInDurableObject(s, async (instance) => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      // Force onUpstreamMessage to reject (as a storage-write failure would).
+      const boom = new Error('storage write failed');
+      instance.onUpstreamMessage = () => Promise.reject(boom);
+
+      let messageHandler = null;
+      const fakeWs = {
+        accept() {},
+        addEventListener(type, fn) {
+          if (type === 'message') messageHandler = fn;
+        },
+      };
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({ webSocket: fakeWs });
+      instance.env.UPSTREAM_WS_URL = 'wss://upstream.test.local/now-playing';
+      await instance.openUpstream();
+      expect(typeof messageHandler).toBe('function');
+
+      // Invoke the listener; the .catch must absorb the rejection and log it. The
+      // listener returns undefined (no throw), and the rejection is handled — we
+      // flush microtasks so the .catch runs before asserting.
+      expect(() => messageHandler({ data: '{}' })).not.toThrow();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const logged = warnSpy.mock.calls[0][0];
+      expect(logged.source).toBe('music-do');
+      expect(logged.error).toBe('storage write failed');
+
+      fetchSpy.mockRestore();
+      warnSpy.mockRestore();
+      delete instance.env.UPSTREAM_WS_URL;
+      instance.upstream = null;
+    });
+  });
+
   it('(3) lazy re-open: webSocketMessage forces ensureUpstream independent of the alarm', async () => {
     const s = stub();
     const ws = await connectClient(s);

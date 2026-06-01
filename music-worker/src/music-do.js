@@ -333,8 +333,22 @@ export class MusicRemoteState extends DurableObject {
     }
     ws.accept();
     this.upstream = ws;
+    // Handle each upstream frame directly. We do NOT wrap in ctx.waitUntil: on a
+    // DurableObjectState, waitUntil exists only for Workers-API surface
+    // compatibility and HAS NO EFFECT — it neither extends DO lifetime nor keeps
+    // the promise alive. DO lifetime here is governed by the open upstream socket
+    // + persisted demand-gate, not waitUntil. onUpstreamMessage is async (it does
+    // ctx.storage.put + fanOut), so attach a .catch: a parse/storage failure is
+    // logged via the file's structured-log idiom rather than becoming an unhandled
+    // rejection silently swallowed differently from every other error path here.
     ws.addEventListener('message', (event) => {
-      this.ctx.waitUntil(this.onUpstreamMessage(event.data));
+      this.onUpstreamMessage(event.data).catch((err) => {
+        console.warn({
+          source: 'music-do',
+          message: '[music-do] onUpstreamMessage failed (snapshot persist/fan-out)',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     });
     const drop = () => {
       if (this.upstream === ws) this.upstream = null;
