@@ -141,8 +141,9 @@ is entirely new. Only the migration-tag style is mirrored from the root wrangler
   - **Upstream URL is DERIVED from `DASHBOARD_REMOTE_BASE`.**
     The now-playing stream originates from the dashboard's
     **`/api/remote/nowplaying`** route — the same ingress the HTTP proxy already
-    targets. `openUpstream()` derives the WS URL from `DASHBOARD_REMOTE_BASE`
-    (`http`→`ws`, `https`→`wss`) and appends `/api/remote/nowplaying`. There is **no
+    targets. `openUpstream()` `fetch`es `DASHBOARD_REMOTE_BASE` + `/api/remote/nowplaying`
+    with an `Upgrade: websocket` header and reads `resp.webSocket` — the http(s)
+    scheme is **kept as-is** (the Workers runtime rejects a `ws`/`wss` URL). There is **no
     separate `UPSTREAM_WS_URL` secret**. When `DASHBOARD_REMOTE_BASE` is unset (e.g.
     a test env) `openUpstream()` no-ops and the fan-out delivers **only** the
     persisted snapshot, never live events.
@@ -311,8 +312,9 @@ npx wrangler deploy --dry-run -c music-worker/wrangler.music.jsonc
    set the secrets above, set `PLASMO_PUBLIC_MUSIC_URL`. (No `USERS_DB` binding —
    auth is JWT-only, escalation 2.)
 5. ~~**Upstream now-playing WS source + its auth**~~ — **RESOLVED.** The upstream is
-   the dashboard's **`/api/remote/nowplaying`** route, derived from
-   `DASHBOARD_REMOTE_BASE` (`http`→`ws` / `https`→`wss` + the path). The upgrade
+   the dashboard's **`/api/remote/nowplaying`** route at
+   `DASHBOARD_REMOTE_BASE` + the path, opened via `fetch` + an `Upgrade: websocket`
+   header (the http(s) scheme is kept — Workers rejects `ws`/`wss`). The upgrade
    carries the frozen **`X-Remote-Key`** (= `DASHBOARD_REMOTE_KEY`), exactly as the
    HTTP proxy does. There is no separate `UPSTREAM_WS_URL`; when
    `DASHBOARD_REMOTE_BASE` is unset, `openUpstream()` no-ops and only the persisted

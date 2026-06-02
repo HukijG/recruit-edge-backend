@@ -199,16 +199,18 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
         .mockResolvedValue({ webSocket: fakeWs });
 
       // The upstream URL is DERIVED from DASHBOARD_REMOTE_BASE
-      // ('https://dashboard.test.local' in vitest miniflare bindings): https->wss
-      // + '/api/remote/nowplaying'. DASHBOARD_REMOTE_KEY = 'test-remote-key'.
-      expect(instance.env.DASHBOARD_REMOTE_BASE).toBe('https://dashboard.test.local');
+      // ('https://dashboard.test.invalid' in vitest miniflare bindings): the http(s)
+      // scheme is KEPT (Workers opens an outbound WS by fetch()ing the http(s) URL
+      // with an `Upgrade: websocket` header — a ws/wss scheme is rejected), plus
+      // '/api/remote/nowplaying'. DASHBOARD_REMOTE_KEY = 'test-remote-key'.
+      expect(instance.env.DASHBOARD_REMOTE_BASE).toBe('https://dashboard.test.invalid');
       expect(instance.env.DASHBOARD_REMOTE_KEY).toBe('test-remote-key');
 
       await instance.openUpstream();
 
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       const [url, init] = fetchSpy.mock.calls[0];
-      expect(url).toBe('wss://dashboard.test.local/api/remote/nowplaying');
+      expect(url).toBe('https://dashboard.test.invalid/api/remote/nowplaying');
       expect(init.headers.Upgrade).toBe('websocket');
       // The outbound credential is present by default (the contract's
       // outbound-auth requirement) — NOT silently omitted.

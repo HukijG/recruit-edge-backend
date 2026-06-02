@@ -308,9 +308,12 @@ export class MusicRemoteState extends DurableObject {
     }
     // ESCALATION 5 RESOLVED: the upstream now-playing WS IS the dashboard's
     // /api/remote/nowplaying route over DASHBOARD_REMOTE_BASE — the same ingress
-    // the HTTP proxy (proxy.js) already targets. DERIVE the WS URL from the base:
-    // http -> ws, https -> wss, then append the nowplaying path.
-    const url = base.replace(/^http(s?):\/\//i, (_m, s) => `ws${s}://`) + '/api/remote/nowplaying';
+    // the HTTP proxy (proxy.js) already targets. In the Workers runtime an
+    // outbound WebSocket is opened by fetch()ing the http(s) URL with an
+    // `Upgrade: websocket` header and reading `resp.webSocket` — the runtime
+    // REJECTS a ws/wss scheme ("Fetch API cannot load: wss://…"). So keep the
+    // base's http(s) scheme as-is and just append the nowplaying path.
+    const url = base.replace(/\/+$/, '') + '/api/remote/nowplaying';
 
     // PLAIN fetch WS upgrade. NO @microlabs wrapper, NO OTel.
     //
