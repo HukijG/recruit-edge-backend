@@ -8,6 +8,7 @@ import {
   MAX_QUEUE,
   MAX_DELIVERY_ATTEMPTS,
   DELIVER_TIMEOUT_MS,
+  UPSTREAM_OPEN_TIMEOUT_MS,
 } from '../src/music-do.js';
 
 function stub() {
@@ -154,8 +155,10 @@ describe('MusicRemoteState — fan-out', () => {
 
 describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
   beforeEach(() => {
-    // sanity: the cadence is a named constant, not an inline magic value
+    // sanity: the cadence + upstream-open timeout are named constants, not inline
+    // magic values.
     expect(UPSTREAM_ALARM_INTERVAL_MS).toBe(30_000);
+    expect(UPSTREAM_OPEN_TIMEOUT_MS).toBe(5000);
   });
 
   it('(1) 0->1 connect arms an alarm and persists demand; the REAL webSocketClose handler drives demand back to 0 (excludes the closing socket), tears down upstream, and deletes the alarm', async () => {
@@ -344,6 +347,42 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
       instance.upstream = null;
     });
   });
+
+  it('(7) a HUNG upstream WS open aborts at UPSTREAM_OPEN_TIMEOUT_MS and leaves upstream null (parity with deliverCommand)', async () => {
+    const s = stub();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runInDurableObject(s, async (instance) => {
+      // A dashboard that ACCEPTS the connection then HANGS — fetch never resolves
+      // except via the AbortController. Without the timeout this would wedge
+      // openUpstream (and, via the constructor's blockConcurrencyWhile, the whole
+      // DO). With it, the abort rejects the fetch and folds into the unreachable
+      // catch: log + upstream null + retry-next-interval.
+      const hung = vi.spyOn(globalThis, 'fetch').mockImplementation(
+        (url, init) =>
+          new Promise((_resolve, reject) => {
+            const sig = init?.signal;
+            if (sig) {
+              sig.addEventListener('abort', () =>
+                reject(new DOMException('aborted', 'AbortError')),
+              );
+            }
+          }),
+      );
+
+      // openUpstream must RETURN (not hang) at the timeout, with upstream left null.
+      await instance.openUpstream();
+      expect(instance.upstream).toBeNull();
+
+      // The hang was LOUD (structured warn naming the timeout) — not silent.
+      expect(warnSpy).toHaveBeenCalled();
+      const logged = warnSpy.mock.calls[warnSpy.mock.calls.length - 1][0];
+      expect(logged.source).toBe('music-do');
+      expect(logged.message).toMatch(/timed out|hung/i);
+
+      hung.mockRestore();
+    });
+    warnSpy.mockRestore();
+  }, 20_000);
 
   it('(3) lazy re-open: webSocketMessage forces ensureUpstream independent of the alarm', async () => {
     const s = stub();

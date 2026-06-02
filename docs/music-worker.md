@@ -317,12 +317,22 @@ is entirely new. Only the migration-tag style is mirrored from the root wrangler
     (`proxy.js`) — the upstream IS the dashboard, so the upgrade satisfies the
     contract's outbound-auth requirement. The header is omitted only when
     `DASHBOARD_REMOTE_KEY` is unset.
-  - **Unreachable dashboard degrades gracefully.** If the upstream `fetch` rejects
-    (DNS failure / cold or absent ingress — the expected steady state while the
-    dashboard is built in parallel, the same condition the HTTP proxy maps to a
-    502), `openUpstream()` logs and leaves `upstream` null rather than throwing; the
-    demand-gate keeps the alarm armed so the next interval (or a reconnecting /
-    message-sending subscriber) retries.
+  - **Unreachable dashboard degrades gracefully — reject AND hang are both bounded.**
+    If the upstream `fetch` rejects (DNS failure / cold or absent ingress — the
+    expected steady state while the dashboard is built in parallel, the same
+    condition the HTTP proxy maps to a 502), `openUpstream()` logs and leaves
+    `upstream` null rather than throwing; the demand-gate keeps the alarm armed so
+    the next interval (or a reconnecting / message-sending subscriber) retries. The
+    **accept-then-hang** case is bounded too: the upstream upgrade hits the SAME
+    dashboard ingress as command delivery and has the SAME hang hazard, so the fetch
+    is wrapped in an **`UPSTREAM_OPEN_TIMEOUT_MS` AbortController** (mirroring
+    delivery's `DELIVER_TIMEOUT_MS`). This matters most because `openUpstream()` is
+    awaited inside the constructor's `blockConcurrencyWhile` — an unbounded hung
+    handshake there would stall the DO from servicing **any** request (every
+    consumer's enqueue / ws-ticket / upgrade blocks). On abort the fetch rejects and
+    folds into the SAME `upstream`-null catch as a connection reject (a distinct
+    "timed out" warn message) — identical degrade-gracefully outcome, now covering a
+    hang.
 
 ### Demand-gate (the load-bearing mechanism)
 

@@ -91,6 +91,17 @@ export const MAX_DELIVERY_ATTEMPTS = 2;
 // into the transient bucket (abort -> attempts++ -> bounded retry -> LOUD drop).
 export const DELIVER_TIMEOUT_MS = 5000;
 
+// The upstream now-playing WS upgrade hits the SAME dashboard ingress as delivery,
+// so it has the SAME accept-then-hang hazard. openUpstream() is awaited inside the
+// constructor's blockConcurrencyWhile (a hung handshake there would stall the DO
+// from servicing ANY request — every consumer's enqueue/ws-ticket/upgrade blocks),
+// and inside handleWsUpgrade / webSocketMessage / alarm(). Bound the upgrade fetch
+// with an AbortController firing at this timeout; on abort fold into the existing
+// "unreachable" catch (log + leave upstream null) so the demand-gate retries on the
+// next interval — identical to the reject handling. Mirrors DELIVER_TIMEOUT_MS for
+// the delivery path; named separately so the two can diverge without coupling.
+export const UPSTREAM_OPEN_TIMEOUT_MS = 5000;
+
 const STORAGE = {
   demand: 'demand',
   snapshot: 'snapshot',
@@ -602,18 +613,33 @@ export class MusicRemoteState extends DurableObject {
     // blockConcurrencyWhile, crashing those paths. Treat it like the no-socket
     // branch: leave upstream null; the demand-gate keeps the alarm armed and the
     // next interval (or a reconnecting/message-sending subscriber) retries.
+    //
+    // HANG HAZARD (parity with deliverCommand): a dashboard that ACCEPTS the
+    // connection then never completes the WS handshake would otherwise wedge this
+    // await — and because openUpstream is awaited inside the constructor's
+    // blockConcurrencyWhile, a hung handshake stalls the DO from servicing ANY
+    // request until the platform's internal timeout. Bound the fetch with an
+    // UPSTREAM_OPEN_TIMEOUT_MS AbortController; an abort REJECTS the fetch and folds
+    // into the SAME catch as a connection reject — log + leave upstream null + retry
+    // next interval. Identical degrade-gracefully outcome, now also covering a hang.
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), UPSTREAM_OPEN_TIMEOUT_MS);
     let ws;
     try {
-      const resp = await fetch(url, { headers });
+      const resp = await fetch(url, { headers, signal: ctl.signal });
       ws = resp.webSocket;
     } catch (err) {
       console.warn({
         source: 'music-do',
-        message: '[music-do] upstream WS open failed (dashboard unreachable) — will retry',
+        message: ctl.signal.aborted
+          ? '[music-do] upstream WS open timed out (dashboard accepted then hung) — will retry'
+          : '[music-do] upstream WS open failed (dashboard unreachable) — will retry',
         error: err instanceof Error ? err.message : String(err),
       });
       this.upstream = null;
       return;
+    } finally {
+      clearTimeout(t);
     }
     if (!ws) {
       this.upstream = null;
