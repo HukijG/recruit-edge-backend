@@ -97,15 +97,29 @@ export const MUSIC_ROUTES = {
  * numeric (FROZEN). Accepts a number or a numeric string; rejects everything
  * else (=> the caller returns 400).
  *
+ * SINGLE SOURCE OF TRUTH for the forwarded id. The validation gate AND the value
+ * the worker forwards to the dashboard are ONE computation here, so they cannot
+ * drift on a future edit.
+ *   - `id`    — the numeric form, for any numeric use.
+ *   - `idStr` — THE value forwarded to the dashboard. The dashboard's IdBody
+ *               deserializes `{ id: String }`, so a JSON NUMBER is 422
+ *               Unprocessable; the canonical digit-STRING is forwarded instead.
+ *               idStr is the caller's exact trimmed digit-string — NOT a Number
+ *               round-trip (String(Number('007'))==='7' drops leading zeros,
+ *               String(Number('9007199254740993'))==='9007199254740992' truncates
+ *               above MAX_SAFE_INTEGER). For a JSON-number input idStr is
+ *               String(raw); for a string input it is raw.trim().
+ *
  * @param {unknown} raw
- * @returns {{ ok: true, id: number } | { ok: false }}
+ * @returns {{ ok: true, id: number, idStr: string } | { ok: false }}
  */
 export function parseDeezerId(raw) {
   if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 0) {
-    return { ok: true, id: raw };
+    return { ok: true, id: raw, idStr: String(raw) };
   }
   if (typeof raw === 'string' && /^[0-9]+$/.test(raw.trim())) {
-    return { ok: true, id: Number(raw.trim()) };
+    const t = raw.trim();
+    return { ok: true, id: Number(t), idStr: t };
   }
   return { ok: false };
 }

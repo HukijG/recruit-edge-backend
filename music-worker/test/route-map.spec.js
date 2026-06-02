@@ -50,11 +50,19 @@ describe('route-map', () => {
     expect(MUSIC_ROUTES.volume).toEqual({ method: 'POST', kind: 'volume' });
   });
 
-  it('parseDeezerId accepts numbers and numeric strings', () => {
-    expect(parseDeezerId(3135556)).toEqual({ ok: true, id: 3135556 });
-    expect(parseDeezerId('3135556')).toEqual({ ok: true, id: 3135556 });
-    expect(parseDeezerId(' 42 ')).toEqual({ ok: true, id: 42 });
-    expect(parseDeezerId(0)).toEqual({ ok: true, id: 0 });
+  it('parseDeezerId accepts numbers and numeric strings, returning { ok, id, idStr }', () => {
+    expect(parseDeezerId(3135556)).toEqual({ ok: true, id: 3135556, idStr: '3135556' });
+    expect(parseDeezerId('3135556')).toEqual({ ok: true, id: 3135556, idStr: '3135556' });
+    expect(parseDeezerId(' 42 ')).toEqual({ ok: true, id: 42, idStr: '42' });
+    expect(parseDeezerId(0)).toEqual({ ok: true, id: 0, idStr: '0' });
+  });
+
+  it('parseDeezerId.idStr is the caller string (NOT a lossy Number round-trip): leading zeros + >2^53 preserved', () => {
+    // String(Number('9007199254740993')) === '9007199254740992' (truncates above
+    // MAX_SAFE_INTEGER); idStr must be the caller's exact digits.
+    expect(parseDeezerId('9007199254740993').idStr).toBe('9007199254740993');
+    // String(Number('007')) === '7' (drops leading zeros); idStr preserves them.
+    expect(parseDeezerId('007').idStr).toBe('007');
   });
 
   it('parseDeezerId rejects non-numeric, negative, float, and junk ids', () => {
