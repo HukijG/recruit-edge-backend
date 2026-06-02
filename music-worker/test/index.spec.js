@@ -227,24 +227,11 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
     expect(JSON.parse(seen.body)).toEqual({ direction: 'down' });
   });
 
-  it('play with a numeric-string id -> proxies POST {id:<number>} (coerced)', async () => {
-    let seen;
-    fetchMock
-      .get(DASH_ORIGIN)
-      .intercept({ path: '/api/remote/songs/play', method: 'POST' })
-      .reply((opts) => {
-        seen = opts;
-        return { statusCode: 200, data: {} };
-      });
-
-    await SELF.fetch(`${BASE}/music/play`, {
-      method: 'POST',
-      headers: authedHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ id: '3135556' }),
-    });
-
-    expect(JSON.parse(seen.body)).toEqual({ id: 3135556 });
-  });
+  // NOTE: `play` is now a QUEUED route (CHANGE B) — it no longer proxies
+  // synchronously, so the old 'play -> proxies POST {id:<number>}' direct-proxy
+  // assertion is gone. The string-forward proof (CHANGE A: { id:"<digits>" } as a
+  // STRING) now lives at the DO drain boundary in music-do.spec.js, where the
+  // outbound delivery fetch is observable.
 
   it('search -> GETs the dashboard with q encoded into the path, status + body passed through verbatim', async () => {
     fetchMock
@@ -260,35 +247,79 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
     expect(await res.json()).toEqual([]);
   });
 
-  it('a non-200 dashboard response is streamed back verbatim (status + body)', async () => {
+  // The non-200 verbatim + fetch-rejection->502 seam tests are pinned on the DIRECT
+  // /music/volume route (play is now queued and never proxies synchronously). A
+  // VALID { direction:'up' } body is sent so inbound validation passes and the
+  // request actually reaches proxyToDashboard — the explicit 503/502 assertions
+  // (NOT a 400) prove the seam is still covered after the retarget.
+  it('a non-200 dashboard response is streamed back verbatim (status + body) — direct /music/volume', async () => {
     fetchMock
       .get(DASH_ORIGIN)
-      .intercept({ path: '/api/remote/songs/play', method: 'POST' })
-      .reply(503, { ok: false, error: 'deezer down' });
+      .intercept({ path: '/api/remote/volume', method: 'POST' })
+      .reply(503, { ok: false, error: 'audio device busy' });
 
-    const res = await SELF.fetch(`${BASE}/music/play`, {
+    const res = await SELF.fetch(`${BASE}/music/volume`, {
       method: 'POST',
       headers: authedHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ id: 42 }),
+      body: JSON.stringify({ direction: 'up' }),
     });
     expect(res.status).toBe(503);
-    expect(await res.json()).toEqual({ ok: false, error: 'deezer down' });
+    expect(await res.json()).toEqual({ ok: false, error: 'audio device busy' });
   });
 
-  it('a dashboard fetch rejection -> 502 dashboard_unreachable (structured, not an opaque 500)', async () => {
+  it('a dashboard fetch rejection -> 502 dashboard_unreachable (structured, not an opaque 500) — direct /music/volume', async () => {
     fetchMock
       .get(DASH_ORIGIN)
-      .intercept({ path: '/api/remote/songs/play', method: 'POST' })
+      .intercept({ path: '/api/remote/volume', method: 'POST' })
       .replyWithError(new TypeError('Network connection lost'));
 
-    const res = await SELF.fetch(`${BASE}/music/play`, {
+    const res = await SELF.fetch(`${BASE}/music/volume`, {
       method: 'POST',
       headers: authedHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ id: 42 }),
+      body: JSON.stringify({ direction: 'up' }),
     });
     expect(res.status).toBe(502);
     const body = await res.json();
     expect(body.ok).toBe(false);
     expect(body.code).toBe('dashboard_unreachable');
+  });
+});
+
+// CHANGE B — the five queued routes (next/prev/play/enqueue/playlist-play) no
+// longer proxy synchronously: they enqueue into the singleton DO's command queue
+// and return 202 { ok:true, queued:true } IMMEDIATELY (the truth returns via the
+// now-playing WS). No fetchMock interceptor is active here — a synchronous proxy
+// would reject (DNS) and surface a 502, so the 202 proves the command was enqueued
+// in the DO, not proxied. (The cmdQueue CONTENTS + the outbound delivery body live
+// in music-do.spec.js at the drain boundary.)
+describe('entry router — queued routes (DO command queue)', () => {
+  const QUEUED = [
+    { route: 'next', body: undefined },
+    { route: 'prev', body: undefined },
+    { route: 'play', body: JSON.stringify({ id: '3135556' }) },
+    { route: 'enqueue', body: JSON.stringify({ id: '3135556' }) },
+    { route: 'playlist-play', body: JSON.stringify({ id: '3135556' }) },
+  ];
+
+  for (const { route, body } of QUEUED) {
+    it(`/music/${route} -> 202 { ok:true, queued:true } (enqueued in the DO, not proxied)`, async () => {
+      const res = await SELF.fetch(`${BASE}/music/${route}`, {
+        method: 'POST',
+        headers: authedHeaders({ 'Content-Type': 'application/json' }),
+        body,
+      });
+      expect(res.status).toBe(202);
+      expect(await res.json()).toEqual({ ok: true, queued: true });
+    });
+  }
+
+  it('play with id:"abc" -> 400 and NOT queued (malformed queued cmd 400s before reaching the DO)', async () => {
+    const res = await SELF.fetch(`${BASE}/music/play`, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ id: 'abc' }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/numeric Deezer id/);
   });
 });

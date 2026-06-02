@@ -32,6 +32,33 @@ export { MusicRemoteState } from './music-do.js';
 // Fixed DO name — one global music-remote instance.
 const DO_NAME = 'global';
 
+// CHANGE B — GLOBAL command queue + per-category cooldowns.
+//
+// These five command routes are SERIALIZED + RATE-LIMITED globally (across ALL
+// extension consumers) by routing them THROUGH the singleton DO's command queue
+// instead of the stateless proxy. The DO is the only shared point across
+// consumers, so the queue lives there. Spamming next/prev (or rapid play/enqueue)
+// no longer breaks dashboard delivery — commands are queued + drained on a
+// cooldown, never dropped (save the loud runaway-backstop / give-up cases).
+//
+// The remaining routes (pause/resume/volume/search/playlist-search/
+// playlist-contents) STAY direct stateless proxies — no cooldown.
+const QUEUED_ROUTES = new Set(['next', 'prev', 'play', 'enqueue', 'playlist-play']);
+
+// Map a queued route to its cooldown category. The DO is route-AGNOSTIC — it sees
+// only { category, dashboardPath, body }; this map (the worker's knowledge of the
+// route surface) is the only place the route->category relationship lives.
+//   'skip'    — next AND prev share one category (5000ms).
+//   'play'    — play + playlist-play share one category (5000ms).
+//   'enqueue' — enqueue (10000ms).
+const ROUTE_CATEGORY = {
+  next: 'skip',
+  prev: 'skip',
+  play: 'play',
+  'playlist-play': 'play',
+  enqueue: 'enqueue',
+};
+
 function json(status, body) {
   return new Response(JSON.stringify(body), {
     status,
@@ -132,7 +159,12 @@ export default {
       if (body === null) return json(400, { ok: false, error: 'malformed JSON body' });
       const parsed = parseDeezerId(body.id);
       if (!parsed.ok) return json(400, { ok: false, error: 'id must be a numeric Deezer id' });
-      init = { method: 'POST', body: JSON.stringify({ id: parsed.id }) };
+      // Forward the id as the canonical digit-STRING (the dashboard's IdBody
+      // deserializes { id: String }, so a JSON NUMBER is 422 Unprocessable).
+      // parsed.idStr is the parser's single source of truth — NOT a lossy Number
+      // round-trip (String(Number('007'))==='7', String(Number('9007199254740993'))
+      // ==='9007199254740992'). parseDeezerId is still the 400 gate above.
+      init = { method: 'POST', body: JSON.stringify({ id: parsed.idStr }) };
     } else if (route.kind === 'search') {
       const q = url.searchParams.get('q');
       if (q == null || q.length === 0) return json(400, { ok: false, error: 'q is required' });
@@ -154,6 +186,42 @@ export default {
       mappedPath = throwIfUnset(routeName, API_REMOTE_PATH[routeName]) + querySuffix;
     } catch (err) {
       return json(501, { ok: false, error: err.message });
+    }
+
+    // CHANGE B — QUEUED routes: serialize + rate-limit globally via the DO.
+    //
+    // The inbound shape is already validated above (a malformed queued command
+    // still 400s and is NEVER queued). Queued routes carry no query suffix, so
+    // mappedPath is the bare dashboard sub-path. Hand the command to the singleton
+    // DO's command queue; it returns 202 { ok:true, queued:true } IMMEDIATELY
+    // (fire-and-forget — the truth returns via the now-playing WS). The DO drains
+    // on a per-category cooldown later.
+    //
+    // The DO-stub fetch is wrapped in the SAME structured-502 discipline as the
+    // direct proxy path below, so a DO overload / broken-input-gate / enqueue
+    // exception surfaces as a structured json error (reusing code:
+    // 'dashboard_unreachable' for extension-side uniformity) rather than an opaque
+    // runtime 500.
+    if (QUEUED_ROUTES.has(routeName)) {
+      try {
+        return await getDoStub(env).fetch(
+          new Request('https://do/enqueue-command', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              category: ROUTE_CATEGORY[routeName],
+              dashboardPath: mappedPath,
+              body: init.body ?? null,
+            }),
+          }),
+        );
+      } catch {
+        return json(502, {
+          ok: false,
+          code: 'dashboard_unreachable',
+          error: 'music command queue unavailable',
+        });
+      }
     }
 
     // The dashboard is a parallel-built dependency that may not exist / be

@@ -34,22 +34,29 @@ office TV.
 Every route runs `authMusicRequest` first (see Auth). Request shapes are frozen in
 `src/route-map.js` and here.
 
-| Route | Method | Body / query | Notes |
-| --- | --- | --- | --- |
-| `/music/pause` | POST | `{}` | transport |
-| `/music/resume` | POST | `{}` | transport |
-| `/music/next` | POST | `{}` | transport |
-| `/music/prev` | POST | `{}` | transport |
-| `/music/volume` | POST | `{ direction: "up" \| "down" }` | the worker forwards the bare `{ direction }` **verbatim**; the **dashboard** owns the fixed ±step magnitude (single source of truth) — never client-supplied, never computed by the worker |
-| `/music/play` | POST | `{ id: <numeric Deezer id> }` | id validated numeric → 400 otherwise |
-| `/music/enqueue` | POST | `{ id: <numeric Deezer id> }` | id validated numeric |
-| `/music/playlist-play` | POST | `{ id: <numeric Deezer id> }` | id validated numeric |
-| `/music/search` | GET | `?q=<free text>` | idempotent read |
-| `/music/playlist-search` | GET | `?q=<free text>` | idempotent read |
-| `/music/playlist-contents` | GET | `?id=<numeric Deezer id>` | id validated numeric |
-| `/music/ws-ticket` | POST | — | auth-gated; issues a single-use WS ticket (see WS auth) |
-| `/music/now-playing` | GET (Upgrade: websocket) | — | now-playing fan-out; the **DO redeems the subprotocol ticket** (no header auth that would leak into a URL/log) |
-| `/health` | GET | — | unauthenticated liveness |
+**Path (`QUEUED` vs `DIRECT`).** Five command routes are `QUEUED` — they route
+**through the singleton DO's global command queue** (serialized + per-category
+cooldown across ALL consumers) and return **`202 { ok:true, queued:true }`**
+immediately; the truth returns over the now-playing WS. The remaining routes are
+`DIRECT` — stateless proxies with no cooldown (transport pause/resume, volume, and
+the idempotent reads). See **Global command queue + per-category cooldowns** below.
+
+| Route | Method | Body / query | Path | Notes |
+| --- | --- | --- | --- | --- |
+| `/music/pause` | POST | `{}` | DIRECT | transport |
+| `/music/resume` | POST | `{}` | DIRECT | transport |
+| `/music/next` | POST | `{}` | **QUEUED** | category `skip` (shared with `prev`), cooldown 5000ms |
+| `/music/prev` | POST | `{}` | **QUEUED** | category `skip` (shared with `next`), cooldown 5000ms |
+| `/music/volume` | POST | `{ direction: "up" \| "down" }` | DIRECT | the worker forwards the bare `{ direction }` **verbatim**; the **dashboard** owns the fixed ±step magnitude (single source of truth) — never client-supplied, never computed by the worker |
+| `/music/play` | POST | `{ id: <Deezer id> }` | **QUEUED** | category `play` (shared with `playlist-play`), cooldown 5000ms; id validated numeric → 400 otherwise, forwarded as a STRING (see Outbound) |
+| `/music/enqueue` | POST | `{ id: <Deezer id> }` | **QUEUED** | category `enqueue`, cooldown 10000ms; id forwarded as a STRING |
+| `/music/playlist-play` | POST | `{ id: <Deezer id> }` | **QUEUED** | category `play` (shared with `play`), cooldown 5000ms; id forwarded as a STRING |
+| `/music/search` | GET | `?q=<free text>` | DIRECT | idempotent read |
+| `/music/playlist-search` | GET | `?q=<free text>` | DIRECT | idempotent read |
+| `/music/playlist-contents` | GET | `?id=<numeric Deezer id>` | DIRECT | id validated numeric |
+| `/music/ws-ticket` | POST | — | DIRECT | auth-gated; issues a single-use WS ticket (see WS auth) |
+| `/music/now-playing` | GET (Upgrade: websocket) | — | DIRECT | now-playing fan-out; the **DO redeems the subprotocol ticket** (no header auth that would leak into a URL/log) |
+| `/health` | GET | — | — | unauthenticated liveness |
 
 ### Outbound — music worker → dashboard (`/api/remote/*`), FROZEN cross-repo contract
 
@@ -80,6 +87,22 @@ fires. The frozen bits (X-Remote-Key, `DASHBOARD_REMOTE_BASE`, Deezer numeric id
 are hard-coded. The volume ±step magnitude is **not** in this worker — the worker
 forwards the bare `{ direction }` and the **dashboard** owns the magnitude.
 
+**Deezer id is forwarded as the canonical digit-STRING (single source of truth).**
+The dashboard's `play` / `enqueue` / `playlist-play` routes deserialize
+`IdBody { id: String }`, so a JSON **number** is a `422 Unprocessable`. The id is
+therefore forwarded as the string returned by **`parseDeezerId().idStr`** — the
+validation gate **and** the forwarded value are the *same* parser computation, so
+they cannot drift on a future edit. `idStr` is the caller's **exact trimmed
+digit-string**, *not* a `String(Number(...))` round-trip (which is lossy:
+`String(Number('007')) === '7'` drops leading zeros, and
+`String(Number('9007199254740993')) === '9007199254740992'` truncates above
+`MAX_SAFE_INTEGER`). **Caveat:** callers MUST send Deezer ids as JSON **strings**
+(`{"id":"9007199254740993"}`) to preserve >2^53 precision — a *bare* JSON number
+above 2^53 is already truncated by `JSON.parse` before the worker runs and cannot
+be recovered. The `playlist-contents` GET still uses `?id=` from `parsed.id`
+(unchanged — a wire query-param is a string and the dashboard reads a query param,
+not a JSON `IdBody`, so no number/string mismatch exists there).
+
 **Validation ordering.** The router validates the **inbound** request shape (this
 worker's own contract: direction, numeric Deezer id, `q` present, well-formed JSON)
 **before** resolving the outbound dashboard sub-path. A malformed client request
@@ -94,7 +117,149 @@ unknown route, `405` wrong method, `426` non-Upgrade WS, `501` unset dashboard p
 and **`502 { code:'dashboard_unreachable' }`** when the outbound
 `fetch` to the dashboard rejects (DNS failure / cold or absent ingress — the
 expected steady state while the dashboard is built in parallel). The extension's
-error handling stays uniform regardless of dashboard availability.
+error handling stays uniform regardless of dashboard availability. For a `QUEUED`
+route the success response is **`202 { ok:true, queued:true }`** (the command was
+enqueued, not yet delivered), and a DO overload / broken-input-gate / enqueue
+exception surfaces as the same structured `502 { code:'dashboard_unreachable' }` —
+the queued path is wrapped in the identical structured-502 discipline as the direct
+path so a queue-unavailable failure never becomes an opaque runtime 500.
+
+## Global command queue + per-category cooldowns
+
+Multiple people now control the TV. Spamming `next`/`prev` (or rapid
+`play`/`enqueue`) breaks dashboard delivery, so the five command routes are
+**SERIALIZED + RATE-LIMITED GLOBALLY** (across ALL extension consumers) — **not
+dropped**. The singleton Music DO (binding `MUSIC_REMOTE`, fixed name `global`) is
+the only shared point across consumers, so the queue lives there. `index.js` routes
+`next`/`prev`/`play`/`enqueue`/`playlist-play` to the DO via **`POST
+/enqueue-command`** on the DO stub (mirroring how the `/ws-ticket` DO fetch path is
+wired); the other routes stay direct proxies.
+
+**Shape.** A FIFO array persisted at `ctx.storage` key `cmdQueue`; each element is
+`{ category, dashboardPath, body, enqueuedAt, attempts }`. `body` is the exact
+replay bytes (`'{}'` for `next`/`prev`, `'{"id":"<digits>"}'` for the id routes —
+the canonical `idStr`, or `null`). Per-category last-execution timestamps live at
+`lastExec:<category>`. Both the array and the timestamps are SQLite-backed via
+`ctx.storage` so they **survive hibernation / eviction**. The DO is
+**route-agnostic** — it only ever sees `{ category, dashboardPath, body }`; the
+route→category map (`next`/`prev`→`skip`, `play`/`playlist-play`→`play`,
+`enqueue`→`enqueue`) lives in `index.js`.
+
+**Constants** (named, module-level, exported for tests): `COOLDOWN_MS = { skip:
+5000, play: 5000, enqueue: 10000 }` (minimum spacing between EXECUTIONS, global),
+`MAX_QUEUE = 100`, `MAX_DELIVERY_ATTEMPTS = 2`, `DELIVER_TIMEOUT_MS = 5000`.
+
+**Arrival** (`enqueueCommand`). Read `cmdQueue` FRESH, append the element, **persist
+before the next await**, `reconcileAlarm()` to arm the drain, and respond `202 {
+ok:true, queued:true }` IMMEDIATELY (fire-and-forget — the real result returns over
+the now-playing WS). A cooldown-ineligible head only **WAITS** (never
+skipped/reordered).
+
+**Drain** (alarm-driven, `drainOneEligible` — SINGLE-SHOT, not a gate-holding
+loop). Read `cmdQueue` FRESH; the head's `last = (lastExec:<cat>) ?? 0` — the
+**`?? 0` is load-bearing**: a first-ever / post-eviction-empty `lastExec` is
+`undefined`, and `now >= undefined + cooldown` is `now >= NaN` (false → a wedge)
+while `Math.max(NaN, now)` is `NaN` (an invalid `setAlarm`); `?? 0` makes the first
+command of every category eligible at `t0`. If `now < last + COOLDOWN_MS[cat]` the
+head STAYS and `reconcileAlarm` re-arms for `max(last+cooldown, now)`. Otherwise
+deliver, then **re-read `cmdQueue` FRESH** before shifting (the delivery await
+opened the input gate — see Platform model — so a concurrent enqueue may have
+appended; the head is still index 0 because drain is the SOLE shifter and only one
+`alarm()` runs per DO).
+
+**Delivery reuses `proxyToDashboard`** (identical `Content-Type: application/json`
++ `X-Remote-Key` + base-join as the direct path — the two paths cannot drift),
+wrapped in a `DELIVER_TIMEOUT_MS` **AbortController** so a HUNG dashboard folds into
+the transient bucket instead of wedging.
+
+**HTTP-status policy** (explicit). `2xx` = **delivered** (terminal, trace
+`delivered`). `4xx` = **permanently-rejected** (terminal — a 4xx is a
+contract/validation error; retrying behind a 5s cooldown would just wedge the
+queue; LOUD warn, trace `dashboard-rejected-<status>`, **not** logged as
+`delivered`). `5xx` + fetch-reject + abort/timeout = bounded **TRANSIENT** (LOUD
+warn, trace `dashboard-error-<status>` / `transient-reject` / `transient-timeout`).
+Bounded-retry is an **immediate single retry** (no backoff): a transient under
+`MAX_DELIVERY_ATTEMPTS` keeps the head (attempts++, **no** `lastExec` bump,
+`reconcileAlarm` re-arms at `now` so the retry fires immediately); on the second
+transient it is a LOUD give-up drop (trace `dropped-after-max-<lastTrace>`). On
+TERMINAL or give-up the per-category `lastExec` is bumped, the head is shifted, and
+the drain-trace records the REAL outcome.
+
+**Drop accounting (truthful — every drop is LOUD, never silent).** Normal operation
+truncates nothing. The ONLY drops are: (i) `MAX_QUEUE` runaway backstop, returning
+the **DISTINCT** envelope `202 { ok:true, queued:false, dropped:'queue_full' }` (the
+success field never lies about a drop; a future ext UI can surface backpressure);
+(ii) transient-attempt exhaustion after `MAX_DELIVERY_ATTEMPTS`; (iii) a 4xx
+permanent dashboard rejection (terminal); (iv) `DASHBOARD_REMOTE_BASE` unset (trace
+`dropped-no-dashboard`). Note the pre-dashboard steady state: a delivery-exhausting
+outage drops the command (LOUD) and the truth does **not** arrive via the WS either
+(the WS upstream is equally unreachable).
+
+All drain/drop/overflow traces are structured `{ source: 'music-do' }` via
+`console.log` / `console.warn` (Cloudflare **native** Workers Logs, already enabled)
+— **no** `@microlabs` OTel, no `instrument()`, no body-capture.
+
+### Single-alarm coexistence
+
+The DO has **exactly ONE alarm**, shared by two responsibilities — the
+upstream-liveness demand-gate (now-playing fan-out) and the command-queue drain.
+**`reconcileAlarm()` is the SOLE `setAlarm`/`deleteAlarm` authority** (`armAlarm()`
+is gone; no other method touches the alarm directly). It computes:
+
+- **liveness** = reads the **PERSISTED `demand` key** (NEVER `getWebSockets()`,
+  which still holds a closing socket inside `webSocketClose`); `demand > 0` ?
+  `now + UPSTREAM_ALARM_INTERVAL_MS` : `null`.
+- **drain** = reads FRESH `cmdQueue`; `null` if empty, else for the head
+  `max((lastExec ?? 0) + cooldown, now)`.
+
+…and sets the alarm to the **EARLIEST non-null** of the two; it **deletes only when
+BOTH are null** (demand===0 AND queue empty) and **never when `armOnly`**. The
+**CONSTRUCTOR** calls `reconcileAlarm({ armOnly: true })` — a fresh isolate must
+never wipe an alarm a prior instance legitimately set, so it ARMS the drain for a
+persisted-undrained queue (drain resumes even at demand 0 post-eviction) + ARMS
+liveness for demand>0, but never deletes. Real demand-change events
+(`recomputeDemandAndReconcile`) and `enqueueCommand` call `reconcileAlarm()`
+without `armOnly` (those MAY legitimately delete when both responsibilities go
+idle).
+
+**Alarm ordering — LIVENESS FIRST, THEN drain.** `alarm()` is `try { liveness;
+drainOneEligible(); } finally { reconcileAlarm(); }`. Liveness (a local
+`readyState` check + a `getWebSockets()` fan of the persisted snapshot for demand>0,
+else `closeUpstream()`) is CHEAP and runs BEFORE the up-to-`DELIVER_TIMEOUT_MS`
+delivery, so the now-playing demand-gate fan is **never starved** behind a slow/hung
+delivery — even when sustained command load makes the `min()` fire on a near-term
+drain time, the fan happens first every wake. The `try/finally` guarantees a re-arm
+even if liveness OR drain throws (the original error still propagates, so the
+platform's at-least-once execution + retry-on-throw also re-drives `alarm()`). A
+drain-only wake at demand 0 tears the upstream down rather than leaking it.
+
+**Cadence consequence.** When a near-term drain is the `min`, the alarm fires
+EARLIER than `UPSTREAM_ALARM_INTERVAL_MS`; the `finally` re-arms liveness at
+`now + UPSTREAM_ALARM_INTERVAL_MS`, so while commands flow liveness fires MORE OFTEN
+than 30s — correct and harmless (`ensureUpstream` is idempotent) but raises billed
+alarm invocations. `UPSTREAM_ALARM_INTERVAL_MS` is therefore an **UPPER BOUND** on
+liveness spacing, **not** a fixed period — the accepted tradeoff for the shared
+alarm.
+
+> **Load-bearing platform model** (verified against the Cloudflare DO
+> rules-of-durable-objects). An **awaited `fetch()`** inside a DO handler **OPENS**
+> the input gate — it does **NOT** hold it. Consequence A: the alarm's delivery
+> fetch does **NOT** block a concurrently-arriving `enqueueCommand` 202 — worst-case
+> 202 latency is the DO's own storage-op time (sub-ms), not `DELIVER_TIMEOUT_MS`.
+> Consequence B (the real hazard the docs flag): a concurrent enqueue can mutate
+> `cmdQueue` DURING the delivery await — so the **HARD invariant** is
+> *read-fresh-at-the-top-of-every-op + persist-before-every-await*, and
+> `drainOneEligible` **re-reads `cmdQueue` after the delivery await** before
+> shifting; never cache the array across an await.
+
+> **Self-clock platform assumption.** A `setAlarm(<= now)` from within `alarm()`
+> re-fires promptly (the drain self-clock) — the queue analogue of the demand-gate's
+> "armed alarm fires post-eviction" invariant. `music-do.spec.js` proves
+> the HANDLER drains exactly one head per `alarm()` invocation, but
+> `runInDurableObject` hands a LIVE instance and cannot prove cross-wake self-re-fire
+> (the same harness limit the demand-gate already documents). `alarm()` also has
+> platform at-least-once execution + retry-on-throw, which the `try/finally` re-arm
+> complements.
 
 ## NowPlayingSnapshot (fanned verbatim, camelCase — never re-shaped)
 
@@ -168,11 +333,17 @@ is entirely new. Only the migration-tag style is mirrored from the root wrangler
   (not an inline 30 s). Rationale: a balance between post-eviction reconnect latency
   (longer → a now-playing change can sit unfanned up to one interval) and wasted
   wakeups when idle (shorter → more billed alarm invocations on an idle-but-subscribed
-  DO).
-- While demand > 0 an alarm is kept armed `UPSTREAM_ALARM_INTERVAL_MS` ahead.
-  `alarm()` re-opens upstream if it died during an eviction gap, re-fans the
+  DO). Since the command queue shipped, this is an **UPPER BOUND** on liveness
+  spacing, not a fixed period (see **Single-alarm coexistence** → Cadence
+  consequence): while commands flow the shared `min()` alarm can fire liveness
+  earlier than 30s, then re-arm.
+- While demand > 0 a liveness alarm is kept armed up to `UPSTREAM_ALARM_INTERVAL_MS`
+  ahead. `alarm()` re-opens upstream if it died during an eviction gap, re-fans the
   persisted snapshot to any reconnected clients, and re-arms. When demand hits 0 it
-  closes upstream and `deleteAlarm()`.
+  closes upstream. **The single alarm is shared with the command-queue drain** and
+  is owned exclusively by `reconcileAlarm()` (it sets the EARLIEST of liveness +
+  drain, and deletes only when demand===0 AND the queue is empty); see **Single-alarm
+  coexistence** above for the full ordering + the input-gate platform model.
 
 ### ⚠️ Load-bearing platform invariant
 

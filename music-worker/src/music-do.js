@@ -53,6 +53,7 @@
  */
 
 import { DurableObject } from 'cloudflare:workers';
+import { proxyToDashboard } from './proxy.js';
 
 // Heartbeat cadence for the upstream-liveness alarm, in ms.
 //
@@ -67,10 +68,38 @@ export const UPSTREAM_ALARM_INTERVAL_MS = 30_000;
 // upgrades; anything older is a replay/stale attempt.
 export const WS_TICKET_TTL_MS = 30_000;
 
+// ---- CHANGE B — GLOBAL command queue + per-category cooldowns ----------------
+//
+// Minimum spacing between EXECUTIONS of commands of a category, GLOBALLY (across
+// ALL extension consumers — the queue lives in the singleton DO). next AND prev
+// share the 'skip' category, play + playlist-play share 'play'. Named constants,
+// NOT inline magic values.
+export const COOLDOWN_MS = { skip: 5000, play: 5000, enqueue: 10000 };
+
+// Runaway backstop ONLY. Normal operation never reaches this; an overflow is a
+// LOUD drop (console.warn), never silent.
+export const MAX_QUEUE = 100;
+
+// A delivery that fails transiently (5xx / fetch-reject / abort-timeout) is
+// retried ONCE more (no backoff); after this many attempts it is a LOUD give-up
+// drop. A 2xx is delivered (terminal) and a 4xx is permanently-rejected
+// (terminal) — neither consumes a retry.
+export const MAX_DELIVERY_ATTEMPTS = 2;
+
+// A dashboard that accepts the connection then HANGS would wedge the drain. Bound
+// every delivery with an AbortController firing at this timeout, folding a hang
+// into the transient bucket (abort -> attempts++ -> bounded retry -> LOUD drop).
+export const DELIVER_TIMEOUT_MS = 5000;
+
 const STORAGE = {
   demand: 'demand',
   snapshot: 'snapshot',
   ticketPrefix: 'ticket:',
+  // CHANGE B — FIFO command queue (array) + per-category last-execution
+  // timestamps. Both SQLite-backed via ctx.storage so they survive hibernation /
+  // eviction.
+  cmdQueue: 'cmdQueue',
+  lastExecPrefix: 'lastExec:',
 };
 
 // Subprotocol marker. The extension presents `Sec-WebSocket-Protocol:
@@ -88,12 +117,19 @@ export class MusicRemoteState extends DurableObject {
     // Defensive re-open on construction: if the DO is being re-instantiated after
     // eviction with persisted demand, get upstream back up without waiting for the
     // next alarm. blockConcurrencyWhile so no request observes a half-built state.
+    //
+    // ARM-ONLY reconcile (CHANGE B): a freshly-constructed isolate must NEVER tear
+    // down an alarm a prior instance legitimately set. reconcileAlarm({armOnly})
+    // ARMS for a persisted-undrained command queue (drain resumes even at demand 0
+    // post-eviction) AND for liveness when demand>0, but NEVER deletes — so a
+    // genuinely-idle reconstruction (demand 0 + empty queue) leaves any prior alarm
+    // intact rather than wiping it.
     this.ctx.blockConcurrencyWhile(async () => {
       const demand = (await this.ctx.storage.get(STORAGE.demand)) ?? 0;
       if (demand > 0) {
         await this.ensureUpstream();
-        await this.armAlarm();
       }
+      await this.reconcileAlarm({ armOnly: true });
     });
   }
 
@@ -107,6 +143,12 @@ export class MusicRemoteState extends DurableObject {
     }
     if (url.pathname.endsWith('/ws-ticket') && request.method === 'POST') {
       return this.issueTicket();
+    }
+    // CHANGE B — enqueue a command into the global FIFO queue (index.js routes
+    // next/prev/play/enqueue/playlist-play here). Mirrors the /ws-ticket fetch
+    // wiring: index.js -> DO stub -> this handler.
+    if (url.pathname.endsWith('/enqueue-command') && request.method === 'POST') {
+      return this.enqueueCommand(await request.json());
     }
     return new Response('Not Found', { status: 404 });
   }
@@ -227,8 +269,11 @@ export class MusicRemoteState extends DurableObject {
   // ---- Demand-gate core ---------------------------------------------------
 
   /**
-   * Recompute demand from the authoritative live socket set, persist it, and
-   * reconcile upstream + alarm: open+arm when demand>0, close+deleteAlarm when 0.
+   * Recompute demand from the authoritative live socket set, persist it, then
+   * reconcile upstream + alarm. CRITICAL: persist the (excluded) demand FIRST,
+   * then open/close upstream per demand, THEN reconcileAlarm() — so reconcileAlarm
+   * reads the JUST-PERSISTED demand and never independently re-reads
+   * getWebSockets() (which still contains a closing socket inside webSocketClose).
    *
    * @param {WebSocket} [excluding] - a socket to exclude from the count. The
    *   close/error handlers pass the closing socket here because it is STILL in
@@ -242,36 +287,261 @@ export class MusicRemoteState extends DurableObject {
     await this.ctx.storage.put(STORAGE.demand, demand);
     if (demand > 0) {
       await this.ensureUpstream();
-      await this.armAlarm();
     } else {
       await this.closeUpstream();
-      await this.ctx.storage.deleteAlarm();
     }
+    // A real demand-change event MAY legitimately delete the alarm when BOTH
+    // responsibilities go idle (demand 0 AND queue empty) — so NOT armOnly.
+    await this.reconcileAlarm();
     return demand;
   }
 
-  async armAlarm() {
-    await this.ctx.storage.setAlarm(Date.now() + UPSTREAM_ALARM_INTERVAL_MS);
+  /**
+   * THE SOLE setAlarm/deleteAlarm authority. The DO has exactly ONE alarm shared
+   * by two responsibilities — upstream-liveness (the now-playing demand-gate) and
+   * the command-queue drain — so the alarm time is the EARLIEST of the two next
+   * eligible times.
+   *
+   *  - LIVENESS: reads the PERSISTED demand key (NEVER getWebSockets(), which still
+   *    holds a closing socket inside webSocketClose). demand>0 => now +
+   *    UPSTREAM_ALARM_INTERVAL_MS, else null.
+   *  - DRAIN: reads the FRESH cmdQueue. Empty => null; else for the head,
+   *    max((lastExec ?? 0) + cooldown, now). The `?? 0` is LOAD-BEARING — a
+   *    first-ever/post-eviction-empty lastExec is undefined, and undefined+cooldown
+   *    is NaN (Math.max(NaN, now) === NaN => an invalid setAlarm); `?? 0` makes the
+   *    first command of every category eligible at t0.
+   *
+   * Sets the alarm to the earliest non-null candidate. Deletes ONLY when BOTH are
+   * null (demand===0 AND queue empty) and NOT armOnly — the constructor passes
+   * armOnly:true so a fresh isolate never wipes an alarm a prior instance set.
+   *
+   * @param {{ armOnly?: boolean }} [opts]
+   */
+  async reconcileAlarm({ armOnly = false } = {}) {
+    const demand = (await this.ctx.storage.get(STORAGE.demand)) ?? 0;
+    const liveness = demand > 0 ? Date.now() + UPSTREAM_ALARM_INTERVAL_MS : null;
+
+    const queue = (await this.ctx.storage.get(STORAGE.cmdQueue)) ?? [];
+    let drain = null;
+    if (queue.length) {
+      const head = queue[0];
+      const last = (await this.ctx.storage.get(STORAGE.lastExecPrefix + head.category)) ?? 0;
+      drain = Math.max(last + COOLDOWN_MS[head.category], Date.now());
+    }
+
+    const next = [liveness, drain].filter((v) => v != null).sort((a, b) => a - b)[0] ?? null;
+    if (next != null) {
+      await this.ctx.storage.setAlarm(next);
+    } else if (!armOnly) {
+      await this.ctx.storage.deleteAlarm();
+    }
+  }
+
+  // ---- Command queue (CHANGE B) -------------------------------------------
+
+  /**
+   * Append a command to the global FIFO queue and respond 202 IMMEDIATELY
+   * (fire-and-forget — the truth returns via the now-playing WS). The command is
+   * NEVER dropped here save the runaway backstop (MAX_QUEUE overflow), which is a
+   * LOUD console.warn returning the DISTINCT { ok:true, queued:false,
+   * dropped:'queue_full' } envelope (the success field never lies about a drop).
+   *
+   * Read the queue FRESH and persist BEFORE the next await — never cache the array
+   * across an await. (An awaited fetch in a DO handler OPENS the input gate, so a
+   * concurrent enqueue/drain can interleave; a cached array would lose the
+   * concurrent mutation.)
+   *
+   * @param {{ category: string, dashboardPath: string, body: string|null }} cmd
+   */
+  async enqueueCommand(cmd) {
+    const queue = (await this.ctx.storage.get(STORAGE.cmdQueue)) ?? [];
+    if (queue.length >= MAX_QUEUE) {
+      console.warn({
+        source: 'music-do',
+        message: '[music-do] command queue overflow — DROPPING (runaway backstop)',
+        category: cmd.category,
+        queueLen: queue.length,
+      });
+      return new Response(
+        JSON.stringify({ ok: true, queued: false, dropped: 'queue_full' }),
+        { status: 202, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+    queue.push({
+      category: cmd.category,
+      dashboardPath: cmd.dashboardPath,
+      body: cmd.body ?? null,
+      enqueuedAt: Date.now(),
+      attempts: 0,
+    });
+    await this.ctx.storage.put(STORAGE.cmdQueue, queue);
+    await this.reconcileAlarm();
+    return new Response(JSON.stringify({ ok: true, queued: true }), {
+      status: 202,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 
   /**
-   * Alarm — the ONLY mechanism that reliably re-runs a fully-hibernated DO whose
-   * subscribers are idle (no message traffic). Re-open upstream if it died during
-   * an eviction gap, re-fan the persisted snapshot to anyone who reconnected, and
-   * re-arm while demand persists.
+   * Drain EXACTLY ONE eligible command — SINGLE-SHOT, NOT a gate-holding loop.
+   * reconcileAlarm() (called by alarm()'s finally) re-arms for the next eligible
+   * time, so the platform re-drives the drain one head per wake.
+   *
+   * Order is preserved and nothing is dropped except the four LOUD cases (queue
+   * overflow handled in enqueueCommand; here: transient give-up after
+   * MAX_DELIVERY_ATTEMPTS, a 4xx permanent rejection, and DASHBOARD_REMOTE_BASE
+   * unset — all surfaced via deliverCommand's outcome + a drain-trace).
+   */
+  async drainOneEligible() {
+    const queue = (await this.ctx.storage.get(STORAGE.cmdQueue)) ?? [];
+    if (queue.length === 0) return;
+
+    const head = queue[0];
+    const last = (await this.ctx.storage.get(STORAGE.lastExecPrefix + head.category)) ?? 0;
+    if (Date.now() < last + COOLDOWN_MS[head.category]) {
+      // Cooldown-ineligible: the head STAYS (never skipped/reordered).
+      // reconcileAlarm re-arms for max(last+cooldown, now).
+      return;
+    }
+
+    const outcome = await this.deliverCommand(head);
+
+    // RE-READ the queue FRESH after the delivery await: the await opened the input
+    // gate, so a concurrent enqueue may have APPENDED. The head is still index 0
+    // because drain is the SOLE shifter and only one alarm() runs per DO at a time.
+    const fresh = (await this.ctx.storage.get(STORAGE.cmdQueue)) ?? [];
+
+    const giveUp = outcome.transient && head.attempts + 1 >= MAX_DELIVERY_ATTEMPTS;
+    if (outcome.terminal || giveUp) {
+      // Drained (delivered, permanently-rejected, or transient give-up): bump the
+      // per-category lastExec, shift the head, persist, trace the REAL outcome.
+      await this.ctx.storage.put(STORAGE.lastExecPrefix + head.category, Date.now());
+      fresh.shift();
+      await this.ctx.storage.put(STORAGE.cmdQueue, fresh);
+      console.log({
+        source: 'music-do',
+        event: 'drain',
+        category: head.category,
+        dashboardPath: head.dashboardPath,
+        outcome: outcome.terminal
+          ? outcome.traceOutcome
+          : 'dropped-after-max-' + outcome.traceOutcome,
+        attempt: head.attempts + 1,
+      });
+    } else {
+      // Transient under MAX: keep the head at index 0, bump its attempts, do NOT
+      // bump lastExec. reconcileAlarm re-arms at now so the retry fires immediately
+      // (one retry total at MAX_DELIVERY_ATTEMPTS=2).
+      fresh[0].attempts = head.attempts + 1;
+      await this.ctx.storage.put(STORAGE.cmdQueue, fresh);
+    }
+  }
+
+  /**
+   * Deliver one command to the dashboard, REUSING proxyToDashboard (identical
+   * Content-Type:application/json + X-Remote-Key + base-join as the direct proxy
+   * path — the two paths cannot drift). Bounded by a DELIVER_TIMEOUT_MS
+   * AbortController so a HUNG dashboard folds into the transient bucket.
+   *
+   * Returns one of:
+   *   { terminal:true,  traceOutcome:'delivered' }                      — 2xx
+   *   { terminal:true,  traceOutcome:'dashboard-rejected-<status>' }    — 4xx (permanent)
+   *   { terminal:true,  traceOutcome:'dropped-no-dashboard' }           — base unset
+   *   { transient:true, traceOutcome:'dashboard-error-<status>' }       — 5xx
+   *   { transient:true, traceOutcome:'transient-timeout'|'transient-reject' } — abort/reject
+   *
+   * @param {{ category:string, dashboardPath:string, body:string|null }} head
+   */
+  async deliverCommand(head) {
+    const base = this.env.DASHBOARD_REMOTE_BASE;
+    if (typeof base !== 'string' || base.length === 0) {
+      console.warn({
+        source: 'music-do',
+        message: '[music-do] DASHBOARD_REMOTE_BASE unset — DROPPING command (no dashboard)',
+        category: head.category,
+        dashboardPath: head.dashboardPath,
+      });
+      return { terminal: true, traceOutcome: 'dropped-no-dashboard' };
+    }
+
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), DELIVER_TIMEOUT_MS);
+    try {
+      const resp = await proxyToDashboard(this.env, head.dashboardPath, {
+        method: 'POST',
+        body: head.body,
+        signal: ctl.signal,
+      });
+      if (resp.status >= 200 && resp.status < 300) {
+        return { terminal: true, traceOutcome: 'delivered' };
+      }
+      if (resp.status >= 400 && resp.status < 500) {
+        console.warn({
+          source: 'music-do',
+          message: '[music-do] dashboard rejected command (4xx) — DROPPING (permanent)',
+          status: resp.status,
+          category: head.category,
+          dashboardPath: head.dashboardPath,
+        });
+        return { terminal: true, traceOutcome: 'dashboard-rejected-' + resp.status };
+      }
+      console.warn({
+        source: 'music-do',
+        message: '[music-do] dashboard 5xx — transient, will retry',
+        status: resp.status,
+        category: head.category,
+        dashboardPath: head.dashboardPath,
+      });
+      return { transient: true, traceOutcome: 'dashboard-error-' + resp.status };
+    } catch (err) {
+      console.warn({
+        source: 'music-do',
+        message: '[music-do] command delivery failed (reject/abort) — transient',
+        category: head.category,
+        dashboardPath: head.dashboardPath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return {
+        transient: true,
+        traceOutcome: ctl.signal.aborted ? 'transient-timeout' : 'transient-reject',
+      };
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  /**
+   * Alarm — services BOTH the single alarm's responsibilities, LIVENESS FIRST then
+   * the command drain. The DO has ONE alarm (reconcileAlarm computes its time as
+   * min(liveness, drain)), so a single wake may be due to either responsibility.
+   *
+   * Ordering rationale: liveness (a local readyState check + a getWebSockets fan of
+   * the persisted snapshot) is CHEAP and must run BEFORE the up-to-DELIVER_TIMEOUT_MS
+   * delivery, so the now-playing demand-gate fan is NEVER starved behind a slow/hung
+   * delivery — even when sustained command load makes the min() fire on a near-term
+   * drain time, the fan happens first every wake.
+   *
+   * The try/finally guarantees a re-arm even if liveness OR drain throws (a drain
+   * exception must not orphan the liveness alarm); beyond that the platform gives
+   * alarm() at-least-once execution + retry on uncaught throw.
    */
   async alarm() {
-    const demand = (await this.ctx.storage.get(STORAGE.demand)) ?? 0;
-    if (demand > 0) {
-      const reopened = await this.ensureUpstream();
-      if (reopened) {
-        // Reconcile reconnect-during-gap clients with the last-known state.
-        await this.fanPersistedSnapshot();
+    try {
+      const demand = (await this.ctx.storage.get(STORAGE.demand)) ?? 0;
+      if (demand > 0) {
+        const reopened = await this.ensureUpstream();
+        if (reopened) {
+          // Reconcile reconnect-during-gap clients with the last-known state.
+          await this.fanPersistedSnapshot();
+        }
+      } else {
+        // A drain-only wake at demand 0 must tear the upstream down rather than
+        // leak it (the demand-gate's close path).
+        await this.closeUpstream();
       }
-      await this.armAlarm();
-    } else {
-      await this.closeUpstream();
-      await this.ctx.storage.deleteAlarm();
+      await this.drainOneEligible();
+    } finally {
+      await this.reconcileAlarm();
     }
   }
 

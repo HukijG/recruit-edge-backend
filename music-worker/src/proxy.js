@@ -10,7 +10,12 @@
  * @param {{ DASHBOARD_REMOTE_BASE: string, DASHBOARD_REMOTE_KEY: string }} env
  * @param {string} mappedPath - dashboard sub-path beginning with '/'
  *   (already validated non-placeholder by route-map.throwIfUnset).
- * @param {{ method?: string, body?: BodyInit | null, headers?: Record<string,string> }} [init]
+ * @param {{ method?: string, body?: BodyInit | null, headers?: Record<string,string>, signal?: AbortSignal }} [init]
+ *   `signal` is optional: the direct-proxy callers pass none (=> undefined =>
+ *   fetch behaves identically). The DO's command-queue delivery passes an
+ *   AbortController signal so a HUNG dashboard delivery aborts at a bounded
+ *   timeout. Delivery and the direct path share this ONE primitive so the
+ *   Content-Type / X-Remote-Key / base-join can never drift between them.
  * @returns {Promise<Response>}
  */
 export async function proxyToDashboard(env, mappedPath, init = {}) {
@@ -29,5 +34,6 @@ export async function proxyToDashboard(env, mappedPath, init = {}) {
     method: init.method ?? 'GET',
     headers,
     body: init.body ?? undefined,
+    signal: init.signal,
   });
 }
