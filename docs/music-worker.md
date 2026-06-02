@@ -152,20 +152,37 @@ route→category map (`next`/`prev`→`skip`, `play`/`playlist-play`→`play`,
 **Arrival** (`enqueueCommand`). Read `cmdQueue` FRESH, append the element, **persist
 before the next await**, `reconcileAlarm()` to arm the drain, and respond `202 {
 ok:true, queued:true }` IMMEDIATELY (fire-and-forget — the real result returns over
-the now-playing WS). A cooldown-ineligible head only **WAITS** (never
-skipped/reordered).
+the now-playing WS).
+
+**Drain order — FIFO WITHIN a category, cross-category overtaking ACROSS them.**
+The queue is **not** strict global FIFO. The per-category cooldown machinery exists
+to **decouple** categories — a 10s `enqueue` cooldown must not stall a stone-cold
+`skip`. So the drain selects the **first cooldown-ELIGIBLE** command
+(`firstEligibleIndex` — the *drain-eligible head*, not strictly index 0): a
+cooldown-blocked head is **overtaken** by the earliest-enqueued command of a
+*different, idle* category behind it, rather than blocking it. **FIFO within a
+category is preserved**: a front-to-back scan returns the earliest-enqueued eligible
+command, and two commands sharing a category share **one** `lastExec:<cat>` timer —
+so if an earlier same-category command is blocked, the later one is **equally**
+blocked and can never overtake it. Only a *different* idle category overtakes a
+blocked one. (Without this, one consumer's `enqueue` would couple everyone's
+`skip`/`play` latency to the 10s enqueue cooldown — exactly the coupling the
+per-category design exists to avoid; pinned by test (D2)/(D3).)
 
 **Drain** (alarm-driven, `drainOneEligible` — SINGLE-SHOT, not a gate-holding
-loop). Read `cmdQueue` FRESH; the head's `last = (lastExec:<cat>) ?? 0` — the
-**`?? 0` is load-bearing**: a first-ever / post-eviction-empty `lastExec` is
-`undefined`, and `now >= undefined + cooldown` is `now >= NaN` (false → a wedge)
-while `Math.max(NaN, now)` is `NaN` (an invalid `setAlarm`); `?? 0` makes the first
-command of every category eligible at `t0`. If `now < last + COOLDOWN_MS[cat]` the
-head STAYS and `reconcileAlarm` re-arms for `max(last+cooldown, now)`. Otherwise
-deliver, then **re-read `cmdQueue` FRESH** before shifting (the delivery await
-opened the input gate — see Platform model — so a concurrent enqueue may have
-appended; the head is still index 0 because drain is the SOLE shifter and only one
-`alarm()` runs per DO).
+loop). Read `cmdQueue` FRESH; for the candidate command's category `last =
+(lastExec:<cat>) ?? 0` — the **`?? 0` is load-bearing**: a first-ever /
+post-eviction-empty `lastExec` is `undefined`, and `now >= undefined + cooldown` is
+`now >= NaN` (false → a wedge) while `Math.max(NaN, now)` is `NaN` (an invalid
+`setAlarm`); `?? 0` makes the first command of every category eligible at `t0`. If
+NO category is eligible (`firstEligibleIndex` returns `-1`) every queued command
+STAYS and `reconcileAlarm` re-arms for the EARLIEST per-category eligibility across
+the queue (`min` over `max(lastExec+cooldown, now)` of each distinct category, NOT
+just the FIFO head). Otherwise deliver the eligible command, then **re-read
+`cmdQueue` FRESH** before removing it (the delivery await opened the input gate —
+see Platform model — so a concurrent enqueue may have appended to the TAIL; appends
+never reorder/remove and drain is the SOLE remover with only one `alarm()` per DO,
+so the selected command is still at the SAME index in the fresh array).
 
 **Delivery reuses `proxyToDashboard`** (identical `Content-Type: application/json`
 + `X-Remote-Key` + base-join as the direct path — the two paths cannot drift),
@@ -209,8 +226,13 @@ is gone; no other method touches the alarm directly). It computes:
 - **liveness** = reads the **PERSISTED `demand` key** (NEVER `getWebSockets()`,
   which still holds a closing socket inside `webSocketClose`); `demand > 0` ?
   `now + UPSTREAM_ALARM_INTERVAL_MS` : `null`.
-- **drain** = reads FRESH `cmdQueue`; `null` if empty, else for the head
-  `max((lastExec ?? 0) + cooldown, now)`.
+- **drain** = reads FRESH `cmdQueue`; `null` if empty, else the **EARLIEST
+  per-category eligibility** across all distinct categories in the queue — `min`
+  over `max((lastExec:<cat> ?? 0) + cooldown, now)` of each category. This MUST
+  match the drain's cross-category overtaking (see **Drain order** above): an idle
+  category behind a cooldown-blocked head drives the alarm to wake at *its*
+  eligibility, not the blocked head's far-future time — otherwise the alarm would
+  sleep out the blocked cooldown while a drainable command sits behind it.
 
 …and sets the alarm to the **EARLIEST non-null** of the two; it **deletes only when
 BOTH are null** (demand===0 AND queue empty) and **never when `armOnly`**. The

@@ -316,11 +316,17 @@ export class MusicRemoteState extends DurableObject {
    *  - LIVENESS: reads the PERSISTED demand key (NEVER getWebSockets(), which still
    *    holds a closing socket inside webSocketClose). demand>0 => now +
    *    UPSTREAM_ALARM_INTERVAL_MS, else null.
-   *  - DRAIN: reads the FRESH cmdQueue. Empty => null; else for the head,
-   *    max((lastExec ?? 0) + cooldown, now). The `?? 0` is LOAD-BEARING — a
-   *    first-ever/post-eviction-empty lastExec is undefined, and undefined+cooldown
-   *    is NaN (Math.max(NaN, now) === NaN => an invalid setAlarm); `?? 0` makes the
-   *    first command of every category eligible at t0.
+   *  - DRAIN: reads the FRESH cmdQueue. Empty => null; else the EARLIEST
+   *    per-category eligibility across ALL distinct categories present in the queue
+   *    — for each category, max((lastExec ?? 0) + cooldown, now), and the drain
+   *    candidate is the MIN of those. This matches drainOneEligible's
+   *    cross-category overtaking: an idle category's eligibility time must drive the
+   *    alarm, not just the strict-FIFO head's — otherwise the alarm would wait on a
+   *    cooldown-blocked head while a behind-it idle category sits drainable. The
+   *    `?? 0` is LOAD-BEARING — a first-ever/post-eviction-empty lastExec is
+   *    undefined, and undefined+cooldown is NaN (Math.max(NaN, now) === NaN => an
+   *    invalid setAlarm); `?? 0` makes the first command of every category eligible
+   *    at t0.
    *
    * Sets the alarm to the earliest non-null candidate. Deletes ONLY when BOTH are
    * null (demand===0 AND queue empty) and NOT armOnly — the constructor passes
@@ -335,9 +341,15 @@ export class MusicRemoteState extends DurableObject {
     const queue = (await this.ctx.storage.get(STORAGE.cmdQueue)) ?? [];
     let drain = null;
     if (queue.length) {
-      const head = queue[0];
-      const last = (await this.ctx.storage.get(STORAGE.lastExecPrefix + head.category)) ?? 0;
-      drain = Math.max(last + COOLDOWN_MS[head.category], Date.now());
+      const now = Date.now();
+      const seen = new Set();
+      for (const cmd of queue) {
+        if (seen.has(cmd.category)) continue;
+        seen.add(cmd.category);
+        const last = (await this.ctx.storage.get(STORAGE.lastExecPrefix + cmd.category)) ?? 0;
+        const eligibleAt = Math.max(last + COOLDOWN_MS[cmd.category], now);
+        if (drain == null || eligibleAt < drain) drain = eligibleAt;
+      }
     }
 
     const next = [liveness, drain].filter((v) => v != null).sort((a, b) => a - b)[0] ?? null;
@@ -394,56 +406,103 @@ export class MusicRemoteState extends DurableObject {
   }
 
   /**
+   * Find the index of the FIRST cooldown-ELIGIBLE command in the queue (the
+   * drain-eligible head, NOT strictly index 0). Returns -1 if every queued command
+   * is still under its category cooldown.
+   *
+   * CROSS-CATEGORY OVERTAKING (no head-of-line blocking): the per-category cooldown
+   * machinery exists to DECOUPLE categories — a 10s `enqueue` cooldown must not
+   * stall a stone-cold `skip`. So when the strict-FIFO head is cooldown-ineligible
+   * we do NOT simply wait on it; we scan forward for the first command whose OWN
+   * category is eligible and drain THAT. Without this, one consumer's `enqueue`
+   * couples everyone's `skip`/`play` latency to the enqueue cooldown — exactly the
+   * coupling the per-category design is meant to avoid.
+   *
+   * FIFO WITHIN a category is PRESERVED: front-to-back scan returns the
+   * earliest-enqueued eligible command, and two commands sharing a category share
+   * one `lastExec:<cat>` timer — so if an earlier same-category command is blocked,
+   * the later one is EQUALLY blocked and can never overtake it. Only a DIFFERENT,
+   * idle category overtakes a cooldown-blocked one.
+   *
+   * @param {Array<{category:string}>} queue
+   * @returns {Promise<number>} index of the first eligible command, or -1
+   */
+  async firstEligibleIndex(queue) {
+    const now = Date.now();
+    // Cache per-category lastExec lookups: a long queue of one category does a
+    // single storage.get, not one per element.
+    const lastByCat = new Map();
+    for (let i = 0; i < queue.length; i++) {
+      const cat = queue[i].category;
+      if (!lastByCat.has(cat)) {
+        lastByCat.set(cat, (await this.ctx.storage.get(STORAGE.lastExecPrefix + cat)) ?? 0);
+      }
+      if (now >= lastByCat.get(cat) + COOLDOWN_MS[cat]) return i;
+    }
+    return -1;
+  }
+
+  /**
    * Drain EXACTLY ONE eligible command — SINGLE-SHOT, NOT a gate-holding loop.
    * reconcileAlarm() (called by alarm()'s finally) re-arms for the next eligible
-   * time, so the platform re-drives the drain one head per wake.
+   * time, so the platform re-drives the drain one command per wake.
    *
-   * Order is preserved and nothing is dropped except the four LOUD cases (queue
-   * overflow handled in enqueueCommand; here: transient give-up after
-   * MAX_DELIVERY_ATTEMPTS, a 4xx permanent rejection, and DASHBOARD_REMOTE_BASE
-   * unset — all surfaced via deliverCommand's outcome + a drain-trace).
+   * Selects the FIRST cooldown-eligible command (firstEligibleIndex) — an idle
+   * category is NEVER blocked behind a busy one. FIFO within a category is intact
+   * (see firstEligibleIndex). If nothing is eligible the drain no-ops and
+   * reconcileAlarm re-arms for the earliest per-category eligibility across the
+   * queue.
+   *
+   * Order is preserved (modulo cross-category overtaking) and nothing is dropped
+   * except the four LOUD cases (queue overflow handled in enqueueCommand; here:
+   * transient give-up after MAX_DELIVERY_ATTEMPTS, a 4xx permanent rejection, and
+   * DASHBOARD_REMOTE_BASE unset — all surfaced via deliverCommand's outcome + a
+   * drain-trace).
    */
   async drainOneEligible() {
     const queue = (await this.ctx.storage.get(STORAGE.cmdQueue)) ?? [];
     if (queue.length === 0) return;
 
-    const head = queue[0];
-    const last = (await this.ctx.storage.get(STORAGE.lastExecPrefix + head.category)) ?? 0;
-    if (Date.now() < last + COOLDOWN_MS[head.category]) {
-      // Cooldown-ineligible: the head STAYS (never skipped/reordered).
-      // reconcileAlarm re-arms for max(last+cooldown, now).
+    const idx = await this.firstEligibleIndex(queue);
+    if (idx === -1) {
+      // No category eligible: every queued command STAYS (never skipped/reordered).
+      // reconcileAlarm re-arms for the earliest per-category eligibility.
       return;
     }
+    const cmd = queue[idx];
 
-    const outcome = await this.deliverCommand(head);
+    const outcome = await this.deliverCommand(cmd);
 
     // RE-READ the queue FRESH after the delivery await: the await opened the input
-    // gate, so a concurrent enqueue may have APPENDED. The head is still index 0
-    // because drain is the SOLE shifter and only one alarm() runs per DO at a time.
+    // gate, so a concurrent enqueue may have APPENDED to the TAIL. Appends never
+    // reorder or remove, and drain is the SOLE remover with only one alarm() per DO
+    // at a time, so the selected command is still at the SAME index `idx` in the
+    // fresh array — re-derive its element from the fresh array rather than caching.
     const fresh = (await this.ctx.storage.get(STORAGE.cmdQueue)) ?? [];
 
-    const giveUp = outcome.transient && head.attempts + 1 >= MAX_DELIVERY_ATTEMPTS;
+    const giveUp = outcome.transient && cmd.attempts + 1 >= MAX_DELIVERY_ATTEMPTS;
     if (outcome.terminal || giveUp) {
       // Drained (delivered, permanently-rejected, or transient give-up): bump the
-      // per-category lastExec, shift the head, persist, trace the REAL outcome.
-      await this.ctx.storage.put(STORAGE.lastExecPrefix + head.category, Date.now());
-      fresh.shift();
+      // per-category lastExec, remove the selected command, persist, trace the REAL
+      // outcome.
+      await this.ctx.storage.put(STORAGE.lastExecPrefix + cmd.category, Date.now());
+      fresh.splice(idx, 1);
       await this.ctx.storage.put(STORAGE.cmdQueue, fresh);
       console.log({
         source: 'music-do',
         event: 'drain',
-        category: head.category,
-        dashboardPath: head.dashboardPath,
+        category: cmd.category,
+        dashboardPath: cmd.dashboardPath,
         outcome: outcome.terminal
           ? outcome.traceOutcome
           : 'dropped-after-max-' + outcome.traceOutcome,
-        attempt: head.attempts + 1,
+        attempt: cmd.attempts + 1,
       });
     } else {
-      // Transient under MAX: keep the head at index 0, bump its attempts, do NOT
+      // Transient under MAX: keep the command in place, bump its attempts, do NOT
       // bump lastExec. reconcileAlarm re-arms at now so the retry fires immediately
       // (one retry total at MAX_DELIVERY_ATTEMPTS=2).
-      fresh[0].attempts = head.attempts + 1;
+      fresh[idx].attempts = cmd.attempts + 1;
       await this.ctx.storage.put(STORAGE.cmdQueue, fresh);
     }
   }

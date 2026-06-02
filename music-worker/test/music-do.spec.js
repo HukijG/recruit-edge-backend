@@ -551,6 +551,74 @@ describe('MusicRemoteState — command queue + cooldowns', () => {
     });
   });
 
+  // (D2) CROSS-CATEGORY OVERTAKING (no head-of-line blocking): the strict-FIFO head
+  // is an `enqueue` still under its 10s cooldown, behind it a `skip` whose category
+  // is stone-cold (eligible NOW). The drain must NOT wait on the blocked head — it
+  // selects the eligible `skip` and delivers it, leaving the blocked enqueue queued.
+  // Without this, one consumer's enqueue couples everyone's skip latency to the 10s
+  // enqueue cooldown — exactly the coupling the per-category design exists to avoid.
+  it('(D2) an idle-category command OVERTAKES a cooldown-blocked head of a different category', async () => {
+    const s = stub();
+    const { calls } = mockFetch(200);
+    await runInDurableObject(s, async (instance, state) => {
+      await state.storage.put('demand', 0);
+      // enqueue under cooldown (just executed), skip stone-cold (lastExec unset).
+      await state.storage.put('lastExec:enqueue', Date.now());
+      await state.storage.put('cmdQueue', [
+        { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '1' }), enqueuedAt: Date.now(), attempts: 0 },
+        { category: 'skip', dashboardPath: '/api/remote/next', body: '{}', enqueuedAt: Date.now(), attempts: 0 },
+      ]);
+
+      // Drain: the blocked enqueue head is SKIPPED; the eligible skip is delivered.
+      await instance.drainOneEligible();
+      expect(calls.length).toBe(1);
+      expect(calls[0].url).toBe('https://dashboard.test.local/api/remote/next');
+
+      // The blocked enqueue remains queued (NOT reordered away, NOT dropped).
+      const queue = await state.storage.get('cmdQueue');
+      expect(queue.length).toBe(1);
+      expect(queue[0].category).toBe('enqueue');
+      // lastExec:skip was bumped (the skip drained); enqueue's timer is untouched.
+      expect(await state.storage.get('lastExec:skip')).toBeGreaterThan(0);
+
+      // reconcileAlarm arms for the EARLIEST per-category eligibility across the
+      // queue — only `enqueue` remains, eligible at lastExec:enqueue + 10000.
+      const lastEnq = await state.storage.get('lastExec:enqueue');
+      await instance.reconcileAlarm();
+      expect(await state.storage.getAlarm()).toBe(lastEnq + COOLDOWN_MS.enqueue);
+
+      // Clear the queue + alarm so this stub leaks no deliverable work into a later
+      // test's global fetch/warn spies (singleWorker:true shares one runtime).
+      await state.storage.put('cmdQueue', []);
+      await state.storage.deleteAlarm();
+    });
+  });
+
+  // (D3) reconcileAlarm with a BLOCKED head but an idle category BEHIND it arms for
+  // the idle category (~now), NOT the blocked head's far-future eligibility — so the
+  // alarm wakes promptly to overtake rather than sleeping out the blocked cooldown.
+  it('(D3) reconcileAlarm arms for the earliest per-category eligibility, not the FIFO head', async () => {
+    const s = stub();
+    await runInDurableObject(s, async (instance, state) => {
+      await state.storage.put('demand', 0); // drain is the sole alarm responsibility
+      await state.storage.put('lastExec:enqueue', Date.now()); // enqueue ~now+10s
+      // skip stone-cold (unset) => eligible ~now.
+      await state.storage.put('cmdQueue', [
+        { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '1' }), enqueuedAt: Date.now(), attempts: 0 },
+        { category: 'skip', dashboardPath: '/api/remote/next', body: '{}', enqueuedAt: Date.now(), attempts: 0 },
+      ]);
+      await instance.reconcileAlarm();
+      const at = await state.storage.getAlarm();
+      // ~now (skip eligible), FAR below the blocked enqueue's now+10s.
+      expect(at).toBeLessThan(Date.now() + 1000);
+
+      // Clear the queue + alarm so this stub leaks no deliverable work into a later
+      // test's global fetch/warn spies (singleWorker:true shares one runtime).
+      await state.storage.put('cmdQueue', []);
+      await state.storage.deleteAlarm();
+    });
+  });
+
   // (E) overflow (runaway backstop): push MAX_QUEUE, then one more -> LOUD warn +
   // the DISTINCT { ok:true, queued:false, dropped:'queue_full' } envelope.
   it('(E) MAX_QUEUE overflow -> LOUD warn + { ok:true, queued:false, dropped:"queue_full" }', async () => {
