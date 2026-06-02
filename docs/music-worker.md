@@ -498,27 +498,3 @@ npm test            # vitest run
 # step 2 — config validation only (NEVER deploy)
 npx wrangler deploy --dry-run -c music-worker/wrangler.music.jsonc
 ```
-
-## Open operator items (escalations)
-
-1. ~~**Dashboard `/api/remote/*` sub-paths**~~ — **RESOLVED.** The 11 sub-paths are
-   confirmed against the dashboard's actual routes (see the Outbound table above)
-   and wired into `API_REMOTE_PATH`. `throwIfUnset()` is retained as a safety net.
-2. ~~**Identity gate**~~ — **RESOLVED: JWT-only per operator.** The identity gate
-   is dropped: a valid Cloudflare Access JWT is the authorization (Access already
-   restricts issuance to the team). No `USERS_DB` binding, no email registry, no
-   `ACCESS_ALLOWED_EMAILS`.
-3. **WS-upgrade auth A vs B** — Option B (DO ticket store) is the default; Option A
-   (separate Access app fronting the WS path) is the alternative (adds a third auth
-   surface + hostname/AUD).
-4. **Ops / secrets / hostname** — create the `rf-music-remote` worker + hostname,
-   set the secrets above, set `PLASMO_PUBLIC_MUSIC_URL`. (No `USERS_DB` binding —
-   auth is JWT-only, escalation 2.)
-5. ~~**Upstream now-playing WS source + its auth**~~ — **RESOLVED.** The upstream is
-   the dashboard's **`/api/remote/nowplaying`** route at
-   `DASHBOARD_REMOTE_BASE` + the path, opened via `fetch` + an `Upgrade: websocket`
-   header (the http(s) scheme is kept — Workers rejects `ws`/`wss`). The upgrade
-   carries the frozen **`X-Remote-Key`** (= `DASHBOARD_REMOTE_KEY`), exactly as the
-   HTTP proxy does. There is no separate `UPSTREAM_WS_URL`; when
-   `DASHBOARD_REMOTE_BASE` is unset, `openUpstream()` no-ops and only the persisted
-   snapshot is fanned.

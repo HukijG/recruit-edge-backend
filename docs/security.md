@@ -36,7 +36,7 @@ If you're unsure whether a new endpoint needs Access:
 | App | Status | Worker | URL | AUD env var | Notes |
 |---|---|---|---|---|---|
 | **App 1** | ✅ Live | `rf-mcp-remote` | `rf-mcp-remote.<account>.workers.dev` (hostname-only — Managed OAuth requires no path) | `ACCESS_AUD_MCP` (secret) | Self-hosted, Managed OAuth ON, DCR enabled, allowed redirect URI `https://claude.ai/api/mcp/auth_callback` |
-| **App 2** | ✅ Phase 2 (code live; dashboard config + secrets operator-pending) | `rf-dialpad-sync-dev` (extension API) | TBD | `ACCESS_AUD_MIDDLEWARE` (secret, operator-pending) + `ACCESS_CLIENT_ID_MIDDLEWARE` (secret, operator-pending) | SaaS-OIDC, public PKCE client. Phase 2 dual-auth helper at `src/auth-extension.js`. Cloudflare Access App 2 dashboard creation, both `ACCESS_*_MIDDLEWARE` secrets set, and the operator's separate extension build remain. Phase 3 (legacy header removal + edge gating) is future work. |
+| **App 2** | ✅ Phase 2 live (App 2 created, both secrets set, extension shipped on OAuth) | `rf-dialpad-sync-dev` (extension API) + `rf-music-remote` (music remote) | redirect URI `https://<chrome-extension-id>.chromiumapp.org/oauth-callback` | `ACCESS_AUD_MIDDLEWARE` + `ACCESS_CLIENT_ID_MIDDLEWARE` (secrets — set on **both** workers) | SaaS-OIDC, public PKCE client. Dual-auth helper: `src/auth-extension.js` (main worker) + `music-worker/src/auth-music.js` (music worker — trimmed JWT-only copy validating the same App-2 token). Phase 3 (legacy header removal + edge gating) is future work. |
 
 ### Extension OAuth client contract (App 2)
 
@@ -148,20 +148,13 @@ App 2's OAuth client is consumed by the operator's separate extension workstream
 
 ---
 
-## State — what's done, what's pending
+## Migration state
 
-- ✅ **Spec A (MCP path)** — landed 2026-05-10. Plan A all 14 tasks complete. claude.ai connector live via DCR + OTP. `MCP_EXTENSION_SECRET` deleted from both workers.
-- ✅ **Phase 2 code shipped** — Helper at `src/auth-extension.js` accepts both SaaS-OIDC access_tokens (`iss=<team>/cdn-cgi/access/sso/oidc/<client_id>`, `aud=<registered redirect URI>`) and the legacy `X-Extension-Token` header. Per-route refactor complete at `src/index.js` (all 12 user-facing routes). The SaaS-OIDC validation path was hardened on 2026-05-13 after the empirical token-shape inspection (initial design assumed an "audience tag" pattern; Cloudflare's actual SaaS-OIDC tokens put the redirect URI in `aud` and use a per-app `iss`). Dashboard config (Access App 2 creation), both `ACCESS_AUD_MIDDLEWARE` + `ACCESS_CLIENT_ID_MIDDLEWARE` secrets, and the operator's separate extension build remain pending — see `docs/archive/handoffs/2026-05-12-extension-access-app2-config.md`.
-- ⏳ **Phase 3 (legacy header removal + edge gating)** — future work. Triggered by operator-confirmed 24-hour drain of `auth.source=legacy` in LD after extension rollout completes. Phase 3 drops the legacy `X-Extension-Token` branch, deletes `LINKEDIN_EXTENSION_SECRET`, and switches App 2 to fronted self-hosted mode with path filter excluding `/webhook/*` and `/test/coldcall`.
-- ⏳ **Drop transitional `consultantFirstName` body fallback** in `src/mcp/router.js` — when Phase 3 confirms zero `[mcp] legacy consultantFirstName fallback` log lines.
+The Access rollout happened in two phases, with one phase still ahead:
 
-## References
-
-- [Spec A — Cloudflare Access for MCP](archived/specs/2026-05-10-cloudflare-access-mcp-design.md) (shipped, archived)
-- [Plan A — implementation step list (manual + code)](archived/plans/2026-05-10-cloudflare-access-mcp.md) (shipped, archived)
-- [Spec B — Cloudflare Access for the extension API (dual-auth design)](archived/specs/2026-05-12-extension-access-dual-auth-design.md) (Phase 2 shipped 2026-05-13, archived. Phase 3 is future work and will be a separate spec.)
-- [Plan B — implementation step list](archived/plans/2026-05-12-extension-access-dual-auth.md) (Phase 2 shipped, archived.)
-- [Operator handoff — Access App 2 + extension contract](archived/handoffs/2026-05-12-extension-access-app2-config.md) (Phase 2 setup completed 2026-05-13, archived.)
+- **MCP path — done.** The AI-assistant connector is live behind Cloudflare Access via DCR + OTP. The earlier shared-secret header (`MCP_EXTENSION_SECRET`) has been removed from both workers; identity is the verified email claim from the Access JWT.
+- **Extension / PWA path — dual-auth live.** The helper at `src/auth-extension.js` accepts both SaaS-OIDC access_tokens (`iss=<team>/cdn-cgi/access/sso/oidc/<client_id>`, `aud=<registered redirect URI>`) and the legacy `X-Extension-Token` header, so the new extension can roll out while the legacy path keeps working. Cloudflare's SaaS-OIDC tokens put the redirect URI in `aud` and use a per-app `iss` (not the "audience tag" pattern of the self-hosted MCP app), which is why App-2 callers pass explicit issuer/JWKS overrides to `verifyAccessJwt`. App 2's config and both `ACCESS_*_MIDDLEWARE` secrets are provisioned on `rf-dialpad-sync-dev` **and** the separate `rf-music-remote` music worker; `music-worker/src/auth-music.js` is a trimmed JWT-only copy of this helper validating the same token.
+- **Legacy removal — future work.** Once the legacy traffic (`auth.source=legacy`) drains after the extension rollout, the legacy `X-Extension-Token` branch and `LINKEDIN_EXTENSION_SECRET` are dropped, App 2 switches to fronted self-hosted edge mode (path filter excluding `/webhook/*` and `/test/coldcall`), and the transitional `consultantFirstName` body fallback in `src/mcp/router.js` is removed.
 
 ## Tangentially-related open work
 
