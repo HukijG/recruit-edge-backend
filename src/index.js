@@ -40,7 +40,7 @@ import {
   getDailyCallCount,
 } from './cache.js';
 import { processCallEvent, parseColdCallActivity, mergeTag } from './cold-call.js';
-import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl } from './enrichment.js';
+import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl, APOLLO_ENRICH_COOLDOWN_SEC } from './enrichment.js';
 import { enrichPerson } from './apollo-client.js';
 import { resolveRFUserId, getUserByFirstName } from './users.js';
 import { authExtensionRequest, setAuthSpanSuccess, setAuthSpanFailure } from './auth-extension.js';
@@ -1300,13 +1300,13 @@ async function processExistingRFCandidate(existing, ext, label, env) {
           await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
             apolloPersonId: apolloPerson.id,
             timestamp: new Date().toISOString(),
-          }), { expirationTtl: 900 });
+          }), { expirationTtl: APOLLO_ENRICH_COOLDOWN_SEC });
           phoneRequested = true;
         } else {
           await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
             noMatch: true,
             timestamp: new Date().toISOString(),
-          }), { expirationTtl: 900 });
+          }), { expirationTtl: APOLLO_ENRICH_COOLDOWN_SEC });
         }
       } catch (error) {
         console.error({ message: `[Candidates] ${label} — phone reveal failed (non-fatal): ${error.message}`, source: 'candidates-endpoint', rfId });
@@ -1428,7 +1428,7 @@ async function processOneCandidate(ext, i, total, env, consultantRfUserId) {
           await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
             apolloPersonId: apolloPerson.id,
             timestamp: new Date().toISOString(),
-          }), { expirationTtl: 900 });
+          }), { expirationTtl: APOLLO_ENRICH_COOLDOWN_SEC });
           phoneRequested = true;
         }
       } catch (error) {

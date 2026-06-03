@@ -10,6 +10,16 @@ import { updateRFCandidate } from './rf-client.js';
 import { patchDialpadContact } from './dialpad-client.js';
 import { makeAsyncCallbackUrl } from './lib/trace-link.js';
 
+/**
+ * Re-enrichment cooldown (seconds), keyed by `apollo_enrich:${rfId}`. This dedups repeat
+ * enrichment *requests* for the same candidate so we don't re-spend Apollo credits on rapid
+ * duplicates (double-submits, batch retries). It deliberately does NOT gate webhook delivery
+ * — `/webhook/apollo` always writes a revealed phone regardless of this flag — so it is kept
+ * short: long enough to swallow accidental duplicates, short enough that an intentional
+ * re-add re-enriches promptly.
+ */
+export const APOLLO_ENRICH_COOLDOWN_SEC = 120;
+
 function log(data) {
 	console.log({ source: 'enrichment', ...data });
 }
@@ -170,7 +180,7 @@ export async function enrichCandidate(candidate, fullCandidate, env) {
 		apolloPersonId: apolloPerson.id,
 		correctedLinkedIn,
 		timestamp: new Date().toISOString(),
-	}), { expirationTtl: 900 });
+	}), { expirationTtl: APOLLO_ENRICH_COOLDOWN_SEC });
 
 	log({ message: `[enrich] complete — phone reveal requested`, rfId, apolloPersonId: apolloPerson.id, correctedLinkedIn: correctedLinkedIn || null });
 
