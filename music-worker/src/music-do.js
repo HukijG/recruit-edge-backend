@@ -68,16 +68,72 @@ export const UPSTREAM_ALARM_INTERVAL_MS = 30_000;
 // upgrades; anything older is a replay/stale attempt.
 export const WS_TICKET_TTL_MS = 30_000;
 
-// ---- CHANGE B — GLOBAL command queue + per-category cooldowns ----------------
+// ---- GLOBAL command rate-limiting — FOUR modes, one per category -------------
 //
-// Minimum spacing between EXECUTIONS of commands of a category, GLOBALLY (across
-// ALL extension consumers — the queue lives in the singleton DO). next AND prev
-// share the 'skip' category, play + playlist-play share 'play'. Named constants,
-// NOT inline magic values.
-export const COOLDOWN_MS = { skip: 5000, play: 5000, enqueue: 10000 };
+// The dashboard's real failure mode is at the transport/PCM layer: every command
+// that starts NEW audio (next / prev / play song / play playlist) forces the TV to
+// flush its playback buffer and re-stream fresh PCM over a fragile WS. Fast
+// SEQUENTIAL new-audio commands collide with an in-flight delivery and choke the
+// server mid-flush. The rate-limiting here is a deliberate bandaid in front of that
+// dashboard-side durability problem — NOT UX politeness — so the modes are tuned to
+// the danger each command poses, GLOBALLY across ALL extension consumers (the
+// singleton DO is the only shared point, so the state lives here).
+//
+// Four modes (see CATEGORY_MODE):
+//   'throttle'    — leading-edge: the FIRST command in a cooldown window delivers
+//                   INLINE immediately, every other same-category command within the
+//                   window is DROPPED (never saved). For toggle (pause+resume merged)
+//                   and next — any single one is fine, so first-wins + drop-the-rest.
+//   'burst'       — token-bucket: allow up to PREV_BURST_LIMIT presses within
+//                   PREV_BURST_WINDOW_MS (so a fast double-tap "go back" always lands)
+//                   then PREV_MIN_SPACING_MS between. Delivered INLINE. For prev only.
+//   'latest-wins' — trailing-edge debounce: a burst of play/playlist-play requests
+//                   COALESCES to the most-recent target, delivered after a quiet
+//                   settle, never faster than the cooldown floor, never deferred past
+//                   a hard cap. The SPECIFIC target must be right (latest), and these
+//                   are the most expensive new-audio ops → longest protection.
+//   'queue'       — save-all FIFO: EVERY enqueue is delivered, one per cooldown.
+//                   Nothing dropped (save the runaway backstop).
+//
+// Minimum spacing between EXECUTIONS of a category, GLOBALLY. Named constants, NOT
+// inline magic values. (prev is NOT here — its token-bucket uses PREV_* below.)
+export const COOLDOWN_MS = { toggle: 5000, next: 5000, play: 10000, enqueue: 20000 };
 
-// Runaway backstop ONLY. Normal operation never reaches this; an overflow is a
-// LOUD drop (console.warn), never silent.
+// Per-category mode. The DO is route-agnostic (it sees only { category,
+// dashboardPath, body }); the route->category map lives in index.js, and this
+// category->mode map is the DO's single source of which mechanism handles a command.
+export const CATEGORY_MODE = {
+  toggle: 'throttle',
+  next: 'throttle',
+  prev: 'burst',
+  play: 'latest-wins',
+  enqueue: 'queue',
+};
+
+// prev token-bucket: allow up to PREV_BURST_LIMIT presses inside any
+// PREV_BURST_WINDOW_MS window (so a fast double-tap always reaches the dashboard's
+// "2 within 3s = go back" gesture), then enforce PREV_MIN_SPACING_MS between further
+// presses. Protects the dashboard from sustained prev-spam WITHOUT killing the
+// gesture — the one case a flat cooldown could not satisfy.
+export const PREV_BURST_LIMIT = 2;
+export const PREV_BURST_WINDOW_MS = 3000;
+export const PREV_MIN_SPACING_MS = 1000;
+
+// Latest-wins (play / playlist-play) debounce. A new pick collapses onto the single
+// pending play slot (latest wins) and is delivered at:
+//   max( COOLDOWN floor, min( max(lastAt + SETTLE, floor), firstAt + MAX_DEFER ) )
+//   - SETTLE   — deliver only after this much quiet, so a rapid burst of picks
+//                collapses to the last one (true trailing-edge debounce).
+//   - floor    — COOLDOWN_MS.play after the previous delivery; a HARD floor (dashboard
+//                protection) the settle/cap can never undercut.
+//   - MAX_DEFER — bounds worst-case latency: under a sustained stream of picks the
+//                settle keeps pushing out, so cap the wait from the FIRST un-delivered
+//                request so a play always lands eventually.
+export const PLAY_DEBOUNCE_SETTLE_MS = 2000;
+export const PLAY_MAX_DEFER_MS = 8000;
+
+// Runaway backstop ONLY (queue mode). Normal operation never reaches this; an
+// overflow is a LOUD drop (console.warn), never silent.
 export const MAX_QUEUE = 100;
 
 // A delivery that fails transiently (5xx / fetch-reject / abort-timeout) is
@@ -106,12 +162,54 @@ const STORAGE = {
   demand: 'demand',
   snapshot: 'snapshot',
   ticketPrefix: 'ticket:',
-  // CHANGE B — FIFO command queue (array) + per-category last-execution
-  // timestamps. Both SQLite-backed via ctx.storage so they survive hibernation /
-  // eviction.
+  // Alarm-deferred command queue (array) — holds 'queue' (enqueue, FIFO) and
+  // 'latest-wins' (play, single coalesced slot) elements — plus per-category
+  // last-execution timestamps. Both SQLite-backed via ctx.storage so they survive
+  // hibernation / eviction.
   cmdQueue: 'cmdQueue',
   lastExecPrefix: 'lastExec:',
+  // 'burst' mode (prev) — the accepted-press timestamps within the current window,
+  // pruned to PREV_BURST_WINDOW_MS. SQLite-backed so the token-bucket survives
+  // hibernation / eviction like every other piece of command state.
+  prevTimestamps: 'prevTimestamps',
 };
+
+/**
+ * The time a queued command becomes deliverable, given its category's last
+ * delivery time. SINGLE SOURCE OF TRUTH for eligibility — used by both
+ * firstEligibleIndex (the drain selector) and reconcileAlarm (the wake time), so
+ * the two can never disagree on when a command is due.
+ *
+ *  - 'latest-wins' (play): the trailing-edge debounce — max(floor, min(max(lastAt +
+ *    SETTLE, floor), firstAt + MAX_DEFER)). floor = lastExec + COOLDOWN.play is a
+ *    HARD lower bound (dashboard protection); the settle waits for quiet; the cap
+ *    bounds worst-case latency under a sustained stream.
+ *  - everything else in the queue ('queue'/enqueue): the flat per-category cooldown,
+ *    lastExec + COOLDOWN[category]. The `?? 0` on lastExec (applied by callers) makes
+ *    a first-ever / post-eviction-empty timer eligible at t0.
+ *
+ * @param {{ category: string, firstAt?: number, lastAt?: number }} cmd
+ * @param {number} lastExec - the category's last delivery time (caller applies ?? 0)
+ * @returns {number} epoch ms at which the command may be delivered
+ */
+function commandEligibleAt(cmd, lastExec) {
+  if (CATEGORY_MODE[cmd.category] === 'latest-wins') {
+    const floor = lastExec + COOLDOWN_MS[cmd.category];
+    const settle = cmd.lastAt + PLAY_DEBOUNCE_SETTLE_MS;
+    const cap = cmd.firstAt + PLAY_MAX_DEFER_MS;
+    return Math.max(floor, Math.min(Math.max(settle, floor), cap));
+  }
+  return lastExec + COOLDOWN_MS[cmd.category];
+}
+
+// Small JSON Response helper (the command surface returns several structured
+// envelopes; the WS/demand-gate paths above build Responses inline).
+function jsonResponse(status, body) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
 
 // Subprotocol marker. The extension presents `Sec-WebSocket-Protocol:
 // rf-music.v1, ticket.<id>`; we redeem the ticket and echo back `rf-music.v1`.
@@ -129,7 +227,7 @@ export class MusicRemoteState extends DurableObject {
     // eviction with persisted demand, get upstream back up without waiting for the
     // next alarm. blockConcurrencyWhile so no request observes a half-built state.
     //
-    // ARM-ONLY reconcile (CHANGE B): a freshly-constructed isolate must NEVER tear
+    // ARM-ONLY reconcile: a freshly-constructed isolate must NEVER tear
     // down an alarm a prior instance legitimately set. reconcileAlarm({armOnly})
     // ARMS for a persisted-undrained command queue (drain resumes even at demand 0
     // post-eviction) AND for liveness when demand>0, but NEVER deletes — so a
@@ -155,11 +253,12 @@ export class MusicRemoteState extends DurableObject {
     if (url.pathname.endsWith('/ws-ticket') && request.method === 'POST') {
       return this.issueTicket();
     }
-    // CHANGE B — enqueue a command into the global FIFO queue (index.js routes
-    // next/prev/play/enqueue/playlist-play here). Mirrors the /ws-ticket fetch
-    // wiring: index.js -> DO stub -> this handler.
+    // Command surface — index.js routes pause/resume/next/prev/play/playlist-play/
+    // enqueue here as { category, dashboardPath, body }. command() dispatches on the
+    // category's mode (throttle / burst / latest-wins / queue). Mirrors the
+    // /ws-ticket fetch wiring: index.js -> DO stub -> this handler.
     if (url.pathname.endsWith('/enqueue-command') && request.method === 'POST') {
-      return this.enqueueCommand(await request.json());
+      return this.command(await request.json());
     }
     return new Response('Not Found', { status: 404 });
   }
@@ -316,17 +415,19 @@ export class MusicRemoteState extends DurableObject {
    *  - LIVENESS: reads the PERSISTED demand key (NEVER getWebSockets(), which still
    *    holds a closing socket inside webSocketClose). demand>0 => now +
    *    UPSTREAM_ALARM_INTERVAL_MS, else null.
-   *  - DRAIN: reads the FRESH cmdQueue. Empty => null; else the EARLIEST
-   *    per-category eligibility across ALL distinct categories present in the queue
-   *    — for each category, max((lastExec ?? 0) + cooldown, now), and the drain
-   *    candidate is the MIN of those. This matches drainOneEligible's
-   *    cross-category overtaking: an idle category's eligibility time must drive the
-   *    alarm, not just the strict-FIFO head's — otherwise the alarm would wait on a
-   *    cooldown-blocked head while a behind-it idle category sits drainable. The
-   *    `?? 0` is LOAD-BEARING — a first-ever/post-eviction-empty lastExec is
-   *    undefined, and undefined+cooldown is NaN (Math.max(NaN, now) === NaN => an
-   *    invalid setAlarm); `?? 0` makes the first command of every category eligible
-   *    at t0.
+   *  - DRAIN: reads the FRESH cmdQueue (only the alarm-deferred modes live here —
+   *    'queue'/enqueue and 'latest-wins'/play; throttle + burst deliver inline and
+   *    never enter the queue). Empty => null; else the EARLIEST per-ELEMENT
+   *    eligibility (commandEligibleAt) clamped to >= now, MIN'd across the queue.
+   *    Per-element (not just per-category) because a latest-wins play's deliverAt
+   *    depends on its own firstAt/lastAt (the debounce), not only its category timer.
+   *    This matches drainOneEligible's cross-category overtaking: an idle category's
+   *    eligibility must drive the alarm, not just the strict-FIFO head's — otherwise
+   *    the alarm would wait on a cooldown-blocked head while a behind-it idle category
+   *    sits drainable. The `?? 0` on lastExec is LOAD-BEARING — a first-ever /
+   *    post-eviction-empty timer is undefined, and undefined+cooldown is NaN
+   *    (Math.max(NaN, now) === NaN => an invalid setAlarm); `?? 0` makes the first
+   *    command of every category eligible at t0.
    *
    * Sets the alarm to the earliest non-null candidate. Deletes ONLY when BOTH are
    * null (demand===0 AND queue empty) and NOT armOnly — the constructor passes
@@ -342,12 +443,15 @@ export class MusicRemoteState extends DurableObject {
     let drain = null;
     if (queue.length) {
       const now = Date.now();
-      const seen = new Set();
+      const lastByCat = new Map();
       for (const cmd of queue) {
-        if (seen.has(cmd.category)) continue;
-        seen.add(cmd.category);
-        const last = (await this.ctx.storage.get(STORAGE.lastExecPrefix + cmd.category)) ?? 0;
-        const eligibleAt = Math.max(last + COOLDOWN_MS[cmd.category], now);
+        if (!lastByCat.has(cmd.category)) {
+          lastByCat.set(
+            cmd.category,
+            (await this.ctx.storage.get(STORAGE.lastExecPrefix + cmd.category)) ?? 0,
+          );
+        }
+        const eligibleAt = Math.max(commandEligibleAt(cmd, lastByCat.get(cmd.category)), now);
         if (drain == null || eligibleAt < drain) drain = eligibleAt;
       }
     }
@@ -360,10 +464,225 @@ export class MusicRemoteState extends DurableObject {
     }
   }
 
-  // ---- Command queue (CHANGE B) -------------------------------------------
+  // ---- Command surface (four modes) ---------------------------------------
 
   /**
-   * Append a command to the global FIFO queue and respond 202 IMMEDIATELY
+   * Dispatch a command by its category's mode. index.js hands us { category,
+   * dashboardPath, body }; the category->mode map (CATEGORY_MODE) decides the
+   * mechanism. An unknown category is a LOUD 400 (never silently swallowed).
+   *
+   * @param {{ category: string, dashboardPath: string, body: string|null }} cmd
+   */
+  async command(cmd) {
+    switch (CATEGORY_MODE[cmd.category]) {
+      case 'throttle':
+        return this.throttleCommand(cmd);
+      case 'burst':
+        return this.burstCommand(cmd);
+      case 'latest-wins':
+        return this.enqueueLatestWins(cmd);
+      case 'queue':
+        return this.enqueueCommand(cmd);
+      default:
+        console.warn({
+          source: 'music-do',
+          message: '[music-do] unknown command category — REJECTING',
+          category: cmd.category,
+          dashboardPath: cmd.dashboardPath,
+        });
+        return jsonResponse(400, { ok: false, error: 'unknown command category' });
+    }
+  }
+
+  /**
+   * THROTTLE mode (leading-edge): toggle (pause+resume) and next. The FIRST command
+   * in a COOLDOWN_MS[category] window claims the window and delivers INLINE; every
+   * other same-category command inside the window is DROPPED (never saved — replaying
+   * a backlog of toggles flickers the transport, a backlog of nexts skips a pile of
+   * tracks).
+   *
+   * The check-and-claim runs inside blockConcurrencyWhile so a near-simultaneous
+   * second command can't read the same stale lastExec and double-fire — the gate is
+   * truly serialized. Delivery happens AFTER the block (a network await inside
+   * blockConcurrencyWhile would stall the whole DO for the request's duration). The
+   * window is claimed (lastExec stamped) BEFORE delivery, so even a delivery that
+   * fails holds the window — the next press one cooldown later retries, and the truth
+   * is on the now-playing WS regardless.
+   *
+   * @param {{ category: string, dashboardPath: string, body: string|null }} cmd
+   */
+  async throttleCommand(cmd) {
+    let allowed = false;
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const now = Date.now();
+      const last = (await this.ctx.storage.get(STORAGE.lastExecPrefix + cmd.category)) ?? 0;
+      if (now >= last + COOLDOWN_MS[cmd.category]) {
+        await this.ctx.storage.put(STORAGE.lastExecPrefix + cmd.category, now);
+        allowed = true;
+      }
+    });
+    if (!allowed) {
+      console.log({
+        source: 'music-do',
+        event: 'throttle-drop',
+        category: cmd.category,
+        dashboardPath: cmd.dashboardPath,
+      });
+      return jsonResponse(200, { ok: true, executed: false, coalesced: true });
+    }
+    return this.deliverInline(cmd);
+  }
+
+  /**
+   * BURST mode (token-bucket): prev only. Allow up to PREV_BURST_LIMIT presses inside
+   * any PREV_BURST_WINDOW_MS window (so a fast double-tap reaches the dashboard's "2
+   * within 3s = go back" gesture even when the taps are <1s apart), then require
+   * PREV_MIN_SPACING_MS between further presses. Accepted presses deliver INLINE.
+   *
+   * Like throttle, the accept-decision-and-record runs inside blockConcurrencyWhile
+   * so concurrent presses can't both consume the same token; delivery is after the
+   * block. The timestamp array is pruned to the window on every press (bounded to a
+   * handful of entries) and persisted whether or not the press is accepted, so the
+   * window stays accurate.
+   *
+   * @param {{ category: string, dashboardPath: string, body: string|null }} cmd
+   */
+  async burstCommand(cmd) {
+    let allowed = false;
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const now = Date.now();
+      const recent = ((await this.ctx.storage.get(STORAGE.prevTimestamps)) ?? []).filter(
+        (t) => t > now - PREV_BURST_WINDOW_MS,
+      );
+      const last = recent.length ? recent[recent.length - 1] : 0;
+      if (recent.length < PREV_BURST_LIMIT || now - last >= PREV_MIN_SPACING_MS) {
+        recent.push(now);
+        allowed = true;
+      }
+      await this.ctx.storage.put(STORAGE.prevTimestamps, recent);
+    });
+    if (!allowed) {
+      console.log({
+        source: 'music-do',
+        event: 'burst-drop',
+        category: cmd.category,
+        dashboardPath: cmd.dashboardPath,
+      });
+      return jsonResponse(200, { ok: true, executed: false, coalesced: true });
+    }
+    return this.deliverInline(cmd);
+  }
+
+  /**
+   * Deliver one command to the dashboard INLINE and forward its response VERBATIM
+   * (status + body) so a real-response route (toggle = pause/resume) can stream the
+   * dashboard's own reply back to the extension — parity with the pre-throttle DIRECT
+   * proxy path. Bounded by a DELIVER_TIMEOUT_MS AbortController so a HUNG dashboard
+   * can't wedge the request; an unset base / reject / timeout returns the structured
+   * 502 the entry router used for the direct path (extension-side uniformity).
+   *
+   * No retry: these are leading-edge / token-bucket transport commands — a failed one
+   * is simply re-pressable, and the now-playing WS carries the truth. (The retry +
+   * give-up machinery lives on the alarm-deferred drain path, deliverCommand.)
+   *
+   * @param {{ dashboardPath: string, body: string|null }} cmd
+   */
+  async deliverInline(cmd) {
+    const base = this.env.DASHBOARD_REMOTE_BASE;
+    if (typeof base !== 'string' || base.length === 0) {
+      console.warn({
+        source: 'music-do',
+        message: '[music-do] DASHBOARD_REMOTE_BASE unset — DROPPING inline command (no dashboard)',
+        dashboardPath: cmd.dashboardPath,
+      });
+      return jsonResponse(502, {
+        ok: false,
+        code: 'dashboard_unreachable',
+        error: 'music dashboard upstream unavailable',
+      });
+    }
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), DELIVER_TIMEOUT_MS);
+    try {
+      const resp = await proxyToDashboard(this.env, cmd.dashboardPath, {
+        method: 'POST',
+        body: cmd.body,
+        signal: ctl.signal,
+      });
+      return new Response(resp.body, {
+        status: resp.status,
+        headers: { 'Content-Type': resp.headers.get('Content-Type') ?? 'application/json' },
+      });
+    } catch (err) {
+      console.warn({
+        source: 'music-do',
+        message: '[music-do] inline command delivery failed (reject/abort)',
+        dashboardPath: cmd.dashboardPath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return jsonResponse(502, {
+        ok: false,
+        code: 'dashboard_unreachable',
+        error: 'music dashboard upstream unavailable',
+      });
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  /**
+   * LATEST-WINS mode (trailing-edge debounce): play + playlist-play share ONE slot
+   * in the queue. A new pick COALESCES onto that single element — overwriting its
+   * target (dashboardPath + body) and bumping lastAt, keeping firstAt — so the most
+   * recent pick wins and a rapid burst collapses to one delivery. The element's
+   * deliverAt (commandEligibleAt) is the debounce: settle after the last pick, never
+   * before the cooldown floor, never past the max-defer cap. Replacing resets attempts
+   * (a fresh target shouldn't inherit a prior target's retry count). Responds 202
+   * IMMEDIATELY (fire-and-forget — truth via the now-playing WS).
+   *
+   * Single slot per category => no MAX_QUEUE concern here (it cannot grow). Read FRESH
+   * + persist before the next await (the input-gate discipline).
+   *
+   * @param {{ category: string, dashboardPath: string, body: string|null }} cmd
+   */
+  async enqueueLatestWins(cmd) {
+    const now = Date.now();
+    const queue = (await this.ctx.storage.get(STORAGE.cmdQueue)) ?? [];
+    const idx = queue.findIndex((c) => c.category === cmd.category);
+    // pickId STAMPS each distinct pick. It is LOAD-BEARING for the drain's
+    // re-read-after-await: a replace lands a NEW pickId, so drainOneEligible can tell
+    // whether the slot it just delivered is still the same pick (remove it) or was
+    // superseded mid-delivery by a fresh pick (leave the fresh one — latest wins).
+    // Without it the index-based splice would discard a pick that arrived during the
+    // in-flight delivery — exactly the re-pick this mode exists to honour.
+    if (idx >= 0) {
+      queue[idx] = {
+        ...queue[idx],
+        dashboardPath: cmd.dashboardPath,
+        body: cmd.body ?? null,
+        lastAt: now,
+        attempts: 0,
+        pickId: crypto.randomUUID(),
+      };
+    } else {
+      queue.push({
+        category: cmd.category,
+        dashboardPath: cmd.dashboardPath,
+        body: cmd.body ?? null,
+        enqueuedAt: now,
+        firstAt: now,
+        lastAt: now,
+        attempts: 0,
+        pickId: crypto.randomUUID(),
+      });
+    }
+    await this.ctx.storage.put(STORAGE.cmdQueue, queue);
+    await this.reconcileAlarm();
+    return jsonResponse(202, { ok: true, queued: true });
+  }
+
+  /**
+   * QUEUE mode (save-all FIFO): enqueue. Append a command and respond 202 IMMEDIATELY
    * (fire-and-forget — the truth returns via the now-playing WS). The command is
    * NEVER dropped here save the runaway backstop (MAX_QUEUE overflow), which is a
    * LOUD console.warn returning the DISTINCT { ok:true, queued:false,
@@ -410,19 +729,20 @@ export class MusicRemoteState extends DurableObject {
    * drain-eligible head, NOT strictly index 0). Returns -1 if every queued command
    * is still under its category cooldown.
    *
-   * CROSS-CATEGORY OVERTAKING (no head-of-line blocking): the per-category cooldown
-   * machinery exists to DECOUPLE categories — a 10s `enqueue` cooldown must not
-   * stall a stone-cold `skip`. So when the strict-FIFO head is cooldown-ineligible
-   * we do NOT simply wait on it; we scan forward for the first command whose OWN
-   * category is eligible and drain THAT. Without this, one consumer's `enqueue`
-   * couples everyone's `skip`/`play` latency to the enqueue cooldown — exactly the
-   * coupling the per-category design is meant to avoid.
+   * CROSS-CATEGORY OVERTAKING (no head-of-line blocking): the per-category timers
+   * exist to DECOUPLE categories — a 20s `enqueue` cooldown must not stall a
+   * stone-cold `play`. So when the strict-FIFO head is ineligible we do NOT wait on
+   * it; we scan forward for the first command whose OWN category is eligible
+   * (commandEligibleAt — the cooldown for enqueue, the debounce deliverAt for a
+   * latest-wins play) and drain THAT. Without this, one consumer's `enqueue` couples
+   * everyone's `play` latency to the enqueue cooldown — exactly the coupling the
+   * per-category design is meant to avoid.
    *
-   * FIFO WITHIN a category is PRESERVED: front-to-back scan returns the
-   * earliest-enqueued eligible command, and two commands sharing a category share
-   * one `lastExec:<cat>` timer — so if an earlier same-category command is blocked,
-   * the later one is EQUALLY blocked and can never overtake it. Only a DIFFERENT,
-   * idle category overtakes a cooldown-blocked one.
+   * Only the alarm-deferred modes ('queue'/enqueue, 'latest-wins'/play) ever reach
+   * this queue — throttle + burst deliver inline. A latest-wins category holds a
+   * SINGLE coalesced slot, so there is no FIFO-within-play to preserve; enqueue
+   * elements share one `lastExec:<cat>` timer, so an earlier same-category element
+   * blocked under cooldown equally blocks a later one (no same-category overtaking).
    *
    * @param {Array<{category:string}>} queue
    * @returns {Promise<number>} index of the first eligible command, or -1
@@ -437,7 +757,7 @@ export class MusicRemoteState extends DurableObject {
       if (!lastByCat.has(cat)) {
         lastByCat.set(cat, (await this.ctx.storage.get(STORAGE.lastExecPrefix + cat)) ?? 0);
       }
-      if (now >= lastByCat.get(cat) + COOLDOWN_MS[cat]) return i;
+      if (now >= commandEligibleAt(queue[i], lastByCat.get(cat))) return i;
     }
     return -1;
   }
@@ -474,20 +794,36 @@ export class MusicRemoteState extends DurableObject {
     const outcome = await this.deliverCommand(cmd);
 
     // RE-READ the queue FRESH after the delivery await: the await opened the input
-    // gate, so a concurrent enqueue may have APPENDED to the TAIL. Appends never
-    // reorder or remove, and drain is the SOLE remover with only one alarm() per DO
-    // at a time, so the selected command is still at the SAME index `idx` in the
-    // fresh array — re-derive its element from the fresh array rather than caching.
+    // gate, so a concurrent enqueue may have mutated cmdQueue. Two shapes of mutation
+    // are possible and must be handled DIFFERENTLY:
+    //   - 'queue' (enqueue) APPENDS to the tail — never reorders/removes, and drain is
+    //     the SOLE remover (one alarm() per DO), so the delivered element is still at
+    //     the SAME index `idx`.
+    //   - 'latest-wins' (play) REPLACES its slot IN PLACE (same index, new pickId) —
+    //     so the element at `idx` may now be a DIFFERENT, newer pick that was NEVER
+    //     delivered. A blind splice(idx) would discard it.
+    // So confirm IDENTITY before acting: the element at `idx` must still be the one we
+    // delivered (same category, same pickId — both undefined for non-latest-wins, which
+    // are never replaced in place, so the check is a no-op there). If it was superseded
+    // mid-delivery, leave the fresh pick untouched (latest wins) and only record that
+    // the delivered work completed.
     const fresh = (await this.ctx.storage.get(STORAGE.cmdQueue)) ?? [];
+    const stillThere =
+      fresh[idx] != null &&
+      fresh[idx].category === cmd.category &&
+      fresh[idx].pickId === cmd.pickId;
 
     const giveUp = outcome.transient && cmd.attempts + 1 >= MAX_DELIVERY_ATTEMPTS;
     if (outcome.terminal || giveUp) {
       // Drained (delivered, permanently-rejected, or transient give-up): bump the
-      // per-category lastExec, remove the selected command, persist, trace the REAL
-      // outcome.
+      // per-category lastExec (the expensive delivery happened, so the next of this
+      // category — incl. a superseding pick — is spaced from now), remove the selected
+      // command ONLY if it is still the same pick, persist, trace the REAL outcome.
       await this.ctx.storage.put(STORAGE.lastExecPrefix + cmd.category, Date.now());
-      fresh.splice(idx, 1);
-      await this.ctx.storage.put(STORAGE.cmdQueue, fresh);
+      if (stillThere) {
+        fresh.splice(idx, 1);
+        await this.ctx.storage.put(STORAGE.cmdQueue, fresh);
+      }
       console.log({
         source: 'music-do',
         event: 'drain',
@@ -497,13 +833,27 @@ export class MusicRemoteState extends DurableObject {
           ? outcome.traceOutcome
           : 'dropped-after-max-' + outcome.traceOutcome,
         attempt: cmd.attempts + 1,
+        superseded: !stillThere,
       });
-    } else {
+    } else if (stillThere) {
       // Transient under MAX: keep the command in place, bump its attempts, do NOT
       // bump lastExec. reconcileAlarm re-arms at now so the retry fires immediately
       // (one retry total at MAX_DELIVERY_ATTEMPTS=2).
       fresh[idx].attempts = cmd.attempts + 1;
       await this.ctx.storage.put(STORAGE.cmdQueue, fresh);
+    } else {
+      // Transient, but the pick was SUPERSEDED mid-delivery by a fresh latest-wins
+      // pick. Abandon the failed target's retry (the user moved on); the fresh pick
+      // delivers on its own eligibility. LOUD so it is never a silent disappearance.
+      console.log({
+        source: 'music-do',
+        event: 'drain',
+        category: cmd.category,
+        dashboardPath: cmd.dashboardPath,
+        outcome: 'superseded-' + outcome.traceOutcome,
+        attempt: cmd.attempts + 1,
+        superseded: true,
+      });
     }
   }
 

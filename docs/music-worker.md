@@ -34,23 +34,31 @@ office TV.
 Every route runs `authMusicRequest` first (see Auth). Request shapes are frozen in
 `src/route-map.js` and here.
 
-**Path (`QUEUED` vs `DIRECT`).** Five command routes are `QUEUED` — they route
-**through the singleton DO's global command queue** (serialized + per-category
-cooldown across ALL consumers) and return **`202 { ok:true, queued:true }`**
-immediately; the truth returns over the now-playing WS. The remaining routes are
-`DIRECT` — stateless proxies with no cooldown (transport pause/resume, volume, and
-the idempotent reads). See **Global command queue + per-category cooldowns** below.
+**Path (`DO-ROUTED` vs `DIRECT`).** Seven command routes are `DO-ROUTED` — they go
+**through the singleton DO**, which rate-limits them GLOBALLY (across ALL consumers)
+by the category's MODE (throttle / burst / latest-wins / queue — see **Global command
+rate-limiting** below). The remaining routes are `DIRECT` — stateless proxies with no
+rate limit (volume + the idempotent reads). `DO-ROUTED` routes return either the
+dashboard's own response verbatim (pause/resume — they deliver inline) or a uniform
+**`202 { ok:true, queued:true }`** fire-and-forget (next/prev/play/enqueue/
+playlist-play; truth returns over the now-playing WS).
+
+The rate limit is tuned to the dashboard's real bottleneck: every command that starts
+NEW audio (next / prev / play song / play playlist) forces the TV to flush its
+playback buffer and re-stream fresh PCM over a fragile WS, and fast SEQUENTIAL
+new-audio commands choke the server mid-flush. This is a deliberate bandaid in front
+of that dashboard-side durability problem, not UX politeness.
 
 | Route | Method | Body / query | Path | Notes |
 | --- | --- | --- | --- | --- |
-| `/music/pause` | POST | `{}` | DIRECT | transport |
-| `/music/resume` | POST | `{}` | DIRECT | transport |
-| `/music/next` | POST | `{}` | **QUEUED** | category `skip` (shared with `prev`), cooldown 5000ms |
-| `/music/prev` | POST | `{}` | **QUEUED** | category `skip` (shared with `next`), cooldown 5000ms |
+| `/music/pause` | POST | `{}` | **DO: throttle** | category `toggle` (shared with `resume`), 5000ms leading-edge; delivers INLINE, forwards the dashboard response verbatim |
+| `/music/resume` | POST | `{}` | **DO: throttle** | category `toggle` (shared with `pause`), 5000ms leading-edge; one transport toggle per window — concurrent pause/play don't flicker |
+| `/music/next` | POST | `{}` | **DO: throttle** | category `next`, 5000ms leading-edge: first lands, the rest in-window dropped; 202 |
+| `/music/prev` | POST | `{}` | **DO: burst** | category `prev`, token-bucket: 2 per 3000ms then 1000ms spacing — preserves the "double-tap to go back" gesture while blocking spam; 202 |
 | `/music/volume` | POST | `{ direction: "up" \| "down" }` | DIRECT | the worker forwards the bare `{ direction }` **verbatim**; the **dashboard** owns the fixed ±step magnitude (single source of truth) — never client-supplied, never computed by the worker |
-| `/music/play` | POST | `{ id: <Deezer id> }` | **QUEUED** | category `play` (shared with `playlist-play`), cooldown 5000ms; id validated numeric → 400 otherwise, forwarded as a STRING (see Outbound) |
-| `/music/enqueue` | POST | `{ id: <Deezer id> }` | **QUEUED** | category `enqueue`, cooldown 10000ms; id forwarded as a STRING |
-| `/music/playlist-play` | POST | `{ id: <Deezer id> }` | **QUEUED** | category `play` (shared with `play`), cooldown 5000ms; id forwarded as a STRING |
+| `/music/play` | POST | `{ id: <Deezer id> }` | **DO: latest-wins** | category `play` (shared with `playlist-play`), debounce: settle 2000ms / floor 10000ms / max-defer 8000ms; id validated numeric → 400 otherwise, forwarded as a STRING (see Outbound); 202 |
+| `/music/enqueue` | POST | `{ id: <Deezer id> }` | **DO: queue** | category `enqueue`, save-all FIFO, 20000ms spacing; id forwarded as a STRING; 202 |
+| `/music/playlist-play` | POST | `{ id: <Deezer id> }` | **DO: latest-wins** | category `play` (shared with `play`), same debounce; id forwarded as a STRING; 202 |
 | `/music/search` | GET | `?q=<free text>` | DIRECT | idempotent read |
 | `/music/playlist-search` | GET | `?q=<free text>` | DIRECT | idempotent read |
 | `/music/playlist-contents` | GET | `?id=<numeric Deezer id>` | DIRECT | id validated numeric |
@@ -117,104 +125,144 @@ unknown route, `405` wrong method, `426` non-Upgrade WS, `501` unset dashboard p
 and **`502 { code:'dashboard_unreachable' }`** when the outbound
 `fetch` to the dashboard rejects (DNS failure / cold or absent ingress — the
 expected steady state while the dashboard is built in parallel). The extension's
-error handling stays uniform regardless of dashboard availability. For a `QUEUED`
-route the success response is **`202 { ok:true, queued:true }`** (the command was
-enqueued, not yet delivered), and a DO overload / broken-input-gate / enqueue
-exception surfaces as the same structured `502 { code:'dashboard_unreachable' }` —
-the queued path is wrapped in the identical structured-502 discipline as the direct
-path so a queue-unavailable failure never becomes an opaque runtime 500.
+error handling stays uniform regardless of dashboard availability. For a fire-and-
+forget `DO-ROUTED` route (next/prev/play/enqueue/playlist-play) the success response
+is **`202 { ok:true, queued:true }`** (accepted, not yet delivered); the inline
+`DO-ROUTED` routes (pause/resume) forward the dashboard's own response, or a synthetic
+`200 { ok:true, coalesced:true }` when the throttle drops the command. A DO overload /
+broken-input-gate / command exception surfaces as the same structured `502 {
+code:'dashboard_unreachable' }` — the DO path is wrapped in the identical structured-
+502 discipline as the direct path so a DO-unavailable failure never becomes an opaque
+runtime 500.
 
-## Global command queue + per-category cooldowns
+## Global command rate-limiting — four modes
 
-Multiple people now control the TV. Spamming `next`/`prev` (or rapid
-`play`/`enqueue`) breaks dashboard delivery, so the five command routes are
-**SERIALIZED + RATE-LIMITED GLOBALLY** (across ALL extension consumers) — **not
-dropped**. The singleton Music DO (binding `MUSIC_REMOTE`, fixed name `global`) is
-the only shared point across consumers, so the queue lives there. `index.js` routes
-`next`/`prev`/`play`/`enqueue`/`playlist-play` to the DO via **`POST
-/enqueue-command`** on the DO stub (mirroring how the `/ws-ticket` DO fetch path is
-wired); the other routes stay direct proxies.
+Multiple people control the TV, and the dashboard's failure mode is at the
+transport/PCM layer (see the bandaid rationale under "Two surfaces" above). So the
+seven command routes are **RATE-LIMITED GLOBALLY** (across ALL extension consumers) by
+the singleton Music DO (binding `MUSIC_REMOTE`, fixed name `global` — the only shared
+point across consumers). `index.js` routes them to the DO via **`POST
+/enqueue-command`** on the DO stub (mirroring the `/ws-ticket` DO fetch path); volume +
+the reads stay direct proxies. The DO is **route-agnostic** — it sees only `{
+category, dashboardPath, body }`; the route→category map lives in `index.js`, and the
+category→mode map (`CATEGORY_MODE`) lives in `music-do.js`. `command()` dispatches on
+the mode.
 
-**Shape.** A FIFO array persisted at `ctx.storage` key `cmdQueue`; each element is
-`{ category, dashboardPath, body, enqueuedAt, attempts }`. `body` is the exact
-replay bytes (`'{}'` for `next`/`prev`, `'{"id":"<digits>"}'` for the id routes —
-the canonical `idStr`, or `null`). Per-category last-execution timestamps live at
-`lastExec:<category>`. Both the array and the timestamps are SQLite-backed via
-`ctx.storage` so they **survive hibernation / eviction**. The DO is
-**route-agnostic** — it only ever sees `{ category, dashboardPath, body }`; the
-route→category map (`next`/`prev`→`skip`, `play`/`playlist-play`→`play`,
-`enqueue`→`enqueue`) lives in `index.js`.
+**The four modes** (one per category):
 
-**Constants** (named, module-level, exported for tests): `COOLDOWN_MS = { skip:
-5000, play: 5000, enqueue: 10000 }` (minimum spacing between EXECUTIONS, global),
-`MAX_QUEUE = 100`, `MAX_DELIVERY_ATTEMPTS = 2`, `DELIVER_TIMEOUT_MS = 5000`.
+| Category (routes) | Mode | Behaviour |
+| --- | --- | --- |
+| `toggle` (pause + resume) | **throttle** | Leading-edge: the FIRST command in the 5s window claims it and delivers INLINE; every other `toggle` in the window is DROPPED. pause+resume merge into one window so concurrent pause/play don't flicker. |
+| `next` | **throttle** | Leading-edge 5s, same as toggle: one skip per window, the rest dropped. |
+| `prev` | **burst** | Token-bucket: up to `PREV_BURST_LIMIT` (2) presses inside `PREV_BURST_WINDOW_MS` (3000) — so a fast double-tap "go back" lands even <1s apart — then `PREV_MIN_SPACING_MS` (1000) between further presses. Delivers INLINE. |
+| `play` (play + playlist-play) | **latest-wins** | Trailing-edge debounce: a burst of picks COALESCES to the most-recent target (single queue slot), delivered after the settle, never before the cooldown floor, never past the max-defer cap. play+playlist-play share the slot (the TV plays one thing). |
+| `enqueue` | **queue** | Save-all FIFO, one per cooldown — every queued song lands; nothing dropped save the runaway backstop. |
 
-**Arrival** (`enqueueCommand`). Read `cmdQueue` FRESH, append the element, **persist
-before the next await**, `reconcileAlarm()` to arm the drain, and respond `202 {
-ok:true, queued:true }` IMMEDIATELY (fire-and-forget — the real result returns over
-the now-playing WS).
+**Constants** (named, module-level, exported for tests): `COOLDOWN_MS = { toggle:
+5000, next: 5000, play: 10000, enqueue: 20000 }` (minimum spacing between EXECUTIONS,
+global); `PREV_BURST_LIMIT = 2`, `PREV_BURST_WINDOW_MS = 3000`, `PREV_MIN_SPACING_MS =
+1000`; `PLAY_DEBOUNCE_SETTLE_MS = 2000`, `PLAY_MAX_DEFER_MS = 8000`; `MAX_QUEUE = 100`,
+`MAX_DELIVERY_ATTEMPTS = 2`, `DELIVER_TIMEOUT_MS = 5000`. These are the tuning dials —
+adjust them, not inline values.
 
-**Drain order — FIFO WITHIN a category, cross-category overtaking ACROSS them.**
-The queue is **not** strict global FIFO. The per-category cooldown machinery exists
-to **decouple** categories — a 10s `enqueue` cooldown must not stall a stone-cold
-`skip`. So the drain selects the **first cooldown-ELIGIBLE** command
-(`firstEligibleIndex` — the *drain-eligible head*, not strictly index 0): a
-cooldown-blocked head is **overtaken** by the earliest-enqueued command of a
-*different, idle* category behind it, rather than blocking it. **FIFO within a
-category is preserved**: a front-to-back scan returns the earliest-enqueued eligible
-command, and two commands sharing a category share **one** `lastExec:<cat>` timer —
-so if an earlier same-category command is blocked, the later one is **equally**
-blocked and can never overtake it. Only a *different* idle category overtakes a
-blocked one. (Without this, one consumer's `enqueue` would couple everyone's
-`skip`/`play` latency to the 10s enqueue cooldown — exactly the coupling the
-per-category design exists to avoid; pinned by test (D2)/(D3).)
+### Inline modes — throttle (toggle, next) + burst (prev)
 
-**Drain** (alarm-driven, `drainOneEligible` — SINGLE-SHOT, not a gate-holding
-loop). Read `cmdQueue` FRESH; for the candidate command's category `last =
-(lastExec:<cat>) ?? 0` — the **`?? 0` is load-bearing**: a first-ever /
-post-eviction-empty `lastExec` is `undefined`, and `now >= undefined + cooldown` is
-`now >= NaN` (false → a wedge) while `Math.max(NaN, now)` is `NaN` (an invalid
-`setAlarm`); `?? 0` makes the first command of every category eligible at `t0`. If
-NO category is eligible (`firstEligibleIndex` returns `-1`) every queued command
-STAYS and `reconcileAlarm` re-arms for the EARLIEST per-category eligibility across
-the queue (`min` over `max(lastExec+cooldown, now)` of each distinct category, NOT
-just the FIFO head). Otherwise deliver the eligible command, then **re-read
-`cmdQueue` FRESH** before removing it (the delivery await opened the input gate —
-see Platform model — so a concurrent enqueue may have appended to the TAIL; appends
-never reorder/remove and drain is the SOLE remover with only one `alarm()` per DO,
-so the selected command is still at the SAME index in the fresh array).
+These deliver INLINE and never enter the queue. The check-and-claim (read
+`lastExec:<cat>` / the pruned `prevTimestamps` array, decide, stamp) runs inside
+`ctx.blockConcurrencyWhile` so a near-simultaneous second command can't read stale
+state and double-fire — the gate is truly serialized. **Delivery happens AFTER the
+block** (a network await inside `blockConcurrencyWhile` would stall the whole DO for
+the request's duration); the window is claimed BEFORE delivery, so even a failed
+delivery holds the window (the next press one cooldown later retries; truth is on the
+WS regardless).
 
-**Delivery reuses `proxyToDashboard`** (identical `Content-Type: application/json`
-+ `X-Remote-Key` + base-join as the direct path — the two paths cannot drift),
-wrapped in a `DELIVER_TIMEOUT_MS` **AbortController** so a HUNG dashboard folds into
-the transient bucket instead of wedging.
+`deliverInline` reuses `proxyToDashboard` (identical `X-Remote-Key` +
+`Content-Type:application/json` + base-join as every other path) bounded by a
+`DELIVER_TIMEOUT_MS` AbortController, and **forwards the dashboard's response verbatim**
+(status + body) so pause/resume preserve the pre-throttle real-response contract.
+There is **no retry** on the inline path — these are re-pressable transport commands.
+A dropped command returns `200 { ok:true, executed:false, coalesced:true }` (logged
+`throttle-drop` / `burst-drop`); an unset base / reject / timeout returns the
+structured `502 { code:'dashboard_unreachable' }`.
 
-**HTTP-status policy** (explicit). `2xx` = **delivered** (terminal, trace
-`delivered`). `4xx` = **permanently-rejected** (terminal — a 4xx is a
-contract/validation error; retrying behind a 5s cooldown would just wedge the
-queue; LOUD warn, trace `dashboard-rejected-<status>`, **not** logged as
-`delivered`). `5xx` + fetch-reject + abort/timeout = bounded **TRANSIENT** (LOUD
-warn, trace `dashboard-error-<status>` / `transient-reject` / `transient-timeout`).
-Bounded-retry is an **immediate single retry** (no backoff): a transient under
-`MAX_DELIVERY_ATTEMPTS` keeps the head (attempts++, **no** `lastExec` bump,
-`reconcileAlarm` re-arms at `now` so the retry fires immediately); on the second
-transient it is a LOUD give-up drop (trace `dropped-after-max-<lastTrace>`). On
-TERMINAL or give-up the per-category `lastExec` is bumped, the head is shifted, and
-the drain-trace records the REAL outcome.
+**Latency note (next/prev).** Because delivery is inline, the router awaits the DO's
+delivery before responding — so an ACCEPTED `next`/`prev` returns up to
+`DELIVER_TIMEOUT_MS` after the press on a slow/hung dashboard (vs the old
+immediate-202 queued path). This is intentional backpressure against the very choke
+this design protects, bounded by the AbortController; the truth still arrives on the
+now-playing WS. (pause/resume always awaited the dashboard, so no change there.)
+Coalesced/dropped presses return immediately.
 
-**Drop accounting (truthful — every drop is LOUD, never silent).** Normal operation
-truncates nothing. The ONLY drops are: (i) `MAX_QUEUE` runaway backstop, returning
-the **DISTINCT** envelope `202 { ok:true, queued:false, dropped:'queue_full' }` (the
-success field never lies about a drop; a future ext UI can surface backpressure);
-(ii) transient-attempt exhaustion after `MAX_DELIVERY_ATTEMPTS`; (iii) a 4xx
-permanent dashboard rejection (terminal); (iv) `DASHBOARD_REMOTE_BASE` unset (trace
-`dropped-no-dashboard`). Note the pre-dashboard steady state: a delivery-exhausting
-outage drops the command (LOUD) and the truth does **not** arrive via the WS either
-(the WS upstream is equally unreachable).
+### Deferred modes — latest-wins (play) + queue (enqueue)
 
-All drain/drop/overflow traces are structured `{ source: 'music-do' }` via
-`console.log` / `console.warn` (Cloudflare **native** Workers Logs, already enabled)
-— **no** `@microlabs` OTel, no `instrument()`, no body-capture.
+These share the alarm-driven queue at `ctx.storage` key `cmdQueue` (SQLite-backed,
+survives hibernation/eviction). Each element is `{ category, dashboardPath, body,
+enqueuedAt, attempts }` (plus `firstAt`/`lastAt` for latest-wins). Per-category
+last-execution timestamps live at `lastExec:<category>`. Both respond `202 { ok:true,
+queued:true }` immediately (fire-and-forget — truth via the now-playing WS).
+
+- **`queue` (enqueue):** `enqueueCommand` reads `cmdQueue` FRESH, appends, **persists
+  before the next await**, `reconcileAlarm()`. Nothing dropped save the `MAX_QUEUE`
+  runaway backstop, which returns the **DISTINCT** `202 { ok:true, queued:false,
+  dropped:'queue_full' }` (the success field never lies about a drop).
+- **`latest-wins` (play):** `enqueueLatestWins` keeps a SINGLE slot per category — a
+  new pick OVERWRITES the slot's target (dashboardPath + body) and bumps `lastAt`,
+  keeping `firstAt` and resetting `attempts` (a fresh target shouldn't inherit a prior
+  target's retry count). No growth ⇒ no `MAX_QUEUE` concern.
+
+**Eligibility (`commandEligibleAt` — single source of truth, used by both the drain
+selector and the alarm time so they can't disagree):**
+
+- `queue`: `lastExec + COOLDOWN[cat]`. The `?? 0` on `lastExec` is load-bearing — a
+  first-ever/post-eviction-empty timer is `undefined`, and `undefined + cooldown` is
+  `NaN`; `?? 0` makes the first command eligible at `t0`.
+- `latest-wins`: the debounce — `max(floor, min(max(lastAt + SETTLE, floor), firstAt +
+  MAX_DEFER))`, where `floor = lastExec + COOLDOWN.play` is a HARD lower bound
+  (dashboard protection), `SETTLE` waits for quiet (collapse the burst), and the
+  `MAX_DEFER` cap bounds worst-case latency under a sustained stream of picks.
+
+**Drain order — cross-category overtaking.** `drainOneEligible` is SINGLE-SHOT (one
+delivery per `alarm()` wake; `reconcileAlarm` re-arms for the next). It selects the
+**first ELIGIBLE** command (`firstEligibleIndex`, per-element via `commandEligibleAt`):
+a cooldown-blocked head is **overtaken** by an eligible command of a *different* idle
+category behind it, so a 20s `enqueue` never stalls a stone-cold `play`. A latest-wins
+category holds a single coalesced slot (no FIFO-within-play); enqueue elements share
+one `lastExec:enqueue` so a blocked earlier element equally blocks a later one. After
+delivery, **re-read `cmdQueue` FRESH** before removing the element (the delivery await
+opened the input gate — a concurrent enqueue may have appended to the TAIL; appends
+never reorder/remove and drain is the SOLE remover, so the element is at the SAME
+index). If nothing is eligible, every command STAYS and `reconcileAlarm` re-arms for
+the EARLIEST per-element eligibility (`min` over `max(commandEligibleAt, now)`).
+
+**Delivery (`deliverCommand`)** reuses `proxyToDashboard` bounded by a
+`DELIVER_TIMEOUT_MS` AbortController. **HTTP-status policy:** `2xx` = delivered
+(terminal, trace `delivered`); `4xx` = permanently-rejected (terminal — retrying a
+contract error would wedge the queue; LOUD warn, trace `dashboard-rejected-<status>`);
+`5xx` + fetch-reject + abort/timeout = bounded **TRANSIENT** (trace
+`dashboard-error-<status>` / `transient-reject` / `transient-timeout`). Bounded-retry
+is an immediate single retry (no backoff): a transient under `MAX_DELIVERY_ATTEMPTS`
+keeps the element (attempts++, NO `lastExec` bump, re-arm at `now`); the second
+transient is a LOUD give-up drop (trace `dropped-after-max-<lastTrace>`). On TERMINAL
+or give-up, `lastExec` is bumped, the element removed, and the drain-trace records the
+REAL outcome.
+
+**Re-read identity guard (latest-wins).** The delivery await opens the input gate, so
+a concurrent `enqueueLatestWins` can REPLACE the play slot IN PLACE (same index, new
+`pickId`) while its prior target is being delivered. So after the await the drain
+confirms IDENTITY (`category` + `pickId`) before splicing/mutating the element at
+`idx`: if the slot was superseded mid-delivery, the fresh pick is left untouched
+(latest wins — it delivers on its own eligibility) and only the completed work is
+recorded (`lastExec` bumped on a terminal delivery; a transient is abandoned with a
+`superseded-<trace>` log — never silent). For `queue` (append-only) the element is
+always still at `idx`, so the guard is a no-op there. Covered by `music-do.spec.js`.
+
+**Drop accounting (truthful — every drop is LOUD, never silent).** The drops are: (i)
+`MAX_QUEUE` runaway backstop; (ii) transient-attempt exhaustion; (iii) a 4xx permanent
+rejection; (iv) `DASHBOARD_REMOTE_BASE` unset (trace `dropped-no-dashboard`); and on
+the inline path, (v) a throttle/burst coalesce-drop (`throttle-drop`/`burst-drop`,
+logged). All traces are structured `{ source: 'music-do' }` via `console.log` /
+`console.warn` (Cloudflare **native** Workers Logs) — **no** `@microlabs` OTel, no
+`instrument()`, no body-capture.
 
 ### Single-alarm coexistence
 
@@ -226,13 +274,15 @@ is gone; no other method touches the alarm directly). It computes:
 - **liveness** = reads the **PERSISTED `demand` key** (NEVER `getWebSockets()`,
   which still holds a closing socket inside `webSocketClose`); `demand > 0` ?
   `now + UPSTREAM_ALARM_INTERVAL_MS` : `null`.
-- **drain** = reads FRESH `cmdQueue`; `null` if empty, else the **EARLIEST
-  per-category eligibility** across all distinct categories in the queue — `min`
-  over `max((lastExec:<cat> ?? 0) + cooldown, now)` of each category. This MUST
-  match the drain's cross-category overtaking (see **Drain order** above): an idle
-  category behind a cooldown-blocked head drives the alarm to wake at *its*
-  eligibility, not the blocked head's far-future time — otherwise the alarm would
-  sleep out the blocked cooldown while a drainable command sits behind it.
+- **drain** = reads FRESH `cmdQueue` (only the deferred modes — enqueue + play); `null`
+  if empty, else the **EARLIEST per-ELEMENT eligibility** — `min` over
+  `max(commandEligibleAt(cmd, lastExec ?? 0), now)` of each element. Per-element (not
+  just per-category) because a latest-wins play's deliverAt depends on its own
+  `firstAt`/`lastAt` debounce, not only its category cooldown. This MUST match the
+  drain's cross-category overtaking (see **Drain order** above): an idle category
+  behind a cooldown-blocked head drives the alarm to wake at *its* eligibility, not the
+  blocked head's far-future time. (The inline modes — throttle/burst — never enter the
+  queue, so they never drive the alarm.)
 
 …and sets the alarm to the **EARLIEST non-null** of the two; it **deletes only when
 BOTH are null** (demand===0 AND queue empty) and **never when `armOnly`**. The
@@ -240,9 +290,9 @@ BOTH are null** (demand===0 AND queue empty) and **never when `armOnly`**. The
 never wipe an alarm a prior instance legitimately set, so it ARMS the drain for a
 persisted-undrained queue (drain resumes even at demand 0 post-eviction) + ARMS
 liveness for demand>0, but never deletes. Real demand-change events
-(`recomputeDemandAndReconcile`) and `enqueueCommand` call `reconcileAlarm()`
-without `armOnly` (those MAY legitimately delete when both responsibilities go
-idle).
+(`recomputeDemandAndReconcile`) and the deferred-mode enqueues (`enqueueCommand`,
+`enqueueLatestWins`) call `reconcileAlarm()` without `armOnly` (those MAY legitimately
+delete when both responsibilities go idle).
 
 **Alarm ordering — LIVENESS FIRST, THEN drain.** `alarm()` is `try { liveness;
 drainOneEligible(); } finally { reconcileAlarm(); }`. Liveness (a local

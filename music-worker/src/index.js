@@ -32,32 +32,47 @@ export { MusicRemoteState } from './music-do.js';
 // Fixed DO name — one global music-remote instance.
 const DO_NAME = 'global';
 
-// CHANGE B — GLOBAL command queue + per-category cooldowns.
+// GLOBAL command rate-limiting — these seven command routes are SERIALIZED +
+// RATE-LIMITED globally (across ALL extension consumers) by routing them THROUGH the
+// singleton DO instead of a stateless proxy. The DO is the only shared point across
+// consumers, so the rate-limit state lives there. The rate-limit mode is per
+// CATEGORY (CATEGORY_MODE in music-do.js); the DO is route-AGNOSTIC (it sees only
+// { category, dashboardPath, body }), so this route->category map is the ONLY place
+// the route->category relationship lives.
 //
-// These five command routes are SERIALIZED + RATE-LIMITED globally (across ALL
-// extension consumers) by routing them THROUGH the singleton DO's command queue
-// instead of the stateless proxy. The DO is the only shared point across
-// consumers, so the queue lives there. Spamming next/prev (or rapid play/enqueue)
-// no longer breaks dashboard delivery — commands are queued + drained on a
-// cooldown, never dropped (save the loud runaway-backstop / give-up cases).
+//   'toggle'  — pause + resume merged (throttle, leading-edge 5s drop): only one
+//               transport toggle per window lands, so concurrent pause/play don't
+//               flicker the song.
+//   'next'    — next (throttle, leading-edge 5s drop): one skip per window.
+//   'prev'    — prev (burst token-bucket, 2-per-3s then 1s): preserves the
+//               "double-tap to go back" gesture while blocking sustained spam.
+//   'play'    — play + playlist-play (latest-wins debounce): the most expensive
+//               new-audio op, so the most protection.
+//   'enqueue' — enqueue (save-all FIFO, 20s spacing): every queued song lands.
 //
-// The remaining routes (pause/resume/volume/search/playlist-search/
-// playlist-contents) STAY direct stateless proxies — no cooldown.
-const QUEUED_ROUTES = new Set(['next', 'prev', 'play', 'enqueue', 'playlist-play']);
-
-// Map a queued route to its cooldown category. The DO is route-AGNOSTIC — it sees
-// only { category, dashboardPath, body }; this map (the worker's knowledge of the
-// route surface) is the only place the route->category relationship lives.
-//   'skip'    — next AND prev share one category (5000ms).
-//   'play'    — play + playlist-play share one category (5000ms).
-//   'enqueue' — enqueue (10000ms).
+// The remaining routes (volume / search / playlist-search / playlist-contents) STAY
+// direct stateless proxies — no rate limit.
 const ROUTE_CATEGORY = {
-  next: 'skip',
-  prev: 'skip',
+  pause: 'toggle',
+  resume: 'toggle',
+  next: 'next',
+  prev: 'prev',
   play: 'play',
   'playlist-play': 'play',
   enqueue: 'enqueue',
 };
+
+// The DO-routed command set (keys of ROUTE_CATEGORY).
+const DO_ROUTES = new Set(Object.keys(ROUTE_CATEGORY));
+
+// Routes whose DO response is forwarded to the extension VERBATIM. pause/resume
+// deliver INLINE through the throttle gate and the DO returns the dashboard's own
+// response (status + body) — preserving the pre-throttle DIRECT-proxy contract where
+// the extension saw the dashboard reply. (On a coalesced drop the DO returns a
+// synthetic 200 { ok:true, coalesced:true }; on dashboard failure a 502 — both still
+// 2xx/structured, so the extension's handling is unchanged.) The other DO routes are
+// fire-and-forget and get a uniform 202 (see below).
+const VERBATIM_DO_ROUTES = new Set(['pause', 'resume']);
 
 function json(status, body) {
   return new Response(JSON.stringify(body), {
@@ -188,23 +203,23 @@ export default {
       return json(501, { ok: false, error: err.message });
     }
 
-    // CHANGE B — QUEUED routes: serialize + rate-limit globally via the DO.
+    // DO-routed commands: serialize + rate-limit globally via the singleton DO.
     //
-    // The inbound shape is already validated above (a malformed queued command
-    // still 400s and is NEVER queued). Queued routes carry no query suffix, so
-    // mappedPath is the bare dashboard sub-path. Hand the command to the singleton
-    // DO's command queue; it returns 202 { ok:true, queued:true } IMMEDIATELY
-    // (fire-and-forget — the truth returns via the now-playing WS). The DO drains
-    // on a per-category cooldown later.
+    // The inbound shape is already validated above (a malformed command still 400s
+    // and is NEVER forwarded). These routes carry no query suffix, so mappedPath is
+    // the bare dashboard sub-path. Hand the command to the DO, which applies the
+    // category's mode (throttle / burst / latest-wins / queue) and either delivers
+    // inline (toggle/next/prev) or accepts for deferred drain (play/enqueue).
     //
     // The DO-stub fetch is wrapped in the SAME structured-502 discipline as the
-    // direct proxy path below, so a DO overload / broken-input-gate / enqueue
+    // direct proxy path below, so a DO overload / broken-input-gate / command
     // exception surfaces as a structured json error (reusing code:
     // 'dashboard_unreachable' for extension-side uniformity) rather than an opaque
     // runtime 500.
-    if (QUEUED_ROUTES.has(routeName)) {
+    if (DO_ROUTES.has(routeName)) {
+      let doResp;
       try {
-        return await getDoStub(env).fetch(
+        doResp = await getDoStub(env).fetch(
           new Request('https://do/enqueue-command', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -219,9 +234,22 @@ export default {
         return json(502, {
           ok: false,
           code: 'dashboard_unreachable',
-          error: 'music command queue unavailable',
+          error: 'music command unavailable',
         });
       }
+      // pause/resume forward the dashboard's own reply verbatim (real-response
+      // contract). next/prev also deliver inline but keep the historical
+      // fire-and-forget 202 (the extension reads transport truth from the now-playing
+      // WS, not this reply); play/playlist-play/enqueue are deferred and the DO
+      // already returns the 202 { queued } envelope (incl. the queue_full backstop),
+      // so those forward verbatim too.
+      if (VERBATIM_DO_ROUTES.has(routeName)) {
+        return doResp;
+      }
+      if (routeName === 'next' || routeName === 'prev') {
+        return json(202, { ok: true, queued: true });
+      }
+      return doResp;
     }
 
     // The dashboard is a parallel-built dependency that may not exist / be

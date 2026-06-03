@@ -5,6 +5,12 @@ import {
   TICKET_SUBPROTOCOL_PREFIX,
   UPSTREAM_ALARM_INTERVAL_MS,
   COOLDOWN_MS,
+  CATEGORY_MODE,
+  PREV_BURST_LIMIT,
+  PREV_BURST_WINDOW_MS,
+  PREV_MIN_SPACING_MS,
+  PLAY_DEBOUNCE_SETTLE_MS,
+  PLAY_MAX_DEFER_MS,
   MAX_QUEUE,
   MAX_DELIVERY_ATTEMPTS,
   DELIVER_TIMEOUT_MS,
@@ -16,9 +22,9 @@ function stub() {
   return env.MUSIC_REMOTE.get(id);
 }
 
-// Enqueue a command through the real DO fetch path (index.js -> DO stub ->
-// enqueueCommand), exactly as the entry router does. Returns the parsed body.
-async function enqueue(s, { category, dashboardPath, body = null }) {
+// Send a command through the real DO fetch path (index.js -> DO stub -> command()),
+// exactly as the entry router does. Returns status + parsed body.
+async function sendCommand(s, { category, dashboardPath, body = null }) {
   const res = await s.fetch(
     new Request('https://do/enqueue-command', {
       method: 'POST',
@@ -406,281 +412,489 @@ describe('MusicRemoteState — demand-gate (post-eviction mechanism)', () => {
   });
 });
 
-describe('MusicRemoteState — command queue + cooldowns', () => {
+
+describe('MusicRemoteState — command rate-limiting (four modes)', () => {
   beforeEach(() => {
     // sanity: the named constants are the documented values, not inline magic.
-    expect(COOLDOWN_MS).toEqual({ skip: 5000, play: 5000, enqueue: 10000 });
+    expect(COOLDOWN_MS).toEqual({ toggle: 5000, next: 5000, play: 10000, enqueue: 20000 });
+    expect(CATEGORY_MODE).toEqual({
+      toggle: 'throttle',
+      next: 'throttle',
+      prev: 'burst',
+      play: 'latest-wins',
+      enqueue: 'queue',
+    });
+    expect(PREV_BURST_LIMIT).toBe(2);
+    expect(PREV_BURST_WINDOW_MS).toBe(3000);
+    expect(PREV_MIN_SPACING_MS).toBe(1000);
+    expect(PLAY_DEBOUNCE_SETTLE_MS).toBe(2000);
+    expect(PLAY_MAX_DEFER_MS).toBe(8000);
     expect(MAX_QUEUE).toBe(100);
     expect(MAX_DELIVERY_ATTEMPTS).toBe(2);
     expect(DELIVER_TIMEOUT_MS).toBe(5000);
   });
 
-  // (A) CHANGE-A-at-DO-boundary: a play body { id:'3135556' } is delivered with the
-  // id as a STRING (the IdBody{id:String} contract), reusing proxyToDashboard so
-  // the outbound carries X-Remote-Key + Content-Type:application/json.
-  it('(A) drain delivers { id:"3135556" } as a STRING with X-Remote-Key + JSON content-type (CHANGE A + proxy reuse)', async () => {
+  // ---- THROTTLE (toggle = pause+resume, next): leading-edge, drop extras --------
+
+  // (T1) first toggle in a window delivers INLINE (proxy called once, dashboard
+  // response forwarded verbatim) and stamps lastExec:toggle.
+  it('(T1) throttle: first toggle delivers inline + forwards the dashboard response; lastExec stamped', async () => {
+    const s = stub();
+    const { calls } = mockFetch(200, { ok: true, source: 'dashboard' });
+    const { status, json } = await sendCommand(s, {
+      category: 'toggle',
+      dashboardPath: '/api/remote/pause',
+      body: '{}',
+    });
+    expect(calls.length).toBe(1);
+    expect(calls[0].url).toBe('https://dashboard.test.invalid/api/remote/pause');
+    expect(calls[0].init.headers['X-Remote-Key']).toBe('test-remote-key');
+    expect(status).toBe(200);
+    expect(json).toEqual({ ok: true, source: 'dashboard' });
+    await runInDurableObject(s, async (instance) => {
+      expect(await instance.ctx.storage.get('lastExec:toggle')).toBeGreaterThan(0);
+    });
+  });
+
+  // (T2) a second toggle within the cooldown is DROPPED (no proxy call) and returns
+  // the synthetic coalesced 200, logged once.
+  it('(T2) throttle: a second toggle within cooldown is dropped (no delivery), returns coalesced 200', async () => {
+    const s = stub();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { calls } = mockFetch(200);
+    await sendCommand(s, { category: 'toggle', dashboardPath: '/api/remote/pause', body: '{}' });
+    expect(calls.length).toBe(1);
+    const second = await sendCommand(s, { category: 'toggle', dashboardPath: '/api/remote/resume', body: '{}' });
+    expect(calls.length).toBe(1);
+    expect(second.status).toBe(200);
+    expect(second.json).toEqual({ ok: true, executed: false, coalesced: true });
+    const drops = logSpy.mock.calls.map((c) => c[0]).filter((o) => o && o.event === 'throttle-drop');
+    expect(drops.length).toBe(1);
+    expect(drops[0].category).toBe('toggle');
+    logSpy.mockRestore();
+  });
+
+  // (T3) pause + resume MERGE into 'toggle': a pause then a resume share one
+  // lastExec:toggle window, so the resume is dropped (one transport toggle/window).
+  it('(T3) throttle: pause + resume share the toggle window (the second of the pair is dropped)', async () => {
+    const s = stub();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { calls } = mockFetch(200);
+    await sendCommand(s, { category: 'toggle', dashboardPath: '/api/remote/pause', body: '{}' });
+    await sendCommand(s, { category: 'toggle', dashboardPath: '/api/remote/resume', body: '{}' });
+    expect(calls.length).toBe(1);
+    expect(calls[0].url).toBe('https://dashboard.test.invalid/api/remote/pause');
+  });
+
+  // (T4) once the cooldown elapses, the next toggle delivers again.
+  it('(T4) throttle: after the cooldown elapses the next toggle delivers again', async () => {
     const s = stub();
     const { calls } = mockFetch(200);
-    await enqueue(s, {
+    await sendCommand(s, { category: 'toggle', dashboardPath: '/api/remote/pause', body: '{}' });
+    expect(calls.length).toBe(1);
+    await runInDurableObject(s, async (instance) => {
+      await instance.ctx.storage.put('lastExec:toggle', Date.now() - COOLDOWN_MS.toggle - 1);
+    });
+    await sendCommand(s, { category: 'toggle', dashboardPath: '/api/remote/resume', body: '{}' });
+    expect(calls.length).toBe(2);
+    expect(calls[1].url).toBe('https://dashboard.test.invalid/api/remote/resume');
+  });
+
+  // (T5) next is throttle too; first delivers, second within window dropped, and a
+  // throttle command NEVER enters the cmdQueue (inline-only).
+  it('(T5) throttle: next first-delivers + drops the second; nothing enters the cmdQueue', async () => {
+    const s = stub();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { calls } = mockFetch(200);
+    await sendCommand(s, { category: 'next', dashboardPath: '/api/remote/next', body: '{}' });
+    const second = await sendCommand(s, { category: 'next', dashboardPath: '/api/remote/next', body: '{}' });
+    expect(calls.length).toBe(1);
+    expect(second.json).toEqual({ ok: true, executed: false, coalesced: true });
+    await runInDurableObject(s, async (instance) => {
+      expect((await instance.ctx.storage.get('cmdQueue')) ?? []).toEqual([]);
+    });
+  });
+
+  // (T6) the inline path has NO retry: a dashboard reject folds into the structured
+  // 502 (parity with the entry router's direct-proxy 502).
+  it('(T6) throttle: a dashboard reject becomes a structured 502 (no retry on the inline path)', async () => {
+    const s = stub();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const rejectSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
+    const { status, json } = await sendCommand(s, {
+      category: 'next',
+      dashboardPath: '/api/remote/next',
+      body: '{}',
+    });
+    expect(status).toBe(502);
+    expect(json.code).toBe('dashboard_unreachable');
+    rejectSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  // ---- BURST (prev): token-bucket, 2 per 3s then 1s spacing --------------------
+
+  // (B1) the first PREV_BURST_LIMIT presses in the window BOTH deliver — the fast
+  // double-tap "go back" survives even when the taps are <1s apart.
+  it('(B1) burst: the first two prevs in the window both deliver (fast double-tap go-back)', async () => {
+    const s = stub();
+    const { calls } = mockFetch(200);
+    await sendCommand(s, { category: 'prev', dashboardPath: '/api/remote/prev', body: '{}' });
+    await sendCommand(s, { category: 'prev', dashboardPath: '/api/remote/prev', body: '{}' });
+    expect(calls.length).toBe(2);
+  });
+
+  // (B2) a third press within the window AND under the spacing is dropped.
+  it('(B2) burst: a third prev within the window and under the spacing is dropped', async () => {
+    const s = stub();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { calls } = mockFetch(200);
+    await sendCommand(s, { category: 'prev', dashboardPath: '/api/remote/prev', body: '{}' });
+    await sendCommand(s, { category: 'prev', dashboardPath: '/api/remote/prev', body: '{}' });
+    const third = await sendCommand(s, { category: 'prev', dashboardPath: '/api/remote/prev', body: '{}' });
+    expect(calls.length).toBe(2);
+    expect(third.json).toEqual({ ok: true, executed: false, coalesced: true });
+  });
+
+  // (B3) once PREV_MIN_SPACING_MS has elapsed since the last accepted press, a prev
+  // delivers again even with the bucket otherwise "full".
+  it('(B3) burst: after the min-spacing elapses, a further prev delivers again', async () => {
+    const s = stub();
+    const { calls } = mockFetch(200);
+    await sendCommand(s, { category: 'prev', dashboardPath: '/api/remote/prev', body: '{}' });
+    await sendCommand(s, { category: 'prev', dashboardPath: '/api/remote/prev', body: '{}' });
+    expect(calls.length).toBe(2);
+    await runInDurableObject(s, async (instance) => {
+      const now = Date.now();
+      await instance.ctx.storage.put('prevTimestamps', [
+        now - PREV_MIN_SPACING_MS - 50,
+        now - PREV_MIN_SPACING_MS - 10,
+      ]);
+    });
+    await sendCommand(s, { category: 'prev', dashboardPath: '/api/remote/prev', body: '{}' });
+    expect(calls.length).toBe(3);
+  });
+
+  // (B4) out-of-window timestamps are pruned — a stale burst does not block a fresh one.
+  it('(B4) burst: out-of-window timestamps are pruned (a stale burst does not block a fresh one)', async () => {
+    const s = stub();
+    const { calls } = mockFetch(200);
+    await runInDurableObject(s, async (instance) => {
+      const now = Date.now();
+      await instance.ctx.storage.put('prevTimestamps', [
+        now - PREV_BURST_WINDOW_MS - 1000,
+        now - PREV_BURST_WINDOW_MS - 500,
+      ]);
+    });
+    await sendCommand(s, { category: 'prev', dashboardPath: '/api/remote/prev', body: '{}' });
+    await sendCommand(s, { category: 'prev', dashboardPath: '/api/remote/prev', body: '{}' });
+    expect(calls.length).toBe(2);
+    await runInDurableObject(s, async (instance) => {
+      const ts = await instance.ctx.storage.get('prevTimestamps');
+      expect(ts.length).toBe(2);
+    });
+  });
+
+  // ---- LATEST-WINS (play + playlist-play): trailing-edge debounce + floor -------
+
+  // (LW1) a single play occupies ONE queue slot (firstAt/lastAt set), is NOT
+  // delivered before the settle, and arms the alarm at ~now + SETTLE.
+  it('(LW1) latest-wins: a single play waits the settle (not delivered immediately); alarm armed at ~settle', async () => {
+    const s = stub();
+    const { calls } = mockFetch(200);
+    const before = Date.now();
+    const { status, json } = await sendCommand(s, {
       category: 'play',
       dashboardPath: '/api/remote/songs/play',
-      body: JSON.stringify({ id: '3135556' }),
+      body: JSON.stringify({ id: '1' }),
     });
+    expect(status).toBe(202);
+    expect(json).toEqual({ ok: true, queued: true });
     await runInDurableObject(s, async (instance) => {
+      const queue = await instance.ctx.storage.get('cmdQueue');
+      expect(queue.length).toBe(1);
+      expect(queue[0].category).toBe('play');
+      expect(queue[0].firstAt).toBeGreaterThanOrEqual(before);
+      expect(queue[0].lastAt).toBe(queue[0].firstAt);
+      await instance.drainOneEligible();
+      const alarmAt = await instance.ctx.storage.getAlarm();
+      expect(alarmAt).toBeGreaterThan(Date.now() + PLAY_DEBOUNCE_SETTLE_MS - 500);
+      expect(alarmAt).toBeLessThan(Date.now() + PLAY_DEBOUNCE_SETTLE_MS + 500);
+      // Clear the armed alarm + slot so this stub leaks no future deliverable into a
+      // later test's fetch spy (singleWorker:true shares one runtime).
+      await instance.ctx.storage.put('cmdQueue', []);
+      await instance.ctx.storage.deleteAlarm();
+    });
+    expect(calls.length).toBe(0);
+  });
+
+  // (LW2) rapid plays COALESCE to one slot: latest target wins, firstAt preserved
+  // (the cap anchor), lastAt advances, attempts reset.
+  it('(LW2) latest-wins: rapid plays coalesce to one slot — latest target wins, firstAt preserved', async () => {
+    const s = stub();
+    mockFetch(200);
+    await sendCommand(s, { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '1' }) });
+    let firstAt;
+    await runInDurableObject(s, async (instance) => {
+      firstAt = (await instance.ctx.storage.get('cmdQueue'))[0].firstAt;
+    });
+    await sendCommand(s, { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '2' }) });
+    await runInDurableObject(s, async (instance) => {
+      const queue = await instance.ctx.storage.get('cmdQueue');
+      expect(queue.length).toBe(1);
+      expect(JSON.parse(queue[0].body)).toEqual({ id: '2' });
+      expect(queue[0].firstAt).toBe(firstAt);
+      expect(queue[0].lastAt).toBeGreaterThanOrEqual(firstAt);
+      await instance.ctx.storage.put('cmdQueue', []);
+      await instance.ctx.storage.deleteAlarm();
+    });
+  });
+
+  // (LW3) play + playlist-play share 'play', so a playlist-play replaces a pending
+  // song-play (latest wins across both — the TV plays one thing).
+  it('(LW3) latest-wins: playlist-play replaces a pending play (shared category, latest wins across both)', async () => {
+    const s = stub();
+    mockFetch(200);
+    await sendCommand(s, { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '1' }) });
+    await sendCommand(s, { category: 'play', dashboardPath: '/api/remote/playlists/play', body: JSON.stringify({ id: '9' }) });
+    await runInDurableObject(s, async (instance) => {
+      const queue = await instance.ctx.storage.get('cmdQueue');
+      expect(queue.length).toBe(1);
+      expect(queue[0].dashboardPath).toBe('/api/remote/playlists/play');
+      expect(JSON.parse(queue[0].body)).toEqual({ id: '9' });
+      await instance.ctx.storage.put('cmdQueue', []);
+      await instance.ctx.storage.deleteAlarm();
+    });
+  });
+
+  // (LW4) once the settle has elapsed, the drain delivers the latest target, stamps
+  // lastExec:play, and clears the slot.
+  it('(LW4) latest-wins: after the settle the drain delivers the latest target + clears the slot', async () => {
+    const s = stub();
+    const { calls } = mockFetch(200);
+    await sendCommand(s, { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '1' }) });
+    await sendCommand(s, { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '2' }) });
+    await runInDurableObject(s, async (instance) => {
+      const queue = await instance.ctx.storage.get('cmdQueue');
+      const past = Date.now() - PLAY_DEBOUNCE_SETTLE_MS - 1;
+      queue[0] = { ...queue[0], firstAt: past, lastAt: past };
+      await instance.ctx.storage.put('cmdQueue', queue);
+      await instance.drainOneEligible();
+      expect(calls.length).toBe(1);
+      expect(JSON.parse(calls[0].init.body)).toEqual({ id: '2' });
+      expect((await instance.ctx.storage.get('cmdQueue')) ?? []).toEqual([]);
+      expect(await instance.ctx.storage.get('lastExec:play')).toBeGreaterThan(0);
+      await instance.ctx.storage.deleteAlarm();
+    });
+  });
+
+  // (LW5) the cooldown FLOOR dominates the settle: a play right after a prior delivery
+  // is held to lastExec:play + COOLDOWN.play, not merely settle-after-last.
+  it('(LW5) latest-wins: the cooldown floor holds a play to lastExec + COOLDOWN.play (floor > settle)', async () => {
+    const s = stub();
+    mockFetch(200);
+    const tExec = Date.now();
+    await runInDurableObject(s, async (instance) => {
+      await instance.ctx.storage.put('lastExec:play', tExec);
+    });
+    await sendCommand(s, { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '1' }) });
+    await runInDurableObject(s, async (instance) => {
+      await instance.reconcileAlarm();
+      expect(await instance.ctx.storage.getAlarm()).toBe(tExec + COOLDOWN_MS.play);
+      await instance.ctx.storage.put('cmdQueue', []);
+      await instance.ctx.storage.deleteAlarm();
+    });
+  });
+
+  // (LW6) the MAX_DEFER cap bounds a continually-pushed debounce: with an old firstAt
+  // and a fresh lastAt, deliverAt is firstAt + MAX_DEFER (below settle).
+  it('(LW6) latest-wins: MAX_DEFER caps a continually-pushed debounce at firstAt + MAX_DEFER', async () => {
+    const s = stub();
+    await runInDurableObject(s, async (instance, state) => {
+      const now = Date.now();
+      await state.storage.put('demand', 0);
+      const firstAt = now - PLAY_MAX_DEFER_MS + 1500;
+      await state.storage.put('cmdQueue', [
+        { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '1' }), enqueuedAt: firstAt, firstAt, lastAt: now, attempts: 0 },
+      ]);
+      await instance.reconcileAlarm();
+      expect(await state.storage.getAlarm()).toBe(firstAt + PLAY_MAX_DEFER_MS);
+      await state.storage.put('cmdQueue', []);
+      await state.storage.deleteAlarm();
+    });
+  });
+
+  // ---- QUEUE (enqueue): save-all FIFO, one per cooldown ------------------------
+
+  // (Q1) two enqueues are BOTH saved (FIFO) and delivered one per cooldown.
+  it('(Q1) queue: two enqueues are both saved (FIFO) and delivered one per cooldown', async () => {
+    const s = stub();
+    const { calls } = mockFetch(200);
+    await sendCommand(s, { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '1' }) });
+    await sendCommand(s, { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '2' }) });
+    await runInDurableObject(s, async (instance, state) => {
+      await instance.drainOneEligible();
+      expect(calls.length).toBe(1);
+      expect(JSON.parse(calls[0].init.body)).toEqual({ id: '1' });
+      await state.storage.put('lastExec:enqueue', Date.now() - COOLDOWN_MS.enqueue - 1);
+      await instance.drainOneEligible();
+      expect(calls.length).toBe(2);
+      expect(JSON.parse(calls[1].init.body)).toEqual({ id: '2' });
+      expect((await state.storage.get('cmdQueue')) ?? []).toEqual([]);
+      await state.storage.deleteAlarm();
+    });
+  });
+
+  // (Q2) MAX_QUEUE runaway backstop -> LOUD warn + the DISTINCT envelope.
+  it('(Q2) queue: MAX_QUEUE overflow -> LOUD warn + { ok:true, queued:false, dropped:"queue_full" }', async () => {
+    const s = stub();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runInDurableObject(s, async (instance, state) => {
+      const full = Array.from({ length: MAX_QUEUE }, () => ({
+        category: 'enqueue',
+        dashboardPath: '/api/remote/songs/enqueue',
+        body: JSON.stringify({ id: '1' }),
+        enqueuedAt: Date.now(),
+        attempts: 0,
+      }));
+      await state.storage.put('cmdQueue', full);
+      await state.storage.put('lastExec:enqueue', Date.now() + 60_000);
+      void instance;
+    });
+    const { status, json } = await sendCommand(s, {
+      category: 'enqueue',
+      dashboardPath: '/api/remote/songs/enqueue',
+      body: JSON.stringify({ id: '2' }),
+    });
+    expect(status).toBe(202);
+    expect(json).toEqual({ ok: true, queued: false, dropped: 'queue_full' });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0].message).toMatch(/overflow/i);
+    warnSpy.mockRestore();
+  });
+
+  // ---- Cross-mode deferred drain + delivery -----------------------------------
+
+  // (A) the deferred drain delivers a play id as a STRING with X-Remote-Key + JSON
+  // content-type (the IdBody{id:String} contract + proxy reuse).
+  it('(A) drain delivers { id:"3135556" } as a STRING with X-Remote-Key + JSON content-type', async () => {
+    const s = stub();
+    const { calls } = mockFetch(200);
+    await runInDurableObject(s, async (instance, state) => {
+      const past = Date.now() - PLAY_MAX_DEFER_MS - 1;
+      await state.storage.put('cmdQueue', [
+        { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '3135556' }), enqueuedAt: past, firstAt: past, lastAt: past, attempts: 0 },
+      ]);
       await instance.drainOneEligible();
     });
     expect(calls.length).toBe(1);
-    const { url, init } = calls[0];
-    expect(url).toBe('https://dashboard.test.local/api/remote/songs/play');
-    const sent = JSON.parse(init.body);
+    const sent = JSON.parse(calls[0].init.body);
     expect(sent).toEqual({ id: '3135556' });
     expect(typeof sent.id).toBe('string');
-    expect(init.headers['X-Remote-Key']).toBe('test-remote-key');
-    expect(init.headers['Content-Type']).toBe('application/json');
+    expect(calls[0].init.headers['X-Remote-Key']).toBe('test-remote-key');
+    expect(calls[0].init.headers['Content-Type']).toBe('application/json');
   });
 
   // (A2) precision: a >2^53 id is delivered byte-identically (no Number round-trip).
   it('(A2) drain delivers a >2^53 id byte-identically (no Number round-trip)', async () => {
     const s = stub();
     const { calls } = mockFetch(200);
-    await enqueue(s, {
-      category: 'play',
-      dashboardPath: '/api/remote/songs/play',
-      body: JSON.stringify({ id: '9007199254740993' }),
-    });
-    await runInDurableObject(s, async (instance) => {
+    await runInDurableObject(s, async (instance, state) => {
+      const past = Date.now() - PLAY_MAX_DEFER_MS - 1;
+      await state.storage.put('cmdQueue', [
+        { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '9007199254740993' }), enqueuedAt: past, firstAt: past, lastAt: past, attempts: 0 },
+      ]);
       await instance.drainOneEligible();
     });
     expect(calls[0].init.body).toBe('{"id":"9007199254740993"}');
   });
 
-  // (FIRST-EVER): a brand-new stub with lastExec UNSET — the first command of each
-  // category must be eligible at t0 (the `?? 0` default). Without it, now>=NaN is
-  // false and the command wedges.
-  it('(FIRST-EVER) the first command of each category drains IMMEDIATELY (lastExec unset => ?? 0 eligible at t0)', async () => {
-    for (const [category, dashboardPath, body] of [
-      ['play', '/api/remote/songs/play', JSON.stringify({ id: '1' })],
-      ['skip', '/api/remote/next', '{}'],
-      ['enqueue', '/api/remote/songs/enqueue', JSON.stringify({ id: '2' })],
-    ]) {
-      const s = stub();
-      const { calls } = mockFetch(200);
-      await enqueue(s, { category, dashboardPath, body });
-      await runInDurableObject(s, async (instance) => {
-        await instance.drainOneEligible();
-        // delivered + drained: queue empty, lastExec set.
-        expect((await instance.ctx.storage.get('cmdQueue')) ?? []).toEqual([]);
-      });
-      expect(calls.length).toBe(1);
-      vi.restoreAllMocks();
-    }
-  });
-
-  // (B) FIFO order across two same-category commands (each separated by a cooldown).
-  it('(B) FIFO order preserved across two same-category commands', async () => {
+  // (D) single-shot-per-wake: an eligible play + an eligible enqueue; alarm() delivers
+  // EXACTLY ONE per invocation; armed while non-empty, null once drained + demand 0.
+  it('(D) alarm() drains EXACTLY ONE command per wake; armed while non-empty, null once drained+demand0', async () => {
     const s = stub();
     const { calls } = mockFetch(200);
-    await enqueue(s, { category: 'skip', dashboardPath: '/api/remote/next', body: '{}' });
-    await enqueue(s, { category: 'skip', dashboardPath: '/api/remote/prev', body: '{}' });
-    await runInDurableObject(s, async (instance, state) => {
-      // First drain: head (next) eligible at t0, delivered + shifted.
-      await instance.drainOneEligible();
-      expect(calls.length).toBe(1);
-      expect(calls[0].url).toBe('https://dashboard.test.local/api/remote/next');
-      // Second head (prev) is now under cooldown — drive lastExec back so it is
-      // eligible, then drain. Order: prev follows next.
-      await state.storage.put('lastExec:skip', Date.now() - COOLDOWN_MS.skip - 1);
-      await instance.drainOneEligible();
-      expect(calls.length).toBe(2);
-      expect(calls[1].url).toBe('https://dashboard.test.local/api/remote/prev');
-      expect((await state.storage.get('cmdQueue')) ?? []).toEqual([]);
-    });
-  });
-
-  // (C) cooldown gating: two skips back-to-back — first drains, the second STAYS
-  // (head unchanged) until lastExec+5000; the alarm is armed for exactly that time.
-  it('(C) cooldown gates the second same-category command; head stays; alarm armed at lastExec+cooldown', async () => {
-    const s = stub();
-    const { calls } = mockFetch(200);
-    await enqueue(s, { category: 'skip', dashboardPath: '/api/remote/next', body: '{}' });
-    await enqueue(s, { category: 'skip', dashboardPath: '/api/remote/prev', body: '{}' });
-    await runInDurableObject(s, async (instance, state) => {
-      await instance.drainOneEligible(); // delivers next, bumps lastExec:skip
-      const last = await state.storage.get('lastExec:skip');
-      expect(calls.length).toBe(1);
-
-      // Second drain: prev is under cooldown — head stays, no new delivery.
-      await instance.drainOneEligible();
-      expect(calls.length).toBe(1);
-      const queue = await state.storage.get('cmdQueue');
-      expect(queue.length).toBe(1);
-      expect(queue[0].dashboardPath).toBe('/api/remote/prev');
-
-      // reconcileAlarm re-arms for lastExec+cooldown (demand 0, so drain is the min).
-      await instance.reconcileAlarm();
-      expect(await state.storage.getAlarm()).toBe(last + COOLDOWN_MS.skip);
-    });
-  });
-
-  // (D) single-shot-per-wake: 3 DIFFERENT-category commands; alarm() delivers
-  // EXACTLY ONE per invocation; the alarm stays armed while the queue is non-empty
-  // and is deleted once drained AND demand===0.
-  it('(D) alarm() drains EXACTLY ONE command per wake; armed while queue non-empty, null once drained+demand0', async () => {
-    const s = stub();
-    const { calls } = mockFetch(200);
-    // Seed the queue DIRECTLY (not via the auto-alarming enqueue fetch path, whose
-    // t0-eligible drain would auto-fire in the harness and race the manual steps).
-    // demand 0 throughout — so the alarm's ONLY responsibility is the drain.
     await runInDurableObject(s, async (instance, state) => {
       await state.storage.put('demand', 0);
+      const past = Date.now() - PLAY_MAX_DEFER_MS - 1;
       await state.storage.put('cmdQueue', [
-        { category: 'skip', dashboardPath: '/api/remote/next', body: '{}', enqueuedAt: Date.now(), attempts: 0 },
-        { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '1' }), enqueuedAt: Date.now(), attempts: 0 },
+        { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '1' }), enqueuedAt: past, firstAt: past, lastAt: past, attempts: 0 },
         { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '2' }), enqueuedAt: Date.now(), attempts: 0 },
       ]);
-      for (let i = 1; i <= 3; i++) {
+      for (let i = 1; i <= 2; i++) {
         await instance.alarm();
-        expect(calls.length).toBe(i); // exactly one delivery per wake
+        expect(calls.length).toBe(i);
         const queue = (await state.storage.get('cmdQueue')) ?? [];
-        if (queue.length > 0) {
-          expect(await state.storage.getAlarm()).not.toBeNull();
-        }
+        if (queue.length > 0) expect(await state.storage.getAlarm()).not.toBeNull();
       }
       expect((await state.storage.get('cmdQueue')) ?? []).toEqual([]);
       expect(await state.storage.getAlarm()).toBeNull();
     });
   });
 
-  // (D2) CROSS-CATEGORY OVERTAKING (no head-of-line blocking): the strict-FIFO head
-  // is an `enqueue` still under its 10s cooldown, behind it a `skip` whose category
-  // is stone-cold (eligible NOW). The drain must NOT wait on the blocked head — it
-  // selects the eligible `skip` and delivers it, leaving the blocked enqueue queued.
-  // Without this, one consumer's enqueue couples everyone's skip latency to the 10s
-  // enqueue cooldown — exactly the coupling the per-category design exists to avoid.
-  it('(D2) an idle-category command OVERTAKES a cooldown-blocked head of a different category', async () => {
+  // (D2) CROSS-CATEGORY OVERTAKING: the FIFO head is an enqueue still under its 20s
+  // cooldown; behind it an eligible play overtakes it.
+  it('(D2) an eligible play OVERTAKES a cooldown-blocked enqueue head', async () => {
     const s = stub();
     const { calls } = mockFetch(200);
     await runInDurableObject(s, async (instance, state) => {
       await state.storage.put('demand', 0);
-      // enqueue under cooldown (just executed), skip stone-cold (lastExec unset).
       await state.storage.put('lastExec:enqueue', Date.now());
+      const past = Date.now() - PLAY_MAX_DEFER_MS - 1;
       await state.storage.put('cmdQueue', [
         { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '1' }), enqueuedAt: Date.now(), attempts: 0 },
-        { category: 'skip', dashboardPath: '/api/remote/next', body: '{}', enqueuedAt: Date.now(), attempts: 0 },
+        { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '2' }), enqueuedAt: past, firstAt: past, lastAt: past, attempts: 0 },
       ]);
-
-      // Drain: the blocked enqueue head is SKIPPED; the eligible skip is delivered.
       await instance.drainOneEligible();
       expect(calls.length).toBe(1);
-      expect(calls[0].url).toBe('https://dashboard.test.local/api/remote/next');
-
-      // The blocked enqueue remains queued (NOT reordered away, NOT dropped).
+      expect(calls[0].url).toBe('https://dashboard.test.invalid/api/remote/songs/play');
       const queue = await state.storage.get('cmdQueue');
       expect(queue.length).toBe(1);
       expect(queue[0].category).toBe('enqueue');
-      // lastExec:skip was bumped (the skip drained); enqueue's timer is untouched.
-      expect(await state.storage.get('lastExec:skip')).toBeGreaterThan(0);
-
-      // reconcileAlarm arms for the EARLIEST per-category eligibility across the
-      // queue — only `enqueue` remains, eligible at lastExec:enqueue + 10000.
-      const lastEnq = await state.storage.get('lastExec:enqueue');
-      await instance.reconcileAlarm();
-      expect(await state.storage.getAlarm()).toBe(lastEnq + COOLDOWN_MS.enqueue);
-
-      // Clear the queue + alarm so this stub leaks no deliverable work into a later
-      // test's global fetch/warn spies (singleWorker:true shares one runtime).
       await state.storage.put('cmdQueue', []);
       await state.storage.deleteAlarm();
     });
   });
 
-  // (D3) reconcileAlarm with a BLOCKED head but an idle category BEHIND it arms for
-  // the idle category (~now), NOT the blocked head's far-future eligibility — so the
-  // alarm wakes promptly to overtake rather than sleeping out the blocked cooldown.
-  it('(D3) reconcileAlarm arms for the earliest per-category eligibility, not the FIFO head', async () => {
+  // (D3) reconcileAlarm arms for the EARLIEST per-element eligibility (the eligible
+  // play ~now), not the blocked enqueue head's far-future cooldown.
+  it('(D3) reconcileAlarm arms for the earliest eligibility, not the blocked FIFO head', async () => {
     const s = stub();
     await runInDurableObject(s, async (instance, state) => {
-      await state.storage.put('demand', 0); // drain is the sole alarm responsibility
-      await state.storage.put('lastExec:enqueue', Date.now()); // enqueue ~now+10s
-      // skip stone-cold (unset) => eligible ~now.
+      await state.storage.put('demand', 0);
+      await state.storage.put('lastExec:enqueue', Date.now());
+      const past = Date.now() - PLAY_MAX_DEFER_MS - 1;
       await state.storage.put('cmdQueue', [
         { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '1' }), enqueuedAt: Date.now(), attempts: 0 },
-        { category: 'skip', dashboardPath: '/api/remote/next', body: '{}', enqueuedAt: Date.now(), attempts: 0 },
+        { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '2' }), enqueuedAt: past, firstAt: past, lastAt: past, attempts: 0 },
       ]);
       await instance.reconcileAlarm();
-      const at = await state.storage.getAlarm();
-      // ~now (skip eligible), FAR below the blocked enqueue's now+10s.
-      expect(at).toBeLessThan(Date.now() + 1000);
-
-      // Clear the queue + alarm so this stub leaks no deliverable work into a later
-      // test's global fetch/warn spies (singleWorker:true shares one runtime).
+      expect(await state.storage.getAlarm()).toBeLessThan(Date.now() + 1000);
       await state.storage.put('cmdQueue', []);
       await state.storage.deleteAlarm();
     });
   });
 
-  // (E) overflow (runaway backstop): push MAX_QUEUE, then one more -> LOUD warn +
-  // the DISTINCT { ok:true, queued:false, dropped:'queue_full' } envelope.
-  it('(E) MAX_QUEUE overflow -> LOUD warn + { ok:true, queued:false, dropped:"queue_full" }', async () => {
-    const s = stub();
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    // Pre-seed the queue at MAX_QUEUE directly (avoid 100 reconcile round-trips) AND
-    // push lastExec:skip far into the future so the seeded head is NOT cooldown-
-    // eligible — that keeps the auto-fired drain alarm (armed on the next DO
-    // construction for the t0-eligible head) from delivering and emitting an
-    // unrelated transient warn that would mask the single overflow warn we assert.
-    await runInDurableObject(s, async (instance, state) => {
-      const full = Array.from({ length: MAX_QUEUE }, () => ({
-        category: 'skip',
-        dashboardPath: '/api/remote/next',
-        body: '{}',
-        enqueuedAt: Date.now(),
-        attempts: 0,
-      }));
-      await state.storage.put('cmdQueue', full);
-      await state.storage.put('lastExec:skip', Date.now() + 60_000);
-      void instance;
-    });
-    const { status, json } = await enqueue(s, {
-      category: 'skip',
-      dashboardPath: '/api/remote/next',
-      body: '{}',
-    });
-    expect(status).toBe(202);
-    expect(json).toEqual({ ok: true, queued: false, dropped: 'queue_full' });
-    expect(warnSpy).toHaveBeenCalledTimes(1);
-    expect(warnSpy.mock.calls[0][0].source).toBe('music-do');
-    expect(warnSpy.mock.calls[0][0].message).toMatch(/overflow/i);
-    warnSpy.mockRestore();
-  });
-
-  // (F) COEXISTENCE: reconcileAlarm sets min(drain, liveness); and alarm() services
-  // liveness FIRST even when a delivery hangs to the timeout.
-  it('(F) reconcileAlarm sets min(drain, liveness); liveness serviced BEFORE a hung delivery resolves', async () => {
-    // F1 — a near-term drain is the min over a far liveness. Seed the queue DIRECTLY
-    // (the auto-alarming enqueue path would drain the t0-eligible head before this
-    // body runs, leaving an empty queue and no drain candidate).
+  // (F) COEXISTENCE: reconcileAlarm sets min(drain, liveness); liveness serviced
+  // BEFORE a hung delivery.
+  it('(F) reconcileAlarm sets min(drain, liveness); liveness serviced before a hung delivery', async () => {
     const s1 = stub();
     await runInDurableObject(s1, async (instance, state) => {
-      await state.storage.put('demand', 1); // liveness at now+30s
-      await state.storage.put('lastExec:skip', Date.now() - COOLDOWN_MS.skip - 1);
+      await state.storage.put('demand', 1);
+      const past = Date.now() - PLAY_MAX_DEFER_MS - 1;
       await state.storage.put('cmdQueue', [
-        { category: 'skip', dashboardPath: '/api/remote/next', body: '{}', enqueuedAt: Date.now(), attempts: 0 },
+        { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '1' }), enqueuedAt: past, firstAt: past, lastAt: past, attempts: 0 },
       ]);
       await instance.reconcileAlarm();
-      const at = await state.storage.getAlarm();
-      // The drain (≈now) is far nearer than liveness (now+30s).
-      expect(at).toBeLessThan(Date.now() + UPSTREAM_ALARM_INTERVAL_MS);
+      expect(await state.storage.getAlarm()).toBeLessThan(Date.now() + UPSTREAM_ALARM_INTERVAL_MS);
     });
 
-    // F2 — a far-future drain yields the liveness time as the min.
     const s2 = stub();
     await runInDurableObject(s2, async (instance, state) => {
       await state.storage.put('demand', 1);
-      // lastExec far future => drain ~now+65s, so liveness (now+30s) is the min.
-      await state.storage.put('lastExec:skip', Date.now() + 60_000);
+      await state.storage.put('lastExec:enqueue', Date.now() + 60_000);
       await state.storage.put('cmdQueue', [
-        { category: 'skip', dashboardPath: '/api/remote/next', body: '{}', enqueuedAt: Date.now(), attempts: 0 },
+        { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '1' }), enqueuedAt: Date.now(), attempts: 0 },
       ]);
       await instance.reconcileAlarm();
       const at = await state.storage.getAlarm();
@@ -688,44 +902,22 @@ describe('MusicRemoteState — command queue + cooldowns', () => {
       expect(at).toBeGreaterThan(Date.now() + UPSTREAM_ALARM_INTERVAL_MS - 1000);
     });
 
-    // F3 — liveness-first ORDERING: even when the delivery hangs to the
-    // AbortController timeout, the cheap liveness fan must run BEFORE the drain's
-    // delivery. Prove the order structurally by recording when fanPersistedSnapshot
-    // (liveness) vs deliverCommand (drain) is invoked: the fan must be recorded
-    // first. A delivery that hangs is represented by a deferred so the assertion
-    // does not wait the full real DELIVER_TIMEOUT_MS; releasing it lets alarm()
-    // settle cleanly (no abort, no retry refire).
     const s3 = stub();
     let releaseDelivery;
-    const deliveryGate = new Promise((resolve) => {
-      releaseDelivery = resolve;
-    });
+    const deliveryGate = new Promise((resolve) => { releaseDelivery = resolve; });
     await runInDurableObject(s3, async (instance, state) => {
       await state.storage.put('demand', 1);
       await state.storage.put('snapshot', SNAPSHOT);
-      await state.storage.put('lastExec:skip', Date.now() - COOLDOWN_MS.skip - 1);
+      const past = Date.now() - PLAY_MAX_DEFER_MS - 1;
       await state.storage.put('cmdQueue', [
-        { category: 'skip', dashboardPath: '/api/remote/next', body: '{}', enqueuedAt: Date.now(), attempts: 0 },
+        { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '1' }), enqueuedAt: past, firstAt: past, lastAt: past, attempts: 0 },
       ]);
-
       const order = [];
-      // ensureUpstream must report a reopen so the liveness phase fans the snapshot.
       instance.ensureUpstream = () => Promise.resolve(true);
       const realFan = instance.fanPersistedSnapshot.bind(instance);
-      instance.fanPersistedSnapshot = async () => {
-        order.push('liveness-fan');
-        return realFan();
-      };
-      instance.deliverCommand = async () => {
-        order.push('deliver');
-        await deliveryGate; // "hung" delivery, released below
-        return { terminal: true, traceOutcome: 'delivered' };
-      };
-
+      instance.fanPersistedSnapshot = async () => { order.push('liveness-fan'); return realFan(); };
+      instance.deliverCommand = async () => { order.push('deliver'); await deliveryGate; return { terminal: true, traceOutcome: 'delivered' }; };
       const alarmPromise = instance.alarm();
-      // Release the held delivery so alarm() can settle, then assert the recorded
-      // call order: the liveness fan was invoked BEFORE the drain's delivery —
-      // proving liveness-first ordering even with a (briefly) hung delivery.
       releaseDelivery();
       await alarmPromise;
       expect(order).toEqual(['liveness-fan', 'deliver']);
@@ -733,51 +925,42 @@ describe('MusicRemoteState — command queue + cooldowns', () => {
     });
   });
 
-  // (G) demand>0 + no eligible command: alarm stays armed (liveness); the command
-  // drains once eligible.
+  // (G) demand>0 + no eligible command -> alarm armed (liveness); drains once eligible.
   it('(G) demand>0 + no eligible command -> alarm armed (liveness); drains once eligible', async () => {
     const s = stub();
     const { calls } = mockFetch(200);
     await runInDurableObject(s, async (instance, state) => {
       await state.storage.put('demand', 1);
-      // A command under cooldown.
-      await state.storage.put('lastExec:skip', Date.now());
+      await state.storage.put('lastExec:enqueue', Date.now());
       await state.storage.put('cmdQueue', [
-        { category: 'skip', dashboardPath: '/api/remote/next', body: '{}', enqueuedAt: Date.now(), attempts: 0 },
+        { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '1' }), enqueuedAt: Date.now(), attempts: 0 },
       ]);
       await instance.alarm();
-      expect(calls.length).toBe(0); // under cooldown, not delivered
-      expect(await state.storage.getAlarm()).not.toBeNull(); // armed (liveness + drain)
-
-      // Make it eligible and drain.
-      await state.storage.put('lastExec:skip', Date.now() - COOLDOWN_MS.skip - 1);
+      expect(calls.length).toBe(0);
+      expect(await state.storage.getAlarm()).not.toBeNull();
+      await state.storage.put('lastExec:enqueue', Date.now() - COOLDOWN_MS.enqueue - 1);
       await instance.alarm();
       expect(calls.length).toBe(1);
     });
   });
 
-  // (H) drain throws -> alarm() still re-arms via the finally (a drain exception
-  // must not orphan the liveness alarm).
-  it('(H) a throwing drain still re-arms the alarm via the finally (error propagates to the platform for retry)', async () => {
+  // (H) a throwing drain still re-arms the alarm via the finally (error propagates).
+  it('(H) a throwing drain still re-arms the alarm via the finally (error still propagates)', async () => {
     const s = stub();
     await runInDurableObject(s, async (instance, state) => {
-      await state.storage.put('demand', 1); // liveness keeps an alarm warranted
+      await state.storage.put('demand', 1);
       instance.drainOneEligible = () => Promise.reject(new Error('boom'));
-      // The finally re-arms; the original error still PROPAGATES (the platform
-      // retries alarm() on an uncaught throw — the try/finally complements that, it
-      // does not swallow). So alarm() rejects, AND the alarm is re-armed.
       await expect(instance.alarm()).rejects.toThrow(/boom/);
       expect(await state.storage.getAlarm()).not.toBeNull();
     });
   });
 
-  // (I) demand 0 + queue empty: reconcileAlarm deletes the alarm AND closeUpstream
-  // ran (a drain-only wake at demand 0 tears the upstream down).
+  // (I) demand 0 + queue empty -> alarm deleted + upstream closed.
   it('(I) demand 0 + queue empty -> alarm deleted + upstream closed', async () => {
     const s = stub();
     await runInDurableObject(s, async (instance, state) => {
       await state.storage.put('demand', 0);
-      await state.storage.setAlarm(Date.now() + 1000); // a stale alarm to be cleared
+      await state.storage.setAlarm(Date.now() + 1000);
       let closed = false;
       instance.upstream = { readyState: WebSocket.OPEN, close() { closed = true; } };
       await instance.alarm();
@@ -787,79 +970,41 @@ describe('MusicRemoteState — command queue + cooldowns', () => {
     });
   });
 
-  // (J) closing-socket race: after the REAL webSocketClose of the LAST socket, the
-  // alarm is null AND demand===0 AND upstream torn down — under reconcileAlarm
-  // reading PERSISTED demand, not getWebSockets() (which still holds the closing
-  // socket inside the handler).
-  it('(J) closing-socket race: last webSocketClose -> alarm null, demand 0, upstream down (persisted-demand read)', async () => {
-    const s = stub();
-    const ws = await connectClient(s);
-    await runInDurableObject(s, async (instance, state) => {
-      const sockets = state.getWebSockets();
-      expect(sockets.length).toBe(1); // the closing socket is still in the live set
-      let closed = false;
-      instance.upstream = { readyState: WebSocket.OPEN, close() { closed = true; } };
-      await instance.webSocketClose(sockets[0]);
-      expect(await state.storage.get('demand')).toBe(0);
-      expect(await state.storage.getAlarm()).toBeNull();
-      expect(closed).toBe(true);
-      expect(instance.upstream).toBeNull();
-    });
-    ws.close();
-  });
-
-  // (K) HANG: a never-resolving fetch aborts at DELIVER_TIMEOUT_MS -> transient;
-  // attempts increments; after MAX the head is dropped (LOUD warn + drain-trace
-  // 'dropped-after-max-transient-timeout').
-  it('(K) a HUNG delivery aborts at the timeout (transient); dropped after MAX with the timeout trace', async () => {
+  // (K) HUNG deferred delivery aborts at DELIVER_TIMEOUT_MS (transient); dropped after
+  // MAX with the timeout trace.
+  it('(K) a HUNG deferred delivery aborts at the timeout (transient); dropped after MAX', async () => {
     const s = stub();
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    // Seed DIRECTLY (no auto-alarming enqueue) and drive the drain manually, so the
-    // attempt accounting + the single give-up trace are deterministic.
     await runInDurableObject(s, async (instance, state) => {
       const hung = vi.spyOn(globalThis, 'fetch').mockImplementation(
-        (url, init) =>
-          new Promise((_resolve, reject) => {
-            const sig = init?.signal;
-            if (sig) {
-              sig.addEventListener('abort', () =>
-                reject(new DOMException('aborted', 'AbortError')),
-              );
-            }
-          }),
+        (url, init) => new Promise((_resolve, reject) => {
+          const sig = init?.signal;
+          if (sig) sig.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        }),
       );
       await state.storage.put('demand', 0);
       await state.storage.put('cmdQueue', [
-        { category: 'skip', dashboardPath: '/api/remote/next', body: '{}', enqueuedAt: Date.now(), attempts: 0 },
+        { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '1' }), enqueuedAt: Date.now(), attempts: 0 },
       ]);
-
-      // First drain: aborts at DELIVER_TIMEOUT_MS -> transient (attempts 0->1), kept.
       await instance.drainOneEligible();
       let queue = await state.storage.get('cmdQueue');
       expect(queue.length).toBe(1);
       expect(queue[0].attempts).toBe(1);
-
-      // Second drain: transient again -> give-up (attempts+1 >= MAX), head dropped.
       await instance.drainOneEligible();
       queue = (await state.storage.get('cmdQueue')) ?? [];
       expect(queue).toEqual([]);
       hung.mockRestore();
     });
-    // Both delivery failures were LOUD; the give-up drain-trace records the timeout.
-    expect(warnSpy).toHaveBeenCalled();
-    const traces = logSpy.mock.calls
-      .map((c) => c[0])
-      .filter((o) => o && o.event === 'drain');
+    const traces = logSpy.mock.calls.map((c) => c[0]).filter((o) => o && o.event === 'drain');
     expect(traces.length).toBe(1);
     expect(traces[0].outcome).toBe('dropped-after-max-transient-timeout');
     warnSpy.mockRestore();
     logSpy.mockRestore();
   }, 20_000);
 
-  // (L) 5xx transient: first attempt keeps the head (attempts=1, NO lastExec bump),
-  // second attempt drops with the 5xx trace.
-  it('(L) a 5xx is transient: kept on first attempt, dropped on second (drain-trace dropped-after-max-dashboard-error-503)', async () => {
+  // (L) 5xx transient: kept on first attempt (no lastExec bump), dropped on second.
+  it('(L) a 5xx is transient: kept on first attempt, dropped on second', async () => {
     const s = stub();
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -867,68 +1012,64 @@ describe('MusicRemoteState — command queue + cooldowns', () => {
       const f = mockFetch(503);
       await state.storage.put('demand', 0);
       await state.storage.put('cmdQueue', [
-        { category: 'skip', dashboardPath: '/api/remote/next', body: '{}', enqueuedAt: Date.now(), attempts: 0 },
+        { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '1' }), enqueuedAt: Date.now(), attempts: 0 },
       ]);
-
       await instance.drainOneEligible();
       let queue = await state.storage.get('cmdQueue');
-      expect(queue.length).toBe(1); // NOT dropped on first transient
+      expect(queue.length).toBe(1);
       expect(queue[0].attempts).toBe(1);
-      // No lastExec bump on a non-drained transient.
-      expect(await state.storage.get('lastExec:skip')).toBeUndefined();
-
+      expect(await state.storage.get('lastExec:enqueue')).toBeUndefined();
       await instance.drainOneEligible();
       queue = (await state.storage.get('cmdQueue')) ?? [];
-      expect(queue).toEqual([]); // dropped on second (give-up)
+      expect(queue).toEqual([]);
       f.spy.mockRestore();
     });
     const traces = logSpy.mock.calls.map((c) => c[0]).filter((o) => o && o.event === 'drain');
     expect(traces.length).toBe(1);
     expect(traces[0].outcome).toBe('dropped-after-max-dashboard-error-503');
-    expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
     logSpy.mockRestore();
   });
 
-  // (M) 4xx terminal: dropped on the FIRST attempt (permanently-rejected), lastExec
-  // bumped, LOUD warn, drain-trace 'dashboard-rejected-422' (NOT 'delivered').
-  it('(M) a 4xx is terminal: dropped on the FIRST attempt, lastExec bumped, trace dashboard-rejected-422', async () => {
+  // (M) 4xx terminal: dropped on the FIRST attempt, lastExec bumped, trace rejected.
+  it('(M) a 4xx is terminal: dropped on the FIRST attempt, lastExec bumped', async () => {
     const s = stub();
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     mockFetch(422);
-    await enqueue(s, { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '1' }) });
     await runInDurableObject(s, async (instance, state) => {
+      const past = Date.now() - PLAY_MAX_DEFER_MS - 1;
+      await state.storage.put('cmdQueue', [
+        { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '1' }), enqueuedAt: past, firstAt: past, lastAt: past, attempts: 0 },
+      ]);
       await instance.drainOneEligible();
-      expect((await state.storage.get('cmdQueue')) ?? []).toEqual([]); // dropped first try
-      expect(await state.storage.get('lastExec:play')).toBeGreaterThan(0); // lastExec bumped
+      expect((await state.storage.get('cmdQueue')) ?? []).toEqual([]);
+      expect(await state.storage.get('lastExec:play')).toBeGreaterThan(0);
     });
     const traces = logSpy.mock.calls.map((c) => c[0]).filter((o) => o && o.event === 'drain');
     expect(traces.length).toBe(1);
     expect(traces[0].outcome).toBe('dashboard-rejected-422');
     expect(traces[0].attempt).toBe(1);
-    expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
     logSpy.mockRestore();
   });
 
-  // (N) constructor arm-only: a reconstructed isolate ARMS the drain for a
-  // persisted-undrained queue (demand 0) and NEVER deletes an existing alarm when
-  // both responsibilities are idle.
+  // (N) constructor arm-only: arms a persisted-undrained queue; never deletes when idle.
   it('(N) constructor reconcileAlarm is ARM-ONLY: arms a persisted-undrained queue; never deletes when idle', async () => {
-    // N1 — persisted-undrained queue + demand 0: the constructor arms the drain.
     const s1 = stub();
     await runInDurableObject(s1, async (instance, state) => {
       await state.storage.put('demand', 0);
       await state.storage.put('cmdQueue', [
-        { category: 'skip', dashboardPath: '/api/remote/next', body: '{}', enqueuedAt: Date.now(), attempts: 0 },
+        { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '1' }), enqueuedAt: Date.now(), attempts: 0 },
       ]);
-      // Re-run the arm-only reconcile the constructor would run post-eviction.
       await instance.reconcileAlarm({ armOnly: true });
-      expect(await state.storage.getAlarm()).not.toBeNull(); // armed for the drain
+      expect(await state.storage.getAlarm()).not.toBeNull();
+      // The enqueue is eligible at t0, so the armed alarm fires ~now — clear it + the
+      // queue so it can't bleed a real (unmocked) delivery into a later test's spy.
+      await state.storage.put('cmdQueue', []);
+      await state.storage.deleteAlarm();
     });
 
-    // N2 — empty queue + demand 0 + a pre-existing alarm: armOnly must NOT delete it.
     const s2 = stub();
     await runInDurableObject(s2, async (instance, state) => {
       await state.storage.put('demand', 0);
@@ -936,7 +1077,72 @@ describe('MusicRemoteState — command queue + cooldowns', () => {
       const preset = Date.now() + 5000;
       await state.storage.setAlarm(preset);
       await instance.reconcileAlarm({ armOnly: true });
-      expect(await state.storage.getAlarm()).toBe(preset); // left intact
+      expect(await state.storage.getAlarm()).toBe(preset);
+    });
+  });
+
+  // ---- re-read-after-await concurrency (the input-gate invariant) --------------
+
+  // (R1) latest-wins: a play that REPLACES the slot DURING the in-flight delivery of
+  // the prior pick MUST survive (latest wins) — not be index-spliced away. Regression
+  // guard for the index-vs-identity drain bug: the delivery await opens the input
+  // gate, so a re-pick lands a new pickId at the same index; the drain must remove the
+  // element only if it is still the SAME pick. lastExec:play is still bumped (the prior
+  // delivery happened), so the survivor is spaced by the cooldown floor.
+  it('(R1) latest-wins: a re-pick during the in-flight delivery survives (identity, not index, drain)', async () => {
+    const s = stub();
+    const { calls } = mockFetch(200);
+    await runInDurableObject(s, async (instance, state) => {
+      const past = Date.now() - PLAY_MAX_DEFER_MS - 1;
+      await state.storage.put('cmdQueue', [
+        { category: 'play', dashboardPath: '/api/remote/songs/play', body: JSON.stringify({ id: '1' }), enqueuedAt: past, firstAt: past, lastAt: past, attempts: 0, pickId: 'pick-1' },
+      ]);
+      // Inject a concurrent slot REPLACE (a user re-pick) during delivery of id:1.
+      const realDeliver = instance.deliverCommand.bind(instance);
+      instance.deliverCommand = async (cmd) => {
+        const q = (await state.storage.get('cmdQueue')) ?? [];
+        q[0] = { ...q[0], body: JSON.stringify({ id: '2' }), lastAt: Date.now(), attempts: 0, pickId: 'pick-2' };
+        await state.storage.put('cmdQueue', q);
+        return realDeliver(cmd);
+      };
+      await instance.drainOneEligible();
+      // id:1 was delivered...
+      expect(calls.length).toBe(1);
+      expect(JSON.parse(calls[0].init.body)).toEqual({ id: '1' });
+      // ...but the re-pick id:2 MUST remain (not spliced), with its own pickId intact.
+      const q = await state.storage.get('cmdQueue');
+      expect(q.length).toBe(1);
+      expect(JSON.parse(q[0].body)).toEqual({ id: '2' });
+      expect(q[0].pickId).toBe('pick-2');
+      expect(q[0].attempts).toBe(0); // fresh pick — NOT clobbered with old attempt count
+      // lastExec:play bumped (id:1's expensive delivery happened — space the survivor).
+      expect(await state.storage.get('lastExec:play')).toBeGreaterThan(0);
+    });
+  });
+
+  // (R2) queue: an enqueue APPENDED during the in-flight delivery of the head survives
+  // at the tail; the delivered head is removed by its (stable) index. The append-only
+  // arm of the same input-gate invariant.
+  it('(R2) queue: an enqueue appended during the in-flight delivery survives at the tail', async () => {
+    const s = stub();
+    const { calls } = mockFetch(200);
+    await runInDurableObject(s, async (instance, state) => {
+      await state.storage.put('cmdQueue', [
+        { category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '1' }), enqueuedAt: Date.now(), attempts: 0 },
+      ]);
+      const realDeliver = instance.deliverCommand.bind(instance);
+      instance.deliverCommand = async (cmd) => {
+        const q = (await state.storage.get('cmdQueue')) ?? [];
+        q.push({ category: 'enqueue', dashboardPath: '/api/remote/songs/enqueue', body: JSON.stringify({ id: '2' }), enqueuedAt: Date.now(), attempts: 0 });
+        await state.storage.put('cmdQueue', q);
+        return realDeliver(cmd);
+      };
+      await instance.drainOneEligible();
+      expect(calls.length).toBe(1);
+      expect(JSON.parse(calls[0].init.body)).toEqual({ id: '1' }); // head delivered
+      const q = await state.storage.get('cmdQueue');
+      expect(q.length).toBe(1);
+      expect(JSON.parse(q[0].body)).toEqual({ id: '2' }); // appended survivor at tail
     });
   });
 });

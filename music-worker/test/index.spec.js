@@ -93,14 +93,16 @@ describe('entry router — routing + method mapping (authed)', () => {
     expect(res.status).toBe(405);
   });
 
-  it('a confirmed route reaches the proxy (escalation 1 resolved): unreachable dashboard -> 502, NOT 501', async () => {
-    // API_REMOTE_PATH.pause is now a CONFIRMED sub-path (/api/remote/pause), so the
-    // throwIfUnset 501 placeholder branch no longer fires. With no fetchMock active
-    // in this block the outbound fetch to the (non-existent) dashboard rejects, so
-    // the router returns the structured 502 dashboard_unreachable — proving the
-    // request now flows to the proxy seam instead of short-circuiting at 501.
-    const res = await SELF.fetch(`${BASE}/music/pause`, {
-      method: 'POST',
+  it('a confirmed DIRECT route reaches the proxy (escalation 1 resolved): unreachable dashboard -> 502, NOT 501', async () => {
+    // API_REMOTE_PATH.search is a CONFIRMED sub-path (/api/remote/songs/results), so
+    // the throwIfUnset 501 placeholder branch no longer fires. With no fetchMock
+    // active in this block the outbound fetch to the (non-existent) dashboard rejects,
+    // so the router returns the structured 502 dashboard_unreachable — proving the
+    // request flows to the proxy seam instead of short-circuiting at 501. (search is a
+    // DIRECT proxy route, chosen so this test does NOT consume the shared 'global' DO's
+    // throttle window — pause/resume routing is covered in its own block below.)
+    const res = await SELF.fetch(`${BASE}/music/search?q=ping`, {
+      method: 'GET',
       headers: authedHeaders(),
     });
     expect(res.status).toBe(502);
@@ -227,11 +229,11 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
     expect(JSON.parse(seen.body)).toEqual({ direction: 'down' });
   });
 
-  // NOTE: `play` is now a QUEUED route (CHANGE B) — it no longer proxies
+  // NOTE: `play` is now a DO-routed command (latest-wins) — it no longer proxies
   // synchronously, so the old 'play -> proxies POST {id:<number>}' direct-proxy
-  // assertion is gone. The string-forward proof (CHANGE A: { id:"<digits>" } as a
-  // STRING) now lives at the DO drain boundary in music-do.spec.js, where the
-  // outbound delivery fetch is observable.
+  // assertion is gone. The string-forward proof ({ id:"<digits>" } as a STRING) now
+  // lives at the DO drain boundary in music-do.spec.js, where the outbound delivery
+  // fetch is observable.
 
   it('search -> GETs the dashboard with q encoded into the path, status + body passed through verbatim', async () => {
     fetchMock
@@ -285,15 +287,17 @@ describe('entry router — proxy composition + verbatim pass-through', () => {
   });
 });
 
-// CHANGE B — the five queued routes (next/prev/play/enqueue/playlist-play) no
-// longer proxy synchronously: they enqueue into the singleton DO's command queue
-// and return 202 { ok:true, queued:true } IMMEDIATELY (the truth returns via the
-// now-playing WS). No fetchMock interceptor is active here — a synchronous proxy
-// would reject (DNS) and surface a 502, so the 202 proves the command was enqueued
-// in the DO, not proxied. (The cmdQueue CONTENTS + the outbound delivery body live
-// in music-do.spec.js at the drain boundary.)
-describe('entry router — queued routes (DO command queue)', () => {
-  const QUEUED = [
+// next/prev/play/enqueue/playlist-play are all DO-routed and return 202 { ok:true,
+// queued:true } to the extension (the historical fire-and-forget contract; the truth
+// returns via the now-playing WS). next/prev deliver INLINE through their gate but
+// the router still wraps a uniform 202; play/enqueue/playlist-play are alarm-deferred
+// and the DO returns the 202 envelope directly. No fetchMock interceptor is active
+// here — next/prev's inline delivery rejects (DNS) and folds to a DO-internal 502,
+// and the deferred routes never deliver synchronously, so the 202 proves DO routing,
+// not a synchronous proxy. (Per-mode behaviour + delivery bodies live in
+// music-do.spec.js, which uses isolated DO stubs.)
+describe('entry router — DO-routed commands (202 fire-and-forget)', () => {
+  const DO_ROUTED = [
     { route: 'next', body: undefined },
     { route: 'prev', body: undefined },
     { route: 'play', body: JSON.stringify({ id: '3135556' }) },
@@ -301,8 +305,8 @@ describe('entry router — queued routes (DO command queue)', () => {
     { route: 'playlist-play', body: JSON.stringify({ id: '3135556' }) },
   ];
 
-  for (const { route, body } of QUEUED) {
-    it(`/music/${route} -> 202 { ok:true, queued:true } (enqueued in the DO, not proxied)`, async () => {
+  for (const { route, body } of DO_ROUTED) {
+    it(`/music/${route} -> 202 { ok:true, queued:true } (DO-routed, not synchronously proxied)`, async () => {
       const res = await SELF.fetch(`${BASE}/music/${route}`, {
         method: 'POST',
         headers: authedHeaders({ 'Content-Type': 'application/json' }),
@@ -313,7 +317,7 @@ describe('entry router — queued routes (DO command queue)', () => {
     });
   }
 
-  it('play with id:"abc" -> 400 and NOT queued (malformed queued cmd 400s before reaching the DO)', async () => {
+  it('play with id:"abc" -> 400 and NOT routed (malformed cmd 400s before reaching the DO)', async () => {
     const res = await SELF.fetch(`${BASE}/music/play`, {
       method: 'POST',
       headers: authedHeaders({ 'Content-Type': 'application/json' }),
@@ -321,5 +325,52 @@ describe('entry router — queued routes (DO command queue)', () => {
     });
     expect(res.status).toBe(400);
     expect((await res.json()).error).toMatch(/numeric Deezer id/);
+  });
+});
+
+// pause/resume are DO-routed but INLINE (throttle, category `toggle`): unlike the
+// fire-and-forget 202 routes, the router forwards the DO's response VERBATIM
+// (VERBATIM_DO_ROUTES). This block pins the router-level contract: a delivered toggle
+// streams the dashboard's own body back; a coalesced toggle (the throttle window is
+// still hot) returns the synthetic 200 { coalesced } with NO dashboard call. It runs
+// LAST and is the only authed pause/resume in the file, so the shared 'global' DO's
+// `toggle` window starts cold here (the two `it`s run in order within the same
+// sub-100ms run, so the second is inside the first's 5s window).
+describe('entry router — DO inline routes (pause/resume): verbatim forward + coalesce', () => {
+  const DASH_ORIGIN = 'https://dashboard.test.invalid';
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.assertNoPendingInterceptors();
+  });
+
+  it('pause (first in the window) delivers inline + forwards the dashboard 200 body VERBATIM', async () => {
+    fetchMock
+      .get(DASH_ORIGIN)
+      .intercept({ path: '/api/remote/pause', method: 'POST' })
+      .reply(200, { ok: true, paused: true });
+
+    const res = await SELF.fetch(`${BASE}/music/pause`, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, paused: true });
+  });
+
+  it('resume immediately after is coalesced by the throttle window: synthetic 200, NO dashboard call', async () => {
+    // No interceptor queued — the request must NOT reach the dashboard (the toggle
+    // window is still hot from the pause above). disableNetConnect would error on any
+    // outbound call, and assertNoPendingInterceptors confirms none was expected.
+    const res = await SELF.fetch(`${BASE}/music/resume`, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, executed: false, coalesced: true });
   });
 });
