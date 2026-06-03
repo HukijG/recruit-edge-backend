@@ -1114,17 +1114,31 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 		expect(cachedData.phone_number).toBe('+15555550100');
 	});
 
-	it('returns 200 silently when enrichment context expired', async () => {
-		const calls = mockFetch([]);
+	it('delivers the phone even when the enrichment context is gone (late Apollo delivery)', async () => {
+		// Regression (rfId 52662, 2026-06-03): Apollo's phone-reveal webhook is delivered
+		// asynchronously with an unbounded lag (observed ~45min) — long after the short-lived
+		// apollo_enrich:* request flag has expired. The phone MUST still be written to RF +
+		// Dialpad; delivery is never gated on that flag.
+		const calls = mockFetch([
+			rfGetCandidateRoute(buildFullRFCandidate({ phone_number: [] })),
+			rfUpdateCandidateRoute(),
+			dialpadContactRoute(),
+		]);
 
-		// No enrichment context in KV (expired)
+		// Make the "context absent" precondition explicit so it holds regardless of any KV
+		// state left by earlier tests (SYNC_STATE is the shared real binding).
+		await env.SYNC_STATE.delete('apollo_enrich:12345');
 
 		const apolloWebhookPayload = {
-			people: [{ id: 'apollo-456', status: 'success', phone_numbers: [{ sanitized_number: '+15555550100', status_cd: 'valid_number' }] }],
+			people: [{
+				id: 'apollo-456',
+				status: 'success',
+				phone_numbers: [{ sanitized_number: '+15555550100', status_cd: 'valid_number', raw_number: '(978) 555-0146' }],
+			}],
 		};
 
 		const request = new Request(
-			`http://example.com/webhook/apollo?token=${env.APOLLO_WEBHOOK_SECRET}&rfId=99999`,
+			`http://example.com/webhook/apollo?token=${env.APOLLO_WEBHOOK_SECRET}&rfId=12345`,
 			{
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
@@ -1138,8 +1152,15 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 
 		expect(response.status).toBe(200);
 
-		// Nothing should be called
-		expect(calls.length).toBe(0);
+		// RF GET (merge) + UPDATE (new phone) both happen despite no pending context
+		const rfUpdateCalls = findCalls(calls, 'recruiterflow.com').filter(c => c.url.includes('/candidate/update'));
+		expect(rfUpdateCalls.length).toBe(1);
+		expect(JSON.parse(rfUpdateCalls[0].opts.body).phone_number).toEqual([{ phone_number: '+15555550100', type: 1 }]);
+
+		// Dialpad PATCH carries only the phone
+		const dialpadCalls = findCalls(calls, 'dialpad.com');
+		expect(dialpadCalls.length).toBe(1);
+		expect(JSON.parse(dialpadCalls[0].opts.body)).toEqual({ phones: ['+15555550100'] });
 	});
 
 	it('returns 200 when no valid phone numbers in payload', async () => {

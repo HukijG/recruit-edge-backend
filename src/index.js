@@ -1086,13 +1086,14 @@ async function handleApolloWebhook(request, env, url) {
       rawPayload: JSON.stringify(payload),
     });
 
-    // Look up pending enrichment context from KV
-    const pendingRaw = await env.SYNC_STATE.get(`apollo_enrich:${rfId}`);
-    if (!pendingRaw) {
-      console.log({ message: `[Apollo] → no pending enrichment context for rfId=${rfId}, skipping`, source: 'apollo', rfId });
-      return new Response('OK', { status: 200 });
-    }
-    const pending = JSON.parse(pendingRaw);
+    // No KV "pending context" gate here, on purpose. Apollo delivers the phone-reveal
+    // webhook asynchronously with an unbounded delay (observed 12s to ~46min) — far
+    // longer than any short-lived flag we'd keep. The reveal is authenticated by the URL
+    // token and fully self-describing (rfId from the URL we built + phone from the
+    // payload), so we ALWAYS deliver a valid phone to RF + Dialpad regardless of when it
+    // lands. The `apollo_enrich:${rfId}` flag stays a request-time dedup guard only (so we
+    // don't re-spend Apollo credits); it intentionally does not gate delivery. The
+    // phoneAlreadyExists check below keeps this idempotent across Apollo's webhook retries.
 
     // Extract phone numbers from the person object
     const phoneNumbers = person?.phone_numbers;
