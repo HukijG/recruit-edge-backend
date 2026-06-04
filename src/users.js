@@ -13,8 +13,11 @@
  * applied by the operator; this module never writes.
  *
  * Identity records are keyed by lowercase email (the `email` PK column has a
- * `CHECK (email = LOWER(email))` constraint). Every public function takes
- * `env` as its first argument and returns a Promise (call sites must `await`).
+ * `CHECK (email = LOWER(email))` constraint). The `krisp_emails` column holds
+ * alternate (Krisp-account) emails per teammate; these fold into the `byEmail`
+ * map so `getUserByEmail` resolves them too (primary email wins on collision),
+ * which drives Krisp note attribution. Every public function takes `env` as its
+ * first argument and returns a Promise (call sites must `await`).
  *
  * Caching:
  *   - Module-level cache populated on first call after Worker boot via a
@@ -46,17 +49,17 @@ function normalizeEmail(email) {
   return trimmed || null;
 }
 
-function parseAliases(raw, email) {
-  // Defensive: a malformed `aliases` JSON value should NOT take the entire
-  // module offline. Log it loudly (so the bad row is fixable) and treat the
-  // record as having no aliases. Schema doesn't validate JSON shape — only
+function parseJsonArray(raw, email, field) {
+  // Defensive: a malformed JSON array value should NOT take the entire module
+  // offline. Log it loudly (so the bad row is fixable, naming the column) and
+  // treat the record as having none. Schema doesn't validate JSON shape — only
   // TEXT vs NULL — so a hand-edited row could legitimately end up here.
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : null;
   } catch (err) {
-    console.error({ source: 'users', message: 'malformed aliases JSON', email, error: err.message });
+    console.error({ source: 'users', message: `malformed ${field} JSON`, email, error: err.message });
     return null;
   }
 }
@@ -68,13 +71,16 @@ function rowToRecord(row) {
     dialpadId: row.dialpad_id,
     firstName: row.first_name,
     calendarMode: row.calendar_mode,
-    aliases: parseAliases(row.aliases, row.email),
+    aliases: parseJsonArray(row.aliases, row.email, 'aliases'),
+    // Alternate "Krisp account" emails — folded into byEmail so a consultant's
+    // Krisp participant email resolves to them (drives Krisp note attribution).
+    krispEmails: parseJsonArray(row.krisp_emails, row.email, 'krisp_emails'),
   };
 }
 
 async function loadCache(env) {
   const { results } = await env.USERS_DB
-    .prepare('SELECT email, rf_user_id, dialpad_id, first_name, calendar_mode, aliases FROM users')
+    .prepare('SELECT email, rf_user_id, dialpad_id, first_name, calendar_mode, aliases, krisp_emails FROM users')
     .all();
   const records = (results ?? []).map(rowToRecord);
 
@@ -90,8 +96,19 @@ async function loadCache(env) {
   }
   for (const r of records) byFirstName.set(r.firstName.toLowerCase(), r);
 
+  // byEmail: krisp emails inserted FIRST, then primary emails second, so a
+  // primary email always wins over a colliding krisp email (Map.set replaces).
+  // Mirrors the byFirstName alias precedence above.
+  const byEmail = new Map();
+  for (const r of records) {
+    if (Array.isArray(r.krispEmails)) {
+      for (const e of r.krispEmails) byEmail.set(e.toLowerCase(), r);
+    }
+  }
+  for (const r of records) byEmail.set(r.email, r);
+
   return {
-    byEmail: new Map(records.map((r) => [r.email, r])),
+    byEmail,
     byDialpadId: new Map(records.map((r) => [r.dialpadId, r])),
     byRFUserId: new Map(records.map((r) => [r.rfUserId, r])),
     byFirstName,

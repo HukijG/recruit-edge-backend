@@ -117,7 +117,7 @@ This file does NOT duplicate that material. References below use the Access auth
 | `src/dialpad-client.js` | Dialpad API client: contact PUT (create/update), data preparation from RF candidate format, `getUserCallerId` and `initiateCall` for the LinkedIn extension calling flow, `buildCallerIdsFromDialpad` (pure transform → opaque-alias `callerIds[]`), `sendSMS` (POST `/sms` rolled-params wrapper), `hangupCall({ callId })` (PUT `/call/{id}/actions/hangup`). |
 | `src/dialpad-aliases.js` | Opaque caller-ID alias signing/verifying (HS256 JWT via jose, audience `dialpad-caller-id`, 7-day TTL). Keeps raw E.164 numbers off the wire. |
 | `src/rate-limit.js` | Rolling-window rate-limit + cheap dedup gate for `/dialpad-call`. Pure decision function + KV-backed `checkAndRecordCall`. 5 calls/60s rolling per Dialpad user_id, plus a 3s per-(user,phone) dedup window for double-clicks. |
-| `src/krisp.js` | Krisp helpers: note formatting (HTML), candidate email extraction from meeting participants. |
+| `src/krisp.js` | Krisp helpers: note formatting (HTML), and `resolveKrispAttribution` — resolves the consultant (note author) + candidate from meeting participants by team membership. |
 | `src/cold-call.js` | Cold call detection: monitored-user filter (registry-driven), Dialpad transcript fetch, Workers AI classification (Llama 3.3 70B), per-outcome summary extraction (Llama 3.1 8B), RF custom activity + tag/source update + Sourced→Replied stage move, generic `mergeTag(tags, value)` helper, `parseColdCallActivity` for the extension shape. |
 | `src/extension-calls.js` | Extension Call/Hangup webhook dispatcher. `processExtensionCallEvent` filters Dialpad webhook payloads (outbound + monitored target), routes `calling`/`hangup` events to the per-user `ExtCallState` DO. |
 | `src/extension-call-do.js` | `ExtCallState` Durable Object class. Per-user store, one instance per Dialpad user (`idFromName(dialpadUserId)`). RPC: `setCallId`, `getCallId`, `clearCallIdIfMatch`. 20-min self-clearing alarm on `setCallId`. |
@@ -381,19 +381,40 @@ If eligible, `moveToCallBooked()` calls `POST /api/external/candidate/move-to-st
 Krisp webhook (summary_generated)
   → POST /webhook/krisp
   → Verify X-Krisp-Webhook-Token (fail closed)
-  → Check KV dedup: krisp:note:{hash} — skip if already processed (24-hour TTL)
-  → Extract non-Joel email from meeting participants
+  → Check KV dedup: krisp:{meeting.id} — skip if already processed (7-day TTL)
+  → resolveKrispAttribution(participants):
+      consultant = first participant whose email resolves to a team member
+                   (getUserByEmail, incl. krisp_emails alias) → note author
+      candidate  = the external (guest-shaped) participant
   → Find RF candidate (two-tier lookup):
-      Tier 1: Email cache lookup
-      Tier 2: RF search API (by email)
-  → Format meeting content as HTML note (summary, action items, key points, etc.)
-  → POST /candidate/notes/add to RF
-  → Set dedup flag: krisp:note:{hash} = "true" (24-hour TTL)
+      Tier 1: Email cache lookup (lookupByEmail)
+      Tier 2: RF search API (searchRFCandidateByEmail), then cacheCandidate on hit
+  → Format meeting content as HTML note (formatKrispNotesAsHtml)
+  → POST /candidate/notes/add to RF with created_by = consultant.rfUserId
+      (fallback: owner Joel's rfUserId if no consultant resolved, + warning log)
+  → On success: set dedup flag krisp:{meeting.id} = "true" (7-day TTL)
 ```
+
+**Attribution**: the note is authored by the consultant on the call, resolved
+from participants by team membership. A consultant's Krisp-account email is
+often distinct from their team `email`; the `krisp_emails` column on
+`USERS_DB.users` (folded into the `byEmail` map, primary email wins on
+collision) maps those aliases. If no participant resolves to a team member
+(their `krisp_email` isn't registered yet) the note is attributed to the owner
+with a warning, and the candidate is identified via the Krisp structural
+signal (`id`/`first_name` populated = consultant; null = guest) so an
+unregistered consultant is never mistaken for the candidate.
 
 **Scope**: One-way, read-only integration. Krisp data flows to RF as candidate notes only. No data flows back to Krisp, no Dialpad sync triggered, no cache updates needed.
 
-**Dedup**: Uses a hash of meeting ID + candidate email to generate the KV dedup key. The 24-hour TTL prevents reprocessing if Krisp retries the webhook.
+**Dedup**: KV key `krisp:{meeting.id}`, written only after a successful note
+post (at-least-once: a failed post returns 500 so Krisp retries). The 7-day TTL
+comfortably exceeds Krisp's re-delivery/retry window so a late *sequential*
+re-delivery of the same meeting does not double-post (notes are immutable once
+posted). The flag is read-then-written (not claimed before processing), so two
+*concurrent* in-flight deliveries of the same meeting can both pass the check
+and double-post — an accepted residual window, traded for the at-least-once
+"never lose a note" guarantee.
 
 ---
 
@@ -948,7 +969,7 @@ Single KV namespace bound on both the main worker and the cache worker. Holds de
 | `email:{lowercase_address}` | RF candidate ID string (one key per email in array) | 60 days | main |
 | `name:{first_lower}:{last_lower}` | RF candidate ID string, or `"AMBIGUOUS"` | 60 days | main |
 | `sync:RF{id}` | `"true"` (debounce flag) | 60 seconds | main |
-| `krisp:note:{hash}` | `"true"` (dedup flag) | 24 hours | main |
+| `krisp:{meeting.id}` | `"true"` (dedup flag) | 7 days | main |
 | `coldcall:{call_id}` | `"true"` (dedup flag, set before AI classification) | 5 minutes | main |
 | `apollo_enrich:{rfId}` | JSON enrichment context (`apolloPersonId` or `noMatch:true`) | 15 minutes | main |
 | `consultant:job{jobId}:cand{rfId}` | RF user_id string or `"none"` sentinel | 30 days | main |

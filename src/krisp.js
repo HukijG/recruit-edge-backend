@@ -1,26 +1,65 @@
 /**
  * Krisp webhook helpers
  *
- * Utilities for extracting candidate info and formatting meeting notes
- * from Krisp summary_generated webhook payloads.
+ * Utilities for resolving consultant/candidate attribution and formatting
+ * meeting notes from Krisp summary_generated webhook payloads.
  */
 
-const OWNER_EMAIL = 'owner@example.com';
+import { getUserByEmail } from './users.js';
 
 /**
- * Extract the candidate's email from a Krisp meeting participants array.
- * Filters out the hardcoded owner email and returns the first remaining
- * participant's email, or null if none found.
- *
- * @param {Array<{email: string}>} participants - data.meeting.participants
- * @returns {string|null}
+ * The Krisp account owner. Single owner constant; the owner's RF user id is
+ * always derived from the registry (getUserByEmail) so no RF id is hardcoded.
  */
-export function extractCandidateEmail(participants) {
-  if (!Array.isArray(participants)) return null;
-  const candidate = participants.find(
-    (p) => p.email && p.email.toLowerCase() !== OWNER_EMAIL
-  );
-  return candidate ? candidate.email : null;
+export const OWNER_EMAIL = 'owner@example.com';
+
+/**
+ * Whether a participant looks like an external guest (the candidate) rather
+ * than the Krisp account-holder (a consultant). Krisp populates `id` and
+ * `first_name` for the account-holder; an external participant has them null.
+ * Used only to disambiguate the no-consultant-resolved fallback.
+ */
+function looksLikeGuest(p) {
+  return !p?.id || !p?.first_name;
+}
+
+/**
+ * Resolve who the consultant (note author) and the candidate are from a Krisp
+ * meeting's participants. Team membership (getUserByEmail) is the primary
+ * discriminator; the structural guest signal disambiguates the fallback case
+ * where the consultant's Krisp email isn't registered.
+ *
+ * @param {Array<{email?: string, id?: string|null, first_name?: string|null}>} participants
+ * @param {Object} env
+ * @returns {Promise<{consultant: object|null, candidateEmail: string|null}>}
+ *   consultant: the resolved team-member record (has rfUserId) or null.
+ *   candidateEmail: the external participant's email (original casing) or null.
+ */
+export async function resolveKrispAttribution(participants, env) {
+  if (!Array.isArray(participants)) return { consultant: null, candidateEmail: null };
+
+  // First pass: resolve the consultant and collect non-team participants.
+  let consultant = null;
+  const unresolved = [];
+  for (const p of participants) {
+    const email = typeof p?.email === 'string' ? p.email.trim().toLowerCase() : null;
+    if (!email) continue;
+    const user = await getUserByEmail(env, email);
+    if (user) {
+      if (!consultant) consultant = user;
+    } else {
+      unresolved.push(p);
+    }
+  }
+
+  // Second pass: pick the candidate. If the consultant is known, any non-team
+  // participant is a candidate (first wins). If not, only trust a guest-shaped
+  // participant so an unregistered consultant isn't mistaken for the candidate.
+  const candidate = consultant
+    ? unresolved[0] ?? null
+    : unresolved.find(looksLikeGuest) ?? null;
+
+  return { consultant, candidateEmail: candidate?.email ?? null };
 }
 
 /**

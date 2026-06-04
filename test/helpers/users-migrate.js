@@ -9,6 +9,7 @@
 import schema from '../../migrations/0001_create_users.sql?raw';
 import seedRaw from '../../migrations/0002_seed_users.sql?raw';
 import smsTemplatesSchema from '../../migrations/0003_create_sms_templates.sql?raw';
+import krispEmailsMigration from '../../migrations/0004_add_krisp_emails.sql?raw';
 
 // TEST_EMAILS substitutes <TODO_EMAIL_*> placeholders so the test seed is
 // self-contained and passes the CHECK (email LIKE '%@%.%') constraint.
@@ -30,7 +31,7 @@ const seed = Object.entries(TEST_EMAILS).reduce(
   seedRaw,
 );
 
-const SCHEMA = [schema, seed, smsTemplatesSchema].join('\n');
+const SCHEMA = [schema, seed, smsTemplatesSchema, krispEmailsMigration].join('\n');
 
 /**
  * Apply the users schema + seed to env.USERS_DB.  Drops the users table first
@@ -53,7 +54,10 @@ export async function applyUsersMigration(env) {
 
   const stmts = SCHEMA.split(/;\s*\n/)
     .map((s) => s.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    // Drop comment-only chunks (e.g. the trailing TODO block in 0004 after the
+    // last real statement) — they would error as "no SQL statements" on prepare.
+    .filter((s) => s.split('\n').some((line) => line.trim() && !line.trim().startsWith('--')));
   for (const stmt of stmts) {
     await db.prepare(stmt).run();
   }

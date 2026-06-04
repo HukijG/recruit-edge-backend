@@ -881,8 +881,7 @@ describe('E2E: Calendar → RF + Dialpad', () => {
 describe('E2E: Krisp → RF (meeting notes)', () => {
 	afterEach(() => { globalThis.fetch = originalFetch; });
 
-	// SKIPPED 2026-05-10: processKrispMeetingNotes is stubbed pending attribution decision.
-	it.skip('adds meeting notes to RF candidate via email lookup', async () => {
+	it('adds meeting notes to RF candidate via email lookup, attributed to the consultant', async () => {
 		const calls = mockFetch([
 			rfAddNoteRoute(),
 		]);
@@ -903,13 +902,14 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 					start_date: '2026-03-30T14:00:00Z',
 					duration: 1800,
 					participants: [
-						{ email: 'owner@example.com', name: 'Joel Haines' },
-						{ email: 'candidate@example.com', name: 'Tony R' },
+						// Joel resolves via krisp_emails (0004) → consultant; candidate does not.
+						{ email: 'owner@example.com', id: 'acct-1', first_name: 'Joel', last_name: 'Haines' },
+						{ email: 'candidate@example.com', id: null, first_name: null, last_name: null },
 					],
 				},
 				content: [
-					{ title: 'Summary', body: 'Discussed the role at Eon.io.' },
-					{ title: 'Action Items', body: 'Send CV by Friday.' },
+					{ title: 'Summary', description: 'Discussed the role at Eon.io.' },
+					{ title: 'Action Items', description: 'Send CV by Friday.' },
 				],
 			},
 		};
@@ -929,13 +929,62 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 
 		expect(response.status).toBe(200);
 
-		// Note should have been posted to RF
+		// Note should have been posted to RF, attributed to Joel (rf_user_id 900001).
 		const noteCalls = findCalls(calls, '/candidate/notes/add');
 		expect(noteCalls.length).toBe(1);
+		const noteBody = JSON.parse(noteCalls[0].opts.body);
+		expect(noteBody.created_by).toBe(900001);
+		expect(noteBody.id).toBe(12345);
 
 		// Dedup flag should now be set
 		const dedup = await env.SYNC_STATE.get('krisp:meeting-001');
 		expect(dedup).toBe('true');
+	});
+
+	it('returns 500 and does NOT write the dedup flag when the RF note post fails', async () => {
+		const calls = mockFetch([
+			{ match: '/candidate/notes/add', response: { error: 'rf boom' }, status: 502 },
+		]);
+
+		await env.SYNC_STATE.put('email:candidate@example.com', '12345');
+		await env.SYNC_STATE.delete('krisp:meeting-fail');
+
+		const krispPayload = {
+			event: 'summary_generated',
+			data: {
+				meeting: {
+					id: 'meeting-fail',
+					title: 'Call with Tony',
+					url: 'https://krisp.ai/meeting/fail',
+					start_date: '2026-03-30T14:00:00Z',
+					duration: 1800,
+					participants: [
+						{ email: 'owner@example.com', id: 'acct-1', first_name: 'Joel' },
+						{ email: 'candidate@example.com', id: null, first_name: null },
+					],
+				},
+				content: [{ title: 'Summary', description: 'Discussed the role.' }],
+			},
+		};
+
+		const request = new Request('http://example.com/webhook/krisp', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Krisp-Webhook-Token': env.KRISP_WEBHOOK_SECRET,
+			},
+			body: JSON.stringify(krispPayload),
+		});
+
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		// Note post threw → handler's catch returns 500 so Krisp retries.
+		expect(response.status).toBe(500);
+		// Dedup flag must NOT be written (at-least-once: the retry re-attempts).
+		const dedup = await env.SYNC_STATE.get('krisp:meeting-fail');
+		expect(dedup).toBeNull();
 	});
 
 	it('skips duplicate meeting (dedup flag already set)', async () => {
@@ -971,8 +1020,7 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 		expect(calls.length).toBe(0);
 	});
 
-	// SKIPPED 2026-05-10: processKrispMeetingNotes is stubbed pending attribution decision.
-	it.skip('searches RF by email when not in cache', async () => {
+	it('searches RF by email when not in cache', async () => {
 		const searchResult = {
 			id: 12345,
 			first_name: 'Tony',
@@ -998,8 +1046,8 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 					start_date: '2026-03-30T14:00:00Z',
 					duration: 900,
 					participants: [
-						{ email: 'owner@example.com', name: 'Joel' },
-						{ email: 'tony@new.com', name: 'Tony' },
+						{ email: 'owner@example.com', id: 'acct-1', first_name: 'Joel', last_name: 'Haines' },
+						{ email: 'tony@new.com', id: null, first_name: null, last_name: null },
 					],
 				},
 				content: [{ title: 'Summary', description: 'Great call.' }],
@@ -1030,6 +1078,57 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 		// Note should have been posted
 		const noteCalls = findCalls(calls, '/candidate/notes/add');
 		expect(noteCalls.length).toBe(1);
+	});
+
+	it('attributes the note to the owner (Joel) when no consultant resolves', async () => {
+		const calls = mockFetch([
+			rfAddNoteRoute(),
+		]);
+
+		await env.SYNC_STATE.put('email:candidate@example.com', '12345');
+		await env.SYNC_STATE.delete('krisp:meeting-unreg');
+
+		const krispPayload = {
+			event: 'summary_generated',
+			data: {
+				meeting: {
+					id: 'meeting-unreg',
+					title: 'Call hosted by an unregistered consultant',
+					url: 'https://krisp.ai/meeting/unreg',
+					start_date: '2026-03-30T14:00:00Z',
+					duration: 1800,
+					participants: [
+						// Consultant: account-holder shape (id/first_name) but email NOT registered.
+						{ email: 'unregistered.consultant@krisp.example', id: 'acct-9', first_name: 'Alice', last_name: 'X' },
+						// Candidate: guest shape.
+						{ email: 'candidate@example.com', id: null, first_name: null, last_name: null },
+					],
+				},
+				content: [{ title: 'Summary', description: 'Discussed the role.' }],
+			},
+		};
+
+		const request = new Request('http://example.com/webhook/krisp', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Krisp-Webhook-Token': env.KRISP_WEBHOOK_SECRET,
+			},
+			body: JSON.stringify(krispPayload),
+		});
+
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+
+		// Note posted to the candidate, attributed to the owner (Joel, 900001) via fallback.
+		const noteCalls = findCalls(calls, '/candidate/notes/add');
+		expect(noteCalls.length).toBe(1);
+		const noteBody = JSON.parse(noteCalls[0].opts.body);
+		expect(noteBody.created_by).toBe(900001);
+		expect(noteBody.id).toBe(12345);
 	});
 });
 

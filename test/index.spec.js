@@ -3,12 +3,12 @@ import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { applyUsersMigration } from './helpers/users-migrate.js';
 import { _resetCacheForTests } from '../src/users.js';
 import worker from '../src';
-import { extractCandidateEmail, formatKrispNotesAsHtml } from '../src/krisp.js';
+import { resolveKrispAttribution, formatKrispNotesAsHtml } from '../src/krisp.js';
 import { createRFCustomActivity, extractRFIdFromDialpadContact, findEligibleJob, convertDialpadContactToRFUpdate, findJobsForStageMove } from '../src/rf-client.js';
 import {
 	isOutboundCall, truncateTranscript, formatActivityTime, classifyColdCall, mergeTag, addHtmlLineBreaks
 } from '../src/cold-call.js';
-import { isMonitoredDialpadUser, getRFUserIdByDialpadId } from '../src/users.js';
+import { isMonitoredDialpadUser, getRFUserIdByDialpadId, getUserByEmail } from '../src/users.js';
 import { enrichPerson, searchPeople, normalizeOrgName, verifyApolloMatch, filterSearchResults, scoreEnrichedCandidate } from '../src/apollo-client.js';
 import { isJoelCandidate, enrichCandidate } from '../src/enrichment.js';
 import { signCallerIdAlias, verifyCallerIdAlias } from '../src/dialpad-aliases.js';
@@ -117,39 +117,83 @@ describe('Manual RF webhook handler', () => {
 // Krisp helper unit tests
 // ---------------------------------------------------------------------------
 
-describe('extractCandidateEmail', () => {
-	it('returns non-Joel email from 2-person participant array', () => {
+describe('resolveKrispAttribution', () => {
+	// Joel's seeded RF id (0002) and his test krisp email (0004 maps
+	// owner@example.com → rf_user_id 900001; primary email is joel@test.local).
+	const JOEL_RF_ID = 900001;
+
+	it('resolves consultant via krisp_emails alias; candidate is the guest', async () => {
 		const participants = [
-			{ email: 'owner@example.com' },
-			{ email: 'candidate@example.com' },
+			{ email: 'owner@example.com', id: 'acct-1', first_name: 'Joel', last_name: 'Haines' },
+			{ email: 'candidate@example.com', id: null, first_name: null, last_name: null },
 		];
-		expect(extractCandidateEmail(participants)).toBe('candidate@example.com');
+		const { consultant, candidateEmail } = await resolveKrispAttribution(participants, env);
+		expect(consultant?.rfUserId).toBe(JOEL_RF_ID);
+		expect(candidateEmail).toBe('candidate@example.com');
 	});
 
-	it('returns null when only Joel is present', () => {
-		const participants = [{ email: 'owner@example.com' }];
-		expect(extractCandidateEmail(participants)).toBeNull();
-	});
-
-	it('returns first non-Joel email in 3+ participant group calls', () => {
+	it('resolves consultant via primary team email', async () => {
 		const participants = [
-			{ email: 'owner@example.com' },
-			{ email: 'first-candidate@example.com' },
-			{ email: 'second-person@example.com' },
+			{ email: 'joel@test.local', id: 'acct-1', first_name: 'Joel' },
+			{ email: 'cand@example.com', id: null, first_name: null },
 		];
-		expect(extractCandidateEmail(participants)).toBe('first-candidate@example.com');
+		const { consultant, candidateEmail } = await resolveKrispAttribution(participants, env);
+		expect(consultant?.rfUserId).toBe(JOEL_RF_ID);
+		expect(candidateEmail).toBe('cand@example.com');
 	});
 
-	it('returns null for empty array', () => {
-		expect(extractCandidateEmail([])).toBeNull();
+	it('does NOT mistake an unregistered consultant for the candidate (BLOCKER regression)', async () => {
+		// The consultant has id/first_name populated (Krisp account holder) but their
+		// email is not registered; the candidate is the guest (id/first_name null).
+		const participants = [
+			{ email: 'unregistered.consultant@krisp.example', id: 'acct-9', first_name: 'Alice', last_name: 'X' },
+			{ email: 'real-candidate@example.com', id: null, first_name: null, last_name: null },
+		];
+		const { consultant, candidateEmail } = await resolveKrispAttribution(participants, env);
+		expect(consultant).toBeNull();
+		expect(candidateEmail).toBe('real-candidate@example.com');
 	});
 
-	it('returns null for null input', () => {
-		expect(extractCandidateEmail(null)).toBeNull();
+	it('picks the first guest in a 3+ participant group call', async () => {
+		const participants = [
+			{ email: 'owner@example.com', id: 'acct-1', first_name: 'Joel' },
+			{ email: 'guest-1@example.com', id: null, first_name: null },
+			{ email: 'guest-2@example.com', id: null, first_name: null },
+		];
+		const { candidateEmail } = await resolveKrispAttribution(participants, env);
+		expect(candidateEmail).toBe('guest-1@example.com');
 	});
 
-	it('returns null for undefined input', () => {
-		expect(extractCandidateEmail(undefined)).toBeNull();
+	it('never returns the owner as the candidate (only the consultant present)', async () => {
+		const participants = [{ email: 'owner@example.com', id: 'acct-1', first_name: 'Joel' }];
+		const { consultant, candidateEmail } = await resolveKrispAttribution(participants, env);
+		expect(consultant?.rfUserId).toBe(JOEL_RF_ID);
+		expect(candidateEmail).toBeNull();
+	});
+
+	it('returns nulls for empty / null / undefined input', async () => {
+		expect(await resolveKrispAttribution([], env)).toEqual({ consultant: null, candidateEmail: null });
+		expect(await resolveKrispAttribution(null, env)).toEqual({ consultant: null, candidateEmail: null });
+		expect(await resolveKrispAttribution(undefined, env)).toEqual({ consultant: null, candidateEmail: null });
+	});
+});
+
+describe('users registry — krisp_emails resolution', () => {
+	it('resolves a teammate by their krisp_emails alias', async () => {
+		const user = await getUserByEmail(env, 'owner@example.com');
+		expect(user?.rfUserId).toBe(900001);
+	});
+
+	it('primary email wins over a colliding krisp_emails alias', async () => {
+		// Give Alice a krisp_email that collides with Joel's PRIMARY email, then
+		// assert the primary owner (Joel) still wins on that key.
+		await env.USERS_DB
+			.prepare("UPDATE users SET krisp_emails = '[\"joel@test.local\"]' WHERE first_name = 'Alice'")
+			.run();
+		_resetCacheForTests();
+		const user = await getUserByEmail(env, 'joel@test.local');
+		expect(user?.firstName).toBe('Joel');
+		expect(user?.rfUserId).toBe(900001);
 	});
 });
 
