@@ -2,7 +2,7 @@
  * Krisp webhook helpers
  *
  * Utilities for resolving consultant/candidate attribution and formatting
- * meeting notes from Krisp summary_generated webhook payloads.
+ * meeting notes from Krisp note_generated webhook payloads.
  */
 
 import { getUserByEmail } from './users.js';

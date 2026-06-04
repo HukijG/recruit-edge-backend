@@ -893,7 +893,7 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 		await env.SYNC_STATE.delete('krisp:meeting-001');
 
 		const krispPayload = {
-			event: 'summary_generated',
+			event: 'note_generated',
 			data: {
 				meeting: {
 					id: 'meeting-001',
@@ -950,7 +950,7 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 		await env.SYNC_STATE.delete('krisp:meeting-fail');
 
 		const krispPayload = {
-			event: 'summary_generated',
+			event: 'note_generated',
 			data: {
 				meeting: {
 					id: 'meeting-fail',
@@ -994,7 +994,7 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 		await env.SYNC_STATE.put('krisp:meeting-002', 'true');
 
 		const krispPayload = {
-			event: 'summary_generated',
+			event: 'note_generated',
 			data: {
 				meeting: { id: 'meeting-002', title: 'Duplicate' },
 				content: [{ title: 'Summary', body: 'test' }],
@@ -1037,7 +1037,7 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 		await env.SYNC_STATE.delete('email:tony@new.com');
 
 		const krispPayload = {
-			event: 'summary_generated',
+			event: 'note_generated',
 			data: {
 				meeting: {
 					id: 'meeting-003',
@@ -1089,7 +1089,7 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 		await env.SYNC_STATE.delete('krisp:meeting-unreg');
 
 		const krispPayload = {
-			event: 'summary_generated',
+			event: 'note_generated',
 			data: {
 				meeting: {
 					id: 'meeting-unreg',
@@ -1587,7 +1587,7 @@ describe('E2E: Auth failures', () => {
 				'Content-Type': 'application/json',
 				'X-Krisp-Webhook-Token': 'wrong-token',
 			},
-			body: JSON.stringify({ event: 'summary_generated' }),
+			body: JSON.stringify({ event: 'note_generated' }),
 		});
 		const ctx = createExecutionContext();
 		const response = await worker.fetch(request, env, ctx);

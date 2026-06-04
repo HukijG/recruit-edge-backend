@@ -293,7 +293,7 @@ describe('Krisp webhook handler', () => {
 		const request = new Request('http://example.com/webhook/krisp', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ event: 'summary_generated' }),
+			body: JSON.stringify({ event: 'note_generated' }),
 		});
 		const ctx = createExecutionContext();
 		const response = await worker.fetch(request, env, ctx);
@@ -308,7 +308,7 @@ describe('Krisp webhook handler', () => {
 				'Content-Type': 'application/json',
 				'X-Krisp-Webhook-Token': 'wrong-secret',
 			},
-			body: JSON.stringify({ event: 'summary_generated' }),
+			body: JSON.stringify({ event: 'note_generated' }),
 		});
 		const ctx = createExecutionContext();
 		const response = await worker.fetch(request, env, ctx);

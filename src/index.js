@@ -922,7 +922,7 @@ async function handleKrispWebhook(request, env) {
 
     const payload = await request.json();
 
-    if (payload.event !== 'summary_generated') {
+    if (payload.event !== 'note_generated') {
       console.log({ message: `[Krisp] → ignored event: ${payload.event}`, source: 'krisp', event: payload.event });
       return new Response('OK', { status: 200 });
     }
@@ -958,7 +958,7 @@ async function handleKrispWebhook(request, env) {
     if (notePosted) {
       // 7 days: notes are immutable once posted, so the idempotency key has no
       // reason to expire quickly. Krisp emits multiple events per meeting and
-      // can re-deliver `summary_generated` on edits/retries — a short TTL would
+      // can re-deliver `note_generated` on edits/retries — a short TTL would
       // let a late re-delivery double-post the note.
       await env.SYNC_STATE.put(dedupeKey, 'true', { expirationTtl: 604800 });
     }

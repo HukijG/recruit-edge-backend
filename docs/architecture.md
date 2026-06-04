@@ -375,10 +375,10 @@ If eligible, `moveToCallBooked()` calls `POST /api/external/candidate/move-to-st
 
 ## Data Flow: Krisp → RF
 
-**Trigger**: Krisp fires `summary_generated` webhook after a meeting ends and the AI summary is ready.
+**Trigger**: Krisp fires the `note_generated` webhook after a meeting ends and the AI meeting notes are ready.
 
 ```
-Krisp webhook (summary_generated)
+Krisp webhook (note_generated)
   → POST /webhook/krisp
   → Verify X-Krisp-Webhook-Token (fail closed)
   → Check KV dedup: krisp:{meeting.id} — skip if already processed (7-day TTL)
