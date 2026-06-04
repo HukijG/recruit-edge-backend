@@ -927,6 +927,11 @@ async function handleKrispWebhook(request, env) {
       return new Response('OK', { status: 200 });
     }
 
+    // TEMP DIAGNOSTIC (remove after capturing one real note_generated payload):
+    // the webhook body is captured only as a size in OTel, so dump the raw shape
+    // to confirm the note_generated structure + how the note content is keyed.
+    console.log({ message: '[Krisp][DEBUG] raw note_generated payload', source: 'krisp', raw: JSON.stringify(payload) });
+
     const meeting = payload.data?.meeting;
     const content = payload.data?.content;
 
