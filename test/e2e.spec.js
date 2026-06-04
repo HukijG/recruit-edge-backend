@@ -907,10 +907,7 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 						{ email: 'candidate@example.com', id: null, first_name: null, last_name: null },
 					],
 				},
-				content: [
-					{ title: 'Summary', description: 'Discussed the role at Eon.io.' },
-					{ title: 'Action Items', description: 'Send CV by Friday.' },
-				],
+				raw_content: '## **Summary**\n\n- Discussed the role at Eon.io.\n\n## **Action Items**\n\n- Send CV by Friday.',
 			},
 		};
 
@@ -963,7 +960,7 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 						{ email: 'candidate@example.com', id: null, first_name: null },
 					],
 				},
-				content: [{ title: 'Summary', description: 'Discussed the role.' }],
+				raw_content: '## **Summary**\n\n- Discussed the role.',
 			},
 		};
 
@@ -997,7 +994,7 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 			event: 'note_generated',
 			data: {
 				meeting: { id: 'meeting-002', title: 'Duplicate' },
-				content: [{ title: 'Summary', body: 'test' }],
+				raw_content: '## **Summary**\n\n- test',
 			},
 		};
 
@@ -1050,7 +1047,7 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 						{ email: 'tony@new.com', id: null, first_name: null, last_name: null },
 					],
 				},
-				content: [{ title: 'Summary', description: 'Great call.' }],
+				raw_content: '## **Summary**\n\n- Great call.',
 			},
 		};
 
@@ -1104,7 +1101,7 @@ describe('E2E: Krisp → RF (meeting notes)', () => {
 						{ email: 'candidate@example.com', id: null, first_name: null, last_name: null },
 					],
 				},
-				content: [{ title: 'Summary', description: 'Discussed the role.' }],
+				raw_content: '## **Summary**\n\n- Discussed the role.',
 			},
 		};
 

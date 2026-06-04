@@ -63,50 +63,129 @@ export async function resolveKrispAttribution(participants, env) {
 }
 
 /**
- * Format Krisp meeting notes as an HTML string suitable for posting
- * as a RecruiterFlow candidate note.
+ * Format Krisp meeting notes as an HTML string suitable for posting as a
+ * RecruiterFlow candidate note.
  *
- * @param {Object} meeting  - data.meeting from the Krisp webhook
- * @param {Array}  content  - data.content from the Krisp webhook
+ * `note_generated` delivers the notes as a single markdown string
+ * (`data.raw_content`): `##`/`###` headings, `- ` bullets, `**bold**`, `---`
+ * rules and emoji metadata lines. We render that subset to the small HTML tag
+ * set RF notes support (`<b>`, `<br>`, `<ul>`/`<li>`, `<a>`), prefixed with a
+ * clickable Krisp link + meeting metadata header.
+ *
+ * @param {Object} meeting     - data.meeting from the Krisp webhook
+ * @param {string} rawContent  - data.raw_content (markdown) from the webhook
  * @returns {string} HTML string
  */
-export function formatKrispNotesAsHtml(meeting, content) {
+export function formatKrispNotesAsHtml(meeting, rawContent) {
   const time = formatTime(meeting.start_date);
   const date = formatDate(meeting.start_date);
   const duration = Math.round((meeting.duration || 0) / 60);
 
   const lines = [];
 
-  // Outline header
-  lines.push('<b>Outline</b><br>');
+  // Metadata header: clickable Krisp link + when/how-long.
   lines.push(
-    `\u{1F4CB} <a href="${escapeHtml(meeting.url)}">${escapeHtml(meeting.title)} Call Notes</a><br>`
+    `\u{1F4CB} <a href="${escapeHtml(meeting.url || '')}">${escapeHtml(meeting.title || 'Krisp Meeting')} Call Notes</a><br>`
   );
-  lines.push(
-    `\u{1F55E} Started at ${time} on ${date}, lasted ${duration}m<br><br>`
-  );
+  lines.push(`\u{1F55E} Started at ${time} on ${date}, lasted ${duration}m<br><br>`);
 
-  // Content sections
-  if (Array.isArray(content)) {
-    for (const section of content) {
-      const title = stripMarkdownBold(section.title || '');
-      lines.push(`<b>${escapeHtml(title)}</b>`);
-
-      const bullets = (section.description || '')
-        .split('\n')
-        .filter((line) => line.trim() !== '');
-
-      if (bullets.length > 0) {
-        lines.push('<ul>');
-        for (const bullet of bullets) {
-          lines.push(`<li>${escapeHtml(bullet.trim())}</li>`);
-        }
-        lines.push('</ul>');
-      }
-    }
-  }
+  // Body: the meeting notes markdown rendered to HTML. raw_content normally
+  // leads with the meeting title as a heading — drop it so it isn't repeated
+  // under the header link above.
+  lines.push(markdownToHtml(stripLeadingTitleHeading(rawContent || '', meeting.title)));
 
   return lines.join('\n');
+}
+
+/**
+ * Remove a leading ATX heading from `md` when its text equals `title` — Krisp's
+ * `raw_content` opens with the meeting title as `## **Title**`, which the
+ * metadata header link already shows. No-op if the first content line isn't a
+ * matching heading.
+ */
+function stripLeadingTitleHeading(md, title) {
+  if (!title) return md;
+  const lines = md.split('\n');
+  let i = 0;
+  while (i < lines.length && !lines[i].trim()) i++;
+  const heading = lines[i]?.trim().match(/^#{1,6}\s+(.*)$/);
+  if (heading && stripMarkdownBold(heading[1]).trim() === title.trim()) {
+    lines.splice(i, 1);
+    return lines.join('\n');
+  }
+  return md;
+}
+
+/**
+ * Render the markdown subset Krisp emits in `raw_content` to the HTML tag set
+ * RecruiterFlow notes support. Handles ATX headings (`#`..`######`), unordered
+ * list items (`- `/`* `), horizontal rules (`---`/`***`), inline `**bold**`,
+ * and treats every other non-blank line as a paragraph. All text is
+ * HTML-escaped before tag insertion.
+ *
+ * Krisp separates every bullet with a blank line, so a blank line keeps an open
+ * list open when the next non-blank line is another bullet (look-ahead) —
+ * otherwise each bullet would render as its own single-item `<ul>`.
+ */
+function markdownToHtml(md) {
+  const lines = md.split('\n');
+  const out = [];
+  let inList = false;
+  const closeList = () => {
+    if (inList) {
+      out.push('</ul>');
+      inList = false;
+    }
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+
+    if (!line) {
+      // Keep the list open across blank lines that sit between bullets.
+      let j = i + 1;
+      while (j < lines.length && !lines[j].trim()) j++;
+      if (!/^[-*]\s+/.test(j < lines.length ? lines[j].trim() : '')) closeList();
+      continue;
+    }
+    if (/^([-*])\1{2,}$/.test(line) || line === '---' || line === '***') {
+      closeList();
+      out.push('<br>');
+      continue;
+    }
+
+    const heading = line.match(/^#{1,6}\s+(.*)$/);
+    if (heading) {
+      closeList();
+      out.push(`<b>${escapeHtml(stripMarkdownBold(heading[1]).trim())}</b><br>`);
+      continue;
+    }
+
+    const bullet = line.match(/^[-*]\s+(.*)$/);
+    if (bullet) {
+      if (!inList) {
+        out.push('<ul>');
+        inList = true;
+      }
+      out.push(`<li>${inlineMarkdownToHtml(bullet[1])}</li>`);
+      continue;
+    }
+
+    closeList();
+    out.push(`${inlineMarkdownToHtml(line)}<br>`);
+  }
+
+  closeList();
+  return out.join('\n');
+}
+
+/**
+ * Escape HTML, then convert inline `**bold**` spans to `<b>…</b>`. Escaping
+ * first means candidate-supplied `<`/`>`/`&` can never inject markup; the
+ * `**` markers survive escaping and are converted afterward.
+ */
+function inlineMarkdownToHtml(text) {
+  return escapeHtml(text).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
 }
 
 // ---------------------------------------------------------------------------

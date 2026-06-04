@@ -205,82 +205,127 @@ describe('formatKrispNotesAsHtml', () => {
 		duration: 1800, // 30 minutes
 	};
 
-	const twoSections = [
-		{
-			title: '**Key Discussion Points**',
-			description: 'Talked about roadmap\nDiscussed hiring priorities',
-		},
-		{
-			title: '**Action Items**',
-			description: 'Follow up with candidate\nSchedule next round',
-		},
-	];
+	// note_generated delivers notes as a single markdown string (data.raw_content).
+	const markdownContent = [
+		'## **Key Discussion Points**',
+		'',
+		'- Talked about roadmap',
+		'- Discussed hiring priorities',
+		'',
+		'---',
+		'',
+		'### Action Items',
+		'',
+		'- Follow up with candidate',
+		'- Schedule next round',
+	].join('\n');
 
-	it('formats a basic meeting with 2 content sections into HTML', () => {
-		const html = formatKrispNotesAsHtml(baseMeeting, twoSections);
+	it('renders markdown raw_content into HTML with a metadata header', () => {
+		const html = formatKrispNotesAsHtml(baseMeeting, markdownContent);
 
-		// Outline header
-		expect(html).toContain('<b>Outline</b>');
-
-		// Meeting title wrapped in <a> tag pointing to Krisp URL
+		// Clickable Krisp link + duration header — and NO "Outline" label anymore.
 		expect(html).toContain('<a href="https://app.krisp.ai/meetings/abc123">Engineering Sync Call Notes</a>');
-
-		// Duration in minutes
 		expect(html).toContain('30m');
+		expect(html).not.toContain('Outline');
 
-		// Section titles rendered as <b> tags, without ** markers
+		// Headings rendered as <b>, with ** markers stripped.
 		expect(html).toContain('<b>Key Discussion Points</b>');
 		expect(html).toContain('<b>Action Items</b>');
 		expect(html).not.toContain('**');
 
-		// Bullet points rendered as <li> tags
+		// Bullets rendered as a <ul> of <li>.
+		expect(html).toContain('<ul>');
+		expect(html).toContain('</ul>');
 		expect(html).toContain('<li>Talked about roadmap</li>');
 		expect(html).toContain('<li>Discussed hiring priorities</li>');
 		expect(html).toContain('<li>Follow up with candidate</li>');
 		expect(html).toContain('<li>Schedule next round</li>');
 	});
 
-	it('does not produce empty <li></li> tags from blank lines in descriptions', () => {
-		const sectionsWithBlanks = [
-			{
-				title: 'Notes',
-				description: 'First point\n\n\nSecond point\n\n',
-			},
-		];
-		const html = formatKrispNotesAsHtml(baseMeeting, sectionsWithBlanks);
+	it('converts inline **bold** within paragraphs and bullets', () => {
+		const md = [
+			'Candidate is a **Principal Engineer** at Acme.',
+			'',
+			'- Wants **fully remote** work',
+		].join('\n');
+		const html = formatKrispNotesAsHtml(baseMeeting, md);
 
-		expect(html).not.toContain('<li></li>');
-		expect(html).toContain('<li>First point</li>');
-		expect(html).toContain('<li>Second point</li>');
+		expect(html).toContain('Candidate is a <b>Principal Engineer</b> at Acme.<br>');
+		expect(html).toContain('<li>Wants <b>fully remote</b> work</li>');
+		expect(html).not.toContain('**');
 	});
 
-	it('escapes special HTML characters in titles and descriptions', () => {
+	it('does not emit empty <li> or stray list tags from blank lines', () => {
+		const md = 'First point\n\n\n- bullet one\n\n- bullet two\n\n';
+		const html = formatKrispNotesAsHtml(baseMeeting, md);
+
+		expect(html).not.toContain('<li></li>');
+		expect(html).toContain('<li>bullet one</li>');
+		expect(html).toContain('<li>bullet two</li>');
+	});
+
+	it('escapes special HTML characters in the title and note body', () => {
 		const meeting = {
 			...baseMeeting,
 			title: 'R&D <Team> "Sync"',
 			url: 'https://app.krisp.ai/meetings/abc&123',
 		};
-		const sections = [
-			{
-				title: 'Q&A Session',
-				description: 'Discussed <script> injection & "quotes"',
-			},
-		];
-		const html = formatKrispNotesAsHtml(meeting, sections);
+		const md = '## Q&A Session\n\n- Discussed <script> injection & "quotes"';
+		const html = formatKrispNotesAsHtml(meeting, md);
 
-		// Title should have & escaped
+		// Title escaped in the header link.
 		expect(html).toContain('R&amp;D &lt;Team&gt; &quot;Sync&quot; Call Notes');
-
-		// URL should have & escaped in href attribute
+		// URL & escaped in the href attribute.
 		expect(html).toContain('href="https://app.krisp.ai/meetings/abc&amp;123"');
-
-		// Section title should have & escaped
+		// Heading escaped.
 		expect(html).toContain('<b>Q&amp;A Session</b>');
-
-		// Description should have special chars escaped
+		// Body special chars escaped — no raw markup injection.
 		expect(html).toContain('&lt;script&gt;');
-		expect(html).toContain('&amp;');
 		expect(html).toContain('&quot;quotes&quot;');
+	});
+
+	it('groups blank-line-separated bullets into a single <ul> (Krisp output shape)', () => {
+		// Krisp separates every bullet with a blank line.
+		const md = '- first\n\n- second\n\n- third';
+		const html = formatKrispNotesAsHtml(baseMeeting, md);
+
+		// Exactly one list open/close, not one <ul> per bullet.
+		expect(html.match(/<ul>/g)).toHaveLength(1);
+		expect(html.match(/<\/ul>/g)).toHaveLength(1);
+		expect(html).toContain('<li>first</li>');
+		expect(html).toContain('<li>second</li>');
+		expect(html).toContain('<li>third</li>');
+	});
+
+	it('escapes raw HTML tags injected in the note body (XSS regression)', () => {
+		const md = '- <img src=x onerror=alert(1)> and <script>alert(2)</script>';
+		const html = formatKrispNotesAsHtml(baseMeeting, md);
+
+		// No live tags from candidate/AI content survive into the output.
+		expect(html).not.toContain('<img');
+		expect(html).not.toContain('<script>');
+		expect(html).toContain('&lt;img');
+		expect(html).toContain('&lt;script&gt;');
+	});
+
+	it('leaves unbalanced ** literal without emitting a stray <b>', () => {
+		const md = 'Candidate wants **fully remote with no close marker';
+		const html = formatKrispNotesAsHtml(baseMeeting, md);
+
+		expect(html).not.toContain('<b>fully remote');
+		expect(html).toContain('**fully remote');
+	});
+
+	it('drops the leading title heading from raw_content (no duplicate title)', () => {
+		const md = '## **Engineering Sync**\n\n## Discussion\n\n- a point';
+		const meeting = { ...baseMeeting, title: 'Engineering Sync' };
+		const html = formatKrispNotesAsHtml(meeting, md);
+
+		// Title appears once (in the header link), not also as a body heading.
+		expect(html).toContain('Engineering Sync Call Notes');
+		expect(html).not.toContain('<b>Engineering Sync</b>');
+		// Other headings still render.
+		expect(html).toContain('<b>Discussion</b>');
 	});
 });
 

@@ -389,9 +389,9 @@ Krisp webhook (note_generated)
   → Find RF candidate (two-tier lookup):
       Tier 1: Email cache lookup (lookupByEmail)
       Tier 2: RF search API (searchRFCandidateByEmail), then cacheCandidate on hit
-  → Format meeting content as HTML note (formatKrispNotesAsHtml)
+  → Render data.raw_content (markdown) → HTML note (formatKrispNotesAsHtml)
   → POST /candidate/notes/add to RF with created_by = consultant.rfUserId
-      (fallback: owner Joel's rfUserId if no consultant resolved, + warning log)
+      (fallback: the owner's rfUserId if no consultant resolved, + warning log)
   → On success: set dedup flag krisp:{meeting.id} = "true" (7-day TTL)
 ```
 
@@ -404,6 +404,16 @@ collision) maps those aliases. If no participant resolves to a team member
 with a warning, and the candidate is identified via the Krisp structural
 signal (`id`/`first_name` populated = consultant; null = guest) so an
 unregistered consultant is never mistaken for the candidate.
+
+**Payload**: the `note_generated` event carries the notes as a single markdown
+string in `data.raw_content` (the retired `summary_generated` event used a
+`data.content[]` section array). `formatKrispNotesAsHtml` renders the markdown
+subset Krisp emits — `#`..`######` headings, `- `/`* ` bullets, `**bold**`,
+`---` rules — to RF's supported tag set (`<b>`, `<br>`, `<ul>`/`<li>`, `<a>`),
+prefixed with a clickable Krisp link + meeting metadata. A structured
+`data.sections` object (`action_items`/`key_points`/`outline`) also ships but is
+frequently null; `raw_content` is the source of truth. See
+`docs/references/krisp_example_payload.json`.
 
 **Scope**: One-way, read-only integration. Krisp data flows to RF as candidate notes only. No data flows back to Krisp, no Dialpad sync triggered, no cache updates needed.
 

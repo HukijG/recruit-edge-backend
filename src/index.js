@@ -927,13 +927,10 @@ async function handleKrispWebhook(request, env) {
       return new Response('OK', { status: 200 });
     }
 
-    // TEMP DIAGNOSTIC (remove after capturing one real note_generated payload):
-    // the webhook body is captured only as a size in OTel, so dump the raw shape
-    // to confirm the note_generated structure + how the note content is keyed.
-    console.log({ message: '[Krisp][DEBUG] raw note_generated payload', source: 'krisp', raw: JSON.stringify(payload) });
-
     const meeting = payload.data?.meeting;
-    const content = payload.data?.content;
+    // note_generated delivers the meeting notes as a single markdown string in
+    // `data.raw_content` (the old `data.content` section array is gone).
+    const rawContent = payload.data?.raw_content;
 
     if (!meeting || !meeting.id) {
       return new Response('Bad Request', { status: 400 });
@@ -955,10 +952,10 @@ async function handleKrispWebhook(request, env) {
       startDate: meeting.start_date,
       duration: meeting.duration,
       participants: meeting.participants,
-      contentSections: content?.length || 0,
+      contentChars: rawContent?.length || 0,
     });
 
-    const notePosted = await processKrispMeetingNotes(meeting, content, env);
+    const notePosted = await processKrispMeetingNotes(meeting, rawContent, env);
 
     if (notePosted) {
       // 7 days: notes are immutable once posted, so the idempotency key has no
@@ -980,7 +977,8 @@ async function handleKrispWebhook(request, env) {
 }
 
 /**
- * Post a Krisp meeting summary to the matching RF candidate as an HTML note.
+ * Post a Krisp meeting's notes (`data.raw_content` markdown) to the matching
+ * RF candidate as an HTML note.
  *
  * Attribution: the consultant on the call (resolved from participants by team
  * membership via `resolveKrispAttribution`). If no participant resolves to a
@@ -990,7 +988,7 @@ async function handleKrispWebhook(request, env) {
  *
  * @returns {Promise<boolean>} true if a note was posted (drives the dedup write).
  */
-async function processKrispMeetingNotes(meeting, content, env) {
+async function processKrispMeetingNotes(meeting, rawContent, env) {
   const { consultant, candidateEmail } = await resolveKrispAttribution(meeting.participants, env);
 
   if (!candidateEmail) {
@@ -1003,8 +1001,8 @@ async function processKrispMeetingNotes(meeting, content, env) {
     return false;
   }
 
-  if (!Array.isArray(content) || content.length === 0) {
-    console.log({ message: '[Krisp] → skipped: no content sections', source: 'krisp', meetingId: meeting.id });
+  if (typeof rawContent !== 'string' || !rawContent.trim()) {
+    console.log({ message: '[Krisp] → skipped: empty raw_content', source: 'krisp', meetingId: meeting.id });
     return false;
   }
 
@@ -1053,7 +1051,7 @@ async function processKrispMeetingNotes(meeting, content, env) {
     return false;
   }
 
-  const htmlContent = formatKrispNotesAsHtml(meeting, content);
+  const htmlContent = formatKrispNotesAsHtml(meeting, rawContent);
   await addRFCandidateNote(candidateId, htmlContent, createdBy, env);
 
   console.log({
