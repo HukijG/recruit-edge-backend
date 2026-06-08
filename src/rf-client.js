@@ -43,6 +43,21 @@ export class RFTransientError extends RFError {
 }
 
 /**
+ * Thrown when an update fails with a 409 "phone/email already exists" conflict
+ * that the dedupe handler could NOT resolve — i.e. we couldn't locate the other
+ * candidate that owns the colliding value (RF search miss / normalization gap),
+ * so we couldn't free it for the target. Distinct from a plain RFError so callers
+ * (the calendar flow in particular) can recognise it and degrade gracefully —
+ * continue stage movement / Dialpad upsert / cache — instead of dying.
+ */
+export class RFContactConflictUnresolvedError extends RFError {
+  constructor(message, opts) {
+    super(message, opts);
+    this.name = 'RFContactConflictUnresolvedError';
+  }
+}
+
+/**
  * Maximum Retry-After we will surface to callers. RFC 7231 allows seconds or
  * an HTTP-date; anything beyond 60s is almost certainly a server-side bug, so
  * we cap to avoid asking callers to back off indefinitely.
@@ -127,9 +142,26 @@ export function extractRFIdFromDialpadContact(dialpadContactId) {
 }
 
 /**
- * Update candidate in RecruiterFlow
+ * Update candidate in RecruiterFlow.
+ *
+ * Universal non-destructive dedupe is built in: RF enforces uniqueness on phone
+ * and email, so an update that adds a value already owned by a DIFFERENT
+ * candidate fails with `409 "A profile with this Phone Number/Email already
+ * exists"`. That collision is almost always a stale duplicate record (added with
+ * a wrong/missing LinkedIn so it never deduped). The target record is canonical
+ * (it carries the correct LinkedIn from the extension), so we trust it: strip the
+ * value from the other record and retry. See `resolveContactFieldConflict`.
+ *
+ * @param {string|number} candidateId
+ * @param {object} updateData
+ * @param {object} env
+ * @param {{ dedupe?: boolean, _depth?: number }} [options] - `dedupe:false`
+ *        disables the conflict handler (used for the internal strip-update).
+ *        `_depth` bounds resolution passes so a record colliding on BOTH phone
+ *        and email gets each freed in turn, while still terminating.
  */
-export async function updateRFCandidate(candidateId, updateData, env) {
+export async function updateRFCandidate(candidateId, updateData, env, options = {}) {
+  const { dedupe = true, _depth = 0 } = options;
   const rfApiKey = env.RF_API_KEY;
   const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
 
@@ -168,11 +200,293 @@ export async function updateRFCandidate(candidateId, updateData, env) {
     candidateId,
   });
 
-  if (!response.ok) {
-    throw classifyRFResponse(response, responseText);
+  if (response.ok) {
+    return JSON.parse(responseText);
   }
 
-  return JSON.parse(responseText);
+  const error = classifyRFResponse(response, responseText);
+
+  // Phone/email uniqueness conflict → run the dedupe handler, then retry. Bound
+  // to 2 passes (one per field: phone + email) so it always terminates.
+  const conflictField = (dedupe && _depth < 2) ? detectContactConflictField(error, updateData) : null;
+  if (conflictField) {
+    await resolveContactFieldConflict({ targetId: candidateId, field: conflictField, updateData, env });
+    // Owner(s) stripped — retry. A second collision (the other field) gets one
+    // more resolution pass; depth 2 then re-enters this same branch and, finding
+    // it can't resolve further, throws the typed unresolved error below.
+    return await updateRFCandidate(candidateId, updateData, env, { dedupe, _depth: _depth + 1 });
+  }
+
+  // A contact 409 we won't auto-resolve (passes exhausted, or the strip didn't
+  // free the value) surfaces as the typed unresolved error — never the raw
+  // RFError — so every caller can discriminate it from generic RF failures and
+  // degrade gracefully. (dedupe:false internal strip-updates skip this and throw
+  // raw, which is correct: a strip-update should never hit a uniqueness 409.)
+  if (dedupe && detectContactConflictField(error, updateData)) {
+    throw new RFContactConflictUnresolvedError(
+      `RF contact conflict for candidate=${candidateId} unresolved after ${_depth} dedupe pass(es)`,
+      { status: error.status, body: error.body },
+    );
+  }
+
+  throw error;
+}
+
+// RF's exact 409 conflict messages (confirmed in production logs):
+//   {"message":"A profile with this Phone Number already exists"}
+//   {"message":"A profile with this Email already exists"}
+const RF_PHONE_CONFLICT_RE = /this phone number already exists/i;
+const RF_EMAIL_CONFLICT_RE = /this email already exists/i;
+
+/**
+ * Decide whether an RF error is a phone/email uniqueness conflict we can dedupe.
+ * Returns 'phone' | 'email' | null. Gated on the update actually having touched
+ * that field, so an unrelated 409 never triggers the (destructive-to-the-other-
+ * record) strip path.
+ */
+function detectContactConflictField(error, updateData) {
+  if (!(error instanceof RFError) || error.status !== 409) return null;
+  const body = String(error.body || error.message || '');
+  // Require the update to actually carry a non-empty value for the field — an
+  // empty array can't be the source of a uniqueness conflict, and gating on it
+  // would send the resolver looking for an owner of nothing.
+  const has = (v) => (Array.isArray(v) ? v.length > 0 : v != null);
+  if (has(updateData.phone_number) && RF_PHONE_CONFLICT_RE.test(body)) return 'phone';
+  if (has(updateData.email) && RF_EMAIL_CONFLICT_RE.test(body)) return 'email';
+  return null;
+}
+
+const FIELD_KEY = { phone: 'phone_number', email: 'email' };
+
+/** Strip a contact value (string or {phone_number|email|value}) to a bare string. */
+function extractContactValue(field, item) {
+  if (item == null) return null;
+  if (typeof item === 'string') return item;
+  if (typeof item === 'object') {
+    return field === 'phone'
+      ? (item.phone_number || item.value || null)
+      : (item.email || item.value || null);
+  }
+  return null;
+}
+
+/** Strip all non-digits — phone equality is digit-only (handles +1 / formatting). */
+function normalizePhoneDigits(p) {
+  return String(p || '').replace(/\D/g, '');
+}
+
+/**
+ * Phone equality tolerant of country-code drift: two numbers match if their full
+ * digit strings are equal OR their last 10 digits are equal (e.g. "+1 555…" vs a
+ * bare "555…"). Used by BOTH the owner search and the strip so the value we
+ * locate is the value we remove — they must agree.
+ */
+function phoneDigitsMatch(a, b) {
+  const da = normalizePhoneDigits(a);
+  const db = normalizePhoneDigits(b);
+  if (!da || !db) return false;
+  return da === db || da.slice(-10) === db.slice(-10);
+}
+
+/**
+ * Normalise one element of an RF email/phone array into the object shape the
+ * UPDATE endpoint expects ({email,is_primary} / {phone_number,type}), preserving
+ * existing primary/type flags. Returns null for empty entries.
+ */
+function normalizeContactItem(field, item) {
+  if (field === 'phone') {
+    if (typeof item === 'string') return item ? { phone_number: item, type: 1 } : null;
+    const pn = item?.phone_number || item?.value;
+    return pn ? { phone_number: pn, type: item?.type ?? 1 } : null;
+  }
+  if (typeof item === 'string') return item ? { email: item, is_primary: 0 } : null;
+  const em = item?.email || item?.value;
+  return em ? { email: em, is_primary: item?.is_primary ?? 0 } : null;
+}
+
+/**
+ * Assess how "thin" the OTHER (losing) record is. A record with no jobs and no
+ * resume file is a deletion candidate; anything richer should be merged by a
+ * human. Uses only fields reliably present on a `/candidate/get` body.
+ */
+function assessThinness(owner) {
+  const jobs = Array.isArray(owner.jobs) ? owner.jobs : [];
+  const files = Array.isArray(owner.files) ? owner.files : [];
+  const thinSignals = [];
+  if (jobs.length === 0) thinSignals.push('no_jobs');
+  if (files.length === 0) thinSignals.push('no_resume');
+  if (!owner.current_organization) thinSignals.push('no_organization');
+  if (!owner.current_title) thinSignals.push('no_title');
+  // Deletion candidate only when it has neither pipeline history nor a resume.
+  const isThin = jobs.length === 0 && files.length === 0;
+  return { isThin, thinSignals, jobCount: jobs.length, fileCount: files.length };
+}
+
+/**
+ * Non-blocking "is this the same person?" signal for the audit log. The strip
+ * happens regardless (we trust the target); this just lets a human spot a
+ * mis-fire. RF guarantees the two records have DIFFERENT LinkedIn slugs (that's
+ * why the duplicate exists), so identity leans on name + work-history overlap.
+ */
+function buildSamePersonSignal(target, owner) {
+  if (!target) return { nameMatch: 'unknown', orgOverlap: null };
+
+  const norm = (s) => String(s || '').trim().toLowerCase();
+  const tName = norm(`${target.first_name || ''} ${target.last_name || ''}`) || norm(target.name);
+  const oName = norm(`${owner.first_name || ''} ${owner.last_name || ''}`) || norm(owner.name);
+  let nameMatch = 'unknown';
+  if (tName && oName) {
+    if (tName === oName) nameMatch = 'exact';
+    else {
+      const tTok = new Set(tName.split(/\s+/).filter(Boolean));
+      const oTok = oName.split(/\s+/).filter(Boolean);
+      nameMatch = oTok.some((t) => tTok.has(t)) ? 'partial' : 'none';
+    }
+  }
+
+  // Work-history overlap proxy: current_organization + any job client company.
+  const orgs = (c) => {
+    const set = new Set();
+    if (c.current_organization) set.add(norm(c.current_organization));
+    (Array.isArray(c.jobs) ? c.jobs : []).forEach((j) => {
+      if (j?.client_company_name) set.add(norm(j.client_company_name));
+    });
+    return set;
+  };
+  const tOrgs = orgs(target);
+  const oOrgs = orgs(owner);
+  const shared = [...oOrgs].filter((o) => tOrgs.has(o));
+  const orgOverlap = (tOrgs.size && oOrgs.size) ? (shared.length > 0) : null;
+
+  return { nameMatch, orgOverlap, sharedOrgs: shared };
+}
+
+/**
+ * Resolve a phone/email uniqueness conflict non-destructively.
+ *
+ * For each colliding value in the update, find the OTHER candidate that owns it
+ * (RF's uniqueness constraint → exactly one), strip the value from that record,
+ * and emit a detailed `source:'dedupe'` audit log so a human can review/merge.
+ * We never delete the other candidate.
+ *
+ * Throws RFContactConflictUnresolvedError if no other owner can be located for
+ * any colliding value — the caller's try/catch then degrades gracefully.
+ */
+async function resolveContactFieldConflict({ targetId, field, updateData, env }) {
+  const fieldKey = FIELD_KEY[field];
+  const raw = Array.isArray(updateData[fieldKey]) ? updateData[fieldKey] : [updateData[fieldKey]];
+  const values = raw.map((v) => extractContactValue(field, v)).filter(Boolean);
+
+  // Target body is for the same-person signal only — never block on it.
+  let target = null;
+  try {
+    target = await getRFCandidate(targetId, env);
+  } catch (e) {
+    console.warn({ message: `[Dedupe] could not load target candidate=${targetId} for signal: ${e.message}`, source: 'dedupe', candidateId: targetId });
+  }
+
+  let resolvedAny = false;
+  for (const value of values) {
+    const owner = field === 'phone'
+      ? await searchRFCandidateByPhone(value, env)
+      : await searchRFCandidateByEmail(value, env);
+
+    // Not the culprit: no owner found, or the value already belongs to the target.
+    if (!owner || String(owner.id) === String(targetId)) continue;
+
+    // Pull the full owner body so we strip against the complete array and have
+    // jobs/files/org for the thinness + same-person assessment.
+    const ownerFull = await getRFCandidate(owner.id, env);
+
+    const existing = Array.isArray(ownerFull[fieldKey]) ? ownerFull[fieldKey] : [];
+    const normalized = existing.map((item) => normalizeContactItem(field, item)).filter(Boolean);
+
+    const matches = (item) => field === 'phone'
+      ? phoneDigitsMatch(item.phone_number, value)
+      : String(item.email).toLowerCase() === String(value).toLowerCase();
+
+    // VERIFY the located record genuinely holds the value before we mutate it.
+    // RF's /candidate/search is substring/loose (esp. for email — see
+    // searchRFCandidateByEmail), so a search hit is NOT proof of ownership. Strip
+    // and search must stay in lockstep: if the value isn't actually on this
+    // record, this isn't the real owner — skip it (conflict stays unresolved →
+    // caller degrades gracefully) rather than mutating the wrong candidate.
+    const removed = normalized.filter(matches);
+    if (removed.length === 0) {
+      console.warn({
+        message: `[Dedupe] search hit candidate=${owner.id} does not actually hold ${field} "${value}" (RF loose match) — skipping`,
+        source: 'dedupe',
+        flag: 'search_false_positive',
+        field,
+        value,
+        searchHitId: owner.id,
+        toCandidateId: targetId,
+      });
+      continue;
+    }
+
+    let kept = normalized.filter((item) => !matches(item));
+
+    // Keep the losing record well-formed: if we removed the primary email and
+    // survivors remain with none flagged primary, promote the first survivor so
+    // the record isn't left without a primary email.
+    if (field === 'email'
+      && removed.some((e) => e.is_primary === 1)
+      && kept.length > 0
+      && !kept.some((e) => e.is_primary === 1)) {
+      kept = kept.map((e, i) => (i === 0 ? { ...e, is_primary: 1 } : e));
+    }
+
+    // Removal can't trip the uniqueness constraint → dedupe:false (also avoids
+    // re-entry). Non-destructive: the candidate stays, only the value leaves.
+    await updateRFCandidate(owner.id, { [fieldKey]: kept }, env, { dedupe: false });
+
+    const { isThin, thinSignals, jobCount, fileCount } = assessThinness(ownerFull);
+    const samePersonSignal = buildSamePersonSignal(target, ownerFull);
+    const flag = isThin ? 'review_delete' : 'manual_merge';
+
+    // Distinctive, fully-detailed audit record (both ids + names, value, flag,
+    // signals). `source:'dedupe'` + warn level is the hook for the #rf-alerts
+    // LaunchDarkly alert rule. console.warn (not error): the conflict WAS
+    // resolved — this needs human review, it is not a failure.
+    console.warn({
+      message: `[Dedupe] ${field} "${value}" moved from candidate=${ownerFull.id} (${ownerFull.name || '?'}) → candidate=${targetId} (${target?.name || '?'}); flag=${flag}`,
+      source: 'dedupe',
+      flag,
+      field,
+      value,
+      fromCandidateId: ownerFull.id,
+      fromCandidateName: ownerFull.name || null,
+      toCandidateId: targetId,
+      toCandidateName: target?.name || null,
+      oldRecord: {
+        jobCount,
+        fileCount,
+        addedOn: ownerFull.added_on || ownerFull.added_time || null,
+        currentOrganization: ownerFull.current_organization || null,
+        thinSignals,
+      },
+      samePersonSignal,
+    });
+
+    resolvedAny = true;
+  }
+
+  if (!resolvedAny) {
+    const err = new RFContactConflictUnresolvedError(
+      `RF ${field} conflict for candidate=${targetId} could not be resolved — no other owner found for: ${values.join(', ')}`,
+      { status: 409 },
+    );
+    console.error({
+      message: err.message,
+      source: 'dedupe',
+      flag: 'conflict_unresolved',
+      candidateId: targetId,
+      field,
+      values,
+    });
+    throw err;
+  }
 }
 
 /**
@@ -549,6 +863,64 @@ export async function searchRFCandidateByEmail(email, env) {
     return candidates.length > 0 ? candidates[0] : null;
   } catch (error) {
     console.error('RF search failed:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Search RF for a candidate by phone number — the owner-lookup the dedupe
+ * handler needs when an update 409s on phone uniqueness.
+ *
+ * RF's `/candidate/search` does loose (substring) matching and formats vary
+ * (+1, spaces, dashes), so we post-filter on digit-only equality against the
+ * returned candidates' phone arrays. Returns the first true match or null.
+ */
+export async function searchRFCandidateByPhone(phone, env) {
+  const rfApiKey = env.RF_API_KEY;
+  const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
+
+  if (!rfApiKey) {
+    throw new Error('RF_API_KEY environment variable is required');
+  }
+
+  const wantDigits = normalizePhoneDigits(phone);
+  if (!wantDigits) return null;
+
+  try {
+    const response = await fetch(`${rfBaseUrl}/candidate/search`, {
+      method: 'POST',
+      headers: {
+        'RF-Api-Key': rfApiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        filters: [{ conjunction: 'in', values: [phone], key: 'phone_number' }],
+        conjunction: 'match-all',
+        current_page: 1,
+        items_per_page: 10
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error({ message: `RF phone search error status=${response.status} body=${errorText}`, source: 'rf-search' });
+      return null;
+    }
+
+    const result = await response.json();
+    const candidates = Array.isArray(result) ? result : (result.candidates || result.data || result.results || []);
+
+    // Post-filter on digit-only equality (RF search is substring/loose). Compare
+    // against every phone the candidate carries, tolerant of country-code drift —
+    // the SAME comparison the strip uses, so search and strip stay in lockstep.
+    const match = candidates.find((c) => {
+      const phones = Array.isArray(c.phone_number) ? c.phone_number : (c.phone_number ? [c.phone_number] : []);
+      return phones.some((p) => phoneDigitsMatch(extractContactValue('phone', p), phone));
+    });
+
+    return match || null;
+  } catch (error) {
+    console.error({ message: `RF phone search failed: ${error.message}`, source: 'rf-search' });
     return null;
   }
 }
@@ -1209,6 +1581,16 @@ export async function addCandidateToJob(candidateId, jobId, env) {
 
   if (!response.ok) {
     const errorText = await response.text();
+    // "Already in the job pipeline" is an expected, graceful outcome — not an
+    // error. Return a signal instead of console.error + throw so this (very
+    // common on re-adds) stops polluting the LaunchDarkly/CF error views. The
+    // frontend already renders this as "already in pipeline". Detection mirrors
+    // the breadth the caller previously used (any "already" + "pipeline"
+    // wording, any 4xx) so RF status/phrasing drift can't reintroduce the noise.
+    const lower = errorText.toLowerCase();
+    if (lower.includes('already') && lower.includes('pipeline')) {
+      return { status: 'already_in_job' };
+    }
     console.error(`RF add-to-job error: ${response.status}`, errorText);
     throw classifyRFResponse(response, errorText);
   }

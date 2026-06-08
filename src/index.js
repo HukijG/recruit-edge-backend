@@ -28,6 +28,7 @@ import {
   listOpenJobs, addCandidateToJob, setJobCandidateConsultantId,
   listCandidateActivities, normalizeToE164, pickConsultantJob,
   prewarmCandidatesIfMissing, searchCandidatesByJobAndStage, extractLinkedInSlug,
+  RFContactConflictUnresolvedError,
 } from './rf-client.js';
 import {
   cacheCandidate, getCachedCandidate, lookupByLinkedIn, lookupByEmail, lookupByName,
@@ -599,7 +600,20 @@ async function processDialpadContactUpdate(contact, env) {
       return;
     }
 
-    await updateRFCandidate(rfCandidateId, updateData, env);
+    // updateRFCandidate auto-resolves phone/email uniqueness conflicts (strips the
+    // value from a stale duplicate, then retries). A genuinely unresolvable
+    // conflict is non-fatal here — log and stop rather than 500-looping the
+    // Dialpad webhook (a retry won't find the missing owner). Transient/other
+    // errors still propagate to the outer catch for legitimate retry.
+    try {
+      await updateRFCandidate(rfCandidateId, updateData, env);
+    } catch (error) {
+      if (error instanceof RFContactConflictUnresolvedError) {
+        console.error({ message: `[Dialpad] RF update unresolved contact conflict (non-fatal) candidate=${rfCandidateId}: ${error.message}`, source: 'dialpad', candidateId: rfCandidateId });
+        return;
+      }
+      throw error;
+    }
     await env.SYNC_STATE.put(syncKey, 'true', { expirationTtl: 60 });
 
     // Update cache with Dialpad changes
@@ -782,11 +796,20 @@ async function processCalendarEvent(payload, env) {
     if (emailAdded) updatePayload.email = mergedEmails;
     if (phoneAdded) updatePayload.phone_number = mergedPhones;
 
-    await updateRFCandidate(candidateId, updatePayload, env);
-
-    // Set debounce flag ONLY when we actually update RF (prevents RF→Dialpad loop)
-    const syncKey = `sync:RF${candidateId}`;
-    await env.SYNC_STATE.put(syncKey, 'true', { expirationTtl: 60 });
+    // Non-fatal: updateRFCandidate auto-resolves phone/email uniqueness conflicts
+    // (stripping the value from the stale duplicate, then retrying). If it STILL
+    // can't (RFContactConflictUnresolvedError) or fails another way, we must not
+    // abort — stage movement, Dialpad upsert and cache update below still need to
+    // run. A buried contact-field conflict killing the whole calendar sync was the
+    // original bug this guards against.
+    try {
+      await updateRFCandidate(candidateId, updatePayload, env);
+      // Set debounce flag ONLY when we actually update RF (prevents RF→Dialpad loop)
+      const syncKey = `sync:RF${candidateId}`;
+      await env.SYNC_STATE.put(syncKey, 'true', { expirationTtl: 60 });
+    } catch (error) {
+      console.error({ message: `[Calendar] RF update failed (non-fatal, continuing) candidate=${candidateId}: ${error.message}`, source: 'calendar', candidateId, attendeeEmail: attendee_email });
+    }
   } else {
     console.log({ message: `[Calendar] → skipped RF update: email/phone already exist`, source: 'calendar', candidateId, attendeeEmail: attendee_email });
   }
@@ -1207,9 +1230,16 @@ async function handleApolloWebhook(request, env, url) {
         ...existingPhones,
         { phone_number: phoneStr, type: 1 },
       ];
-      await updateRFCandidate(rfId, { phone_number: mergedPhones }, env);
-      // Debounce prevents the eventual RF Updated webhook from re-syncing to Dialpad
-      await env.SYNC_STATE.put(`sync:RF${rfId}`, 'true', { expirationTtl: 60 });
+      // updateRFCandidate auto-resolves phone uniqueness conflicts (strips the
+      // number from a stale duplicate, then retries). Non-fatal: if it's still
+      // unresolvable, don't abort — the direct Dialpad patch below must still run.
+      try {
+        await updateRFCandidate(rfId, { phone_number: mergedPhones }, env);
+        // Debounce prevents the eventual RF Updated webhook from re-syncing to Dialpad
+        await env.SYNC_STATE.put(`sync:RF${rfId}`, 'true', { expirationTtl: 60 });
+      } catch (error) {
+        console.error({ message: `[Apollo] RF update failed (non-fatal, continuing) rfId=${rfId}: ${error.message}`, source: 'apollo', rfId });
+      }
     } else {
       console.log({ message: `[Apollo] → phone already in RF, skipped RF update`, source: 'apollo', rfId, phone: phoneStr });
     }
@@ -1712,14 +1742,12 @@ async function handleAddToJobEndpoint(request, env, ctx, corsHeaders, auth) {
       let addResult = null;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          await addCandidateToJob(rfId, jobId, env);
-          addResult = { rfId, status: 'added' };
+          // addCandidateToJob returns {status:'already_in_job'} for the expected
+          // "already in pipeline" case (no throw) — treat it as a non-error here.
+          const addRes = await addCandidateToJob(rfId, jobId, env);
+          addResult = { rfId, status: addRes?.status === 'already_in_job' ? 'already_in_job' : 'added' };
           break;
         } catch (error) {
-          if (error.message.toLowerCase().includes('already') && error.message.toLowerCase().includes('pipeline')) {
-            addResult = { rfId, status: 'already_in_job' };
-            break;
-          }
           if (error.message.includes('502') && attempt < 3) {
             console.log({ message: `[AddToJob] rfId=${rfId} → 502, retrying (${attempt}/2)`, source: 'add-to-job' });
             continue;

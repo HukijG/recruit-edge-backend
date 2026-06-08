@@ -301,6 +301,29 @@ Dialpad webhook (Updated only)
 
 ---
 
+## Contact-field dedupe (phone/email uniqueness)
+
+RF enforces uniqueness on phone and email. When any `/candidate/update` tries to add a value already held by a **different** candidate (a stale duplicate, usually added with a wrong/missing LinkedIn so it never deduped), RF returns `409 {"message":"A profile with this Phone Number|Email already exists"}`. This used to throw and silently kill downstream steps (most visibly the calendar flow's stage move + Dialpad upsert + cache).
+
+Dedupe is built into `updateRFCandidate` itself (`src/rf-client.js`), so **every** update path benefits — calendar, Dialpad→RF, Apollo, extension:
+
+```
+updateRFCandidate → 409 phone/email exists
+  → find the OTHER candidate owning the value (searchRFCandidateByPhone / searchRFCandidateByEmail)
+  → GET it in full; VERIFY it actually holds the value (RF search is substring-loose, so a
+    hit isn't proof of ownership — strip and search must stay in lockstep)
+  → strip the value from that record (non-destructive: candidate stays, only the value leaves;
+    re-promotes a surviving email to primary if the stripped one was primary)
+  → retry the target update (we TRUST the target — it carries the correct LinkedIn)
+  → bounded to 2 passes (phone + email) so it always terminates
+```
+
+**Policy**: always trust the target and strip from the other record — the same-person / record-thinness assessment is **logged signal only**, never a gate (per the team's decision). Every resolution emits a detailed `source:'dedupe'` warn log (both candidate ids + names, the value, and `flag: review_delete` when the losing record is thin / `manual_merge` when it has substance) for human follow-up; wire an alert channel via a LaunchDarkly alert rule on `source = "dedupe"`. If no owner can be located the value is left alone and the update throws `RFContactConflictUnresolvedError` (typed, so callers degrade gracefully) with `flag:'conflict_unresolved'`.
+
+Separately, `addCandidateToJob`'s expected `409 "already present in the job pipeline"` is **not** an error — it returns `{status:'already_in_job'}` instead of logging+throwing, so the common re-add case no longer pollutes the error views.
+
+---
+
 ## Data Flow: Calendar → RF + Dialpad
 
 **Trigger**: Google Apps Script detects a Reclaim booking event on Google Calendar (via EventUpdated trigger, runs every invocation scanning next 14 days).
