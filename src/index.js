@@ -49,6 +49,10 @@ import { authExtensionRequest, setAuthSpanSuccess, setAuthSpanFailure } from './
 import {
   handleSmsTemplatesList, handleSmsTemplateUpsert, handleSmsTemplateDelete,
 } from './sms-templates.js';
+import { handleStageMovedWebhook } from './stage-stats/webhook.js';
+import { handleAggregatePull } from './stage-stats/pull.js';
+import { handleReconcileRoute, runReconcile } from './stage-stats/reconcile.js';
+import { handleBackfillRoute } from './stage-stats/backfill.js';
 
 const handler = {
   async fetch(request, env, ctx) {
@@ -99,6 +103,26 @@ const handler = {
       if (url.pathname === '/webhook/recruiterflow/manual' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.WEBHOOK_RF_MANUAL);
         return await handleManualRFWebhook(request, env, url);
+      }
+
+      if (url.pathname === '/webhook/recruiterflow/stage-moved' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.WEBHOOK_RF_STAGE_MOVED);
+        return await handleStageMovedWebhook(request, env, ctx);
+      }
+
+      if (url.pathname === '/stats/stage-aggregate' && request.method === 'GET') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.STATS_AGGREGATE_PULL);
+        return await handleAggregatePull(request, env, url);
+      }
+
+      if (url.pathname === '/admin/stage-stats/reconcile' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.STATS_RECONCILE);
+        return await handleReconcileRoute(request, env);
+      }
+
+      if (url.pathname === '/admin/stage-stats/backfill' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.STATS_BACKFILL);
+        return await handleBackfillRoute(request, env);
       }
 
       if (url.pathname === '/webhook/krisp' && request.method === 'POST') {
@@ -354,6 +378,23 @@ const handler = {
         headers: corsHeaders
       });
     }
+  },
+
+  // Hourly stage-stats reconcile (cron "7 * * * *" in wrangler.jsonc) — the
+  // backstop for missed/failed stage-moved webhooks. Same instrumented-
+  // scheduled pattern as the cache worker's tail-sync cron.
+  async scheduled(event, env, ctx) {
+    trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.STATS_RECONCILE);
+    ctx.waitUntil(
+      runReconcile(env).catch((error) => {
+        console.error({
+          message: `[stage-stats] cron reconcile failed: ${error?.message}`,
+          source: 'stage-stats',
+          error: error?.message,
+          stack: error?.stack,
+        });
+      }),
+    );
   },
 };
 

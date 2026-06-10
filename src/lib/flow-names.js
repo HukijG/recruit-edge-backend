@@ -18,6 +18,7 @@ export const FLOWS = Object.freeze({
 
   WEBHOOK_RF: 'WebhookRecruiterflow',
   WEBHOOK_RF_MANUAL: 'WebhookRecruiterflowManual',
+  WEBHOOK_RF_STAGE_MOVED: 'WebhookRecruiterflowStageMoved',
   WEBHOOK_DIALPAD_GENERAL: 'WebhookDialpadGeneral',
   WEBHOOK_DIALPAD_CALL: 'WebhookDialpadCall',
   WEBHOOK_DIALPAD_EXT_CALL: 'WebhookDialpadExtensionCall',
@@ -26,6 +27,10 @@ export const FLOWS = Object.freeze({
   WEBHOOK_APOLLO_ENRICHMENT: 'WebhookApolloEnrichment',
 
   MCP_PROXY: 'MCP/Proxy',
+
+  STATS_AGGREGATE_PULL: 'StatsStageAggregatePull',
+  STATS_RECONCILE: 'StatsStageReconcile',
+  STATS_BACKFILL: 'StatsStageBackfill',
 
   HEALTH: 'Health',
   TEST_COLD_CALL: 'TestColdCall',
