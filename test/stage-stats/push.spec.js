@@ -160,7 +160,9 @@ describe('GET /stats/stage-aggregate (pull)', () => {
   });
 
   it('400s missing / non-numeric / inverted windows', async () => {
-    for (const qs of ['', 'afterMs=1', 'afterMs=a&beforeMs=2', 'afterMs=5&beforeMs=5', 'afterMs=9&beforeMs=2']) {
+    // 'beforeMs=5' is the load-bearing case: a missing afterMs must NOT be
+    // coerced to 0 ("since the epoch") by Number(null).
+    for (const qs of ['', 'afterMs=1', 'beforeMs=5', 'afterMs=a&beforeMs=2', 'afterMs=5&beforeMs=5', 'afterMs=9&beforeMs=2']) {
       const [request, url] = pullRequest(qs);
       const res = await handleAggregatePull(request, env, url);
       expect(res.status).toBe(400);

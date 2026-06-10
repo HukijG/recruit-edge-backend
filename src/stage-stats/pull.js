@@ -8,6 +8,12 @@
 import { computeAggregate } from './store.js';
 import { requireStatsToken } from './stats-token.js';
 
+/** Decimal-integer string → number; anything else (incl. null/empty) → null. */
+function parseEpochMsParam(raw) {
+  if (typeof raw !== 'string' || !/^-?\d+$/.test(raw.trim())) return null;
+  return parseInt(raw, 10);
+}
+
 /**
  * @param {Request} request
  * @param {*} env
@@ -18,9 +24,11 @@ export async function handleAggregatePull(request, env, url) {
   const denied = requireStatsToken(request, env);
   if (denied) return denied;
 
-  const afterMs = Number(url.searchParams.get('afterMs'));
-  const beforeMs = Number(url.searchParams.get('beforeMs'));
-  if (!Number.isInteger(afterMs) || !Number.isInteger(beforeMs) || afterMs >= beforeMs) {
+  // Strict parse: a MISSING param must 400 — Number(null) === 0 would
+  // silently turn it into "since the epoch" instead.
+  const afterMs = parseEpochMsParam(url.searchParams.get('afterMs'));
+  const beforeMs = parseEpochMsParam(url.searchParams.get('beforeMs'));
+  if (afterMs === null || beforeMs === null || afterMs >= beforeMs) {
     return Response.json(
       { ok: false, error: 'afterMs and beforeMs must be integers with afterMs < beforeMs' },
       { status: 400 },
