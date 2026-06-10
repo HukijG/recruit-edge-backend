@@ -146,6 +146,31 @@ App 2's OAuth client is consumed by the operator's separate extension workstream
 
 **X-Admin-Token is still required** when reaching the endpoint via `wrangler dev --remote` (option 1) — the `handleAdmin` gate is unchanged.
 
+## Shared-token machine routes (main worker, stage-stats plane)
+
+Machine-to-machine routes — the callers are the office dashboard server and
+the operator's curl, never a teammate's browser/AI client — so per the
+convention they use shared-token headers, not Cloudflare Access. Every
+compare is timing-safe (`src/lib/timing-safe-equal.js`) and fails closed when
+the secret is unset. Full plane semantics: [`docs/stage-stats.md`](stage-stats.md).
+
+| Route | Auth header | Secret |
+|---|---|---|
+| `POST /webhook/recruiterflow/stage-moved` | `X-RF-Webhook-Token` | `RF_WEBHOOK_SECRET` (shared with the other RF webhooks; this route's compare is timing-safe, the pre-existing `/webhook/recruiterflow` compare is plain `!==` — different sphere, separate change if wanted) |
+| `GET /stats/stage-aggregate` | `X-Stats-Token` | `STATS_PULL_TOKEN` |
+| `POST /admin/stage-stats/reconcile` | `X-Stats-Token` | `STATS_PULL_TOKEN` |
+| `POST /admin/stage-stats/backfill` | `X-Stats-Token` | `STATS_PULL_TOKEN` |
+
+Outbound: the stats push presents `X-Remote-Key: env.DASHBOARD_REMOTE_KEY` to
+the dashboard ingress targets (`DASHBOARD_REMOTE_BASE` /
+`DASHBOARD_REMOTE_BASE_DEV`) — the same key the music worker holds; the
+dashboard's gate is the auth (no Cloudflare Access app on those hostnames).
+
+The `STAGE_EVENTS` D1 (`rf-stage-events`) is owned read+write by the main
+worker — distinct from `RF_MCP_CACHE` (cache-worker-owned) and `USERS_DB`
+(registry; migrations-only writes). Runtime writes go through the idempotent
+stage-stats upsert only.
+
 ---
 
 ## Migration state

@@ -127,6 +127,9 @@ This file does NOT duplicate that material. References below use the Access auth
 | `src/mcp/{cache-status,candidate-get,candidate-search,candidate-move-stage,candidate-log-interview,job-pipeline,job-candidates-filter,candidate-call-notes}.js` | Per-tool middleware handlers. |
 | `src/mcp/{resolvers,fuzzy,projection,linkedin,d1-read,snapshot,handlers-registry,concurrency}.js` | Shared middleware infrastructure. `concurrency.js` provides `pMapLimit` for bounded parallel RF `/candidate/get` fan-out in pipeline hydration. |
 | `src/webhook/dialpad-hangup-forwarder.js` | Forwards Dialpad hangup webhook payloads to cache-worker via service binding for live `calls` table insertion. Fire-and-forget inside `ctx.waitUntil`; cron backstop catches any drops. |
+| `src/stage-stats/` | The stage-movement stats plane: classification, London week windows, RF stage-movement client, STAGE_EVENTS D1 store, the shared ingest engine, dashboard push fan-out, and the webhook/pull/reconcile/backfill handlers. The main worker's `scheduled()` (cron `7 * * * *`) runs the hourly reconcile. Canonical doc: [`docs/stage-stats.md`](stage-stats.md). |
+| `src/lib/timing-safe-equal.js` | Constant-time string compare for shared-secret headers (same implementation as the cache worker's local helper). |
+| `migrations-stage-events/0001_create_stage_events.sql` | `STAGE_EVENTS` D1 schema (database `rf-stage-events`, owned read+write by the main worker). |
 | `migrations/0001_create_users.sql`, `migrations/0002_seed_users.sql` | `USERS_DB` schema + seed data (six teammates). Email PK with lowercase + LIKE-form CHECK constraints; UNIQUE indexes on `dialpad_id`, `rf_user_id`, `first_name`. |
 | `migrations/0003_create_sms_templates.sql` | `USERS_DB.sms_templates` — per-user SMS template store backing `/sms-templates`. Composite PK `(sub, id)`; `sub` is the JWT identity, `id` is a client-minted UUID v4. CHECK constraints on name length (1..80) and body length (≤2000). Index on `(sub, updated_at DESC)` powers the list-ordered-by-recency query. |
 | `scripts/calendar-sync.gs` | Google Apps Script: detects Reclaim bookings on Google Calendar, extracts candidate data, posts to worker. |
@@ -195,6 +198,10 @@ Every worker emits OTel traces + logs to LaunchDarkly Observability. The pipelin
 | `/health` | GET | None | Health check |
 | `/webhook/recruiterflow` | POST | `X-RF-Webhook-Token` header | RF candidate Created/Updated events |
 | `/webhook/recruiterflow/manual` | POST | `?token=` query param (`RF_WEBHOOK_SECRET`) | Manual RF candidate sync (flat payload) |
+| `/webhook/recruiterflow/stage-moved` | POST | `X-RF-Webhook-Token` header (timing-safe) | RF stage-moved events → enrich + STAGE_EVENTS D1 + dashboard push (see [`docs/stage-stats.md`](stage-stats.md)) |
+| `/stats/stage-aggregate?afterMs=&beforeMs=` | GET | `X-Stats-Token` header (`STATS_PULL_TOKEN`, timing-safe) | CV-Sent / 1st-Interview aggregate for a caller-chosen window (dashboard puller + LAST-WEEK toggle) |
+| `/admin/stage-stats/reconcile` | POST | `X-Stats-Token` header (timing-safe) | The hourly reconcile sweep on demand |
+| `/admin/stage-stats/backfill` | POST | `X-Stats-Token` header (timing-safe) | Cursor-batched historical stage-movement walk (seed / recovery / label-change re-run) |
 | `/webhook/dialpad` | POST | JWT Bearer (HS256) | Dialpad contact Updated events |
 | `/webhook/calendar` | POST | `X-Calendar-Webhook-Token` header | Calendar booking events (from Apps Script) |
 | `/webhook/krisp` | POST | `X-Krisp-Webhook-Token` header | Krisp meeting note webhooks |
