@@ -33,8 +33,7 @@ export async function recomputeAndPush(env) {
     return;
   }
 
-  const now = Date.now();
-  const window = currentWeekWindowLondon(now);
+  const window = currentWeekWindowLondon(Date.now());
   let aggregate;
   try {
     aggregate = await computeAggregate(env, window.startMs, window.endMs);
@@ -53,7 +52,11 @@ export async function recomputeAndPush(env) {
     schema: 1,
     windowStartMs: window.startMs,
     windowEndMs: window.endMs,
-    asOfMs: now,
+    // asOfMs MUST be stamped AFTER the D1 read: the dashboard's monotonic
+    // guard orders racing pushes by asOf, so the stamp has to reflect read
+    // recency — a pre-read stamp would let an older aggregate beat a newer
+    // one whose push started earlier (§4.1: "when the aggregate was computed").
+    asOfMs: Date.now(),
     cvSent: aggregate.cvSent,
     firstInterviews: aggregate.firstInterviews,
   });
