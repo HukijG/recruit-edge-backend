@@ -42,8 +42,17 @@
       "database_name": "rf-users",
       "database_id": "00000000-0000-0000-0000-000000000002",
       "migrations_dir": "migrations"
+    },
+    {
+      "binding": "STAGE_EVENTS",
+      "database_name": "rf-stage-events",
+      "database_id": "00000000-0000-0000-0000-000000000003",
+      "migrations_dir": "migrations-stage-events"
     }
   ],
+  "triggers": {
+    "crons": ["7 * * * *"]
+  },
   "services": [
     { "binding": "SYNC_WORKER", "service": "rf-mcp-cache-sync" }
   ],

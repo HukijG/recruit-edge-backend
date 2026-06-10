@@ -18,6 +18,7 @@ export default defineWorkersConfig({
 						DIALPAD_WEBHOOK_SECRET: 'test-dialpad-webhook-secret',
 						CALENDAR_WEBHOOK_SECRET: 'test-calendar-webhook-secret',
 						RF_WEBHOOK_SECRET: 'test-rf-webhook-secret',
+						STATS_PULL_TOKEN: 'test-stats-pull-token',
 						KRISP_WEBHOOK_SECRET: 'test-krisp-webhook-secret',
 						APOLLO_WEBHOOK_SECRET: 'test-apollo-webhook-secret',
 						ACCESS_TEAM_DOMAIN: 'https://test.cloudflareaccess.com',
@@ -37,6 +38,7 @@ export default defineWorkersConfig({
 					d1Databases: {
 						RF_MCP_CACHE: 'rf-mcp-cache-test',
 						USERS_DB: 'rf-users-test',
+						STAGE_EVENTS: 'rf-stage-events-test',
 					},
 					// Mock the SYNC_WORKER service binding so miniflare starts cleanly.
 					// Tests that need to assert on forwarded requests inject their own
