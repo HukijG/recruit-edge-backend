@@ -33,13 +33,27 @@ export async function recomputeAndPush(env) {
     return;
   }
 
-  const window = currentWeekWindowLondon(Date.now());
-  const aggregate = await computeAggregate(env, window.startMs, window.endMs);
+  const now = Date.now();
+  const window = currentWeekWindowLondon(now);
+  let aggregate;
+  try {
+    aggregate = await computeAggregate(env, window.startMs, window.endMs);
+  } catch (err) {
+    // Honour the never-throws contract — the webhook path runs this inside
+    // ctx.waitUntil, where a rejection would be silent. The next push or the
+    // dashboard's puller heals.
+    console.warn({
+      message: `[stage-stats] push skipped: aggregate computation failed (${err?.message})`,
+      source: SOURCE,
+      error: err?.message,
+    });
+    return;
+  }
   const body = JSON.stringify({
     schema: 1,
     windowStartMs: window.startMs,
     windowEndMs: window.endMs,
-    asOfMs: Date.now(),
+    asOfMs: now,
     cvSent: aggregate.cvSent,
     firstInterviews: aggregate.firstInterviews,
   });

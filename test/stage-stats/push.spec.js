@@ -130,6 +130,18 @@ describe('recomputeAndPush', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('absorbs a D1 read failure (never throws — webhook runs it in waitUntil)', async () => {
+    const calls = mockPushTargets(() => ok200());
+    const brokenEnv = pushEnv({
+      STAGE_EVENTS: {
+        prepare: () => ({ bind: () => ({}) }),
+        batch: () => Promise.reject(new Error('D1 unavailable')),
+      },
+    });
+    await expect(recomputeAndPush(brokenEnv)).resolves.toBeUndefined();
+    expect(calls).toHaveLength(0); // no push attempted with no aggregate
+  });
+
   it('a failing dev target never affects the prod outcome', async () => {
     const calls = mockPushTargets((url) =>
       url.startsWith(DEV) ? new Response('down', { status: 502 }) : ok200(),

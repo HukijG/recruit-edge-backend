@@ -46,6 +46,8 @@ export async function upsertRows(env, rows, source, nowMs) {
         r.enteredRaw,
         r.enteredMs,
         r.fromStage,
+        // '' == null for classification (both are "not submitted"); the empty
+        // string just satisfies the NOT NULL column.
         r.toStage ?? '',
         r.moverRfId,
         r.isCvCross ? 1 : 0,

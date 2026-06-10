@@ -120,6 +120,29 @@ describe('POST /webhook/recruiterflow/stage-moved', () => {
     expect(rows.every((r) => r.mover_rf_id === 900005)).toBe(true);
   });
 
+  it('skips (does not store, does not crash on) transitions with missing/unparseable entered', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      rfMovementResponse([
+        {
+          id: 984,
+          transitions: [
+            { from: 'Sourced', to: 'CV Sent', entered: null, stage_moved_by: { id: 900005 } },
+            { from: 'Sourced', to: 'CV Sent', entered: '12/06/2026 09:00', stage_moved_by: { id: 900005 } },
+            { from: 'Sourced', to: 'CV Sent', entered: '2026-06-08T08:45:00+0000', stage_moved_by: { id: 900005 } },
+          ],
+        },
+      ]),
+    );
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(webhookRequest({ candidate: { id: 50256 } }), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, stored: 1 }); // only the parseable one
+    const rows = (await env.STAGE_EVENTS.prepare('SELECT * FROM stage_events').all()).results;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].entered_raw).toBe('2026-06-08T08:45:00+0000');
+  });
+
   it('stores the verbatim entered string as identity (never normalised)', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(
       rfMovementResponse([
