@@ -238,12 +238,19 @@ Dashboards are LD-UI configured (not in code). Draft queries for each panel are 
 | Webhook + Integration Health | `10015445` | `/dashboards/10015445` |
 | CF Binding Usage | `10015446` | `/dashboards/10015446` |
 
-What each one covers:
+What each one covers (panel inventory as designed 2026-06-11 — the UI is the
+source of truth for what's actually built; this is the reference to rebuild
+from):
 
-1. **Live firehose / Flow Health** — fast trace stream filtered/grouped by `flow.name`. Use to spot traffic in real-time, drill into a specific flow's spans, or watch a deploy for regressions.
-2. **CF Binding Usage** — D1 / KV / AI / Worker request rates derived from span aggregations (`db.system`, `db.name`, `cache.operation`, `ai.run` span names, etc.). Cross-references the hourly metrics-poller metrics for storage trend.
-3. **Per-worker Health** — error rate, latency p50 / p95 / p99 per service, grouped by `service.name`. First port of call for Alert 3 (worker error rate, once alerts land).
-4. **Webhook + Integration Health** — RF / Dialpad / Apollo / Krisp inbound webhook rates + Apollo enrichment outcomes. Consumes the `rf.event_type` and `dialpad.event_type` span attributes set in webhook handlers for per-event-type breakdowns.
+1. **Flow Health** (`10015443`) — the no-memorizing flows view:
+   - *All flows — volume*: Table · Traces · Count · filter `flow.name` exists · group by `flow.name` · 24h · sorted desc. The live inventory of every flow name and its traffic.
+   - *Flow errors*: Table · Traces · Count · filter `flow.name` exists + error status · group by `flow.name`.
+   - *Flow p95 duration*: Line · Traces · P95(duration) · group by `flow.name`.
+   - *Flow volume over time*: Line · Traces · Count · group by `flow.name`.
+   Root spans are RENAMED to their flow name by the postProcessor, so the raw Traces tab also reads as flows.
+2. **CF Usage & Billing** (`10015446`, formerly "CF Binding Usage") — one panel per CF billing dimension, all from the metrics-poller gauges (see § Metrics-poller for the metric ↔ billing map): Workers requests/errors/CPU-p99 per script (hourly), D1 rows written + rows read + storage per database (day-to-date sawtooth — daily max = the billing number), KV operations by action + stored bytes, DO requests + stored bytes, AI neurons + requests, and an LD span-ingest panel (Traces · Count · group by `service.name`) against the 25M spans/mo free tier.
+3. **Per-worker Health** (`10015444`) — error rate, latency p50 / p95 / p99 per service, grouped by `service.name`. First port of call for Alert 3.
+4. **Webhook + Integration Health** (`10015445`) — RF / Dialpad / Apollo / Krisp inbound webhook rates + Apollo enrichment outcomes. Consumes the `rf.event_type` and `dialpad.event_type` span attributes set in webhook handlers for per-event-type breakdowns — includes `rf.event_type=stage_moved` (the stage-stats plane stamps it BEFORE auth, so failed deliveries surface here too).
 
 (Plus an auto-generated `User Insights` dashboard the LD project ships with — frontend-RUM template, not used by our backend setup.)
 
