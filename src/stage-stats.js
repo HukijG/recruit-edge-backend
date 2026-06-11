@@ -201,7 +201,8 @@ function warnOnce(ictx, key, record) {
  * The ordered stage-name list for one job, from (in order) the invocation
  * memo, the KV cache (1-day TTL — pipeline structure is near-immutable; on
  * warm hours landmarked jobs cost zero pipeline fetches, landmark-less jobs
- * one heal-refetch per sweep), or a live `/job/pipeline` fetch. `bypassCache` skips memo + KV —
+ * one heal-refetch per invocation, sweep or webhook), or a live
+ * `/job/pipeline` fetch. `bypassCache` skips memo + KV —
  * used to self-heal when a transition references a stage the cached list
  * doesn't know (pipeline edited within the TTL).
  *
@@ -656,8 +657,8 @@ async function searchActiveCandidates(env, sinceDate) {
  * stage by the previous stage (DQ is off the linear ladder; unknown previous
  * → keep). Same positional semantics as classification, fed by the same
  * memo/KV pipeline cache — landmarked jobs cost zero pipeline fetches on
- * warm hours; landmark-less jobs one heal-refetch per sweep (the gate cannot
- * tell "stale no-landmark" from "genuinely no-landmark" without it).
+ * warm hours; landmark-less jobs one heal-refetch per invocation (the heal
+ * cannot tell "stale no-landmark" from "genuinely no-landmark" without it).
  *
  * Exists purely to bound RF detail calls on the recurring path — backfill
  * runs ungated because a historical window's current stage no longer reflects

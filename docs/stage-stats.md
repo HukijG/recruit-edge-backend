@@ -90,8 +90,9 @@ canonical for this RF tenant:
 
 Pipeline stage lists are near-immutable structure → memoised per
 sweep/webhook invocation and KV-cached for a day (landmarked jobs: zero
-fetches on warm hours; landmark-less jobs: one heal-refetch per sweep —
-the gate can't tell stale-no-landmark from genuinely-no-landmark)
+fetches on warm hours; landmark-less jobs: one heal-refetch per invocation,
+sweep or webhook — the heal can't tell stale-no-landmark from
+genuinely-no-landmark)
 (`stagestats:pipeline:<jobId>` in the `SYNC_STATE` KV). When a transition
 references a stage the cached list doesn't know, OR the cached list has no
 landmark (a job made CV-tracked mid-TTL), the list is refetched fresh once —
@@ -235,8 +236,10 @@ affected window recovers it exactly.
 Each invocation re-runs the window's `candidate/search`, sorts ids ascending,
 processes the first `batchSize` ids `> cursor` (UNGATED — for historical
 windows the current stage no longer reflects what happened then), ~120ms
-spacing. The operator loops until `done: true`, then calls reconcile once to
-push. Idempotent — re-running any batch is harmless (settled rows are
+spacing. The operator loops until `done: true`; delivery then comes from the
+dashboard's puller (30-min + boot seed) or the next ingest that changes rows
+— the push path is change-gated, so a reconcile after a backfill only pushes
+if its own sweep changed something. Idempotent — re-running any batch is harmless (settled rows are
 zero-write no-ops), and it is also the recovery tool after a classification
 change, a pipeline restructure, or D1 loss. It never touches the reconcile
 waterline.
@@ -331,5 +334,5 @@ or this plane stays invisible there even though the spans flow.
 | dashboard down | its boot-seed pull on restart | restart |
 | Monday rollover race | dashboard 409s `window_mismatch` + fires its puller | seconds–minutes, benign |
 | pipeline restructure / classification change | warn-once surfaces ghosts; KV refetch self-heals renames + newly-CV-tracked jobs; re-run backfill to recompute flags | operator-driven |
-| search window overflows the 50-page cap persistently | hourly truncation warn + waterline held. Backfill the window (cursor-batched), then MANUALLY advance the waterline: `wrangler d1 execute rf-stage-events --remote --command "INSERT INTO sync_state (key, value, updated_ms) VALUES ('reconcile_waterline_ms', '<epoch-ms>', <now-ms>) ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_ms = excluded.updated_ms"`. Do NOT delete the row — that re-bootstraps to prev-Monday, a strictly bigger window, still truncated, still pinned | operator-driven |
+| search window overflows the 50-page cap persistently | hourly truncation warn + waterline held. Backfill the window (cursor-batched), then MANUALLY advance the waterline: `wrangler d1 execute rf-stage-events --remote --command "INSERT INTO sync_state (key, value, updated_ms) VALUES ('reconcile_waterline_ms', '<end of the BACKFILLED window, epoch ms>', <now-ms>) ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_ms = excluded.updated_ms"`. Do NOT delete the row — that re-bootstraps to prev-Monday, a strictly bigger window, still truncated, still pinned | operator-driven |
 | D1 wiped | re-run backfill over any horizon (delete the waterline row to force a deep reconcile) | operator-driven |
