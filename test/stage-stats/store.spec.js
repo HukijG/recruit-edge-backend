@@ -70,6 +70,24 @@ describe('upsertRows', () => {
     const rows = await selectAll();
     expect(rows[0].to_stage).toBe('');
   });
+
+  it('an unchanged replay writes NOTHING (changed=0); a real change writes', async () => {
+    expect(await upsertRows(env, [row()], 'webhook', 1000)).toEqual({ attempted: 1, changed: 1 });
+    // idempotent replay — the conditional DO-UPDATE WHERE skips the write
+    expect(await upsertRows(env, [row()], 'reconcile', 2000)).toEqual({ attempted: 1, changed: 0 });
+    // a flag fix (label/pipeline change re-run) IS a write
+    expect(await upsertRows(env, [row({ isIvLanding: true })], 'backfill', 3000)).toEqual({
+      attempted: 1,
+      changed: 1,
+    });
+  });
+
+  it('mover changes count honestly: attribution arriving = changed, null replay = no-op', async () => {
+    await upsertRows(env, [row({ moverRfId: null })], 'webhook', 1000);
+    expect((await upsertRows(env, [row({ moverRfId: DAVE })], 'reconcile', 2000)).changed).toBe(1);
+    expect((await upsertRows(env, [row({ moverRfId: null })], 'reconcile', 3000)).changed).toBe(0);
+    expect((await selectAll())[0].mover_rf_id).toBe(DAVE);
+  });
 });
 
 describe('computeAggregate — latest-event-wins per (candidate, job) pair', () => {

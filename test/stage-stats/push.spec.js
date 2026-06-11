@@ -85,9 +85,18 @@ describe('recomputeAndPush', () => {
     expect(payload.firstInterviews).toEqual([]);
   });
 
-  it('skips entirely (no fetch) when DASHBOARD_REMOTE_BASE is unset', async () => {
+  it('targets are symmetric: dev-only when the prod base is unset (staged cutover)', async () => {
     const calls = mockPushTargets(() => ok200());
     await recomputeAndPush(pushEnv({ DASHBOARD_REMOTE_BASE: undefined }));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(`${DEV}/api/remote/stats/stage-weekly`);
+  });
+
+  it('skips entirely (no fetch) when NO target base is set', async () => {
+    const calls = mockPushTargets(() => ok200());
+    await recomputeAndPush(
+      pushEnv({ DASHBOARD_REMOTE_BASE: undefined, DASHBOARD_REMOTE_BASE_DEV: undefined }),
+    );
     expect(calls).toHaveLength(0);
   });
 
@@ -126,6 +135,14 @@ describe('recomputeAndPush', () => {
 
   it('does NOT retry a 404 (target still runs a pre-stats dashboard build)', async () => {
     const calls = mockPushTargets(() => new Response('not found', { status: 404 }));
+    await recomputeAndPush(pushEnv({ DASHBOARD_REMOTE_BASE_DEV: undefined }));
+    expect(calls).toHaveLength(1);
+  });
+
+  it('does NOT retry a 405 (pre-stats build: static fallback answers GET,HEAD → POST 405)', async () => {
+    const calls = mockPushTargets(
+      () => new Response(null, { status: 405, headers: { allow: 'GET,HEAD' } }),
+    );
     await recomputeAndPush(pushEnv({ DASHBOARD_REMOTE_BASE_DEV: undefined }));
     expect(calls).toHaveLength(1);
   });

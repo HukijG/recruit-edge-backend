@@ -374,11 +374,20 @@ ON CONFLICT (candidate_id, job_id, entered_raw) DO UPDATE SET
   mover_rf_id = COALESCE(excluded.mover_rf_id, mover_rf_id),
   is_cv_cross = excluded.is_cv_cross,
   is_iv_landing = excluded.is_iv_landing
+WHERE from_stage IS NOT excluded.from_stage
+   OR to_stage IS NOT excluded.to_stage
+   OR (excluded.mover_rf_id IS NOT NULL AND mover_rf_id IS NULL)
+   OR is_cv_cross IS NOT excluded.is_cv_cross
+   OR is_iv_landing IS NOT excluded.is_iv_landing
 `;
 
 /**
  * Upsert classified transition rows. Idempotent — replaying the same rows is
- * a no-op race even from concurrent invocations (PK + ON CONFLICT).
+ * a no-op race even from concurrent invocations (PK + ON CONFLICT). The
+ * DO-UPDATE WHERE clause makes an UNCHANGED replay a true no-op (zero D1
+ * rows written — overlap re-reads and RF's queued-delivery flushes are free)
+ * and makes `changed` an honest signal: callers skip the recompute+push when
+ * nothing changed.
  *
  * @param {*} env
  * @param {Array<{candidateId: number, jobId: number, enteredRaw: string, enteredMs: number,
@@ -386,12 +395,13 @@ ON CONFLICT (candidate_id, job_id, entered_raw) DO UPDATE SET
  *                isCvCross: boolean, isIvLanding: boolean}>} rows
  * @param {string} source - 'webhook' | 'reconcile' | 'backfill'
  * @param {number} nowMs - first_seen_ms for rows not previously sighted
- * @returns {Promise<number>} rows written
+ * @returns {Promise<{attempted: number, changed: number}>} changed = rows
+ *          actually inserted or updated (per-statement sqlite changes())
  */
 export async function upsertRows(env, rows, source, nowMs) {
-  if (rows.length === 0) return 0;
+  if (rows.length === 0) return { attempted: 0, changed: 0 };
   const stmt = env.STAGE_EVENTS.prepare(UPSERT_SQL);
-  await env.STAGE_EVENTS.batch(
+  const results = await env.STAGE_EVENTS.batch(
     rows.map((r) =>
       stmt.bind(
         r.candidateId,
@@ -410,7 +420,8 @@ export async function upsertRows(env, rows, source, nowMs) {
       ),
     ),
   );
-  return rows.length;
+  const changed = results.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
+  return { attempted: rows.length, changed };
 }
 
 /**
@@ -546,7 +557,7 @@ const DETAIL_SPACING_MS = 120;
  * @param {number} beforeMs
  * @param {string} source - 'webhook' | 'reconcile' | 'backfill'
  * @param {{pipelines: Map, warned: Set}} [ictx] - shared across a sweep/batch
- * @returns {Promise<{fetched: number, stored: number}>}
+ * @returns {Promise<{fetched: number, stored: number, changed: number}>}
  */
 export async function ingestCandidate(env, candidateId, afterMs, beforeMs, source, ictx = newIngestContext()) {
   const transitions = await fetchStageMovements(env, candidateId, afterMs, beforeMs);
@@ -565,8 +576,8 @@ export async function ingestCandidate(env, candidateId, afterMs, beforeMs, sourc
     const { isCvCross, isIvLanding } = await classifyTransitionForJob(env, candidateId, t, ictx);
     rows.push({ candidateId, ...t, isCvCross, isIvLanding });
   }
-  const stored = await upsertRows(env, rows, source, Date.now());
-  return { fetched: transitions.length, stored };
+  const { attempted, changed } = await upsertRows(env, rows, source, Date.now());
+  return { fetched: transitions.length, stored: attempted, changed };
 }
 
 /**
@@ -663,7 +674,8 @@ export async function passesSubmissionGate(env, jobs, ictx) {
  *
  * @param {*} env
  * @param {{afterMs: number, beforeMs: number, gate: boolean, source: string}} opts
- * @returns {Promise<{candidates: number, gated: number, fetched: number, stored: number, failed: number}>}
+ * @returns {Promise<{candidates: number, gated: number, fetched: number, stored: number,
+ *                    changed: number, failed: number}>}
  */
 export async function ingestWindow(env, { afterMs, beforeMs, gate, source }) {
   const sinceDate = londonDateString(afterMs - 86_400_000);
@@ -679,12 +691,14 @@ export async function ingestWindow(env, { afterMs, beforeMs, gate, source }) {
 
   let fetched = 0;
   let stored = 0;
+  let changed = 0;
   let failed = 0;
   for (const c of targets) {
     try {
       const r = await ingestCandidate(env, c.id, afterMs, beforeMs, source, ictx);
       fetched += r.fetched;
       stored += r.stored;
+      changed += r.changed;
     } catch (err) {
       failed += 1;
       console.warn({
@@ -696,7 +710,7 @@ export async function ingestWindow(env, { afterMs, beforeMs, gate, source }) {
     }
     await new Promise((r) => setTimeout(r, DETAIL_SPACING_MS));
   }
-  return { candidates: candidates.length, gated: targets.length, fetched, stored, failed };
+  return { candidates: candidates.length, gated: targets.length, fetched, stored, changed, failed };
 }
 
 // ──────────────────────────────── Push ─────────────────────────────────────
@@ -705,10 +719,12 @@ export async function ingestWindow(env, { afterMs, beforeMs, gate, source }) {
 // (event → TV in seconds); the dashboard's puller is the seed/heal path —
 // both carry the same payload shape.
 //
-// Fan-out: `DASHBOARD_REMOTE_BASE` (prod — required for the plane to push at
-// all) and `DASHBOARD_REMOTE_BASE_DEV` (optional additional target; unset ⇒
-// single-target). Targets are fully independent — one target's failure never
-// affects the other.
+// Fan-out: whichever of `DASHBOARD_REMOTE_BASE` (prod) and
+// `DASHBOARD_REMOTE_BASE_DEV` (dev container) are set — the targets are
+// symmetric and fully independent; one target's failure never affects the
+// other. During the staged cutover only the dev base is configured;
+// redirecting to prod once verified is purely a secret change (set the prod
+// base), no deploy.
 
 /**
  * Recompute the current week's aggregate and push it to all configured
@@ -719,10 +735,14 @@ export async function ingestWindow(env, { afterMs, beforeMs, gate, source }) {
  * @returns {Promise<void>}
  */
 export async function recomputeAndPush(env) {
-  if (!env.DASHBOARD_REMOTE_BASE || !env.DASHBOARD_REMOTE_KEY) {
+  const targets = [
+    { base: env.DASHBOARD_REMOTE_BASE, kind: 'prod' },
+    { base: env.DASHBOARD_REMOTE_BASE_DEV, kind: 'dev' },
+  ].filter((t) => t.base);
+  if (targets.length === 0 || !env.DASHBOARD_REMOTE_KEY) {
     console.warn({
       message:
-        '[stage-stats] push skipped: DASHBOARD_REMOTE_BASE / DASHBOARD_REMOTE_KEY unset — stats are computed but never delivered',
+        '[stage-stats] push skipped: no DASHBOARD_REMOTE_BASE / DASHBOARD_REMOTE_BASE_DEV target or DASHBOARD_REMOTE_KEY unset — stats are computed but never delivered',
       source: SOURCE,
     });
     return;
@@ -758,12 +778,6 @@ export async function recomputeAndPush(env) {
   const cvTotal = aggregate.cvSent.reduce((n, e) => n + e.count, 0);
   const ivTotal = aggregate.firstInterviews.reduce((n, e) => n + e.count, 0);
 
-  const targets = [
-    { base: env.DASHBOARD_REMOTE_BASE, kind: 'prod' },
-    ...(env.DASHBOARD_REMOTE_BASE_DEV
-      ? [{ base: env.DASHBOARD_REMOTE_BASE_DEV, kind: 'dev' }]
-      : []),
-  ];
   await Promise.allSettled(
     targets.map((t) => pushToTarget(env, t, body, { windowStartMs: window.startMs, cvTotal, ivTotal })),
   );
@@ -772,9 +786,11 @@ export async function recomputeAndPush(env) {
 /**
  * POST the payload to one target with one immediate retry on 5xx/network
  * error, then give up — the puller heals. 409 (window_mismatch around Monday
- * 00:00, stale when pushes race) and 404 (a target still running a pre-stats
- * dashboard build) are expected terminal outcomes, logged at info, never
- * retried. The 409 `unconfigured` reason is warn — operator-actionable.
+ * 00:00, stale when pushes race) and 404/405 (a target still running a
+ * pre-stats dashboard build — its static-file fallback answers unknown paths
+ * with `allow: GET,HEAD`, so a POST gets 405 rather than 404; observed live
+ * 2026-06-11) are expected terminal outcomes, logged at info, never retried.
+ * The 409 `unconfigured` reason is warn — operator-actionable.
  */
 async function pushToTarget(env, target, body, logCtx) {
   const url = `${target.base.replace(/\/+$/, '')}/api/remote/stats/stage-weekly`;
@@ -835,11 +851,11 @@ async function pushToTarget(env, target, body, logCtx) {
     return;
   }
 
-  if (response.status === 404) {
+  if (response.status === 404 || response.status === 405) {
     console.log({
       ...base,
-      message: `[stage-stats] push to ${target.kind} 404 — target runs a pre-stats dashboard build`,
-      status: 404,
+      message: `[stage-stats] push to ${target.kind} ${response.status} — target runs a pre-stats dashboard build`,
+      status: response.status,
     });
     return;
   }
@@ -885,12 +901,18 @@ export const ENRICH_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
 
 /**
  * Handler flow (synchronous through the D1 write; push deferred):
- *   verify token → 401 on mismatch (fail closed when the secret is unset)
+ *   stamp rf.event_type on the span FIRST — auth-failed and unparseable
+ *     deliveries must still surface on LD Dashboard 4, or delivery problems
+ *     are exactly the thing observability goes blind on
+ *   verify token → 401 + warn log on mismatch (fail closed when the secret
+ *     is unset)
  *   parse JSON; require candidate.id → 200 {ok, ignored} + loud warn
  *     (a malformed hook must NOT retry-storm; body-capture logs the payload)
  *   ingestCandidate over the 14-day lookback → 500 on throw (RF may retry;
  *     the reconcile cron heals regardless)
- *   ctx.waitUntil(recomputeAndPush) → fire-and-forget
+ *   ctx.waitUntil(recomputeAndPush) — only when rows actually changed; an
+ *     idempotent replay (RF flushing queued deliveries for already-stored
+ *     moves) skips the recompute+push entirely
  *
  * @param {Request} request
  * @param {*} env
@@ -898,9 +920,18 @@ export const ENRICH_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
  * @returns {Promise<Response>}
  */
 export async function handleStageMovedWebhook(request, env, ctx) {
+  const span = trace.getActiveSpan();
+  span?.setAttribute('rf.event_type', 'stage_moved');
+
   const secret = env.RF_WEBHOOK_SECRET;
   const token = request.headers.get('X-RF-Webhook-Token');
   if (!secret || !token || !timingSafeEqual(token, secret)) {
+    console.warn({
+      message: '[stage-stats] stage-moved webhook unauthorized — delivery dropped (check the RF recipe token / RF_WEBHOOK_SECRET)',
+      source: SOURCE,
+      tokenPresent: !!token,
+      secretConfigured: !!secret,
+    });
     return Response.json({ ok: false, error: 'unauthorized' }, { status: 401 });
   }
 
@@ -923,8 +954,6 @@ export async function handleStageMovedWebhook(request, env, ctx) {
 
   // The payload's own from/to are span attributes only (observability) —
   // never written to D1; the enrichment rows are the single canonical shape.
-  const span = trace.getActiveSpan();
-  span?.setAttribute('rf.event_type', 'stage_moved');
   if (typeof payload.from_stage === 'string') span?.setAttribute('rf.from_stage', payload.from_stage);
   if (typeof payload.to_stage === 'string') span?.setAttribute('rf.to_stage', payload.to_stage);
 
@@ -943,15 +972,18 @@ export async function handleStageMovedWebhook(request, env, ctx) {
   }
 
   console.log({
-    message: `[stage-stats] stage-moved candidate=${candidateId} stored=${result.stored}`,
+    message: `[stage-stats] stage-moved candidate=${candidateId} stored=${result.stored} changed=${result.changed}`,
     source: SOURCE,
     candidateId,
     stored: result.stored,
+    changed: result.changed,
     tookMs: Date.now() - startedAt,
   });
 
-  ctx.waitUntil(recomputeAndPush(env));
-  return Response.json({ ok: true, stored: result.stored });
+  if (result.changed > 0) {
+    ctx.waitUntil(recomputeAndPush(env));
+  }
+  return Response.json({ ok: true, stored: result.stored, changed: result.changed });
 }
 
 // ───────────────────────────── Reconcile ───────────────────────────────────
@@ -1009,16 +1041,21 @@ export async function runReconcile(env) {
     await writeSyncStateMs(env, WATERLINE_KEY, now);
   }
   console.log({
-    message: `[stage-stats] reconcile: candidates=${stats.candidates} gated=${stats.gated} stored=${stats.stored} failed=${stats.failed} window=${new Date(afterMs).toISOString()}→now waterline=${waterlineAdvanced ? 'advanced' : 'held'}`,
+    message: `[stage-stats] reconcile: candidates=${stats.candidates} gated=${stats.gated} stored=${stats.stored} changed=${stats.changed} failed=${stats.failed} window=${new Date(afterMs).toISOString()}→now waterline=${waterlineAdvanced ? 'advanced' : 'held'}`,
     source: SOURCE,
     candidates: stats.candidates,
     gated: stats.gated,
     stored: stats.stored,
+    changed: stats.changed,
     failed: stats.failed,
     windowAfterMs: afterMs,
     waterlineAdvanced,
   });
-  await recomputeAndPush(env);
+  // Push only when the sweep changed something — the dashboard's puller is
+  // the heal path; an unchanged aggregate has nothing to deliver.
+  if (stats.changed > 0) {
+    await recomputeAndPush(env);
+  }
   return { ...stats, windowAfterMs: afterMs, waterlineAdvanced };
 }
 
@@ -1159,11 +1196,13 @@ export async function handleBackfillRoute(request, env) {
 
   const ictx = newIngestContext();
   let stored = 0;
+  let changed = 0;
   let failed = 0;
   for (const id of batch) {
     try {
       const r = await ingestCandidate(env, id, afterMs, beforeMs, 'backfill', ictx);
       stored += r.stored;
+      changed += r.changed;
     } catch (err) {
       failed += 1;
       console.warn({
@@ -1179,13 +1218,14 @@ export async function handleBackfillRoute(request, env) {
   const nextCursor = batch.length > 0 ? batch[batch.length - 1] : cursor;
   const done = batch.length === remaining.length;
   console.log({
-    message: `[stage-stats] backfill batch: processed=${batch.length} stored=${stored} failed=${failed} nextCursor=${nextCursor} done=${done}`,
+    message: `[stage-stats] backfill batch: processed=${batch.length} stored=${stored} changed=${changed} failed=${failed} nextCursor=${nextCursor} done=${done}`,
     source: SOURCE,
     processed: batch.length,
     stored,
+    changed,
     failed,
     nextCursor,
     done,
   });
-  return Response.json({ ok: true, done, nextCursor, processed: batch.length, stored, failed });
+  return Response.json({ ok: true, done, nextCursor, processed: batch.length, stored, changed, failed });
 }

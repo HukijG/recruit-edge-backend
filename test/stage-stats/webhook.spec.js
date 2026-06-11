@@ -122,7 +122,7 @@ describe('POST /webhook/recruiterflow/stage-moved', () => {
     const res = await worker.fetch(webhookRequest({ candidate: { id: 50256 }, from_stage: 'Sourced', to_stage: 'CV Sent' }), env, ctx);
     await waitOnExecutionContext(ctx);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, stored: 3 });
+    expect(await res.json()).toEqual({ ok: true, stored: 3, changed: 3 });
 
     // the enrichment call used the 14-day lookback with seconds-precision params
     const rfUrl = globalThis.fetch.mock.calls[0][0];
@@ -195,7 +195,7 @@ describe('POST /webhook/recruiterflow/stage-moved', () => {
     const res = await worker.fetch(webhookRequest({ candidate: { id: 60002 } }), env, ctx);
     await waitOnExecutionContext(ctx);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, stored: 1 });
+    expect(await res.json()).toEqual({ ok: true, stored: 1, changed: 1 });
 
     const rows = (await env.STAGE_EVENTS.prepare('SELECT * FROM stage_events').all()).results;
     expect(rows[0].is_cv_cross).toBe(0);
@@ -248,6 +248,49 @@ describe('POST /webhook/recruiterflow/stage-moved', () => {
     expect(pipelineCalls()).toHaveLength(0);
   });
 
+  it('pushes when rows changed; an idempotent replay (changed=0) skips the push', async () => {
+    const envWithPush = {
+      ...env,
+      DASHBOARD_REMOTE_BASE_DEV: 'https://dev-dash.example.com',
+      DASHBOARD_REMOTE_KEY: 'remote-key',
+    };
+    const movement = [
+      {
+        id: 984,
+        transitions: [
+          { from: 'Sourced', to: 'CV Sent', entered: '2026-06-08T08:45:00+0000', stage_moved_by: { id: 900005 } },
+        ],
+      },
+    ];
+    const pushes = [];
+    const arm = () => {
+      globalThis.fetch = vi.fn(async (input) => {
+        const url = typeof input === 'string' ? input : input.url;
+        if (url.includes('/candidate/activities/stage-movement/list')) return rfMovementResponse(movement);
+        if (url.includes('/job/pipeline')) return pipelineResponse();
+        if (url.includes('/api/remote/stats/stage-weekly')) {
+          pushes.push(url);
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        throw new Error(`unexpected fetch in test: ${url}`);
+      });
+    };
+
+    arm();
+    let ctx = createExecutionContext();
+    let res = await worker.fetch(webhookRequest({ candidate: { id: 50256 } }), envWithPush, ctx);
+    await waitOnExecutionContext(ctx); // flushes the waitUntil'd push
+    expect((await res.json()).changed).toBe(1);
+    expect(pushes).toHaveLength(1);
+
+    arm(); // same movement again — RF flushing a queued duplicate delivery
+    ctx = createExecutionContext();
+    res = await worker.fetch(webhookRequest({ candidate: { id: 50256 } }), envWithPush, ctx);
+    await waitOnExecutionContext(ctx);
+    expect((await res.json()).changed).toBe(0);
+    expect(pushes).toHaveLength(1); // no second push
+  });
+
   it('self-heals a stale KV pipeline: unknown stage triggers one fresh refetch', async () => {
     // Warm the KV cache with a pipeline that predates a rename.
     await env.SYNC_STATE.put(
@@ -288,7 +331,7 @@ describe('POST /webhook/recruiterflow/stage-moved', () => {
     const res = await worker.fetch(webhookRequest({ candidate: { id: 50256 } }), env, ctx);
     await waitOnExecutionContext(ctx);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, stored: 1 }); // only the parseable one
+    expect(await res.json()).toEqual({ ok: true, stored: 1, changed: 1 }); // only the parseable one
     const rows = (await env.STAGE_EVENTS.prepare('SELECT * FROM stage_events').all()).results;
     expect(rows).toHaveLength(1);
     expect(rows[0].entered_raw).toBe('2026-06-08T08:45:00+0000');
