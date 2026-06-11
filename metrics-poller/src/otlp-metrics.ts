@@ -105,6 +105,31 @@ export async function pushOTelMetrics(config: OTLPMetricsConfig, metrics: CFMetr
 	const workersCpuP50Points = workersPoint((w) => w.cpuTimeP50Us);
 	const workersCpuP99Points = workersPoint((w) => w.cpuTimeP99Us);
 
+	// Day-to-date per-script Workers totals — daily-bar panels (stacked by
+	// script, the stack height is the account total per day).
+	const workersDayPoint = (pick: (w: typeof metrics.workersDay[number]) => number) =>
+		metrics.workersDay.map((w) => ({
+			value: pick(w),
+			dims: { 'cf.script_name': w.scriptName, 'cf.account_id': accountId },
+		}));
+	const workersDayRequestsPoints = workersDayPoint((w) => w.requests);
+	const workersDayErrorsPoints = workersDayPoint((w) => w.errors);
+	const workersDaySubrequestsPoints = workersDayPoint((w) => w.subrequests);
+
+	// Today's AI neurons — the free tier is per-day, so this is the number
+	// the AI panel actually compares against 10k.
+	const aiNeuronsTodayPoints = metrics.aiNeuronsToday !== null
+		? [{ value: metrics.aiNeuronsToday, dims: { 'cf.account_id': accountId } }]
+		: [];
+
+	// The billing snapshot: one series per billable dimension, label carries
+	// the quota — a single Table panel grouped by cf.billing.dimension IS the
+	// month-to-date invoice preview.
+	const billingMtdPoints = metrics.billingMtd.map((b) => ({
+		value: b.value,
+		dims: { 'cf.billing.dimension': b.dimension, 'cf.account_id': accountId },
+	}));
+
 	const payload = {
 		resourceMetrics: [
 			{
@@ -140,6 +165,11 @@ export async function pushOTelMetrics(config: OTLPMetricsConfig, metrics: CFMetr
 							{ name: 'cf.workers.subrequests_hour', unit: '{subrequest}', gauge: { dataPoints: buildDataPoints(workersSubrequestsPoints) } },
 							{ name: 'cf.workers.cpu_time_p50_us', unit: 'us', gauge: { dataPoints: buildDataPoints(workersCpuP50Points) } },
 							{ name: 'cf.workers.cpu_time_p99_us', unit: 'us', gauge: { dataPoints: buildDataPoints(workersCpuP99Points) } },
+							{ name: 'cf.workers.requests_day', unit: '{request}', gauge: { dataPoints: buildDataPoints(workersDayRequestsPoints) } },
+							{ name: 'cf.workers.errors_day', unit: '{error}', gauge: { dataPoints: buildDataPoints(workersDayErrorsPoints) } },
+							{ name: 'cf.workers.subrequests_day', unit: '{subrequest}', gauge: { dataPoints: buildDataPoints(workersDaySubrequestsPoints) } },
+							{ name: 'cf.ai.neurons_day', unit: '{neuron}', gauge: { dataPoints: buildDataPoints(aiNeuronsTodayPoints) } },
+							{ name: 'cf.billing.mtd', unit: '{unit}', gauge: { dataPoints: buildDataPoints(billingMtdPoints) } },
 						],
 					},
 				],

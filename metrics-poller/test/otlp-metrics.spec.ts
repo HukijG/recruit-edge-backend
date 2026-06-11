@@ -7,10 +7,13 @@ const metrics = (over: Partial<CFMetricsResult> = {}): CFMetricsResult => ({
   d1Storage: [],
   kvStorage: [],
   aiUsage: null,
+  aiNeuronsToday: null,
   d1Analytics: [],
   kvOperations: [],
   workersHour: [],
+  workersDay: [],
   doUsage: null,
+  billingMtd: [],
   ...over,
 });
 
@@ -193,7 +196,13 @@ describe('pushOTelMetrics', () => {
       d1Analytics: [{ databaseName: 'rf-stage-events', rowsRead: 54_100, rowsWritten: 16_894, readQueries: 410, writeQueries: 51 }],
       kvOperations: [{ namespaceName: 'SYNC_STATE', actionType: 'read', requests: 1200 }],
       workersHour: [{ scriptName: 'rf-dialpad-sync-dev', requests: 320, errors: 2, subrequests: 4100, cpuTimeP50Us: 4200, cpuTimeP99Us: 91_000 }],
+      workersDay: [{ scriptName: 'rf-dialpad-sync-dev', requests: 5400, errors: 12, subrequests: 81_000 }],
       doUsage: { requests: 44, cpuTimeUs: 123_456, storedBytes: 2048 },
+      aiNeuronsToday: 312,
+      billingMtd: [
+        { dimension: 'Workers requests (10M/mo incl)', value: 123_456 },
+        { dimension: 'KV writes (1M/mo incl)', value: 7_890 },
+      ],
     }));
 
     const body = JSON.parse((fetchSpy as any).mock.calls[0][1].body);
@@ -220,6 +229,16 @@ describe('pushOTelMetrics', () => {
     expect(byName('cf.do.requests_day').gauge.dataPoints[0].asInt).toBe('44');
     expect(byName('cf.do.cpu_time_day_us').gauge.dataPoints[0].asInt).toBe('123456');
     expect(byName('cf.do.stored_bytes').gauge.dataPoints[0].asInt).toBe('2048');
+
+    expect(byName('cf.workers.requests_day').gauge.dataPoints[0].asInt).toBe('5400');
+    expect(byName('cf.workers.errors_day').gauge.dataPoints[0].asInt).toBe('12');
+    expect(byName('cf.ai.neurons_day').gauge.dataPoints[0].asInt).toBe('312');
+
+    const mtd = byName('cf.billing.mtd').gauge.dataPoints;
+    expect(mtd).toHaveLength(2);
+    expect(mtd[0].asInt).toBe('123456');
+    expect(mtd[0].attributes.find((a: any) => a.key === 'cf.billing.dimension').value.stringValue)
+      .toBe('Workers requests (10M/mo incl)');
   });
 
   it('throws if CF_ACCOUNT_ID is missing', async () => {

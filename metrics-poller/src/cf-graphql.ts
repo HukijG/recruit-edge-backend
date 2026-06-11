@@ -40,18 +40,34 @@ export interface CFDOUsage {
 	storedBytes: number;
 }
 
+export interface CFBillingMtd {
+	/** Human-readable billing dimension label, includes the Paid-plan quota. */
+	dimension: string;
+	value: number;
+}
+
 export interface CFMetricsResult {
 	d1Storage: { databaseName: string; sizeBytes: number }[];
 	kvStorage: { namespaceName: string; byteCount: number; keyCount: number }[];
 	aiUsage: CFAIUsage | null;
+	/** Workers AI neurons consumed TODAY (UTC) — the free tier is per-day. */
+	aiNeuronsToday: number | null;
 	/** Day-to-date (UTC) billable D1 query/row counts, per database. */
 	d1Analytics: CFD1Analytics[];
 	/** Day-to-date (UTC) billable KV operation counts, per namespace + action. */
 	kvOperations: CFKVOperations[];
 	/** Previous-hour per-script Workers invocation stats. */
 	workersHour: CFWorkersHour[];
+	/** Day-to-date (UTC) per-script Workers invocation totals. */
+	workersDay: { scriptName: string; requests: number; errors: number; subrequests: number }[];
 	/** Day-to-date (UTC) Durable Objects usage (account-wide). Null when the query failed. */
 	doUsage: CFDOUsage | null;
+	/**
+	 * Month-to-date (UTC calendar month ≈ the billing period) account totals,
+	 * one entry per billable dimension — the numbers the CF invoice is made
+	 * of, labelled with their included quotas.
+	 */
+	billingMtd: CFBillingMtd[];
 }
 
 export interface CFGraphQLConfig {
@@ -189,6 +205,79 @@ const workersHourQuery = (startIso: string, endIso: string) => `
   }
 `;
 
+/** Same dataset, day-to-date window, per script — feeds the daily bar panels. */
+const workersDayQuery = (startIso: string, endIso: string) => `
+  query WorkersDay($accountTag: String!) {
+    viewer {
+      accounts(filter: { accountTag: $accountTag }) {
+        workersInvocationsAdaptive(
+          filter: { datetime_geq: "${startIso}", datetime_leq: "${endIso}" }
+          limit: 1000
+        ) {
+          sum { requests errors subrequests }
+          dimensions { scriptName }
+        }
+      }
+    }
+  }
+`;
+
+/** Month-to-date account total — feeds the billing snapshot table. */
+const workersMtdQuery = (startIso: string, endIso: string) => `
+  query WorkersMtd($accountTag: String!) {
+    viewer {
+      accounts(filter: { accountTag: $accountTag }) {
+        workersInvocationsAdaptive(
+          filter: { datetime_geq: "${startIso}", datetime_leq: "${endIso}" }
+          limit: 1000
+        ) {
+          sum { requests }
+          dimensions { scriptName }
+        }
+      }
+    }
+  }
+`;
+
+// Month-to-date totals for the date-granular datasets, summed client-side
+// from per-date rows (all field names verified — see provenance above).
+const MTD_QUERY = `
+  query MonthToDate($accountTag: String!, $start: Date, $end: Date) {
+    viewer {
+      accounts(filter: { accountTag: $accountTag }) {
+        d1AnalyticsAdaptiveGroups(
+          filter: { date_geq: $start, date_leq: $end }
+          limit: 500
+        ) {
+          sum { rowsRead rowsWritten }
+          dimensions { date }
+        }
+        kvOperationsAdaptiveGroups(
+          filter: { date_geq: $start, date_leq: $end }
+          limit: 500
+        ) {
+          sum { requests }
+          dimensions { actionType date }
+        }
+        durableObjectsInvocationsAdaptiveGroups(
+          filter: { date_geq: $start, date_leq: $end }
+          limit: 100
+        ) {
+          sum { requests }
+          dimensions { date }
+        }
+        aiInferenceAdaptiveGroups(
+          filter: { date_geq: $start, date_leq: $end }
+          limit: 100
+        ) {
+          sum { totalNeurons }
+          dimensions { date }
+        }
+      }
+    }
+  }
+`;
+
 const DO_USAGE_QUERY = `
   query DOUsage($accountTag: String!, $start: Date, $end: Date) {
     viewer {
@@ -274,13 +363,19 @@ export async function fetchCFMetrics(config: CFGraphQLConfig): Promise<CFMetrics
 	const hourStart = new Date(hourEnd.getTime() - 3_600_000);
 	const isoSeconds = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, 'Z');
 
+	const dayStart = `${today}T00:00:00Z`;
+	const monthStart = `${today.slice(0, 8)}01`;
+
 	const accountTag = config.CF_ACCOUNT_ID;
-	const [storageAi, d1An, kvOps, workers, doUsage] = await Promise.all([
+	const [storageAi, d1An, kvOps, workers, doUsage, workersDayRes, workersMtdRes, mtd] = await Promise.all([
 		runQuery(config, 'storage+ai', STORAGE_AI_QUERY, { accountTag, start: yesterday, end: today }),
 		runQuery(config, 'd1-analytics', D1_ANALYTICS_QUERY, { accountTag, start: today, end: today }),
 		runQuery(config, 'kv-operations', KV_OPERATIONS_QUERY, { accountTag, start: today, end: today }),
 		runQuery(config, 'workers-invocations', workersHourQuery(isoSeconds(hourStart), isoSeconds(hourEnd)), { accountTag }),
 		runQuery(config, 'durable-objects', DO_USAGE_QUERY, { accountTag, start: today, end: today }),
+		runQuery(config, 'workers-day', workersDayQuery(dayStart, isoSeconds(new Date(now))), { accountTag }),
+		runQuery(config, 'workers-mtd', workersMtdQuery(`${monthStart}T00:00:00Z`, isoSeconds(new Date(now))), { accountTag }),
+		runQuery(config, 'month-to-date', MTD_QUERY, { accountTag, start: monthStart, end: today }),
 	]);
 
 	const d1Storage = ((storageAi?.d1StorageAdaptiveGroups as any[]) || []).map((row: any) => ({
@@ -350,13 +445,68 @@ export async function fetchCFMetrics(config: CFGraphQLConfig): Promise<CFMetrics
 		};
 	}
 
+	// The free AI tier is PER DAY — surface today's slice of the per-date
+	// groups the storage+ai query already returns.
+	const aiNeuronsToday = aiGroups.length > 0
+		? aiGroups
+			.filter((g: any) => g.dimensions?.date === today)
+			.reduce((n: number, g: any) => n + (g.sum?.totalNeurons ?? 0), 0)
+		: null;
+
+	const workersDay = ((workersDayRes?.workersInvocationsAdaptive as any[]) || []).map((row: any) => ({
+		scriptName: row.dimensions?.scriptName ?? 'unknown',
+		requests: row.sum?.requests ?? 0,
+		errors: row.sum?.errors ?? 0,
+		subrequests: row.sum?.subrequests ?? 0,
+	}));
+
+	// The billing snapshot: month-to-date account totals per billable
+	// dimension, quota in the label so the dashboard table is self-describing.
+	const billingMtd: CFBillingMtd[] = [];
+	const sumRows = (rows: any[] | undefined, pick: (r: any) => number) =>
+		(rows || []).reduce((n: number, r: any) => n + pick(r), 0);
+	if (workersMtdRes) {
+		billingMtd.push({
+			dimension: 'Workers requests (10M/mo incl)',
+			value: sumRows(workersMtdRes.workersInvocationsAdaptive as any[], (r) => r.sum?.requests ?? 0),
+		});
+	}
+	if (mtd) {
+		billingMtd.push(
+			{ dimension: 'D1 rows read (25B/mo incl)', value: sumRows(mtd.d1AnalyticsAdaptiveGroups as any[], (r) => r.sum?.rowsRead ?? 0) },
+			{ dimension: 'D1 rows written (50M/mo incl)', value: sumRows(mtd.d1AnalyticsAdaptiveGroups as any[], (r) => r.sum?.rowsWritten ?? 0) },
+			{ dimension: 'DO requests (1M/mo incl)', value: sumRows(mtd.durableObjectsInvocationsAdaptiveGroups as any[], (r) => r.sum?.requests ?? 0) },
+			{ dimension: 'AI neurons MTD ($0.011/1k past 10k/day)', value: sumRows(mtd.aiInferenceAdaptiveGroups as any[], (r) => r.sum?.totalNeurons ?? 0) },
+		);
+		const KV_QUOTA: Record<string, string> = {
+			read: 'KV reads (10M/mo incl)',
+			write: 'KV writes (1M/mo incl)',
+			delete: 'KV deletes (1M/mo incl)',
+			list: 'KV lists (1M/mo incl)',
+		};
+		const kvTotals = new Map<string, number>();
+		for (const row of (mtd.kvOperationsAdaptiveGroups as any[]) || []) {
+			const action = row.dimensions?.actionType ?? 'unknown';
+			kvTotals.set(action, (kvTotals.get(action) ?? 0) + (row.sum?.requests ?? 0));
+		}
+		for (const [action, value] of kvTotals) {
+			billingMtd.push({ dimension: KV_QUOTA[action] ?? `KV ${action} ops`, value });
+		}
+	}
+	if (aiNeuronsToday !== null) {
+		billingMtd.push({ dimension: 'AI neurons TODAY (10k/day free)', value: aiNeuronsToday });
+	}
+
 	return {
 		d1Storage,
 		kvStorage,
 		aiUsage,
+		aiNeuronsToday,
 		d1Analytics: [...d1ByDb.values()],
 		kvOperations: [...kvByKey.values()],
 		workersHour,
+		workersDay,
 		doUsage: doResult,
+		billingMtd,
 	};
 }

@@ -146,6 +146,55 @@ describe('fetchCFMetrics', () => {
 		expect(result.doUsage).toEqual({ requests: 44, cpuTimeUs: 123_456, storedBytes: 2048 });
 	});
 
+	it('parses day-to-date Workers totals and the month-to-date billing snapshot', async () => {
+		const today = new Date().toISOString().slice(0, 10);
+		mockGraphQL({
+			WorkersDay: {
+				workersInvocationsAdaptive: [
+					{ sum: { requests: 5400, errors: 12, subrequests: 81_000 }, dimensions: { scriptName: 'rf-dialpad-sync-dev' } },
+				],
+			},
+			WorkersMtd: {
+				workersInvocationsAdaptive: [
+					{ sum: { requests: 100_000 }, dimensions: { scriptName: 'rf-dialpad-sync-dev' } },
+					{ sum: { requests: 23_456 }, dimensions: { scriptName: 'rf-music-remote' } },
+				],
+			},
+			MonthToDate: {
+				d1AnalyticsAdaptiveGroups: [
+					{ sum: { rowsRead: 900_000, rowsWritten: 60_000 }, dimensions: { date: today } },
+					{ sum: { rowsRead: 100_000, rowsWritten: 5_000 }, dimensions: { date: '2026-06-01' } },
+				],
+				kvOperationsAdaptiveGroups: [
+					{ sum: { requests: 12_000 }, dimensions: { actionType: 'read', date: today } },
+					{ sum: { requests: 300 }, dimensions: { actionType: 'write', date: today } },
+				],
+				durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 77 }, dimensions: { date: today } }],
+				aiInferenceAdaptiveGroups: [{ sum: { totalNeurons: 45_000 }, dimensions: { date: today } }],
+			},
+			StorageAndAI: {
+				aiInferenceAdaptiveGroups: [
+					{ count: 2, sum: { totalNeurons: 999, totalInferenceSteps: 1, totalInputTokens: 1, totalOutputTokens: 1 }, dimensions: { date: '2026-06-10' } },
+					{ count: 3, sum: { totalNeurons: 312, totalInferenceSteps: 1, totalInputTokens: 1, totalOutputTokens: 1 }, dimensions: { date: today } },
+				],
+			},
+		});
+		const result = await fetchCFMetrics(CONFIG);
+		expect(result.workersDay).toEqual([
+			{ scriptName: 'rf-dialpad-sync-dev', requests: 5400, errors: 12, subrequests: 81_000 },
+		]);
+		expect(result.aiNeuronsToday).toBe(312); // today's slice only, not the 2-day sum
+		const dim = (d: string) => result.billingMtd.find((b) => b.dimension === d)?.value;
+		expect(dim('Workers requests (10M/mo incl)')).toBe(123_456); // summed across scripts
+		expect(dim('D1 rows read (25B/mo incl)')).toBe(1_000_000); // summed across dates
+		expect(dim('D1 rows written (50M/mo incl)')).toBe(65_000);
+		expect(dim('KV reads (10M/mo incl)')).toBe(12_000);
+		expect(dim('KV writes (1M/mo incl)')).toBe(300);
+		expect(dim('DO requests (1M/mo incl)')).toBe(77);
+		expect(dim('AI neurons MTD ($0.011/1k past 10k/day)')).toBe(45_000);
+		expect(dim('AI neurons TODAY (10k/day free)')).toBe(312);
+	});
+
 	// Regression guard against CF schema drift. The original un-prefixed AI
 	// field name broke when CF renamed it. Datasets are now isolated per
 	// request, but the verified names still deserve a loud diff on change.

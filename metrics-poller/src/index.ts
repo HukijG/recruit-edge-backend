@@ -34,6 +34,8 @@ interface TickResult {
   kvOpsCount: number;
   workersScriptCount: number;
   doRequestsDay: number | null;
+  billingDimensions: number;
+  aiNeuronsToday: number | null;
   error?: string;
 }
 
@@ -57,6 +59,8 @@ async function runTick(env: Env): Promise<TickResult> {
       kvOpsCount: metrics.kvOperations.length,
       workersScriptCount: metrics.workersHour.length,
       doRequestsDay: metrics.doUsage?.requests ?? null,
+      billingDimensions: metrics.billingMtd.length,
+      aiNeuronsToday: metrics.aiNeuronsToday,
     };
     console.log({ source: 'metrics-poller', message: 'tick ok', ...result });
     return result;
@@ -76,6 +80,8 @@ async function runTick(env: Env): Promise<TickResult> {
       kvOpsCount: 0,
       workersScriptCount: 0,
       doRequestsDay: null,
+      billingDimensions: 0,
+      aiNeuronsToday: null,
       error: String(err),
     };
   }
