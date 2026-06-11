@@ -471,6 +471,29 @@ export async function computeAggregate(env, afterMs, beforeMs) {
   return { cvSent: toEntries(cv), firstInterviews: toEntries(iv) };
 }
 
+// ───────────────────────────── Sync state ──────────────────────────────────
+// One-row-per-key state in STAGE_EVENTS (migration 0002). Currently holds
+// the reconcile waterline.
+
+/** Read a millisecond value from sync_state; null when absent/garbled. */
+async function readSyncStateMs(env, key) {
+  const row = await env.STAGE_EVENTS.prepare('SELECT value FROM sync_state WHERE key = ?1')
+    .bind(key)
+    .first();
+  const n = row ? Number(row.value) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Upsert a millisecond value into sync_state. */
+async function writeSyncStateMs(env, key, ms) {
+  await env.STAGE_EVENTS.prepare(
+    `INSERT INTO sync_state (key, value, updated_ms) VALUES (?1, ?2, ?3)
+     ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_ms = excluded.updated_ms`,
+  )
+    .bind(key, String(ms), Date.now())
+    .run();
+}
+
 // ─────────────────────────────── Token gate ────────────────────────────────
 
 /**
@@ -935,41 +958,68 @@ export async function handleStageMovedWebhook(request, env, ctx) {
 // The backstop for missed/failed webhooks (worker down, RF outage, 500s RF
 // never retried, rate-limit residue).
 //
-// The window reaches back to the PREVIOUS week's Monday (Europe/London) so
-// the last-week aggregate keeps healing across the weekly boundary — a move
-// missed Sunday 23:50 is still swept on Monday, which is what the dashboard's
-// LAST-WEEK toggle reads. Gated (reached-submission) to bound RF detail
-// calls; the gate's residual hole is recoverable via an ungated backfill.
+// Waterlined: sync_state's 'reconcile_waterline_ms' marks the instant up to
+// which a fully-successful sweep has ingested everything, so the hourly run
+// re-reads only [waterline − overlap, now] instead of re-walking the full
+// prev-Monday window every hour (that re-walk was rewriting every stored row
+// every hour — ~17k D1 writes/day for an append-only dataset). The pieces:
+//
+//  - RF's candidate/search `last_activity` filter is DAY-granular, so the
+//    search since-date is floored a day below the window start and the
+//    per-candidate stage-movement window does the real (seconds-precision)
+//    bounding — RF's `entered` timestamps are the granular dedup axis.
+//  - The 3h overlap absorbs the search index's ~1h lag and any skew between
+//    a movement's `entered` stamp and when it became visible. Overlap
+//    re-reads are free on the write side (the conditional upsert skips
+//    unchanged rows).
+//  - The waterline only advances (to this sweep's start instant) when NO
+//    candidate in the window failed — a transient failure holds it back so
+//    the next hour re-covers the same ground. Structural anomalies don't
+//    fail candidates (see classifyTransitionForJob) and so can't pin it.
+//  - First run (no sync_state row) bootstraps from the previous week's
+//    London Monday — same horizon the dashboard's LAST-WEEK toggle reads.
 //
 // Runs hourly from cron (`7 * * * *` → src/index.js `scheduled()`) and on
 // demand via `POST /admin/stage-stats/reconcile`.
 
+const WATERLINE_KEY = 'reconcile_waterline_ms';
+export const RECONCILE_OVERLAP_MS = 3 * 60 * 60 * 1000;
+
 /**
- * One reconcile sweep: ingest the prev-Monday → now window (gated), then push
- * unconditionally — the push is cheap and idempotent; no changed-detection
- * bookkeeping.
+ * One reconcile sweep over [waterline − overlap, now] (gated), advancing the
+ * waterline on a clean sweep, then pushing.
  *
  * @param {*} env
- * @returns {Promise<{candidates: number, gated: number, fetched: number, stored: number, failed: number}>}
+ * @returns {Promise<{candidates: number, gated: number, fetched: number, stored: number,
+ *                    failed: number, windowAfterMs: number, waterlineAdvanced: boolean}>}
  */
 export async function runReconcile(env) {
   const now = Date.now();
+  const waterline = await readSyncStateMs(env, WATERLINE_KEY);
+  const afterMs =
+    waterline === null ? previousWeekStartLondon(now) : waterline - RECONCILE_OVERLAP_MS;
   const stats = await ingestWindow(env, {
-    afterMs: previousWeekStartLondon(now),
+    afterMs,
     beforeMs: now,
     gate: true,
     source: 'reconcile',
   });
+  const waterlineAdvanced = stats.failed === 0;
+  if (waterlineAdvanced) {
+    await writeSyncStateMs(env, WATERLINE_KEY, now);
+  }
   console.log({
-    message: `[stage-stats] reconcile: candidates=${stats.candidates} gated=${stats.gated} stored=${stats.stored} failed=${stats.failed}`,
+    message: `[stage-stats] reconcile: candidates=${stats.candidates} gated=${stats.gated} stored=${stats.stored} failed=${stats.failed} window=${new Date(afterMs).toISOString()}→now waterline=${waterlineAdvanced ? 'advanced' : 'held'}`,
     source: SOURCE,
     candidates: stats.candidates,
     gated: stats.gated,
     stored: stats.stored,
     failed: stats.failed,
+    windowAfterMs: afterMs,
+    waterlineAdvanced,
   });
   await recomputeAndPush(env);
-  return stats;
+  return { ...stats, windowAfterMs: afterMs, waterlineAdvanced };
 }
 
 /**

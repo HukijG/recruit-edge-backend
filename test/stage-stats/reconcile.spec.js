@@ -159,12 +159,13 @@ describe('POST /admin/stage-stats/reconcile', () => {
     expect(rows[0].source).toBe('reconcile');
   });
 
-  it('windows the sweep from the PREVIOUS London Monday (cross-boundary healing)', async () => {
+  it('bootstrap (no waterline): windows the sweep from the PREVIOUS London Monday', async () => {
     mockRF([searchRow(101, [job(11, 'CV Sent')])], { 101: [] });
     const ctx = createExecutionContext();
     const res = await worker.fetch(reconcileRequest(), env, ctx);
     await waitOnExecutionContext(ctx);
     expect(res.status).toBe(200);
+    expect((await res.json()).waterlineAdvanced).toBe(true);
 
     const detailUrl = globalThis.fetch.mock.calls
       .map((c) => (typeof c[0] === 'string' ? c[0] : c[0].url))
@@ -174,6 +175,54 @@ describe('POST /admin/stage-stats/reconcile', () => {
     const ageDays = (Date.now() - Date.parse(after)) / 86_400_000;
     expect(ageDays).toBeGreaterThanOrEqual(7);
     expect(ageDays).toBeLessThan(15);
+  });
+
+  it('advances the waterline on a clean sweep; the next sweep windows from waterline − overlap', async () => {
+    mockRF([searchRow(101, [job(11, 'CV Sent')])], { 101: [] });
+    let ctx = createExecutionContext();
+    await worker.fetch(reconcileRequest(), env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    const stored = await env.STAGE_EVENTS.prepare(
+      "SELECT value FROM sync_state WHERE key = 'reconcile_waterline_ms'",
+    ).first();
+    const waterline = Number(stored.value);
+    expect(Math.abs(Date.now() - waterline)).toBeLessThan(60_000);
+
+    mockRF([searchRow(101, [job(11, 'CV Sent')])], { 101: [] });
+    ctx = createExecutionContext();
+    const res = await worker.fetch(reconcileRequest(), env, ctx);
+    await waitOnExecutionContext(ctx);
+    const body = await res.json();
+    // second sweep starts 3h below the first sweep's waterline, not last Monday
+    expect(body.windowAfterMs).toBe(waterline - 3 * 60 * 60 * 1000);
+
+    const detailUrl = globalThis.fetch.mock.calls
+      .map((c) => (typeof c[0] === 'string' ? c[0] : c[0].url))
+      .find((u) => u.includes('stage-movement'));
+    const after = Date.parse(new URL(detailUrl).searchParams.get('after'));
+    expect(Math.abs(after - body.windowAfterMs)).toBeLessThan(1000); // seconds-precision truncation only
+  });
+
+  it('holds the waterline when any candidate fails (the next sweep re-covers)', async () => {
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('/candidate/search')) {
+        return new Response(JSON.stringify({ data: [searchRow(101, [job(11, 'CV Sent')])] }), { status: 200 });
+      }
+      if (url.includes('/job/pipeline')) return pipelineResponse();
+      return new Response('nope', { status: 400 }); // detail fetch fails
+    });
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(reconcileRequest(), env, ctx);
+    await waitOnExecutionContext(ctx);
+    const body = await res.json();
+    expect(body).toMatchObject({ ok: true, failed: 1, waterlineAdvanced: false });
+
+    const stored = await env.STAGE_EVENTS.prepare(
+      "SELECT value FROM sync_state WHERE key = 'reconcile_waterline_ms'",
+    ).first();
+    expect(stored).toBeNull();
   });
 
   it('a failing candidate is skipped, the sweep continues', async () => {
