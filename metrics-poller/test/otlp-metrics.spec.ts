@@ -1,5 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { pushOTelMetrics } from '../src/otlp-metrics.js';
+import type { CFMetricsResult } from '../src/cf-graphql.js';
+
+/** Full result shape with everything empty — tests override what they assert on. */
+const metrics = (over: Partial<CFMetricsResult> = {}): CFMetricsResult => ({
+  d1Storage: [],
+  kvStorage: [],
+  aiUsage: null,
+  d1Analytics: [],
+  kvOperations: [],
+  workersHour: [],
+  doUsage: null,
+  ...over,
+});
 
 describe('pushOTelMetrics', () => {
   let errSpy: ReturnType<typeof vi.spyOn>;
@@ -18,9 +31,9 @@ describe('pushOTelMetrics', () => {
       LD_OTLP_METRICS_URL: 'https://x/v1/metrics',
       LD_SDK_KEY: 'test-key',
       CF_ACCOUNT_ID: 'account-id-xyz',
-    }, {
-      d1Storage: [{ databaseId: 'rf-mcp-cache', sizeBytes: 12345 }],
-      kvStorage: [{ namespaceId: 'SYNC_STATE', byteCount: 9876, keyCount: 42 }],
+    }, metrics({
+      d1Storage: [{ databaseName: 'rf-mcp-cache', sizeBytes: 12345 }],
+      kvStorage: [{ namespaceName: 'SYNC_STATE', byteCount: 9876, keyCount: 42 }],
       aiUsage: {
         neurons: 100,
         inferenceSteps: 12,
@@ -28,7 +41,7 @@ describe('pushOTelMetrics', () => {
         outputTokens: 800,
         requests: 7,
       },
-    });
+    }));
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     const [url, init] = (fetchSpy as any).mock.calls[0];
@@ -79,11 +92,7 @@ describe('pushOTelMetrics', () => {
       LD_OTLP_METRICS_URL: 'https://x/v1/metrics',
       LD_SDK_KEY: 'test-key',
       CF_ACCOUNT_ID: 'account-id-xyz',
-    }, {
-      d1Storage: [],
-      kvStorage: [],
-      aiUsage: null,
-    });
+    }, metrics());
 
     const body = JSON.parse((fetchSpy as any).mock.calls[0][1].body);
     const metricsBlock = body.resourceMetrics[0].scopeMetrics[0].metrics;
@@ -101,11 +110,7 @@ describe('pushOTelMetrics', () => {
       LD_OTLP_METRICS_URL: 'https://x/v1/metrics',
       LD_SDK_KEY: 'test-key',
       CF_ACCOUNT_ID: 'account-id-xyz',
-    }, {
-      d1Storage: [],
-      kvStorage: [],
-      aiUsage: null,
-    });
+    }, metrics());
 
     expect(errSpy).toHaveBeenCalledTimes(1);
     const logged = errSpy.mock.calls[0][0] as any;
@@ -121,11 +126,7 @@ describe('pushOTelMetrics', () => {
       LD_OTLP_METRICS_URL: 'https://x/v1/metrics',
       LD_SDK_KEY: 'test-key',
       CF_ACCOUNT_ID: 'account-id-xyz',
-    }, {
-      d1Storage: [],
-      kvStorage: [],
-      aiUsage: null,
-    });
+    }, metrics());
 
     expect(errSpy).toHaveBeenCalledTimes(1);
     const logged = errSpy.mock.calls[0][0] as any;
@@ -147,9 +148,8 @@ describe('pushOTelMetrics', () => {
       LD_OTLP_METRICS_URL: 'https://x/v1/metrics',
       LD_SDK_KEY: 'test-key',
       CF_ACCOUNT_ID: 'account-id-xyz',
-    }, {
-      d1Storage: [{ databaseId: 'db-int', sizeBytes: 95617020 }],
-      kvStorage: [],
+    }, metrics({
+      d1Storage: [{ databaseName: 'db-int', sizeBytes: 95617020 }],
       aiUsage: {
         neurons: 12082.193518913959,  // ← float
         inferenceSteps: 0,
@@ -157,7 +157,7 @@ describe('pushOTelMetrics', () => {
         outputTokens: 14829,           // ← int
         requests: 347,                  // ← int
       },
-    });
+    }));
 
     const body = JSON.parse((fetchSpy as any).mock.calls[0][1].body);
     const metricsBlock = body.resourceMetrics[0].scopeMetrics[0].metrics;
@@ -181,16 +181,53 @@ describe('pushOTelMetrics', () => {
     expect(errSpy).not.toHaveBeenCalled();
   });
 
+  it('emits the billing-dimension gauges with their resource attributes', async () => {
+    const fetchSpy = vi.fn(async () => new Response('', { status: 200 }));
+    globalThis.fetch = fetchSpy as any;
+
+    await pushOTelMetrics({
+      LD_OTLP_METRICS_URL: 'https://x/v1/metrics',
+      LD_SDK_KEY: 'test-key',
+      CF_ACCOUNT_ID: 'account-id-xyz',
+    }, metrics({
+      d1Analytics: [{ databaseName: 'rf-stage-events', rowsRead: 54_100, rowsWritten: 16_894, readQueries: 410, writeQueries: 51 }],
+      kvOperations: [{ namespaceName: 'SYNC_STATE', actionType: 'read', requests: 1200 }],
+      workersHour: [{ scriptName: 'rf-dialpad-sync-dev', requests: 320, errors: 2, subrequests: 4100, cpuTimeP50Us: 4200, cpuTimeP99Us: 91_000 }],
+      doUsage: { requests: 44, cpuTimeUs: 123_456, storedBytes: 2048 },
+    }));
+
+    const body = JSON.parse((fetchSpy as any).mock.calls[0][1].body);
+    const metricsBlock = body.resourceMetrics[0].scopeMetrics[0].metrics;
+    const byName = (n: string) => metricsBlock.find((m: any) => m.name === n);
+
+    expect(byName('cf.d1.rows_read_day').gauge.dataPoints[0].asInt).toBe('54100');
+    expect(byName('cf.d1.rows_written_day').gauge.dataPoints[0].asInt).toBe('16894');
+    expect(byName('cf.d1.read_queries_day').gauge.dataPoints[0].asInt).toBe('410');
+    expect(byName('cf.d1.write_queries_day').gauge.dataPoints[0].asInt).toBe('51');
+    const d1Attrs = byName('cf.d1.rows_written_day').gauge.dataPoints[0].attributes;
+    expect(d1Attrs.find((a: any) => a.key === 'cf.binding_name').value.stringValue).toBe('rf-stage-events');
+
+    const kvDp = byName('cf.kv.operations_day').gauge.dataPoints[0];
+    expect(kvDp.asInt).toBe('1200');
+    expect(kvDp.attributes.find((a: any) => a.key === 'cf.kv.action').value.stringValue).toBe('read');
+
+    expect(byName('cf.workers.requests_hour').gauge.dataPoints[0].asInt).toBe('320');
+    expect(byName('cf.workers.errors_hour').gauge.dataPoints[0].asInt).toBe('2');
+    expect(byName('cf.workers.cpu_time_p99_us').gauge.dataPoints[0].asInt).toBe('91000');
+    const wAttrs = byName('cf.workers.requests_hour').gauge.dataPoints[0].attributes;
+    expect(wAttrs.find((a: any) => a.key === 'cf.script_name').value.stringValue).toBe('rf-dialpad-sync-dev');
+
+    expect(byName('cf.do.requests_day').gauge.dataPoints[0].asInt).toBe('44');
+    expect(byName('cf.do.cpu_time_day_us').gauge.dataPoints[0].asInt).toBe('123456');
+    expect(byName('cf.do.stored_bytes').gauge.dataPoints[0].asInt).toBe('2048');
+  });
+
   it('throws if CF_ACCOUNT_ID is missing', async () => {
     globalThis.fetch = vi.fn(async () => new Response('', { status: 200 })) as any;
     await expect(pushOTelMetrics({
       LD_OTLP_METRICS_URL: 'https://x/v1/metrics',
       LD_SDK_KEY: 'test-key',
       CF_ACCOUNT_ID: '',
-    }, {
-      d1Storage: [],
-      kvStorage: [],
-      aiUsage: null,
-    })).rejects.toThrow(/CF_ACCOUNT_ID/);
+    }, metrics())).rejects.toThrow(/CF_ACCOUNT_ID/);
   });
 });

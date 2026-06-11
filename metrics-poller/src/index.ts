@@ -30,6 +30,10 @@ interface TickResult {
   aiInputTokens: number | null;
   aiOutputTokens: number | null;
   aiRequests: number | null;
+  d1AnalyticsCount: number;
+  kvOpsCount: number;
+  workersScriptCount: number;
+  doRequestsDay: number | null;
   error?: string;
 }
 
@@ -49,6 +53,10 @@ async function runTick(env: Env): Promise<TickResult> {
       aiInputTokens: metrics.aiUsage?.inputTokens ?? null,
       aiOutputTokens: metrics.aiUsage?.outputTokens ?? null,
       aiRequests: metrics.aiUsage?.requests ?? null,
+      d1AnalyticsCount: metrics.d1Analytics.length,
+      kvOpsCount: metrics.kvOperations.length,
+      workersScriptCount: metrics.workersHour.length,
+      doRequestsDay: metrics.doUsage?.requests ?? null,
     };
     console.log({ source: 'metrics-poller', message: 'tick ok', ...result });
     return result;
@@ -64,6 +72,10 @@ async function runTick(env: Env): Promise<TickResult> {
       aiInputTokens: null,
       aiOutputTokens: null,
       aiRequests: null,
+      d1AnalyticsCount: 0,
+      kvOpsCount: 0,
+      workersScriptCount: 0,
+      doRequestsDay: null,
       error: String(err),
     };
   }

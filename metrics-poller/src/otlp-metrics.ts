@@ -29,11 +29,11 @@ export async function pushOTelMetrics(config: OTLPMetricsConfig, metrics: CFMetr
 
 	const d1Points = metrics.d1Storage.map((d) => ({
 		value: d.sizeBytes,
-		dims: { 'cf.binding_name': d.databaseId, 'cf.account_id': accountId },
+		dims: { 'cf.binding_name': d.databaseName, 'cf.account_id': accountId },
 	}));
 	const kvPoints = metrics.kvStorage.map((k) => ({
 		value: k.byteCount,
-		dims: { 'cf.binding_name': k.namespaceId, 'cf.account_id': accountId },
+		dims: { 'cf.binding_name': k.namespaceName, 'cf.account_id': accountId },
 	}));
 	// AI metric naming reflects CF's published billing/usage semantics
 	// (https://developers.cloudflare.com/workers-ai/platform/pricing/):
@@ -57,6 +57,54 @@ export async function pushOTelMetrics(config: OTLPMetricsConfig, metrics: CFMetr
 		? [{ value: metrics.aiUsage.requests, dims: { 'cf.account_id': accountId } }]
 		: [];
 
+	// Day-to-date (UTC) billable counters — daily sawtooth by design, so an LD
+	// panel's daily max IS the billing-relevant "per day" number. These are the
+	// dimensions CF actually charges on (see docs/observability.md § dashboard
+	// guide): D1 rows read/written, KV ops by action, DO requests.
+	const d1RowsReadPoints = metrics.d1Analytics.map((d) => ({
+		value: d.rowsRead,
+		dims: { 'cf.binding_name': d.databaseName, 'cf.account_id': accountId },
+	}));
+	const d1RowsWrittenPoints = metrics.d1Analytics.map((d) => ({
+		value: d.rowsWritten,
+		dims: { 'cf.binding_name': d.databaseName, 'cf.account_id': accountId },
+	}));
+	const d1ReadQueriesPoints = metrics.d1Analytics.map((d) => ({
+		value: d.readQueries,
+		dims: { 'cf.binding_name': d.databaseName, 'cf.account_id': accountId },
+	}));
+	const d1WriteQueriesPoints = metrics.d1Analytics.map((d) => ({
+		value: d.writeQueries,
+		dims: { 'cf.binding_name': d.databaseName, 'cf.account_id': accountId },
+	}));
+	const kvOpsPoints = metrics.kvOperations.map((k) => ({
+		value: k.requests,
+		dims: { 'cf.binding_name': k.namespaceName, 'cf.kv.action': k.actionType, 'cf.account_id': accountId },
+	}));
+	const doRequestPoints = metrics.doUsage
+		? [{ value: metrics.doUsage.requests, dims: { 'cf.account_id': accountId } }]
+		: [];
+	const doCpuPoints = metrics.doUsage
+		? [{ value: metrics.doUsage.cpuTimeUs, dims: { 'cf.account_id': accountId } }]
+		: [];
+	const doStoredPoints = metrics.doUsage
+		? [{ value: metrics.doUsage.storedBytes, dims: { 'cf.account_id': accountId } }]
+		: [];
+
+	// Previous-hour per-script Workers stats (datetime-granular dataset).
+	// Requests are the billable count; CPU quantiles are the operational
+	// signal for the CPU-ms billing dimension (a total isn't exposed).
+	const workersPoint = (pick: (w: typeof metrics.workersHour[number]) => number) =>
+		metrics.workersHour.map((w) => ({
+			value: pick(w),
+			dims: { 'cf.script_name': w.scriptName, 'cf.account_id': accountId },
+		}));
+	const workersRequestsPoints = workersPoint((w) => w.requests);
+	const workersErrorsPoints = workersPoint((w) => w.errors);
+	const workersSubrequestsPoints = workersPoint((w) => w.subrequests);
+	const workersCpuP50Points = workersPoint((w) => w.cpuTimeP50Us);
+	const workersCpuP99Points = workersPoint((w) => w.cpuTimeP99Us);
+
 	const payload = {
 		resourceMetrics: [
 			{
@@ -79,6 +127,19 @@ export async function pushOTelMetrics(config: OTLPMetricsConfig, metrics: CFMetr
 							{ name: 'cf.ai.input_tokens', unit: '{token}', gauge: { dataPoints: buildDataPoints(aiInputTokenPoints) } },
 							{ name: 'cf.ai.output_tokens', unit: '{token}', gauge: { dataPoints: buildDataPoints(aiOutputTokenPoints) } },
 							{ name: 'cf.ai.requests', unit: '{request}', gauge: { dataPoints: buildDataPoints(aiRequestPoints) } },
+							{ name: 'cf.d1.rows_read_day', unit: '{row}', gauge: { dataPoints: buildDataPoints(d1RowsReadPoints) } },
+							{ name: 'cf.d1.rows_written_day', unit: '{row}', gauge: { dataPoints: buildDataPoints(d1RowsWrittenPoints) } },
+							{ name: 'cf.d1.read_queries_day', unit: '{query}', gauge: { dataPoints: buildDataPoints(d1ReadQueriesPoints) } },
+							{ name: 'cf.d1.write_queries_day', unit: '{query}', gauge: { dataPoints: buildDataPoints(d1WriteQueriesPoints) } },
+							{ name: 'cf.kv.operations_day', unit: '{operation}', gauge: { dataPoints: buildDataPoints(kvOpsPoints) } },
+							{ name: 'cf.do.requests_day', unit: '{request}', gauge: { dataPoints: buildDataPoints(doRequestPoints) } },
+							{ name: 'cf.do.cpu_time_day_us', unit: 'us', gauge: { dataPoints: buildDataPoints(doCpuPoints) } },
+							{ name: 'cf.do.stored_bytes', unit: 'By', gauge: { dataPoints: buildDataPoints(doStoredPoints) } },
+							{ name: 'cf.workers.requests_hour', unit: '{request}', gauge: { dataPoints: buildDataPoints(workersRequestsPoints) } },
+							{ name: 'cf.workers.errors_hour', unit: '{error}', gauge: { dataPoints: buildDataPoints(workersErrorsPoints) } },
+							{ name: 'cf.workers.subrequests_hour', unit: '{subrequest}', gauge: { dataPoints: buildDataPoints(workersSubrequestsPoints) } },
+							{ name: 'cf.workers.cpu_time_p50_us', unit: 'us', gauge: { dataPoints: buildDataPoints(workersCpuP50Points) } },
+							{ name: 'cf.workers.cpu_time_p99_us', unit: 'us', gauge: { dataPoints: buildDataPoints(workersCpuP99Points) } },
 						],
 					},
 				],

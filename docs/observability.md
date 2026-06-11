@@ -203,12 +203,27 @@ All three are read at request time from `env.*`. Set / unset via `wrangler secre
 
 ## Metrics-poller
 
-The `rf-cf-metrics-poller` is a separate worker living at `metrics-poller/`. Runs on an hourly cron, executes three Cloudflare GraphQL Analytics queries (D1 storage bytes, KV stored bytes, Workers AI neurons), constructs OTel metric records, and POSTs them as OTLP/JSON to LaunchDarkly's `/v1/metrics` endpoint. Cloudflare account id sourced from `env.CF_ACCOUNT_ID` (declared as a plain var in `metrics-poller/wrangler.metrics.jsonc` — account ids are non-secret); the OTLP push is error-handled and structured-logs both network failures and non-2xx responses via `console.error` so the metric pipeline failure surfaces as a span attribute + log record. The poller carries the same OTel lib stack as the application workers (body capture, logs bridge, trace SDK) — it is self-observable through the same pipeline, with its own `flow.name=CronMetricsTick` span.
+The `rf-cf-metrics-poller` is a separate worker living at `metrics-poller/`. Runs on an hourly cron, executes five Cloudflare GraphQL Analytics queries — **one HTTP request per dataset, with per-request error isolation**, because CF GraphQL rejects an entire query when any one field is unknown (the original combined query lost D1+KV+AI together on a single schema drift) — constructs OTel metric records, and POSTs them as OTLP/JSON to LaunchDarkly's `/v1/metrics` endpoint. Cloudflare account id sourced from `env.CF_ACCOUNT_ID` (declared as a plain var in `metrics-poller/wrangler.metrics.jsonc` — account ids are non-secret); the OTLP push is error-handled and structured-logs both network failures and non-2xx responses via `console.error` so the metric pipeline failure surfaces as a span attribute + log record. The poller carries the same OTel lib stack as the application workers (body capture, logs bridge, trace SDK) — it is self-observable through the same pipeline, with its own `flow.name=CronMetricsTick` span.
 
-Three metrics emitted per tick:
-- `cf.d1.storage_bytes` (per D1 database)
-- `cf.kv.stored_bytes` (per KV namespace)
-- `cf.ai.neurons` (per account, hourly)
+The metric set covers **every dimension CF bills the account on** (Workers Paid). D1 database ids and KV namespace ids are mapped to friendly names (`rf-stage-events`, `SYNC_STATE`, …) in `cf-graphql.ts` — extend the map when a new binding appears.
+
+| Metric | Granularity | Attributes | CF billing dimension (Paid plan included → overage) |
+|---|---|---|---|
+| `cf.workers.requests_hour` | previous hour, per script | `cf.script_name` | Workers requests — 10M/mo → $0.30/M |
+| `cf.workers.errors_hour` / `cf.workers.subrequests_hour` | previous hour, per script | `cf.script_name` | operational signal |
+| `cf.workers.cpu_time_p50_us` / `cf.workers.cpu_time_p99_us` | previous hour, per script | `cf.script_name` | Workers CPU time — 30M CPU-ms/mo → $0.02/M ms (totals aren't exposed; quantiles × request volume are the storm signal) |
+| `cf.d1.rows_read_day` / `cf.d1.rows_written_day` | UTC day-to-date, per database | `cf.binding_name` | D1 rows read — 25B/mo → $0.001/M · rows written — 50M/mo → $1.00/M |
+| `cf.d1.read_queries_day` / `cf.d1.write_queries_day` | UTC day-to-date, per database | `cf.binding_name` | operational signal |
+| `cf.d1.storage_bytes` | daily max, per database | `cf.binding_name` | D1 storage — 5 GB → $0.75/GB-mo |
+| `cf.kv.operations_day` | UTC day-to-date, per namespace + action | `cf.binding_name`, `cf.kv.action` (read/write/delete/list) | KV reads 10M/mo → $0.50/M · writes/deletes/lists 1M/mo → $5.00/M |
+| `cf.kv.stored_bytes` | daily max, per namespace | `cf.binding_name` | KV storage — 1 GB → $0.50/GB-mo |
+| `cf.ai.neurons` | yesterday+today sum | `cf.account_id` | Workers AI — 10k neurons/day free → $0.011/1k |
+| `cf.ai.requests` / `cf.ai.inference_steps` / `cf.ai.input_tokens` / `cf.ai.output_tokens` | yesterday+today sum | `cf.account_id` | operational signal |
+| `cf.do.requests_day` | UTC day-to-date | `cf.account_id` | DO requests — 1M/mo → $0.15/M |
+| `cf.do.cpu_time_day_us` | UTC day-to-date | `cf.account_id` | operational signal (DO duration GB-s isn't exposed by the documented datasets; introspect + extend if DO usage ever grows) |
+| `cf.do.stored_bytes` | daily max | `cf.account_id` | DO storage — $0.20/GB-mo |
+
+Day-to-date gauges are deliberately sawtooth: each UTC day resets to zero, so a panel's **daily max IS the billing-relevant per-day number** and a runaway (like the 17k-writes/day reconcile storm this design exists to catch) shows as an anomalous ramp within hours, not at month-end.
 
 Resource attributes include `cf.account_id` so LD can pivot by account.
 
