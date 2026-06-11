@@ -231,34 +231,24 @@ Resource attributes include `cf.account_id` so LD can pivot by account.
 
 Dashboards are built via the LaunchDarkly Observability MCP server
 (`https://mcp.launchdarkly.com/mcp/observability`, registered at user scope —
-`claude mcp list` → `observability`). The May 2026 set (ids 10015443–10015446)
-no longer exists; the current set was rebuilt 2026-06-11 via MCP
-(`create-dashboard` / `create-graph`), so it is REPRODUCIBLE from the specs
-below — don't hand-edit panels without updating this doc.
+`claude mcp list` → `observability`) using `create-dashboard` / `create-graph` —
+REPRODUCIBLE from the specs below; don't hand-edit panels without updating this
+doc. Grouped by product; billing-period numbers come from the poller's
+month-to-date / day-to-date gauges, NOT rolling windows.
 
-| Name | ID | Path |
+| Name | Default range | Panels |
 |---|---|---|
-| CF Usage & Billing | `10016694` | `/dashboards/10016694` |
-| Flows | `10016695` | `/dashboards/10016695` |
+| Billing — Month to Date | 24h | THE invoice preview: Table · Max(value) · `metric_name=cf.billing.mtd` · group `cf.billing.dimension` (labels carry quotas) + LD spans today hourly bar |
+| Workers | 7d | Requests/day + Errors/day (stacked daily bars · `cf.workers.*_day` · by `cf.script_name` — stack = account total) + CPU p99 hourly line |
+| D1 | 7d | Rows written/day + rows read/day (stacked daily bars · `cf.d1.rows_*_day` · by `cf.binding_name`) + storage line |
+| KV · DO · AI | 7d | KV ops/day grouped bars by `cf.kv.action` + KV stored line + DO requests/day bar + AI neurons/day bar (`cf.ai.neurons_day` vs the 10k/day free tier) |
+| Webhooks | 24h | RF + Dialpad hourly stacked bars by event type (`rf.event_type=*` / `dialpad.event_type=*` — includes `stage_moved`, stamped BEFORE auth) + webhook-flows table (`flow.name=Webhook*`) |
+| Flows | 24h | All-flows table (`flow.name=*` · group flow.name + service_name — prefix categories Webhook/Extension/MCP/Stats/Cron/Mobile) + errors-by-flow table (empty = healthy) + volume + p95 lines (busiest 10, hourly) |
 
-1. **CF Usage & Billing** (default range 7d) — one Line panel per CF billing
-   dimension, all `Max(value)` over `metric_name=<metric>` from the
-   metrics-poller gauges (§ Metrics-poller has the metric ↔ billing ↔ price
-   map): Workers requests/errors/CPU-p99 per `cf.script_name` (hourly) · D1
-   rows written / rows read / storage per `cf.binding_name` (day-to-date
-   sawtooth — the daily peak IS the billing number) · KV operations per
-   `cf.kv.action` + stored bytes · DO requests · AI neurons + requests ·
-   LD span ingest (Traces · Count · by `service_name`, vs the 25M spans/mo
-   free tier).
-2. **Flows** (default range 24h) — the no-memorizing flows view, all Traces:
-   *All flows — volume* (Table · Count · `flow.name=*` · group by `flow.name`
-   · limit 50 — the live directory of every flow name) · *Flow errors*
-   (same + `has_errors=true`; empty = healthy) · *Flow p95 duration* and
-   *Flow volume over time* (Line · busiest 10) · *RF webhooks by event type*
-   (`rf.event_type=*`, stacked — includes `stage_moved`, which is stamped
-   BEFORE auth so failed deliveries surface) · *Dialpad webhooks by event
-   type*. Root spans are RENAMED to their flow name by the postProcessor, so
-   the raw Traces tab also reads as flows.
+Root spans are RENAMED to their flow name by the postProcessor, so the raw
+Traces tab also reads as flows. Day-to-date metrics are deliberately sawtooth
+(daily bar = calendar-day total regardless of LD's rolling bucket edges); the
+MTD table sidesteps rolling windows entirely.
 
 (Plus an auto-generated `User Insights` dashboard the LD project ships with — frontend-RUM template, not used by our backend setup.)
 

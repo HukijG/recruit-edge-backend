@@ -1,11 +1,11 @@
 # Observability alert runbooks
 
-Each alert in `#rf-alerts` is paired with a short runbook of what to check and how to respond.
+Each alert is paired with a short runbook of what to check and how to respond. Alerts are delivered to a configured alerting channel (e.g. a Slack channel via a LaunchDarkly alert rule).
 
-**Dashboards** (rebuilt 2026-06-11; references below to "Dashboard 2" map to
-CF Usage & Billing, "Dashboard 4" to Flows' webhook panels):
-- CF Usage & Billing: `/dashboards/10016694` (Workers / D1 / KV / DO / AI billing dimensions + LD ingest)
-- Flows: `/dashboards/10016695` (flow directory, flow errors, p95, RF/Dialpad webhook event types)
+**Dashboards** (references below to "Dashboard 2" map to Billing / D1 / KV·DO·AI /
+Workers, "Dashboard 4" to Webhooks): the LaunchDarkly project carries Billing — Month
+to Date, Workers, D1, KV · DO · AI, Webhooks, and Flows dashboards. See
+[`docs/observability.md`](observability.md) § Dashboards for the panel inventory.
 
 ## Alert 1: D1 write storm (>5000 writes/min)
 
