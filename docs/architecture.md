@@ -127,7 +127,7 @@ This file does NOT duplicate that material. References below use the Access auth
 | `src/mcp/{cache-status,candidate-get,candidate-search,candidate-move-stage,candidate-log-interview,job-pipeline,job-candidates-filter,candidate-call-notes}.js` | Per-tool middleware handlers. |
 | `src/mcp/{resolvers,fuzzy,projection,linkedin,d1-read,snapshot,handlers-registry,concurrency}.js` | Shared middleware infrastructure. `concurrency.js` provides `pMapLimit` for bounded parallel RF `/candidate/get` fan-out in pipeline hydration. |
 | `src/webhook/dialpad-hangup-forwarder.js` | Forwards Dialpad hangup webhook payloads to cache-worker via service binding for live `calls` table insertion. Fire-and-forget inside `ctx.waitUntil`; cron backstop catches any drops. |
-| `src/stage-stats/` | The stage-movement stats plane: classification, London week windows, RF stage-movement client, STAGE_EVENTS D1 store, the shared ingest engine, dashboard push fan-out, and the webhook/pull/reconcile/backfill handlers. The main worker's `scheduled()` (cron `7 * * * *`) runs the hourly reconcile. Canonical doc: [`docs/stage-stats.md`](stage-stats.md). |
+| `src/stage-stats.js` | The stage-movement stats plane: pipeline-positional classification (+ per-job pipeline KV cache), London week windows, STAGE_EVENTS D1 store (conditional upsert + latest-event-wins aggregate + reconcile waterline), the shared ingest engine, change-gated dashboard push fan-out, and the webhook/pull/reconcile/backfill handlers. RF calls live in `src/rf-client.js`; the main worker's `scheduled()` (cron `7 * * * *`) runs the hourly waterlined reconcile. Canonical doc: [`docs/stage-stats.md`](stage-stats.md). |
 | `src/lib/timing-safe-equal.js` | Constant-time string compare for shared-secret headers (same implementation as the cache worker's local helper). |
 | `migrations-stage-events/0001_create_stage_events.sql` | `STAGE_EVENTS` D1 schema (database `rf-stage-events`, owned read+write by the main worker). |
 | `migrations/0001_create_users.sql`, `migrations/0002_seed_users.sql` | `USERS_DB` schema + seed data (six teammates). Email PK with lowercase + LIKE-form CHECK constraints; UNIQUE indexes on `dialpad_id`, `rf_user_id`, `first_name`. |
@@ -1018,6 +1018,7 @@ Single KV namespace bound on both the main worker and the cache worker. Holds de
 | `batch:job{jobId}` | JSON array of rfId strings in extension-add order | 30 days | main |
 | `prewarm:rec{rfUserId}:job{jobId}` | `{ lastPrewarmIdx }` per-recruiter+job state | 1 hour | main |
 | `ratelimit:call:{dialpadUserId}` | JSON `[{t: ms-epoch, phone: E164}]` rolling-window state for `/dialpad-call` rate-limit + dedup | 120 sec | main |
+| `stagestats:pipeline:{jobId}` | JSON array of the job's ordered pipeline stage names (near-immutable structure; stage-stats positional classification + reconcile gate) | 1 day | main |
 
 Active Dialpad `call_id` per consultant — formerly `extcall:callid:{dialpadUserId}` in KV — now lives in the `ExtCallState` Durable Object (see "Durable Object" below).
 
