@@ -22,6 +22,7 @@ import { trace } from '@opentelemetry/api';
 import { timingSafeEqual } from './lib/timing-safe-equal.js';
 import {
   fetchStageMovements,
+  fetchRFJobPipeline,
   searchCandidatesByPredicateOnly,
   toIntOrNull,
 } from './rf-client.js';
@@ -143,68 +144,212 @@ export function londonDateString(ms) {
 }
 
 // ──────────────────────────── Classification ───────────────────────────────
-// Stage-label classification for the stats plane.
+// Positional, per job — the same "is submitted" semantics as the MCP pipeline
+// tools (src/mcp/job-pipeline.js + pipeline-index.js), which are canonical
+// for our RF setup:
 //
-// KEPT IN LOCKSTEP with company_dashboard/server/config/consultants.json
-// (`pre_submission_stage_labels`, `first_interview_stage_labels`). When the
-// label sets change, edit BOTH files together, then re-run the backfill
-// (POST /admin/stage-stats/backfill) over the horizon you care about — the
-// is_cv_cross / is_iv_landing flags are denormalised into D1 at write time
-// and do not self-heal on a label change.
+//  - Each job's RF pipeline (`/job/pipeline` → `summary[]`) is an ORDERED
+//    stage list. Submitted territory is every stage at or after the exact
+//    'CV Sent' landmark IN THAT JOB'S OWN ORDER — no global label lists; a
+//    custom stage is judged by its position, not its name.
+//  - 'Disqualified' is off the linear ladder (exact match, as in
+//    pipeline-index.js): never submitted territory, judged separately.
+//  - CV-Sent crossing: to is at/after the landmark && from is not. A
+//    missing `from` is not-submitted, so a first entry straight into
+//    submitted territory IS a crossing, and stage-skipping jumps are
+//    crossings.
+//  - 1st-Interview landing: `to` is THE first interview stage of that job's
+//    pipeline — the first stage at/after the landmark whose name contains
+//    "interview" (handles 'Client Interview 1' vs '1st Interview' vs any
+//    custom label without an allowlist).
+//  - A stage name not in the pipeline (renamed/deleted since) classifies as
+//    nothing, with a warn — fabricating counts from unverifiable labels is
+//    worse than missing them, and the warn is the operator's signal. The
+//    stale-cache case self-heals (see getPipelineStages).
 //
-// Counting semantics (canonical, shared with the dashboard):
-//  - Submitted territory is a DENYLIST: a stage is submitted-or-beyond unless
-//    its trimmed, lowercased name is in PRE_SUBMISSION_STAGES or contains
-//    "disqualif". Empty/whitespace-only/missing names are NOT submitted.
-//  - CV-Sent crossing: is_submitted(to) && !is_submitted(from); a missing
-//    `from` counts as not-submitted, so a first entry straight into submitted
-//    territory IS a crossing, and stage-skipping jumps are crossings.
-//  - 1st-Interview landing: trimmed, lowercased `to` is in
-//    FIRST_INTERVIEW_STAGES (allowlist).
+// The flags are denormalised into D1 at write time; a pipeline restructure
+// (or a fix to this logic) requires a backfill re-run over the horizon you
+// care about — the upsert updates flags in place.
 
-export const PRE_SUBMISSION_STAGES = new Set([
-  'sourced', 'applied', 'replied', 'replied (cold)', 'call booked', 'shortlist',
-  'new lead', 'new', 'contacted', 'prospect', 'screening',
-]);
+/** Keep in lockstep with SUBMITTED_LANDMARK in src/mcp/job-pipeline.js. */
+const SUBMITTED_LANDMARK = 'CV Sent';
+/** Exact off-ladder stage, as in src/mcp/pipeline-index.js. */
+const DISQUALIFIED_STAGE = 'Disqualified';
+const INTERVIEW_NAME_RE = /interview/i;
 
-export const FIRST_INTERVIEW_STAGES = new Set([
-  '1st interview', 'first interview', 'client interview 1', 'client interview',
-  'interview 1',
-]);
+/** KV cache for per-job pipeline stage lists (near-immutable structure). */
+const PIPELINE_KV_PREFIX = 'stagestats:pipeline:';
+const PIPELINE_KV_TTL_S = 86_400;
 
 /**
- * Denylist test: a stage is "submitted territory" (CV-Sent-or-beyond) unless
- * it is empty, disqualified, or a configured pre-submission stage. Errs toward
- * counting an unknown stage as submitted — a wasted event row is harmless, a
- * silently dropped submission is not.
- *
- * @param {string|null|undefined} stageName
- * @returns {boolean}
+ * Per-invocation context threaded through ingest paths: memoised pipeline
+ * stage lists (one RF fetch per job per invocation at most) and a
+ * warn-once-per-key set so a 50-transition job logs one warn, not 50.
  */
-export function isSubmittedStage(stageName) {
-  if (stageName === null || stageName === undefined) return false;
-  const n = String(stageName).trim().toLowerCase();
-  if (n === '' || n.includes('disqualif')) return false;
-  return !PRE_SUBMISSION_STAGES.has(n);
+export function newIngestContext() {
+  return { pipelines: new Map(), warned: new Set() };
+}
+
+function warnOnce(ictx, key, record) {
+  if (ictx.warned.has(key)) return;
+  ictx.warned.add(key);
+  console.warn(record);
 }
 
 /**
- * Classify one stage transition.
+ * The ordered stage-name list for one job, from (in order) the invocation
+ * memo, the KV cache (1-day TTL — pipeline structure is near-immutable; this
+ * is what keeps reconcile sweeps and webhook bursts at ~zero pipeline
+ * fetches), or a live `/job/pipeline` fetch. `bypassCache` skips memo + KV —
+ * used to self-heal when a transition references a stage the cached list
+ * doesn't know (pipeline edited within the TTL).
  *
+ * Throws what fetchRFJobPipeline throws (404 job-gone, 429/5xx transient) —
+ * callers decide structural-vs-transient.
+ *
+ * @param {*} env
+ * @param {number} jobId
+ * @param {{pipelines: Map}} ictx
+ * @param {boolean} [bypassCache=false]
+ * @returns {Promise<{names: string[], fresh: boolean}>}
+ */
+async function getPipelineStages(env, jobId, ictx, bypassCache = false) {
+  if (!bypassCache) {
+    const memoised = ictx.pipelines.get(jobId);
+    if (memoised) return memoised;
+    const cached = await env.SYNC_STATE.get(PIPELINE_KV_PREFIX + jobId, 'json');
+    if (Array.isArray(cached)) {
+      const entry = { names: cached, fresh: false };
+      ictx.pipelines.set(jobId, entry);
+      return entry;
+    }
+  }
+  const pipeline = await fetchRFJobPipeline(env, jobId);
+  const summary = Array.isArray(pipeline?.summary) ? pipeline.summary : [];
+  const names = summary
+    .map((s) => (typeof s?.name === 'string' ? s.name : ''))
+    .filter(Boolean);
+  await env.SYNC_STATE.put(PIPELINE_KV_PREFIX + jobId, JSON.stringify(names), {
+    expirationTtl: PIPELINE_KV_TTL_S,
+  });
+  const entry = { names, fresh: true };
+  ictx.pipelines.set(jobId, entry);
+  return entry;
+}
+
+/** Where a stage name sits relative to a pipeline's ordered stage list. */
+function stagePosition(names, stageName) {
+  if (stageName === null || stageName === undefined) return { kind: 'absent' };
+  const n = String(stageName).trim();
+  if (n === '') return { kind: 'absent' };
+  if (n === DISQUALIFIED_STAGE) return { kind: 'disqualified' };
+  const idx = names.indexOf(n);
+  return idx >= 0 ? { kind: 'known', idx } : { kind: 'unknown', name: n };
+}
+
+/**
+ * Classify one transition against one job's ordered stage list. Pure —
+ * pipeline acquisition/caching/warning lives in the callers.
+ *
+ * @param {string[]} names - the job's pipeline stage names, canonical order
  * @param {string|null|undefined} fromStage
  * @param {string|null|undefined} toStage
- * @returns {{ isCvCross: boolean, isIvLanding: boolean }}
+ * @returns {{isCvCross: boolean, isIvLanding: boolean, noLandmark: boolean,
+ *            unknownStages: string[]}}
  */
-export function classifyTransition(fromStage, toStage) {
-  const toSubmitted = isSubmittedStage(toStage);
-  const fromSubmitted = isSubmittedStage(fromStage);
-  const toNorm = toStage === null || toStage === undefined
-    ? ''
-    : String(toStage).trim().toLowerCase();
+export function classifyAgainstPipeline(names, fromStage, toStage) {
+  const landmarkIdx = names.indexOf(SUBMITTED_LANDMARK);
+  if (landmarkIdx < 0) {
+    return { isCvCross: false, isIvLanding: false, noLandmark: true, unknownStages: [] };
+  }
+  let ivStage = null;
+  for (let i = landmarkIdx; i < names.length; i++) {
+    if (INTERVIEW_NAME_RE.test(names[i])) {
+      ivStage = names[i];
+      break;
+    }
+  }
+  const from = stagePosition(names, fromStage);
+  const to = stagePosition(names, toStage);
+  const fromSubmitted = from.kind === 'known' && from.idx >= landmarkIdx;
+  const toSubmitted = to.kind === 'known' && to.idx >= landmarkIdx;
+  const unknownStages = [from, to].filter((p) => p.kind === 'unknown').map((p) => p.name);
   return {
     isCvCross: toSubmitted && !fromSubmitted,
-    isIvLanding: FIRST_INTERVIEW_STAGES.has(toNorm),
+    isIvLanding: ivStage !== null && to.kind === 'known' && names[to.idx] === ivStage,
+    noLandmark: false,
+    unknownStages,
   };
+}
+
+const NO_FLAGS = { isCvCross: false, isIvLanding: false };
+
+/**
+ * Classify one fetched transition, acquiring (and self-healing) the job's
+ * pipeline. Structural anomalies — job id missing, job deleted (404),
+ * pipeline without a 'CV Sent' landmark, stage name unknown even after a
+ * fresh refetch — classify as nothing with a warn and DO NOT fail the
+ * candidate: they would never resolve by retrying, and a permanent retry
+ * would pin the reconcile waterline forever. Transient pipeline-fetch
+ * failures (429/5xx/network) throw, failing the candidate so the sweep
+ * retries it later.
+ *
+ * @returns {Promise<{isCvCross: boolean, isIvLanding: boolean}>}
+ */
+async function classifyTransitionForJob(env, candidateId, t, ictx) {
+  const jobId = t.jobId;
+  if (!Number.isInteger(jobId) || jobId <= 0) {
+    warnOnce(ictx, `nojob:${candidateId}`, {
+      message: `[stage-stats] candidate ${candidateId} transition carries no job id — stored unclassified`,
+      source: SOURCE,
+      candidateId,
+    });
+    return NO_FLAGS;
+  }
+
+  let entry;
+  try {
+    entry = await getPipelineStages(env, jobId, ictx);
+  } catch (err) {
+    if (err?.status === 404) {
+      warnOnce(ictx, `gone:${jobId}`, {
+        message: `[stage-stats] job ${jobId} pipeline 404 (job deleted?) — transitions stored unclassified`,
+        source: SOURCE,
+        jobId,
+      });
+      return NO_FLAGS;
+    }
+    throw err;
+  }
+
+  let cls = classifyAgainstPipeline(entry.names, t.fromStage, t.toStage);
+  if (cls.unknownStages.length > 0 && !entry.fresh) {
+    // The KV-cached stage list may predate a pipeline edit — refetch once.
+    try {
+      entry = await getPipelineStages(env, jobId, ictx, true);
+      cls = classifyAgainstPipeline(entry.names, t.fromStage, t.toStage);
+    } catch (err) {
+      if (err?.status !== 404) throw err;
+    }
+  }
+
+  if (cls.noLandmark) {
+    warnOnce(ictx, `nolandmark:${jobId}`, {
+      message: `[stage-stats] job ${jobId} pipeline has no '${SUBMITTED_LANDMARK}' stage — not CV-tracked; transitions stored unclassified`,
+      source: SOURCE,
+      jobId,
+    });
+    return NO_FLAGS;
+  }
+  for (const name of cls.unknownStages) {
+    warnOnce(ictx, `unknown:${jobId}:${name}`, {
+      message: `[stage-stats] job ${jobId} transition references stage '${name}' not in the live pipeline (renamed/deleted?) — treated as not submitted`,
+      source: SOURCE,
+      jobId,
+      stageName: name,
+    });
+  }
+  return { isCvCross: cls.isCvCross, isIvLanding: cls.isIvLanding };
 }
 
 // ─────────────────────────────── D1 store ──────────────────────────────────
@@ -366,14 +511,21 @@ const DETAIL_SPACING_MS = 120;
  * missing or unparseable are skipped with a warn — without a verbatim
  * timestamp there is no identity to store under.
  *
+ * Classification is per job against the job's own pipeline (see the
+ * Classification section); every pipeline the candidate's transitions touch
+ * is resolved BEFORE the upsert, so a transient pipeline failure throws
+ * before any row is written (the candidate fails atomically and the sweep
+ * retries it).
+ *
  * @param {*} env
  * @param {number} candidateId
  * @param {number} afterMs
  * @param {number} beforeMs
  * @param {string} source - 'webhook' | 'reconcile' | 'backfill'
+ * @param {{pipelines: Map, warned: Set}} [ictx] - shared across a sweep/batch
  * @returns {Promise<{fetched: number, stored: number}>}
  */
-export async function ingestCandidate(env, candidateId, afterMs, beforeMs, source) {
+export async function ingestCandidate(env, candidateId, afterMs, beforeMs, source, ictx = newIngestContext()) {
   const transitions = await fetchStageMovements(env, candidateId, afterMs, beforeMs);
   const rows = [];
   for (const t of transitions) {
@@ -387,7 +539,7 @@ export async function ingestCandidate(env, candidateId, afterMs, beforeMs, sourc
       });
       continue;
     }
-    const { isCvCross, isIvLanding } = classifyTransition(t.fromStage, t.toStage);
+    const { isCvCross, isIvLanding } = await classifyTransitionForJob(env, candidateId, t, ictx);
     rows.push({ candidateId, ...t, isCvCross, isIvLanding });
   }
   const stored = await upsertRows(env, rows, source, Date.now());
@@ -435,25 +587,47 @@ async function searchActiveCandidates(env, sinceDate) {
 
 /**
  * The reconcile gate: keep a candidate when any search-row job's CURRENT
- * stage is in submitted territory, judging a `disqualif*` stage by the
- * previous stage (DQ is off the linear ladder; unknown previous → keep).
+ * stage sits at/after that job's 'CV Sent' landmark, judging a 'Disqualified'
+ * stage by the previous stage (DQ is off the linear ladder; unknown previous
+ * → keep). Same positional semantics as classification, fed by the same
+ * memo/KV pipeline cache, so a sweep costs ~zero extra pipeline fetches.
+ *
  * Exists purely to bound RF detail calls on the recurring path — backfill
  * runs ungated because a historical window's current stage no longer reflects
- * what happened then.
+ * what happened then. Errs toward keeping: an unknown stage, a transient
+ * pipeline failure, or an unknown previous stage on a DQ all keep the
+ * candidate (a wasted detail fetch is harmless; a silently dropped
+ * submission is not). Jobs whose pipeline lacks the landmark are not
+ * CV-tracked and never qualify.
  *
- * @param {Array<{stageName: string|null, prevStageName: string|null}>} jobs
- * @returns {boolean}
+ * @param {*} env
+ * @param {Array<{jobId: number|null, stageName: string|null, prevStageName: string|null}>} jobs
+ * @param {{pipelines: Map, warned: Set}} ictx
+ * @returns {Promise<boolean>}
  */
-export function passesSubmissionGate(jobs) {
+export async function passesSubmissionGate(env, jobs, ictx) {
   for (const j of jobs) {
     const cur = (j.stageName ?? '').trim();
-    if (!cur) continue;
-    if (cur.toLowerCase().includes('disqualif')) {
-      const prev = (j.prevStageName ?? '').trim();
-      if (!prev || isSubmittedStage(prev)) return true;
-    } else if (isSubmittedStage(cur)) {
-      return true;
+    if (!cur || !Number.isInteger(j.jobId) || j.jobId <= 0) continue;
+
+    let entry;
+    try {
+      entry = await getPipelineStages(env, j.jobId, ictx);
+    } catch (err) {
+      if (err?.status === 404) continue; // job gone — nothing to track
+      return true; // transient — keep; the detail path settles it
     }
+    const landmarkIdx = entry.names.indexOf(SUBMITTED_LANDMARK);
+    if (landmarkIdx < 0) continue; // not CV-tracked
+
+    let probe = cur;
+    if (cur === DISQUALIFIED_STAGE) {
+      probe = (j.prevStageName ?? '').trim();
+      if (!probe) return true; // DQ with unknown previous → keep
+    }
+    const idx = entry.names.indexOf(probe);
+    if (idx < 0) return true; // unknown stage → keep
+    if (probe !== DISQUALIFIED_STAGE && idx >= landmarkIdx) return true;
   }
   return false;
 }
@@ -471,14 +645,21 @@ export function passesSubmissionGate(jobs) {
 export async function ingestWindow(env, { afterMs, beforeMs, gate, source }) {
   const sinceDate = londonDateString(afterMs - 86_400_000);
   const candidates = await searchActiveCandidates(env, sinceDate);
-  const targets = gate ? candidates.filter((c) => passesSubmissionGate(c.jobs)) : candidates;
+  const ictx = newIngestContext();
+  let targets = candidates;
+  if (gate) {
+    targets = [];
+    for (const c of candidates) {
+      if (await passesSubmissionGate(env, c.jobs, ictx)) targets.push(c);
+    }
+  }
 
   let fetched = 0;
   let stored = 0;
   let failed = 0;
   for (const c of targets) {
     try {
-      const r = await ingestCandidate(env, c.id, afterMs, beforeMs, source);
+      const r = await ingestCandidate(env, c.id, afterMs, beforeMs, source, ictx);
       fetched += r.fetched;
       stored += r.stored;
     } catch (err) {
@@ -926,11 +1107,12 @@ export async function handleBackfillRoute(request, env) {
     .filter((id) => id > cursor);
   const batch = remaining.slice(0, batchSize);
 
+  const ictx = newIngestContext();
   let stored = 0;
   let failed = 0;
   for (const id of batch) {
     try {
-      const r = await ingestCandidate(env, id, afterMs, beforeMs, 'backfill');
+      const r = await ingestCandidate(env, id, afterMs, beforeMs, 'backfill', ictx);
       stored += r.stored;
     } catch (err) {
       failed += 1;

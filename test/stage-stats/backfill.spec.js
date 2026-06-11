@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import worker from '../../src';
 import { applyStageEventsMigration } from '../helpers/stage-events-migrate.js';
+import { pipelineResponse } from '../helpers/rf-pipeline-mock.js';
 
 const ROUTE = 'http://example.com/admin/stage-stats/backfill';
 
@@ -32,10 +33,11 @@ function mockRF(ids) {
     const url = typeof input === 'string' ? input : input.url;
     if (url.includes('/candidate/search')) {
       return new Response(
-        JSON.stringify({ data: ids.map((id) => ({ id, jobs: [{ stage_name: 'Sourced' }] })) }),
+        JSON.stringify({ data: ids.map((id) => ({ id, jobs: [{ job_id: 900 + id, stage_name: 'Sourced' }] })) }),
         { status: 200 },
       );
     }
+    if (url.includes('/job/pipeline')) return pipelineResponse();
     const id = Number(new URL(url).searchParams.get('id'));
     return new Response(
       JSON.stringify({

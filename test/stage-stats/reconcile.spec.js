@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import worker from '../../src';
 import { applyStageEventsMigration } from '../helpers/stage-events-migrate.js';
-import { passesSubmissionGate } from '../../src/stage-stats.js';
+import { DEFAULT_PIPELINE, pipelineResponse } from '../helpers/rf-pipeline-mock.js';
+import { passesSubmissionGate, newIngestContext } from '../../src/stage-stats.js';
 
 const ROUTE = 'http://example.com/admin/stage-stats/reconcile';
 
@@ -22,15 +23,19 @@ const reconcileRequest = (token = env.STATS_PULL_TOKEN) =>
 
 const searchRow = (id, jobs) => ({ id, jobs });
 // Raw RF search-row job shape (what the mocked /candidate/search returns).
-const job = (stageName, prevStageName = null) => ({
+const job = (jobId, stageName, prevStageName = null) => ({
+  job_id: jobId,
   stage_name: stageName,
   previous_stage_details: prevStageName === null ? undefined : { prev_stage_name: prevStageName },
 });
 // Flattened shape (what searchActiveCandidates hands to the gate).
-const flatJob = (stageName, prevStageName = null) => ({ stageName, prevStageName });
+const flatJob = (jobId, stageName, prevStageName = null) => ({ jobId, stageName, prevStageName });
 
-/** Mock RF: one search page of `rows`, and per-candidate movement responses. */
-function mockRF(rows, movementsByCandidate = {}) {
+/**
+ * Mock RF: one search page of `rows`, per-candidate movement responses, and
+ * per-job pipelines (default pipeline when unmapped).
+ */
+function mockRF(rows, movementsByCandidate = {}, pipelinesByJob = {}) {
   globalThis.fetch = vi.fn(async (input) => {
     const url = typeof input === 'string' ? input : input.url;
     if (url.includes('/candidate/search')) {
@@ -43,27 +48,62 @@ function mockRF(rows, movementsByCandidate = {}) {
         { status: 200 },
       );
     }
+    if (url.includes('/job/pipeline')) {
+      const jobId = Number(new URL(url).searchParams.get('job_id'));
+      const pipeline = pipelinesByJob[jobId];
+      if (pipeline instanceof Response) return pipeline;
+      return pipelineResponse(pipeline ?? DEFAULT_PIPELINE);
+    }
     throw new Error(`unexpected fetch in test: ${url}`);
   });
 }
 
-describe('passesSubmissionGate', () => {
-  it('keeps a candidate with any submitted-territory job', () => {
-    expect(passesSubmissionGate([flatJob('Sourced'), flatJob('CV Sent')])).toBe(true);
-    expect(passesSubmissionGate([flatJob('Offer')])).toBe(true);
+describe('passesSubmissionGate (positional, per job pipeline)', () => {
+  const gate = (jobs) => passesSubmissionGate(env, jobs, newIngestContext());
+
+  it('keeps a candidate with any job at/after that job’s CV Sent landmark', async () => {
+    mockRF([], {}, {});
+    expect(await gate([flatJob(11, 'Sourced'), flatJob(12, 'CV Sent')])).toBe(true);
+    expect(await gate([flatJob(13, 'Offer')])).toBe(true);
   });
 
-  it('drops a candidate with only pre-submission jobs', () => {
-    expect(passesSubmissionGate([flatJob('Sourced'), flatJob('Shortlist')])).toBe(false);
-    expect(passesSubmissionGate([])).toBe(false);
-    expect(passesSubmissionGate([flatJob(null), flatJob('')])).toBe(false);
+  it('drops a candidate with only pre-landmark jobs', async () => {
+    mockRF([], {}, {});
+    expect(await gate([flatJob(11, 'Sourced'), flatJob(12, 'Shortlist')])).toBe(false);
+    expect(await gate([])).toBe(false);
+    expect(await gate([flatJob(11, null), flatJob(12, '')])).toBe(false);
   });
 
-  it('judges a disqualified job by the previous stage; unknown previous keeps', () => {
-    expect(passesSubmissionGate([flatJob('Disqualified', 'CV Sent')])).toBe(true);
-    expect(passesSubmissionGate([flatJob('Disqualified', 'Sourced')])).toBe(false);
-    expect(passesSubmissionGate([flatJob('Disqualified')])).toBe(true); // unknown prev → keep
-    expect(passesSubmissionGate([flatJob('Disqualified', '')])).toBe(true);
+  it('judges a custom stage by its position in THAT job’s pipeline', async () => {
+    mockRF([], {}, { 21: ['Sourced', 'Client Review', 'CV Sent', 'Offer', 'Disqualified'] });
+    // 'Client Review' is pre-landmark in job 21 — the old denylist kept it.
+    expect(await gate([flatJob(21, 'Client Review')])).toBe(false);
+  });
+
+  it('judges a disqualified job by the previous stage; unknown previous keeps', async () => {
+    mockRF([], {}, {});
+    expect(await gate([flatJob(11, 'Disqualified', 'CV Sent')])).toBe(true);
+    expect(await gate([flatJob(11, 'Disqualified', 'Sourced')])).toBe(false);
+    expect(await gate([flatJob(11, 'Disqualified')])).toBe(true); // unknown prev → keep
+    expect(await gate([flatJob(11, 'Disqualified', '')])).toBe(true);
+  });
+
+  it('a job whose pipeline lacks the landmark never qualifies', async () => {
+    mockRF([], {}, { 31: ['Sourced', 'Screening', 'Hired'] });
+    expect(await gate([flatJob(31, 'Hired')])).toBe(false);
+  });
+
+  it('errs toward keeping: unknown stage or transient pipeline failure', async () => {
+    mockRF([], {}, {});
+    expect(await gate([flatJob(11, 'Some Ghost Stage')])).toBe(true);
+
+    mockRF([], {}, { 41: new Response('rf down', { status: 503 }) });
+    expect(await gate([flatJob(41, 'Sourced')])).toBe(true);
+  });
+
+  it('skips a deleted job (pipeline 404)', async () => {
+    mockRF([], {}, { 51: new Response('gone', { status: 404 }) });
+    expect(await gate([flatJob(51, 'CV Sent')])).toBe(false);
   });
 });
 
@@ -80,9 +120,9 @@ describe('POST /admin/stage-stats/reconcile', () => {
   it('gates the walk: only submitted-territory candidates get a detail fetch', async () => {
     mockRF(
       [
-        searchRow(101, [job('CV Sent')]), // gated in
-        searchRow(102, [job('Sourced')]), // gated out
-        searchRow(103, [job('Disqualified', '1st Interview')]), // DQ from submitted → in
+        searchRow(101, [job(11, 'CV Sent')]), // gated in
+        searchRow(102, [job(12, 'Sourced')]), // gated out
+        searchRow(103, [job(13, 'Disqualified', '1st Interview')]), // DQ from submitted → in
       ],
       {
         101: [
@@ -104,11 +144,15 @@ describe('POST /admin/stage-stats/reconcile', () => {
     const body = await res.json();
     expect(body).toMatchObject({ ok: true, candidates: 3, gated: 2, stored: 1, failed: 0 });
 
-    const detailCalls = globalThis.fetch.mock.calls
-      .map((c) => (typeof c[0] === 'string' ? c[0] : c[0].url))
-      .filter((u) => u.includes('stage-movement'));
+    const calls = globalThis.fetch.mock.calls
+      .map((c) => (typeof c[0] === 'string' ? c[0] : c[0].url));
+    const detailCalls = calls.filter((u) => u.includes('stage-movement'));
     expect(detailCalls).toHaveLength(2);
     expect(detailCalls.some((u) => u.includes('id=102'))).toBe(false);
+
+    // pipelines memoised per sweep: one fetch per distinct job id
+    const pipelineCalls = calls.filter((u) => u.includes('/job/pipeline'));
+    expect(pipelineCalls).toHaveLength(new Set(pipelineCalls).size);
 
     const rows = (await env.STAGE_EVENTS.prepare('SELECT * FROM stage_events').all()).results;
     expect(rows).toHaveLength(1);
@@ -116,7 +160,7 @@ describe('POST /admin/stage-stats/reconcile', () => {
   });
 
   it('windows the sweep from the PREVIOUS London Monday (cross-boundary healing)', async () => {
-    mockRF([searchRow(101, [job('CV Sent')])], { 101: [] });
+    mockRF([searchRow(101, [job(11, 'CV Sent')])], { 101: [] });
     const ctx = createExecutionContext();
     const res = await worker.fetch(reconcileRequest(), env, ctx);
     await waitOnExecutionContext(ctx);
@@ -137,10 +181,11 @@ describe('POST /admin/stage-stats/reconcile', () => {
       const url = typeof input === 'string' ? input : input.url;
       if (url.includes('/candidate/search')) {
         return new Response(
-          JSON.stringify({ data: [searchRow(101, [job('CV Sent')]), searchRow(102, [job('Offer')])] }),
+          JSON.stringify({ data: [searchRow(101, [job(11, 'CV Sent')]), searchRow(102, [job(12, 'Offer')])] }),
           { status: 200 },
         );
       }
+      if (url.includes('/job/pipeline')) return pipelineResponse();
       const id = Number(new URL(url).searchParams.get('id'));
       if (id === 101) return new Response('nope', { status: 400 });
       return new Response(
