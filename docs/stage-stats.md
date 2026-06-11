@@ -89,7 +89,9 @@ canonical for this RF tenant:
 ### Pipeline cache + landmark lockstep
 
 Pipeline stage lists are near-immutable structure → memoised per
-sweep/webhook invocation and KV-cached for a day
+sweep/webhook invocation and KV-cached for a day (landmarked jobs: zero
+fetches on warm hours; landmark-less jobs: one heal-refetch per sweep —
+the gate can't tell stale-no-landmark from genuinely-no-landmark)
 (`stagestats:pipeline:<jobId>` in the `SYNC_STATE` KV). When a transition
 references a stage the cached list doesn't know, OR the cached list has no
 landmark (a job made CV-tracked mid-TTL), the list is refetched fresh once —
@@ -205,8 +207,9 @@ that finished with zero failed candidates:
   horizon the dashboard's LAST-WEEK toggle reads.
 - A candidate/search that overflows the 50-page cap (`truncated`) also HOLDS
   the waterline — advancing over never-ingested candidates would be permanent
-  silent loss. The warn names the window; a window that big is backfill
-  territory.
+  silent loss. The warn names the window. Recovery is NOT just a backfill —
+  see "search window overflows the cap" in the failure matrix (backfill never
+  moves the waterline, and deleting the row re-bootstraps a BIGGER window).
 - The sweep is **gated** by the reached-submission predicate — positional,
   per job, fed by the same pipeline cache as classification: any search-row
   job whose current stage sits at/after its own landmark (a `Disqualified`
@@ -328,4 +331,5 @@ or this plane stays invisible there even though the spans flow.
 | dashboard down | its boot-seed pull on restart | restart |
 | Monday rollover race | dashboard 409s `window_mismatch` + fires its puller | seconds–minutes, benign |
 | pipeline restructure / classification change | warn-once surfaces ghosts; KV refetch self-heals renames + newly-CV-tracked jobs; re-run backfill to recompute flags | operator-driven |
+| search window overflows the 50-page cap persistently | hourly truncation warn + waterline held. Backfill the window (cursor-batched), then MANUALLY advance the waterline: `wrangler d1 execute rf-stage-events --remote --command "INSERT INTO sync_state (key, value, updated_ms) VALUES ('reconcile_waterline_ms', '<epoch-ms>', <now-ms>) ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_ms = excluded.updated_ms"`. Do NOT delete the row — that re-bootstraps to prev-Monday, a strictly bigger window, still truncated, still pinned | operator-driven |
 | D1 wiped | re-run backfill over any horizon (delete the waterline row to force a deep reconcile) | operator-driven |

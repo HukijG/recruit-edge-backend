@@ -703,7 +703,11 @@ export async function fetchRFJobPipeline(env, jobId) {
       });
       continue;
     }
-    console.error({
+    // 429 is an expected, HANDLED outcome (MCP surfaces a rate_limited
+    // envelope; stage-stats machine paths retry under withBurstRetry) — warn,
+    // not error, or every healed burst spams the LD error views.
+    const log = err instanceof RFRateLimitedError ? console.warn : console.error;
+    log({
       message: `RF /job/pipeline error job=${jobId} status=${response.status} body=${errorText}`,
       source: 'rf-job-pipeline',
       jobId,
@@ -1602,33 +1606,34 @@ async function searchCandidatesByFilters({ filters, maxPages = 10, burstRetry = 
     let result = null;
     if (burstRetry) {
       result = await rfRequestWithRetry(doFetch, `candidate/search page ${page}`);
-    }
-    for (let attempt = 1; !burstRetry && attempt <= 2; attempt++) {
-      const response = await doFetch();
+    } else {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const response = await doFetch();
 
-      if (response.ok) {
-        result = await response.json();
-        break;
-      }
+        if (response.ok) {
+          result = await response.json();
+          break;
+        }
 
-      const errorText = await response.text();
-      const err = classifyRFResponse(response, errorText);
-      if (err instanceof RFTransientError && attempt === 1) {
-        console.warn({
-          message: `[RF candidate/search] ${response.status} on page=${page}, retrying once`,
+        const errorText = await response.text();
+        const err = classifyRFResponse(response, errorText);
+        if (err instanceof RFTransientError && attempt === 1) {
+          console.warn({
+            message: `[RF candidate/search] ${response.status} on page=${page}, retrying once`,
+            source: 'rf-search',
+            page,
+            filterKeys: filters.map(f => f.key),
+          });
+          continue;
+        }
+        console.error({
+          message: `RF candidate/search error status=${response.status} body=${errorText}`,
           source: 'rf-search',
           page,
           filterKeys: filters.map(f => f.key),
         });
-        continue;
+        throw err;
       }
-      console.error({
-        message: `RF candidate/search error status=${response.status} body=${errorText}`,
-        source: 'rf-search',
-        page,
-        filterKeys: filters.map(f => f.key),
-      });
-      throw err;
     }
 
     const candidates = Array.isArray(result?.data)

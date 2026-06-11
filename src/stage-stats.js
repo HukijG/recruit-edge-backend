@@ -199,9 +199,9 @@ function warnOnce(ictx, key, record) {
 
 /**
  * The ordered stage-name list for one job, from (in order) the invocation
- * memo, the KV cache (1-day TTL — pipeline structure is near-immutable; this
- * is what keeps reconcile sweeps and webhook bursts at ~zero pipeline
- * fetches), or a live `/job/pipeline` fetch. `bypassCache` skips memo + KV —
+ * memo, the KV cache (1-day TTL — pipeline structure is near-immutable; on
+ * warm hours landmarked jobs cost zero pipeline fetches, landmark-less jobs
+ * one heal-refetch per sweep), or a live `/job/pipeline` fetch. `bypassCache` skips memo + KV —
  * used to self-heal when a transition references a stage the cached list
  * doesn't know (pipeline edited within the TTL).
  *
@@ -655,7 +655,9 @@ async function searchActiveCandidates(env, sinceDate) {
  * stage sits at/after that job's 'CV Sent' landmark, judging a 'Disqualified'
  * stage by the previous stage (DQ is off the linear ladder; unknown previous
  * → keep). Same positional semantics as classification, fed by the same
- * memo/KV pipeline cache, so a sweep costs ~zero extra pipeline fetches.
+ * memo/KV pipeline cache — landmarked jobs cost zero pipeline fetches on
+ * warm hours; landmark-less jobs one heal-refetch per sweep (the gate cannot
+ * tell "stale no-landmark" from "genuinely no-landmark" without it).
  *
  * Exists purely to bound RF detail calls on the recurring path — backfill
  * runs ungated because a historical window's current stage no longer reflects
@@ -1059,7 +1061,8 @@ export const RECONCILE_OVERLAP_MS = 3 * 60 * 60 * 1000;
  *
  * @param {*} env
  * @returns {Promise<{candidates: number, gated: number, fetched: number, stored: number,
- *                    failed: number, windowAfterMs: number, waterlineAdvanced: boolean}>}
+ *                    changed: number, failed: number, truncated: boolean,
+ *                    windowAfterMs: number, waterlineAdvanced: boolean}>}
  */
 export async function runReconcile(env) {
   const now = Date.now();
@@ -1081,13 +1084,14 @@ export async function runReconcile(env) {
     await writeSyncStateMs(env, WATERLINE_KEY, now);
   }
   console.log({
-    message: `[stage-stats] reconcile: candidates=${stats.candidates} gated=${stats.gated} stored=${stats.stored} changed=${stats.changed} failed=${stats.failed} window=${new Date(afterMs).toISOString()}→now waterline=${waterlineAdvanced ? 'advanced' : 'held'}`,
+    message: `[stage-stats] reconcile: candidates=${stats.candidates} gated=${stats.gated} stored=${stats.stored} changed=${stats.changed} failed=${stats.failed}${stats.truncated ? ' truncated=true' : ''} window=${new Date(afterMs).toISOString()}→now waterline=${waterlineAdvanced ? 'advanced' : `held (${stats.failed > 0 ? 'failures' : 'truncated search'})`}`,
     source: SOURCE,
     candidates: stats.candidates,
     gated: stats.gated,
     stored: stats.stored,
     changed: stats.changed,
     failed: stats.failed,
+    truncated: stats.truncated,
     windowAfterMs: afterMs,
     waterlineAdvanced,
   });
