@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import worker from '../../src';
 import { applyStageEventsMigration } from '../helpers/stage-events-migrate.js';
-import { passesSubmissionGate } from '../../src/stage-stats/ingest.js';
+import { passesSubmissionGate } from '../../src/stage-stats.js';
 
 const ROUTE = 'http://example.com/admin/stage-stats/reconcile';
 

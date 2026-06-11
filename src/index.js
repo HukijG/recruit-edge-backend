@@ -49,10 +49,10 @@ import { authExtensionRequest, setAuthSpanSuccess, setAuthSpanFailure } from './
 import {
   handleSmsTemplatesList, handleSmsTemplateUpsert, handleSmsTemplateDelete,
 } from './sms-templates.js';
-import { handleStageMovedWebhook } from './stage-stats/webhook.js';
-import { handleAggregatePull } from './stage-stats/pull.js';
-import { handleReconcileRoute, runReconcile } from './stage-stats/reconcile.js';
-import { handleBackfillRoute } from './stage-stats/backfill.js';
+import {
+  handleStageMovedWebhook, handleAggregatePull,
+  handleReconcileRoute, runReconcile, handleBackfillRoute,
+} from './stage-stats.js';
 
 const handler = {
   async fetch(request, env, ctx) {

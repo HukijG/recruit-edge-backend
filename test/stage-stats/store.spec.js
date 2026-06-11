@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
 import { applyStageEventsMigration } from '../helpers/stage-events-migrate.js';
-import { upsertRows, computeAggregate } from '../../src/stage-stats/store.js';
+import { upsertRows, computeAggregate } from '../../src/stage-stats.js';
 
 const DAVE = 900005;
 const CAROL = 900004;

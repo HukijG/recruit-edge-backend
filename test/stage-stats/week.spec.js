@@ -3,7 +3,7 @@ import {
   currentWeekWindowLondon,
   previousWeekStartLondon,
   londonDateString,
-} from '../../src/stage-stats/week.js';
+} from '../../src/stage-stats.js';
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;

@@ -4,7 +4,7 @@ import {
   classifyTransition,
   PRE_SUBMISSION_STAGES,
   FIRST_INTERVIEW_STAGES,
-} from '../../src/stage-stats/classify.js';
+} from '../../src/stage-stats.js';
 
 describe('isSubmittedStage', () => {
   it('denylists every configured pre-submission stage (case-insensitive, trimmed)', () => {

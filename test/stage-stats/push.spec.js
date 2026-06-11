@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { env } from 'cloudflare:test';
 import { applyStageEventsMigration } from '../helpers/stage-events-migrate.js';
-import { upsertRows } from '../../src/stage-stats/store.js';
-import { recomputeAndPush } from '../../src/stage-stats/push.js';
-import { currentWeekWindowLondon } from '../../src/stage-stats/week.js';
-import { handleAggregatePull } from '../../src/stage-stats/pull.js';
+import { upsertRows } from '../../src/stage-stats.js';
+import { recomputeAndPush } from '../../src/stage-stats.js';
+import { currentWeekWindowLondon } from '../../src/stage-stats.js';
+import { handleAggregatePull } from '../../src/stage-stats.js';
 
 const PROD = 'https://music.example.com';
 const DEV = 'https://music-dev.example.com';
