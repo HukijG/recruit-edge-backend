@@ -88,6 +88,14 @@ describe('upsertRows', () => {
     expect((await upsertRows(env, [row({ moverRfId: null })], 'reconcile', 3000)).changed).toBe(0);
     expect((await selectAll())[0].mover_rf_id).toBe(DAVE);
   });
+
+  it('a DIFFERING attributed mover wins (RF corrected the fact) — and counts as changed', async () => {
+    await upsertRows(env, [row({ moverRfId: DAVE })], 'webhook', 1000);
+    expect((await upsertRows(env, [row({ moverRfId: CAROL })], 'reconcile', 2000)).changed).toBe(1);
+    expect((await selectAll())[0].mover_rf_id).toBe(CAROL);
+    // replaying the same attributed mover is still a no-op
+    expect((await upsertRows(env, [row({ moverRfId: CAROL })], 'reconcile', 3000)).changed).toBe(0);
+  });
 });
 
 describe('computeAggregate — latest-event-wins per (candidate, job) pair', () => {

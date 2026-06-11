@@ -204,6 +204,34 @@ describe('POST /admin/stage-stats/reconcile', () => {
     expect(Math.abs(after - body.windowAfterMs)).toBeLessThan(1000); // seconds-precision truncation only
   });
 
+  it('holds the waterline when the search overflows the 50-page cap (incomplete coverage)', async () => {
+    // 50 full pages + a totalItems above them: the shared walk stops at the
+    // cap; advancing the waterline would silently skip the overflow forever.
+    globalThis.fetch = vi.fn(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('/candidate/search')) {
+        const page = JSON.parse(init.body).current_page;
+        const rows = Array.from({ length: 100 }, (_, i) => ({
+          id: (page - 1) * 100 + i + 1,
+          jobs: [], // gated out — this test is about the search, not the details
+        }));
+        return new Response(JSON.stringify({ data: rows, total_items: 5050 }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch in test: ${url}`);
+    });
+
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(reconcileRequest(), env, ctx);
+    await waitOnExecutionContext(ctx);
+    const body = await res.json();
+    expect(body).toMatchObject({ ok: true, candidates: 5000, truncated: true, waterlineAdvanced: false });
+
+    const stored = await env.STAGE_EVENTS.prepare(
+      "SELECT value FROM sync_state WHERE key = 'reconcile_waterline_ms'",
+    ).first();
+    expect(stored).toBeNull();
+  });
+
   it('holds the waterline when any candidate fails (the next sweep re-covers)', async () => {
     globalThis.fetch = vi.fn(async (input) => {
       const url = typeof input === 'string' ? input : input.url;

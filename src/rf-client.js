@@ -820,43 +820,38 @@ export function parseRFTimestamp(s) {
 const STAGE_RETRY_DELAYS_MS = [400, 1600];
 
 /**
- * Send one RF request with a bounded burst backoff: 3 attempts total,
- * retrying on 429 (RFRateLimitedError), 5xx (RFTransientError), and network
- * throws, with jittered 0.4s → 1.6s delays. Bulk stage-moves in RF fan out as
- * many near-simultaneous webhook invocations each fetching from RF — the
- * backoff absorbs the burst limit; anything that still fails is healed by the
- * hourly reconcile. (The one-shot-retry helpers above serve interactive MCP
- * paths where a caller is waiting; this one serves machine paths where
- * waiting two extra seconds is free.)
+ * Run an RF call with a bounded burst backoff: 3 attempts total, retrying on
+ * 429 (RFRateLimitedError), 5xx (RFTransientError), and network-level throws
+ * (anything that is not a typed RFError), with jittered 0.4s → 1.6s delays.
+ * Hard RFErrors (4xx) propagate immediately. Bulk stage-moves in RF fan out
+ * as many near-simultaneous invocations each fetching from RF — the backoff
+ * absorbs the burst limit; anything that still fails is healed by the hourly
+ * reconcile. (The one-shot-retry helpers above serve interactive MCP paths
+ * where a caller is waiting; this engine serves machine paths where waiting
+ * two extra seconds is free.)
  *
- * @param {() => Promise<Response>} doFetch - invoked fresh each attempt
+ * @param {() => Promise<any>} doCall - invoked fresh each attempt; throws
+ *        typed RFErrors for HTTP failures
  * @param {string} what - request description for logs/errors
- * @returns {Promise<any>} parsed JSON body
+ * @returns {Promise<any>}
  */
-export async function rfRequestWithRetry(doFetch, what) {
+export async function withBurstRetry(doCall, what) {
   let lastError;
   for (let attempt = 0; attempt < STAGE_RETRY_DELAYS_MS.length + 1; attempt++) {
     if (attempt > 0) {
       const jitter = Math.floor(Math.random() * 200);
       await new Promise((r) => setTimeout(r, STAGE_RETRY_DELAYS_MS[attempt - 1] + jitter));
     }
-    let response;
     try {
-      response = await doFetch();
+      return await doCall();
     } catch (err) {
-      lastError = err; // network-level throw — retryable
-      continue;
+      const retryable =
+        err instanceof RFRateLimitedError ||
+        err instanceof RFTransientError ||
+        !(err instanceof RFError); // network-level throw
+      if (!retryable) throw err; // hard 4xx — retrying won't help
+      lastError = err;
     }
-    if (response.ok) {
-      return await response.json();
-    }
-    const body = await response.text().catch(() => null);
-    const error = classifyRFResponse(response, body);
-    if (error instanceof RFRateLimitedError || error instanceof RFTransientError) {
-      lastError = error;
-      continue;
-    }
-    throw error; // hard 4xx — retrying won't help
   }
   console.warn({
     message: `[RF retry] request exhausted retries: ${what}: ${lastError?.message}`,
@@ -865,6 +860,26 @@ export async function rfRequestWithRetry(doFetch, what) {
     error: lastError?.message,
   });
   throw lastError;
+}
+
+/**
+ * `withBurstRetry` for a raw fetch: classifies non-2xx responses into typed
+ * RFErrors (so the engine can tell transient from hard) and returns the
+ * parsed JSON body on success.
+ *
+ * @param {() => Promise<Response>} doFetch - invoked fresh each attempt
+ * @param {string} what - request description for logs/errors
+ * @returns {Promise<any>} parsed JSON body
+ */
+export function rfRequestWithRetry(doFetch, what) {
+  return withBurstRetry(async () => {
+    const response = await doFetch();
+    if (response.ok) {
+      return await response.json();
+    }
+    const body = await response.text().catch(() => null);
+    throw classifyRFResponse(response, body);
+  }, what);
 }
 
 /**
@@ -1534,14 +1549,14 @@ export async function searchCandidatesByIdsAndPredicate({ ids, predicateFilters,
  * @param {Object} env
  * @returns {Promise<{candidates: Array, totalItems: number|null}>}
  */
-export async function searchCandidatesByPredicateOnly({ predicateFilters, maxPages = 10 }, env) {
+export async function searchCandidatesByPredicateOnly({ predicateFilters, maxPages = 10, burstRetry = false }, env) {
   const filters = Array.isArray(predicateFilters) ? predicateFilters.slice() : [];
   if (filters.length === 0) {
     // Defensive — caller should never reach here with no filters; bail before
     // RF returns the entire account.
     return { candidates: [], totalItems: 0 };
   }
-  return searchCandidatesByFilters({ filters, maxPages }, env);
+  return searchCandidatesByFilters({ filters, maxPages, burstRetry }, env);
 }
 
 /**
@@ -1550,11 +1565,14 @@ export async function searchCandidatesByPredicateOnly({ predicateFilters, maxPag
  * `maxPages` reached. Used by both `searchCandidatesByIdsAndPredicate` and
  * `searchCandidatesByPredicateOnly`.
  *
- * Per-page one-shot 5xx retry (mirrors `getRFCandidate` + `fetchRFJobPipeline`).
- * Does NOT retry on 429: propagate immediately so callers can respect
- * Retry-After.
+ * Per-page retry: one-shot 5xx by default (mirrors `getRFCandidate` —
+ * interactive MCP callers should propagate 429s immediately so they can
+ * respect Retry-After). `burstRetry: true` routes each page through
+ * `rfRequestWithRetry` instead (3 attempts, retries 429/5xx/network) — for
+ * machine paths (stage-stats reconcile/backfill walks) that run exactly when
+ * RF bursts make 429s likeliest and where waiting is free.
  */
-async function searchCandidatesByFilters({ filters, maxPages = 10 }, env) {
+async function searchCandidatesByFilters({ filters, maxPages = 10, burstRetry = false }, env) {
   const rfApiKey = env.RF_API_KEY;
   const rfBaseUrl = env.RF_API_BASE_URL || 'https://api.recruiterflow.com/api/external';
   if (!rfApiKey) {
@@ -1574,13 +1592,19 @@ async function searchCandidatesByFilters({ filters, maxPages = 10 }, env) {
       include_count: true,
     };
 
-    let result = null;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const response = await fetch(`${rfBaseUrl}/candidate/search`, {
+    const doFetch = () =>
+      fetch(`${rfBaseUrl}/candidate/search`, {
         method: 'POST',
         headers: { 'RF-Api-Key': rfApiKey, 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
       });
+
+    let result = null;
+    if (burstRetry) {
+      result = await rfRequestWithRetry(doFetch, `candidate/search page ${page}`);
+    }
+    for (let attempt = 1; !burstRetry && attempt <= 2; attempt++) {
+      const response = await doFetch();
 
       if (response.ok) {
         result = await response.json();

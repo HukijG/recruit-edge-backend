@@ -25,6 +25,7 @@ import {
   fetchRFJobPipeline,
   searchCandidatesByPredicateOnly,
   toIntOrNull,
+  withBurstRetry,
 } from './rf-client.js';
 
 const SOURCE = 'stage-stats';
@@ -224,11 +225,22 @@ async function getPipelineStages(env, jobId, ictx, bypassCache = false) {
       return entry;
     }
   }
-  const pipeline = await fetchRFJobPipeline(env, jobId);
+  // fetchRFJobPipeline does its own one-shot 5xx retry (the interactive MCP
+  // stance); machine paths additionally absorb 429 bursts here.
+  const pipeline = await withBurstRetry(() => fetchRFJobPipeline(env, jobId), `job ${jobId} pipeline`);
   const summary = Array.isArray(pipeline?.summary) ? pipeline.summary : [];
+  // Trimmed at the boundary so a stage saved with stray whitespace can't
+  // silently declassify the job (stagePosition trims the transition side).
   const names = summary
-    .map((s) => (typeof s?.name === 'string' ? s.name : ''))
+    .map((s) => (typeof s?.name === 'string' ? s.name.trim() : ''))
     .filter(Boolean);
+  if (names.length === 0) {
+    // A real pipeline always has stages — an empty/missing summary is RF
+    // flake or shape drift. Throw (transient: the candidate fails atomically
+    // and the sweep retries) and NEVER cache it: a cached empty list would
+    // classify the job's every transition as no-landmark for a full TTL.
+    throw new Error(`job ${jobId} pipeline returned no stages`);
+  }
   await env.SYNC_STATE.put(PIPELINE_KV_PREFIX + jobId, JSON.stringify(names), {
     expirationTtl: PIPELINE_KV_TTL_S,
   });
@@ -323,8 +335,10 @@ async function classifyTransitionForJob(env, candidateId, t, ictx) {
   }
 
   let cls = classifyAgainstPipeline(entry.names, t.fromStage, t.toStage);
-  if (cls.unknownStages.length > 0 && !entry.fresh) {
+  if (!entry.fresh && (cls.noLandmark || cls.unknownStages.length > 0)) {
     // The KV-cached stage list may predate a pipeline edit — refetch once.
+    // The no-landmark case heals too: a job made CV-tracked mid-TTL (or a
+    // poisoned cache) must not stay unclassified until the TTL expires.
     try {
       entry = await getPipelineStages(env, jobId, ictx, true);
       cls = classifyAgainstPipeline(entry.names, t.fromStage, t.toStage);
@@ -358,9 +372,10 @@ async function classifyTransitionForJob(env, candidateId, t, ictx) {
 //
 // The PK (candidate_id, job_id, entered_raw) matches the cross-repo dedup
 // identity. ON CONFLICT UPDATES classification + stages in place (so a
-// backfill re-run after a label change or an RF data fix heals stored flags —
-// INSERT OR IGNORE would fossilise them), COALESCEs the mover (an attributed
-// sighting is never overwritten by an unattributed one), and preserves
+// backfill re-run after a classification change or an RF data fix heals
+// stored flags — INSERT OR IGNORE would fossilise them), COALESCEs the mover
+// (an attributed sighting is never overwritten by an unattributed one; a
+// DIFFERING attributed sighting wins — RF corrected the fact), and preserves
 // source/first_seen_ms (provenance of first sighting).
 
 const UPSERT_SQL = `
@@ -376,7 +391,7 @@ ON CONFLICT (candidate_id, job_id, entered_raw) DO UPDATE SET
   is_iv_landing = excluded.is_iv_landing
 WHERE from_stage IS NOT excluded.from_stage
    OR to_stage IS NOT excluded.to_stage
-   OR (excluded.mover_rf_id IS NOT NULL AND mover_rf_id IS NULL)
+   OR (excluded.mover_rf_id IS NOT NULL AND excluded.mover_rf_id IS NOT mover_rf_id)
    OR is_cv_cross IS NOT excluded.is_cv_cross
    OR is_iv_landing IS NOT excluded.is_iv_landing
 `;
@@ -587,22 +602,37 @@ export async function ingestCandidate(env, candidateId, afterMs, beforeMs, sourc
  * lagging search index the webhook path escapes — fine here: reconcile and
  * backfill are backstops measured in hours.
  *
+ * Returns `truncated: true` when RF reported more matches than the 50-page
+ * cap returned — callers MUST treat that as incomplete coverage (reconcile
+ * holds its waterline; backfill surfaces it), never as a silent "done".
+ *
  * @param {*} env
  * @param {string} sinceDate - `YYYY-MM-DD` (Europe/London local date)
- * @returns {Promise<Array<{id: number, jobs: Array<{jobId: number|null,
- *           stageName: string|null, prevStageName: string|null}>}>>}
+ * @returns {Promise<{candidates: Array<{id: number, jobs: Array<{jobId: number|null,
+ *           stageName: string|null, prevStageName: string|null}>}>, truncated: boolean}>}
  */
 async function searchActiveCandidates(env, sinceDate) {
-  const { candidates } = await searchCandidatesByPredicateOnly(
+  const { candidates: raw, totalItems } = await searchCandidatesByPredicateOnly(
     {
       predicateFilters: [
         { key: 'last_activity', is_relative: false, filter_type: 'after', date: sinceDate },
       ],
       maxPages: 50,
+      burstRetry: true,
     },
     env,
   );
-  return candidates
+  const truncated = typeof totalItems === 'number' && raw.length < totalItems;
+  if (truncated) {
+    console.warn({
+      message: `[stage-stats] candidate/search window since ${sinceDate} truncated at the 50-page cap (${raw.length}/${totalItems}) — coverage is INCOMPLETE`,
+      source: SOURCE,
+      sinceDate,
+      returned: raw.length,
+      totalItems,
+    });
+  }
+  const candidates = raw
     .map((row) => ({
       id: toIntOrNull(row?.id),
       jobs: Array.isArray(row?.jobs)
@@ -617,6 +647,7 @@ async function searchActiveCandidates(env, sinceDate) {
         : [],
     }))
     .filter((c) => c.id !== null);
+  return { candidates, truncated };
 }
 
 /**
@@ -647,6 +678,11 @@ export async function passesSubmissionGate(env, jobs, ictx) {
     let entry;
     try {
       entry = await getPipelineStages(env, j.jobId, ictx);
+      if (!entry.fresh && !entry.names.includes(SUBMITTED_LANDMARK)) {
+        // Same staleness heal as classification: a job made CV-tracked
+        // mid-TTL must not be gate-dropped until the cache expires.
+        entry = await getPipelineStages(env, j.jobId, ictx, true);
+      }
     } catch (err) {
       if (err?.status === 404) continue; // job gone — nothing to track
       return true; // transient — keep; the detail path settles it
@@ -675,11 +711,11 @@ export async function passesSubmissionGate(env, jobs, ictx) {
  * @param {*} env
  * @param {{afterMs: number, beforeMs: number, gate: boolean, source: string}} opts
  * @returns {Promise<{candidates: number, gated: number, fetched: number, stored: number,
- *                    changed: number, failed: number}>}
+ *                    changed: number, failed: number, truncated: boolean}>}
  */
 export async function ingestWindow(env, { afterMs, beforeMs, gate, source }) {
   const sinceDate = londonDateString(afterMs - 86_400_000);
-  const candidates = await searchActiveCandidates(env, sinceDate);
+  const { candidates, truncated } = await searchActiveCandidates(env, sinceDate);
   const ictx = newIngestContext();
   let targets = candidates;
   if (gate) {
@@ -710,7 +746,7 @@ export async function ingestWindow(env, { afterMs, beforeMs, gate, source }) {
     }
     await new Promise((r) => setTimeout(r, DETAIL_SPACING_MS));
   }
-  return { candidates: candidates.length, gated: targets.length, fetched, stored, changed, failed };
+  return { candidates: candidates.length, gated: targets.length, fetched, stored, changed, failed, truncated };
 }
 
 // ──────────────────────────────── Push ─────────────────────────────────────
@@ -1036,7 +1072,11 @@ export async function runReconcile(env) {
     gate: true,
     source: 'reconcile',
   });
-  const waterlineAdvanced = stats.failed === 0;
+  // A truncated search means candidates past the 50-page cap were never
+  // ingested — advancing over them would be permanent silent loss. Holding
+  // the waterline keeps the gap visible (and re-tried); a window that big is
+  // backfill territory (the warn from searchActiveCandidates says so).
+  const waterlineAdvanced = stats.failed === 0 && !stats.truncated;
   if (waterlineAdvanced) {
     await writeSyncStateMs(env, WATERLINE_KEY, now);
   }
@@ -1146,7 +1186,10 @@ const MAX_BATCH_SIZE = 200;
 /**
  * Body: `{ afterMs, beforeMs, cursor?, batchSize? }` — cursor is a
  * candidate-id watermark (process ids strictly greater than it, ascending).
- * Response: `{ ok, done, nextCursor, processed, stored, failed }`.
+ * Response: `{ ok, done, nextCursor, processed, stored, changed, failed,
+ * truncated }` — `truncated: true` means the window's search overflowed the
+ * 50-page cap, so `done` covers only the ids the search returned; shrink the
+ * window and re-run.
  *
  * @param {Request} request
  * @param {*} env
@@ -1188,7 +1231,7 @@ export async function handleBackfillRoute(request, env) {
   // slice of the id-ordered result this batch processes, so re-invocations
   // see a stable ordering even as RF activity moves on.
   const sinceDate = londonDateString(afterMs - 86_400_000);
-  const candidates = await searchActiveCandidates(env, sinceDate);
+  const { candidates, truncated } = await searchActiveCandidates(env, sinceDate);
   const remaining = [...new Set(candidates.map((c) => c.id))]
     .sort((a, b) => a - b)
     .filter((id) => id > cursor);
@@ -1218,7 +1261,7 @@ export async function handleBackfillRoute(request, env) {
   const nextCursor = batch.length > 0 ? batch[batch.length - 1] : cursor;
   const done = batch.length === remaining.length;
   console.log({
-    message: `[stage-stats] backfill batch: processed=${batch.length} stored=${stored} changed=${changed} failed=${failed} nextCursor=${nextCursor} done=${done}`,
+    message: `[stage-stats] backfill batch: processed=${batch.length} stored=${stored} changed=${changed} failed=${failed} nextCursor=${nextCursor} done=${done}${truncated ? ' TRUNCATED' : ''}`,
     source: SOURCE,
     processed: batch.length,
     stored,
@@ -1226,6 +1269,7 @@ export async function handleBackfillRoute(request, env) {
     failed,
     nextCursor,
     done,
+    truncated,
   });
-  return Response.json({ ok: true, done, nextCursor, processed: batch.length, stored, changed, failed });
+  return Response.json({ ok: true, done, nextCursor, processed: batch.length, stored, changed, failed, truncated });
 }

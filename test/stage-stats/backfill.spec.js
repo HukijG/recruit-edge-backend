@@ -155,6 +155,32 @@ describe('POST /admin/stage-stats/backfill', () => {
     );
     await waitOnExecutionContext(ctx);
     const body = await res.json();
-    expect(body).toMatchObject({ ok: true, done: true, nextCursor: 99, processed: 0, stored: 0 });
+    expect(body).toMatchObject({ ok: true, done: true, nextCursor: 99, processed: 0, stored: 0, truncated: false });
+  });
+
+  it('surfaces a search that overflowed the 50-page cap as truncated (done is not complete)', async () => {
+    globalThis.fetch = vi.fn(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('/candidate/search')) {
+        const page = JSON.parse(init.body).current_page;
+        const rows = Array.from({ length: 100 }, (_, i) => ({
+          id: (page - 1) * 100 + i + 1,
+          jobs: [{ job_id: 900, stage_name: 'Sourced' }],
+        }));
+        return new Response(JSON.stringify({ data: rows, total_items: 5050 }), { status: 200 });
+      }
+      if (url.includes('/job/pipeline')) return pipelineResponse();
+      // cursor: 4999 → the batch is just candidate 5000
+      return new Response(JSON.stringify({ data: { jobs: [] } }), { status: 200 });
+    });
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      backfillRequest({ afterMs: AFTER, beforeMs: BEFORE, cursor: 4999 }),
+      env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    const body = await res.json();
+    expect(body).toMatchObject({ ok: true, done: true, processed: 1, truncated: true });
   });
 });

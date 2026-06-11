@@ -316,6 +316,58 @@ describe('POST /webhook/recruiterflow/stage-moved', () => {
     expect(rows[0].is_cv_cross).toBe(1); // classified against the FRESH list
   });
 
+  it('self-heals a stale NO-LANDMARK cache: a job made CV-tracked mid-TTL refetches fresh', async () => {
+    // Cached list predates the pipeline gaining its 'CV Sent' stage.
+    await env.SYNC_STATE.put(
+      'stagestats:pipeline:984',
+      JSON.stringify(['Sourced', 'Screening', 'Hired']),
+    );
+    mockRF([
+      {
+        id: 984,
+        transitions: [
+          { from: 'Sourced', to: 'CV Sent', entered: '2026-06-08T08:45:00+0000', stage_moved_by: { id: 900005 } },
+        ],
+      },
+    ]);
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(webhookRequest({ candidate: { id: 50256 } }), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(200);
+    expect(pipelineCalls()).toHaveLength(1); // the bypass refetch
+
+    const rows = (await env.STAGE_EVENTS.prepare('SELECT * FROM stage_events').all()).results;
+    expect(rows[0].is_cv_cross).toBe(1); // classified against the fresh, landmarked list
+  });
+
+  it('an empty pipeline summary is transient: 500s atomically and is NEVER cached', async () => {
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('/candidate/activities/stage-movement/list')) {
+        return rfMovementResponse([
+          {
+            id: 984,
+            transitions: [
+              { from: 'Sourced', to: 'CV Sent', entered: '2026-06-08T08:45:00+0000', stage_moved_by: { id: 900005 } },
+            ],
+          },
+        ]);
+      }
+      if (url.includes('/job/pipeline')) {
+        return new Response(JSON.stringify({ summary: [], detail: [] }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch in test: ${url}`);
+    });
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(webhookRequest({ candidate: { id: 50256 } }), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(500);
+    const rows = (await env.STAGE_EVENTS.prepare('SELECT * FROM stage_events').all()).results;
+    expect(rows).toHaveLength(0); // atomic — nothing stored
+    // a cached empty list would mis-classify the job for a full TTL
+    expect(await env.SYNC_STATE.get('stagestats:pipeline:984')).toBeNull();
+  });
+
   it('skips (does not store, does not crash on) transitions with missing/unparseable entered', async () => {
     mockRF([
       {

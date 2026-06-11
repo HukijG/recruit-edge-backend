@@ -91,8 +91,14 @@ canonical for this RF tenant:
 Pipeline stage lists are near-immutable structure → memoised per
 sweep/webhook invocation and KV-cached for a day
 (`stagestats:pipeline:<jobId>` in the `SYNC_STATE` KV). When a transition
-references a stage the cached list doesn't know, the list is refetched fresh
-once (self-heal for pipeline edits inside the TTL).
+references a stage the cached list doesn't know, OR the cached list has no
+landmark (a job made CV-tracked mid-TTL), the list is refetched fresh once —
+self-heal for pipeline edits inside the TTL, in both classification and the
+reconcile gate. An empty `summary[]` from RF is treated as transient (thrown,
+never cached): a cached empty list would mis-classify the job's every
+transition for a full TTL. Names are trimmed at the boundary; pipeline
+fetches and the reconcile/backfill search pages run under the burst backoff
+(3 attempts, 429/5xx/network).
 
 The `SUBMITTED_LANDMARK` constant (`'CV Sent'`) exists twice — in
 `src/stage-stats.js` and as the MCP layer's landmark in
@@ -127,7 +133,8 @@ sync_state (key PRIMARY KEY, value, updated_ms)   -- 'reconcile_waterline_ms'
 
 - The upsert is `INSERT ... ON CONFLICT DO UPDATE ... WHERE <anything
   changed>`: flags + stages update in place, `mover_rf_id` is `COALESCE`d (an
-  attributed sighting is never overwritten by an unattributed one),
+  attributed sighting is never overwritten by an unattributed one; a
+  DIFFERING attributed sighting wins — RF corrected the fact),
   `source`/`first_seen_ms` keep their first-sighting values — and an
   UNCHANGED replay writes **zero** D1 rows. Replays and concurrent duplicates
   are free no-op races, and the summed per-statement `changes()` is an honest
@@ -196,6 +203,10 @@ that finished with zero failed candidates:
 - Bootstrap (no stored waterline — first deploy, or after deleting the row to
   force a deep sweep): previous-London-Monday → now, which is also the
   horizon the dashboard's LAST-WEEK toggle reads.
+- A candidate/search that overflows the 50-page cap (`truncated`) also HOLDS
+  the waterline — advancing over never-ingested candidates would be permanent
+  silent loss. The warn names the window; a window that big is backfill
+  territory.
 - The sweep is **gated** by the reached-submission predicate — positional,
   per job, fed by the same pipeline cache as classification: any search-row
   job whose current stage sits at/after its own landmark (a `Disqualified`
@@ -214,7 +225,9 @@ affected window recovers it exactly.
 
 `POST /admin/stage-stats/backfill` body:
 `{ afterMs, beforeMs, cursor?: 0, batchSize?: 100 (max 200) }` →
-`{ ok, done, nextCursor, processed, stored, changed, failed }`.
+`{ ok, done, nextCursor, processed, stored, changed, failed, truncated }`.
+`truncated: true` means the window's search overflowed the 50-page cap —
+`done` covers only what the search returned; shrink the window and re-run.
 
 Each invocation re-runs the window's `candidate/search`, sorts ids ascending,
 processes the first `batchSize` ids `> cursor` (UNGATED — for historical
@@ -314,5 +327,5 @@ or this plane stays invisible there even though the spans flow.
 | worker down | reconcile on recovery (waterline never advanced — the gap window is re-swept) | outage + ≤1h |
 | dashboard down | its boot-seed pull on restart | restart |
 | Monday rollover race | dashboard 409s `window_mismatch` + fires its puller | seconds–minutes, benign |
-| pipeline restructure / classification change | warn-once surfaces ghosts; KV refetch self-heals renames; re-run backfill to recompute flags | operator-driven |
+| pipeline restructure / classification change | warn-once surfaces ghosts; KV refetch self-heals renames + newly-CV-tracked jobs; re-run backfill to recompute flags | operator-driven |
 | D1 wiped | re-run backfill over any horizon (delete the waterline row to force a deep reconcile) | operator-driven |
