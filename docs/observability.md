@@ -229,28 +229,36 @@ Resource attributes include `cf.account_id` so LD can pivot by account.
 
 ## Dashboards
 
-Dashboards are LD-UI configured (not in code). Draft queries for each panel are preserved in `docs/archived/handoffs/2026-05-11-observability-merge-prep.md` § 6.5 if needed. Four dashboards exist in the `rf-dialpad-sync` LD project as of 2026-05-12:
+Dashboards are built via the LaunchDarkly Observability MCP server
+(`https://mcp.launchdarkly.com/mcp/observability`, registered at user scope —
+`claude mcp list` → `observability`). The May 2026 set (ids 10015443–10015446)
+no longer exists; the current set was rebuilt 2026-06-11 via MCP
+(`create-dashboard` / `create-graph`), so it is REPRODUCIBLE from the specs
+below — don't hand-edit panels without updating this doc.
 
 | Name | ID | Path |
 |---|---|---|
-| Flow Health (by flow.name) | `10015443` | `/dashboards/10015443` |
-| Per-worker Health | `10015444` | `/dashboards/10015444` |
-| Webhook + Integration Health | `10015445` | `/dashboards/10015445` |
-| CF Binding Usage | `10015446` | `/dashboards/10015446` |
+| CF Usage & Billing | `10016694` | `/dashboards/10016694` |
+| Flows | `10016695` | `/dashboards/10016695` |
 
-What each one covers (panel inventory as designed 2026-06-11 — the UI is the
-source of truth for what's actually built; this is the reference to rebuild
-from):
-
-1. **Flow Health** (`10015443`) — the no-memorizing flows view:
-   - *All flows — volume*: Table · Traces · Count · filter `flow.name` exists · group by `flow.name` · 24h · sorted desc. The live inventory of every flow name and its traffic.
-   - *Flow errors*: Table · Traces · Count · filter `flow.name` exists + error status · group by `flow.name`.
-   - *Flow p95 duration*: Line · Traces · P95(duration) · group by `flow.name`.
-   - *Flow volume over time*: Line · Traces · Count · group by `flow.name`.
-   Root spans are RENAMED to their flow name by the postProcessor, so the raw Traces tab also reads as flows.
-2. **CF Usage & Billing** (`10015446`, formerly "CF Binding Usage") — one panel per CF billing dimension, all from the metrics-poller gauges (see § Metrics-poller for the metric ↔ billing map): Workers requests/errors/CPU-p99 per script (hourly), D1 rows written + rows read + storage per database (day-to-date sawtooth — daily max = the billing number), KV operations by action + stored bytes, DO requests + stored bytes, AI neurons + requests, and an LD span-ingest panel (Traces · Count · group by `service.name`) against the 25M spans/mo free tier.
-3. **Per-worker Health** (`10015444`) — error rate, latency p50 / p95 / p99 per service, grouped by `service.name`. First port of call for Alert 3.
-4. **Webhook + Integration Health** (`10015445`) — RF / Dialpad / Apollo / Krisp inbound webhook rates + Apollo enrichment outcomes. Consumes the `rf.event_type` and `dialpad.event_type` span attributes set in webhook handlers for per-event-type breakdowns — includes `rf.event_type=stage_moved` (the stage-stats plane stamps it BEFORE auth, so failed deliveries surface here too).
+1. **CF Usage & Billing** (default range 7d) — one Line panel per CF billing
+   dimension, all `Max(value)` over `metric_name=<metric>` from the
+   metrics-poller gauges (§ Metrics-poller has the metric ↔ billing ↔ price
+   map): Workers requests/errors/CPU-p99 per `cf.script_name` (hourly) · D1
+   rows written / rows read / storage per `cf.binding_name` (day-to-date
+   sawtooth — the daily peak IS the billing number) · KV operations per
+   `cf.kv.action` + stored bytes · DO requests · AI neurons + requests ·
+   LD span ingest (Traces · Count · by `service_name`, vs the 25M spans/mo
+   free tier).
+2. **Flows** (default range 24h) — the no-memorizing flows view, all Traces:
+   *All flows — volume* (Table · Count · `flow.name=*` · group by `flow.name`
+   · limit 50 — the live directory of every flow name) · *Flow errors*
+   (same + `has_errors=true`; empty = healthy) · *Flow p95 duration* and
+   *Flow volume over time* (Line · busiest 10) · *RF webhooks by event type*
+   (`rf.event_type=*`, stacked — includes `stage_moved`, which is stamped
+   BEFORE auth so failed deliveries surface) · *Dialpad webhooks by event
+   type*. Root spans are RENAMED to their flow name by the postProcessor, so
+   the raw Traces tab also reads as flows.
 
 (Plus an auto-generated `User Insights` dashboard the LD project ships with — frontend-RUM template, not used by our backend setup.)
 

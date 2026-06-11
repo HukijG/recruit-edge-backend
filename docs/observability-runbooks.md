@@ -2,11 +2,10 @@
 
 Each alert in `#rf-alerts` is paired with a short runbook of what to check and how to respond.
 
-**Dashboard URLs** (paste actual LD URLs after the dashboards are provisioned in the LD UI):
-- Dashboard 1 — Live firehose: `<set after LD UI dashboards are provisioned>`
-- Dashboard 2 — CF binding usage: `<set after LD UI dashboards are provisioned>`
-- Dashboard 3 — Per-worker request health: `<set after LD UI dashboards are provisioned>`
-- Dashboard 4 — Webhook + integration health: `<set after LD UI dashboards are provisioned>`
+**Dashboards** (rebuilt 2026-06-11; references below to "Dashboard 2" map to
+CF Usage & Billing, "Dashboard 4" to Flows' webhook panels):
+- CF Usage & Billing: `/dashboards/10016694` (Workers / D1 / KV / DO / AI billing dimensions + LD ingest)
+- Flows: `/dashboards/10016695` (flow directory, flow errors, p95, RF/Dialpad webhook event types)
 
 ## Alert 1: D1 write storm (>5000 writes/min)
 
