@@ -109,14 +109,19 @@ function isNANP(e164) {
  * Country comes from the RF candidate; falls back to the number's country code.
  */
 export function regionFor(candidateCountry, sampleE164) {
+  // The RETURNED number's own country code is the reliable signal: a NANP (+1) number
+  // means Apollo found a US/Canada number — its strong zone — so there's no reason to
+  // chase ContactOut. RF's `location.country` is unreliable (observed in prod: a
+  // "Greater St. Louis" candidate geocoded to France), so it's only a fallback when we
+  // have no number to judge from.
+  if (sampleE164) return isNANP(sampleE164) ? 'apollo_strong' : 'apollo_weak';
   // Normalize away punctuation/spacing so "U.S.A.", "United States of America" etc. all collapse.
   const c = (candidateCountry || '').toLowerCase().replace(/[.\s]/g, '');
   if (c) {
     const STRONG = new Set(['unitedstates', 'unitedstatesofamerica', 'usa', 'us', 'america', 'canada', 'ca']);
     return STRONG.has(c) ? 'apollo_strong' : 'apollo_weak';
   }
-  if (sampleE164) return isNANP(sampleE164) ? 'apollo_strong' : 'apollo_weak';
-  return 'apollo_strong'; // unknown country: don't over-rerun
+  return 'apollo_strong'; // unknown country, no number: don't over-rerun
 }
 
 /** Does this number's country match the region we expect (used as a ranking nudge)? */

@@ -280,6 +280,32 @@ describe('regionFor — robust to US/Canada string variants', () => {
 	});
 });
 
+describe('regionFor — the returned number country code wins over unreliable RF country', () => {
+	it('a +1 number keeps a mis-geocoded US candidate apollo_strong (no needless EU re-run)', () => {
+		// Prod case: "Greater St. Louis" candidate whose RF location.country = "France".
+		expect(regionFor('France', '+16365550145')).toBe('apollo_strong');
+	});
+	it('a genuine European number is apollo_weak even with no RF country', () => {
+		expect(regionFor('', '+4915123456789')).toBe('apollo_weak');
+	});
+	it('falls back to RF country only when there is no number to judge', () => {
+		expect(regionFor('Germany', null)).toBe('apollo_weak');
+	});
+});
+
+describe('buildPhoneOrder — US number with mis-geocoded RF country does not trigger an EU re-run', () => {
+	const result = buildPhoneOrder({
+		existingNumbers: [],
+		state: {},
+		apolloEntries: [mobileUS],
+		waterfall: apolloWaterfall('+1 301-555-0163'),
+		candidateCountry: 'France', // RF mis-geocode of a US candidate
+	});
+	it('classifies apollo_strong off the +1 number, so the handler will not re-run', () => {
+		expect(result.region).toBe('apollo_strong');
+	});
+});
+
 describe('buildPhoneOrder — waterfall exhaustion (re-run yields nothing new)', () => {
 	const state = { seen: ['5555550100'], added: [{ digits: '5555550100', e164: '+5555550100', source: 'Apollo', typeRank: 0 }], rerunCount: 1 };
 	const result = buildPhoneOrder({

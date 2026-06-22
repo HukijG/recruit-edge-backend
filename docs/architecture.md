@@ -616,6 +616,20 @@ ranked order, and decides whether to re-run the waterfall for a better number.
       → its own webhook lands and repeats the loop
 ```
 
+`region` (apollo_strong = US/Canada, apollo_weak = elsewhere) is derived primarily from the
+RETURNED number's country code (a `+1`/NANP number ⇒ strong), falling back to RF
+`location.country` only when no number is available — RF's geocoded country is unreliable
+(observed: a "Greater St. Louis" candidate stored as country=France).
+
+> **Known limitation (verified 2026-06-22):** the re-run **cannot reach ContactOut** via
+> `/people/match`. Apollo always runs its own DB step first and short-circuits the rest with
+> `request_already_fulfilled`, on every call — regardless of timing or prior state (proven with
+> a settled re-reveal: same number, `credits_consumed: 5`, ContactOut SKIPPED). There is no
+> vendor-control param. The genuine EU benefit of `run_waterfall_phone` is the **pass-1
+> fall-through** (ContactOut runs automatically when Apollo has no number). See
+> `docs/archive/phone-enrichment-investigation-report.md` § 6b. The re-run loop is slated
+> for removal as dead weight.
+
 The extension dial path is unchanged: `/candidate-details` returns `phone_number[0]`, which
 is now the best number because ordering is applied at write time.
 
