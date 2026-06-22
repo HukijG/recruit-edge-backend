@@ -1268,7 +1268,6 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 			dialpadContactRoute(),
 		]);
 
-		await env.SYNC_STATE.delete('apollo_reveal_state:12345');
 		await env.SYNC_STATE.put('apollo_enrich:12345', JSON.stringify({
 			apolloPersonId: 'apollo-123',
 		}), { expirationTtl: 900 });
@@ -1318,7 +1317,6 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 			},
 		]);
 
-		await env.SYNC_STATE.delete('apollo_reveal_state:12345');
 
 		const apolloWebhookPayload = {
 			people: [{ id: 'apollo-123', status: 'success', phone_numbers: [
@@ -1345,18 +1343,13 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 		expect(dialpadPatch.length).toBe(1);
 	});
 
-	it('propagates the originating flow trace id onto a waterfall re-run (async stays in-flow)', async () => {
-		// A work_direct-only payload is fully excluded → the handler re-runs the waterfall.
-		// The re-run reveal must carry the ORIGINATING flow's trace id (passed in via the
-		// inbound webhook URL) so every async pass links back to the same flow.
-		const originTrace = 'a'.repeat(32);
+	it('a work_direct-only payload stores nothing and does NOT re-run the waterfall', async () => {
+		// Excluded-only payloads used to trigger a re-run; that was removed (Apollo can't be
+		// forced past its own DB). The handler must now simply store nothing and fire no reveal.
 		const calls = mockFetch([
 			rfGetCandidateRoute(buildFullRFCandidate({ phone_number: [] })),
 			dialpadContactRoute(),
-			{ match: 'apollo.io/api/v1/people/match', response: { person: { id: 'apollo-123' } } },
 		]);
-
-		await env.SYNC_STATE.delete('apollo_reveal_state:12345');
 
 		const apolloWebhookPayload = {
 			people: [{
@@ -1367,7 +1360,7 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 		};
 
 		const request = new Request(
-			`http://example.com/webhook/apollo?token=${env.APOLLO_WEBHOOK_SECRET}&rfId=12345&_otel_trace=${originTrace}`,
+			`http://example.com/webhook/apollo?token=${env.APOLLO_WEBHOOK_SECRET}&rfId=12345`,
 			{ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(apolloWebhookPayload) }
 		);
 
@@ -1377,12 +1370,10 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 
 		expect(response.status).toBe(200);
 
-		// The re-run reveal fired, and its callback URL carries the origin trace id.
-		const revealCalls = findCalls(calls, 'apollo.io/api/v1/people/match');
-		expect(revealCalls.length).toBe(1);
-		const revealBody = JSON.parse(revealCalls[0].opts.body);
-		expect(revealBody.run_waterfall_phone).toBe(true);
-		expect(revealBody.webhook_url).toContain(`_otel_trace=${originTrace}`);
+		// No Apollo reveal (no re-run), no RF update, no Dialpad PATCH.
+		expect(findCalls(calls, 'apollo.io/api/v1/people/match').length).toBe(0);
+		expect(findCalls(calls, 'recruiterflow.com').filter(c => c.url.includes('/candidate/update')).length).toBe(0);
+		expect(findCalls(calls, 'dialpad.com').filter(c => c.opts.method === 'PATCH').length).toBe(0);
 	});
 });
 

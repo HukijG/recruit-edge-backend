@@ -1200,34 +1200,27 @@ async function handleDialpadCallWebhook(request, env) {
   }
 }
 
-// Re-run state for the Apollo phone waterfall. Separate from the 120s
-// `apollo_enrich:` request-dedup flag — this drives the multi-pass sequence and
-// must outlive Apollo's webhook delay, so it gets a longer TTL.
-const APOLLO_REVEAL_STATE_TTL = 60 * 60; // 1 hour
-// Max waterfall re-runs per candidate (loop safety only; credits aren't a constraint).
-// Caps total reveals at 1 (initial) + APOLLO_RERUN_CAP.
-const APOLLO_RERUN_CAP = 3;
-
 /**
  * Apply an Apollo phone-reveal webhook: merge all desirable numbers into both RF and
- * Dialpad in one ranked best-first order, then decide whether to re-run the waterfall
- * for a better number (EU candidates whose best number is still Apollo-sourced, or
- * candidates where only excluded types came back). The decisions are pure
- * (`buildPhoneOrder`); this function owns the I/O.
+ * Dialpad in one ranked best-first order (`buildPhoneOrder`, pure). This function owns
+ * the I/O.
+ *
+ * There is deliberately NO waterfall re-run: Apollo always runs its own DB first and
+ * short-circuits the rest (`request_already_fulfilled`), so a re-reveal can never reach
+ * ContactOut — verified 2026-06-22 (investigation report § 6b). `run_waterfall_phone`
+ * still helps via the pass-1 fall-through when Apollo has no number.
  *
  * Returns `{ ok }` — `ok:false` when an intended RF/Dialpad write threw, so the caller
  * can reply non-2xx and let Apollo retry the webhook. Retry is self-healing: the
  * per-system sequence-skip below re-attempts only the side that's still out of date.
  *
  * @param {string} rfId
- * @param {Object} person - payload.people[0] ({ id, phone_numbers, waterfall })
+ * @param {Object} person - payload.people[0] ({ id, phone_numbers })
  * @param {Object} env
- * @param {string|null} originTraceId - originating flow's trace id, propagated onto any re-run callback URL
  * @returns {Promise<{ ok: boolean }>}
  */
-async function applyApolloEnrichment(rfId, person, env, originTraceId = null) {
+async function applyApolloEnrichment(rfId, person, env) {
   const apolloEntries = Array.isArray(person?.phone_numbers) ? person.phone_numbers : [];
-  const waterfall = person?.waterfall || null;
 
   // Existing numbers from BOTH systems — so the two never diverge and manual numbers
   // survive. Keep them as their ORIGINAL strings (do not normalize/drop): a real number
@@ -1249,26 +1242,16 @@ async function applyApolloEnrichment(rfId, person, env, originTraceId = null) {
 
   const existingNumbers = [...rfExisting, ...dpExisting];
 
-  // Load prior re-run state (seen digits, contributed pool, rerun count).
-  let state = {};
-  const rawState = await env.SYNC_STATE.get(`apollo_reveal_state:${rfId}`);
-  if (rawState) {
-    try { state = JSON.parse(rawState); } catch { state = {}; }
-  }
-
-  const candidateCountry = currentCandidate?.location?.country || '';
-  const {
-    ordered, region, best, bestIsApolloLike, survivorsCount, producedSomethingNew, droppedUnnormalizable, nextState,
-  } = buildPhoneOrder({ existingNumbers, state, apolloEntries, waterfall, candidateCountry });
+  const { ordered, droppedUnnormalizable } = buildPhoneOrder({ existingNumbers, apolloEntries });
 
   if (droppedUnnormalizable.length) {
     console.warn({ message: `[Apollo] dropped un-normalizable number(s) rfId=${rfId}`, source: 'apollo', rfId, count: droppedUnnormalizable.length });
   }
 
   // Write the full ordered set to each system only when its current sequence differs
-  // (avoids redundant RF Updated webhooks on re-run passes that change nothing). A write
-  // that throws flips `writeFailed` so the caller can 500 → Apollo retries and the
-  // sequence-skip re-attempts only the still-stale side (self-healing, no divergence).
+  // (idempotent across Apollo's webhook retries). A write that throws flips its flag so
+  // the caller can 500 → Apollo retries and the sequence-skip re-attempts only the
+  // still-stale side (self-healing, no divergence).
   const newSeq = ordered.map(digitsOnly).join('|');
   const rfSeq = rfExisting.map(digitsOnly).join('|');
   const dpSeq = dpExisting.map(digitsOnly).join('|');
@@ -1295,38 +1278,6 @@ async function applyApolloEnrichment(rfId, person, env, originTraceId = null) {
   }
   const writeFailed = rfWriteFailed || dpWriteFailed;
 
-  // Decide re-run. Only when this pass surfaced something new (else the waterfall is
-  // exhausted) and we're under the loop-safety cap. The cap is best-effort: two webhook
-  // deliveries racing on the same rfId read the same rerunCount (KV get→put isn't atomic),
-  // so it can be exceeded by a pass or two — acceptable since credits aren't a constraint.
-  let rerun = false;
-  if (producedSomethingNew && (nextState.rerunCount || 0) < APOLLO_RERUN_CAP) {
-    if (survivorsCount === 0) {
-      rerun = true; // only excluded types (or nothing) came back → go deeper
-    } else if (region === 'apollo_weak' && best && bestIsApolloLike) {
-      rerun = true; // EU: we have a number but it's Apollo-sourced → seek ContactOut
-    }
-  }
-
-  if (rerun) {
-    nextState.rerunCount = (nextState.rerunCount || 0) + 1;
-    await env.SYNC_STATE.put(`apollo_reveal_state:${rfId}`, JSON.stringify(nextState), { expirationTtl: APOLLO_REVEAL_STATE_TTL });
-    try {
-      // Keep the re-run's callback bound to the originating flow's trace (not this
-      // webhook's own trace), so the whole multi-pass chain links back to one flow.
-      const webhookUrl = makeAsyncCallbackUrl(buildApolloWebhookUrl(rfId, env), {}, { traceId: originTraceId || undefined });
-      await enrichPerson({ id: person.id }, { reveal_phone_number: true, run_waterfall_phone: true, webhook_url: webhookUrl }, env);
-      console.log({
-        message: `[Apollo] re-run waterfall pass=${nextState.rerunCount} rfId=${rfId} region=${region} reason=${survivorsCount === 0 ? 'excluded_only' : 'apollo_source'}`,
-        source: 'apollo', rfId,
-      });
-    } catch (error) {
-      console.error({ message: `[Apollo] re-run reveal failed (non-fatal) rfId=${rfId}: ${error.message}`, source: 'apollo', rfId });
-    }
-  } else {
-    await env.SYNC_STATE.put(`apollo_reveal_state:${rfId}`, JSON.stringify(nextState), { expirationTtl: APOLLO_REVEAL_STATE_TTL });
-  }
-
   // Refresh caches so a freshly-enriched number shows up immediately. Invalidate the
   // details/activities snapshot (the /candidate-details fast path) unconditionally so the
   // next read repulls live RF. Only update the canonical record's phone string when the RF
@@ -1346,20 +1297,14 @@ async function applyApolloEnrichment(rfId, person, env, originTraceId = null) {
   const span = trace.getActiveSpan();
   if (span) {
     span.setAttribute('apollo.rf_id', String(rfId));
-    span.setAttribute('apollo.region', region);
     span.setAttribute('apollo.stored', ordered.length);
-    span.setAttribute('apollo.survivors', survivorsCount);
-    span.setAttribute('apollo.best_source', best ? best.source : 'none');
-    span.setAttribute('apollo.produced_new', producedSomethingNew);
-    span.setAttribute('apollo.rerun', rerun);
-    span.setAttribute('apollo.rerun_count', nextState.rerunCount || 0);
     if (droppedUnnormalizable.length) span.setAttribute('apollo.dropped_unnormalizable', droppedUnnormalizable.length);
     if (writeFailed) span.setAttribute('apollo.write_failed', true);
   }
 
   console.log({
-    message: `[Apollo] applied rfId=${rfId} stored=${ordered.length} best=${best ? best.source : 'none'} region=${region} rerun=${rerun}`,
-    source: 'apollo', rfId, stored: ordered.length, region, rerun,
+    message: `[Apollo] applied rfId=${rfId} stored=${ordered.length}`,
+    source: 'apollo', rfId, stored: ordered.length,
   });
 
   return { ok: !writeFailed };
@@ -1402,23 +1347,17 @@ async function handleApolloWebhook(request, env, url) {
     // `apollo_enrich:${rfId}` flag stays a request-time dedup guard only (so we don't
     // re-spend Apollo credits); it intentionally does not gate delivery. Idempotency
     // across Apollo's webhook retries comes from applyApolloEnrichment's per-system
-    // digit-set sequence-skip (it only writes a side whose current numbers differ) plus
-    // the `producedSomethingNew` exhaustion check that bounds re-runs.
+    // digit-set sequence-skip (it only writes a side whose current numbers differ).
 
     // A truly empty payload (no phone_numbers at all) has nothing to merge and no
-    // context worth fetching — short-circuit. Payloads with only excluded/invalid
-    // entries DO flow through, so the "only bad types → re-run" path still fires.
+    // context worth fetching — short-circuit.
     const phoneNumbers = person?.phone_numbers;
     if (!Array.isArray(phoneNumbers) || phoneNumbers.length === 0) {
       console.log({ message: `[Apollo] → no phone numbers in payload`, source: 'apollo', rfId });
       return new Response('OK', { status: 200 });
     }
 
-    // Propagate the ORIGINATING flow's trace id (set on the reveal callback URL by the
-    // extension-add flow) through to any waterfall re-run, so every async pass links back
-    // to the same originating flow rather than drifting to each hop's own trace.
-    const originTraceId = readInboundTraceLink(request)?.traceId || null;
-    const { ok } = await applyApolloEnrichment(rfId, person, env, originTraceId);
+    const { ok } = await applyApolloEnrichment(rfId, person, env);
     return new Response(ok ? 'OK' : 'Write failed — retry', { status: ok ? 200 : 500 });
 
   } catch (error) {
