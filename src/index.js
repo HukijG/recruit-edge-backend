@@ -9,7 +9,7 @@ import { instrument } from '@microlabs/otel-cf-workers';
 import { resolveOtelConfig } from './lib/otel-config.js';
 import { trace } from '@opentelemetry/api';
 import { FLOWS } from './lib/flow-names.js';
-import { readInboundTraceLink } from './lib/trace-link.js';
+import { readInboundTraceLink, makeAsyncCallbackUrl } from './lib/trace-link.js';
 import {
   createOrUpdateDialpadContact, patchDialpadContact, getDialpadContact,
   getUserCallerId, initiateCall, buildCallerIdsFromDialpad, sendSMS,
@@ -43,6 +43,7 @@ import {
 import { processCallEvent, parseColdCallActivity, mergeTag } from './cold-call.js';
 import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl, APOLLO_ENRICH_COOLDOWN_SEC } from './enrichment.js';
 import { enrichPerson } from './apollo-client.js';
+import { buildPhoneOrder, digitsOnly } from './phone-merge.js';
 import { resolveRFUserId, getUserByFirstName, getUserByEmail } from './users.js';
 import { formatKrispNotesAsHtml, resolveKrispAttribution, OWNER_EMAIL } from './krisp.js';
 import { authExtensionRequest, setAuthSpanSuccess, setAuthSpanFailure } from './auth-extension.js';
@@ -1199,6 +1200,171 @@ async function handleDialpadCallWebhook(request, env) {
   }
 }
 
+// Re-run state for the Apollo phone waterfall. Separate from the 120s
+// `apollo_enrich:` request-dedup flag — this drives the multi-pass sequence and
+// must outlive Apollo's webhook delay, so it gets a longer TTL.
+const APOLLO_REVEAL_STATE_TTL = 60 * 60; // 1 hour
+// Max waterfall re-runs per candidate (loop safety only; credits aren't a constraint).
+// Caps total reveals at 1 (initial) + APOLLO_RERUN_CAP.
+const APOLLO_RERUN_CAP = 3;
+
+/**
+ * Apply an Apollo phone-reveal webhook: merge all desirable numbers into both RF and
+ * Dialpad in one ranked best-first order, then decide whether to re-run the waterfall
+ * for a better number (EU candidates whose best number is still Apollo-sourced, or
+ * candidates where only excluded types came back). The decisions are pure
+ * (`buildPhoneOrder`); this function owns the I/O.
+ *
+ * Returns `{ ok }` — `ok:false` when an intended RF/Dialpad write threw, so the caller
+ * can reply non-2xx and let Apollo retry the webhook. Retry is self-healing: the
+ * per-system sequence-skip below re-attempts only the side that's still out of date.
+ *
+ * @param {string} rfId
+ * @param {Object} person - payload.people[0] ({ id, phone_numbers, waterfall })
+ * @param {Object} env
+ * @param {string|null} originTraceId - originating flow's trace id, propagated onto any re-run callback URL
+ * @returns {Promise<{ ok: boolean }>}
+ */
+async function applyApolloEnrichment(rfId, person, env, originTraceId = null) {
+  const apolloEntries = Array.isArray(person?.phone_numbers) ? person.phone_numbers : [];
+  const waterfall = person?.waterfall || null;
+
+  // Existing numbers from BOTH systems — so the two never diverge and manual numbers
+  // survive. Keep them as their ORIGINAL strings (do not normalize/drop): a real number
+  // RF stored in a non-E.164 shape must not be silently lost when we rewrite the array.
+  const currentCandidate = await getRFCandidate(rfId, env);
+  const rfExisting = (Array.isArray(currentCandidate?.phone_number) ? currentCandidate.phone_number : [])
+    .map(p => (typeof p === 'string' ? p : p?.phone_number))
+    .filter(n => typeof n === 'string' && n.trim() !== '');
+
+  let dialpadContact = null;
+  try {
+    dialpadContact = await getDialpadContact(rfId, env);
+  } catch (err) {
+    console.error({ message: `[Apollo] Dialpad GET failed (non-fatal): ${err.message}`, source: 'apollo', rfId });
+  }
+  const dpExisting = (Array.isArray(dialpadContact?.phones) ? dialpadContact.phones : [])
+    .map(n => (typeof n === 'string' ? n : ''))
+    .filter(n => n.trim() !== '');
+
+  const existingNumbers = [...rfExisting, ...dpExisting];
+
+  // Load prior re-run state (seen digits, contributed pool, rerun count).
+  let state = {};
+  const rawState = await env.SYNC_STATE.get(`apollo_reveal_state:${rfId}`);
+  if (rawState) {
+    try { state = JSON.parse(rawState); } catch { state = {}; }
+  }
+
+  const candidateCountry = currentCandidate?.location?.country || '';
+  const {
+    ordered, region, best, bestIsApolloLike, survivorsCount, producedSomethingNew, droppedUnnormalizable, nextState,
+  } = buildPhoneOrder({ existingNumbers, state, apolloEntries, waterfall, candidateCountry });
+
+  if (droppedUnnormalizable.length) {
+    console.warn({ message: `[Apollo] dropped un-normalizable number(s) rfId=${rfId}`, source: 'apollo', rfId, count: droppedUnnormalizable.length });
+  }
+
+  // Write the full ordered set to each system only when its current sequence differs
+  // (avoids redundant RF Updated webhooks on re-run passes that change nothing). A write
+  // that throws flips `writeFailed` so the caller can 500 → Apollo retries and the
+  // sequence-skip re-attempts only the still-stale side (self-healing, no divergence).
+  const newSeq = ordered.map(digitsOnly).join('|');
+  const rfSeq = rfExisting.map(digitsOnly).join('|');
+  const dpSeq = dpExisting.map(digitsOnly).join('|');
+  let rfWriteFailed = false;
+  let dpWriteFailed = false;
+
+  if (ordered.length && newSeq !== rfSeq) {
+    // updateRFCandidate auto-resolves phone-uniqueness 409s.
+    try {
+      await updateRFCandidate(rfId, { phone_number: ordered.map(n => ({ phone_number: n, type: 1 })) }, env);
+      await env.SYNC_STATE.put(`sync:RF${rfId}`, 'true', { expirationTtl: 60 });
+    } catch (error) {
+      rfWriteFailed = true;
+      console.error({ message: `[Apollo] RF update failed (will retry) rfId=${rfId}: ${error.message}`, source: 'apollo', rfId, parity: 'rf_write_failed' });
+    }
+  }
+  if (ordered.length && newSeq !== dpSeq) {
+    try {
+      await patchDialpadContact(rfId, { phones: ordered }, env);
+    } catch (dialpadErr) {
+      dpWriteFailed = true;
+      console.error({ message: `[Apollo] Dialpad patch failed (will retry) rfId=${rfId}: ${dialpadErr.message}`, source: 'apollo', rfId, parity: 'dialpad_write_failed' });
+    }
+  }
+  const writeFailed = rfWriteFailed || dpWriteFailed;
+
+  // Decide re-run. Only when this pass surfaced something new (else the waterfall is
+  // exhausted) and we're under the loop-safety cap. The cap is best-effort: two webhook
+  // deliveries racing on the same rfId read the same rerunCount (KV get→put isn't atomic),
+  // so it can be exceeded by a pass or two — acceptable since credits aren't a constraint.
+  let rerun = false;
+  if (producedSomethingNew && (nextState.rerunCount || 0) < APOLLO_RERUN_CAP) {
+    if (survivorsCount === 0) {
+      rerun = true; // only excluded types (or nothing) came back → go deeper
+    } else if (region === 'apollo_weak' && best && bestIsApolloLike) {
+      rerun = true; // EU: we have a number but it's Apollo-sourced → seek ContactOut
+    }
+  }
+
+  if (rerun) {
+    nextState.rerunCount = (nextState.rerunCount || 0) + 1;
+    await env.SYNC_STATE.put(`apollo_reveal_state:${rfId}`, JSON.stringify(nextState), { expirationTtl: APOLLO_REVEAL_STATE_TTL });
+    try {
+      // Keep the re-run's callback bound to the originating flow's trace (not this
+      // webhook's own trace), so the whole multi-pass chain links back to one flow.
+      const webhookUrl = makeAsyncCallbackUrl(buildApolloWebhookUrl(rfId, env), {}, { traceId: originTraceId || undefined });
+      await enrichPerson({ id: person.id }, { reveal_phone_number: true, run_waterfall_phone: true, webhook_url: webhookUrl }, env);
+      console.log({
+        message: `[Apollo] re-run waterfall pass=${nextState.rerunCount} rfId=${rfId} region=${region} reason=${survivorsCount === 0 ? 'excluded_only' : 'apollo_source'}`,
+        source: 'apollo', rfId,
+      });
+    } catch (error) {
+      console.error({ message: `[Apollo] re-run reveal failed (non-fatal) rfId=${rfId}: ${error.message}`, source: 'apollo', rfId });
+    }
+  } else {
+    await env.SYNC_STATE.put(`apollo_reveal_state:${rfId}`, JSON.stringify(nextState), { expirationTtl: APOLLO_REVEAL_STATE_TTL });
+  }
+
+  // Refresh caches so a freshly-enriched number shows up immediately. Invalidate the
+  // details/activities snapshot (the /candidate-details fast path) unconditionally so the
+  // next read repulls live RF. Only update the canonical record's phone string when the RF
+  // write didn't fail — otherwise the cache would briefly advertise a number RF doesn't yet
+  // have. `ordered[0]` is intentionally the manual-first number (manual-stays-at-top rule);
+  // the dial target the extension uses is the RF/Dialpad array[0], not this snapshot field.
+  await invalidateCandidateDetailsCache(rfId, env);
+  if (!rfWriteFailed) {
+    const cached = await getCachedCandidate(rfId, env);
+    if (cached) {
+      await cacheCandidate({ ...cached, phone_number: ordered[0] || cached.phone_number || '' }, env);
+    }
+  }
+
+  // Decision attributes on the active (webhook) span — makes the enrichment outcome
+  // queryable in the trace alongside the auto-instrumented RF/Dialpad/Apollo fetch spans.
+  const span = trace.getActiveSpan();
+  if (span) {
+    span.setAttribute('apollo.rf_id', String(rfId));
+    span.setAttribute('apollo.region', region);
+    span.setAttribute('apollo.stored', ordered.length);
+    span.setAttribute('apollo.survivors', survivorsCount);
+    span.setAttribute('apollo.best_source', best ? best.source : 'none');
+    span.setAttribute('apollo.produced_new', producedSomethingNew);
+    span.setAttribute('apollo.rerun', rerun);
+    span.setAttribute('apollo.rerun_count', nextState.rerunCount || 0);
+    if (droppedUnnormalizable.length) span.setAttribute('apollo.dropped_unnormalizable', droppedUnnormalizable.length);
+    if (writeFailed) span.setAttribute('apollo.write_failed', true);
+  }
+
+  console.log({
+    message: `[Apollo] applied rfId=${rfId} stored=${ordered.length} best=${best ? best.source : 'none'} region=${region} rerun=${rerun}`,
+    source: 'apollo', rfId, stored: ordered.length, region, rerun,
+  });
+
+  return { ok: !writeFailed };
+}
+
 async function handleApolloWebhook(request, env, url) {
   try {
     const webhookSecret = env.APOLLO_WEBHOOK_SECRET;
@@ -1231,75 +1397,29 @@ async function handleApolloWebhook(request, env, url) {
     // No KV "pending context" gate here, on purpose. Apollo delivers the phone-reveal
     // webhook asynchronously with an unbounded delay (observed 12s to ~46min) — far
     // longer than any short-lived flag we'd keep. The reveal is authenticated by the URL
-    // token and fully self-describing (rfId from the URL we built + phone from the
-    // payload), so we ALWAYS deliver a valid phone to RF + Dialpad regardless of when it
-    // lands. The `apollo_enrich:${rfId}` flag stays a request-time dedup guard only (so we
-    // don't re-spend Apollo credits); it intentionally does not gate delivery. The
-    // phoneAlreadyExists check below keeps this idempotent across Apollo's webhook retries.
+    // token and fully self-describing (rfId from the URL we built + phones from the
+    // payload), so we ALWAYS deliver to RF + Dialpad regardless of when it lands. The
+    // `apollo_enrich:${rfId}` flag stays a request-time dedup guard only (so we don't
+    // re-spend Apollo credits); it intentionally does not gate delivery. Idempotency
+    // across Apollo's webhook retries comes from applyApolloEnrichment's per-system
+    // digit-set sequence-skip (it only writes a side whose current numbers differ) plus
+    // the `producedSomethingNew` exhaustion check that bounds re-runs.
 
-    // Extract phone numbers from the person object
+    // A truly empty payload (no phone_numbers at all) has nothing to merge and no
+    // context worth fetching — short-circuit. Payloads with only excluded/invalid
+    // entries DO flow through, so the "only bad types → re-run" path still fires.
     const phoneNumbers = person?.phone_numbers;
     if (!Array.isArray(phoneNumbers) || phoneNumbers.length === 0) {
-      console.log({ message: `[Apollo] → no phone numbers in payload, skipping`, source: 'apollo', rfId });
+      console.log({ message: `[Apollo] → no phone numbers in payload`, source: 'apollo', rfId });
       return new Response('OK', { status: 200 });
     }
 
-    // Pick first valid phone — Apollo uses status_cd, not status
-    const validPhone = phoneNumbers.find(p => p.sanitized_number && p.status_cd !== 'invalid_number');
-    if (!validPhone) {
-      console.log({ message: `[Apollo] → no valid phone numbers, skipping`, source: 'apollo', rfId });
-      return new Response('OK', { status: 200 });
-    }
-    const phoneStr = validPhone.sanitized_number;
-
-    // Update RF directly — Dialpad Created events are intentionally ignored,
-    // so we can't rely on Dialpad→RF sync to carry the phone across.
-    const currentCandidate = await getRFCandidate(rfId, env);
-    const rawPhones = Array.isArray(currentCandidate.phone_number) ? currentCandidate.phone_number : [];
-    // Drop legacy/malformed entries with no actual phone_number value before
-    // sending back to RF — RF rejects {type:1} entries as "invalid format".
-    const existingPhones = rawPhones
-      .map(p => (typeof p === 'string' ? { phone_number: p, type: 1 } : { phone_number: p.phone_number, type: p.type ?? 1 }))
-      .filter(p => p.phone_number);
-    const normalizedNew = phoneStr.replace(/\D/g, '');
-    const phoneAlreadyExists = existingPhones.some(
-      p => (p.phone_number || '').replace(/\D/g, '') === normalizedNew
-    );
-
-    if (!phoneAlreadyExists) {
-      const mergedPhones = [
-        ...existingPhones,
-        { phone_number: phoneStr, type: 1 },
-      ];
-      // updateRFCandidate auto-resolves phone uniqueness conflicts (strips the
-      // number from a stale duplicate, then retries). Non-fatal: if it's still
-      // unresolvable, don't abort — the direct Dialpad patch below must still run.
-      try {
-        await updateRFCandidate(rfId, { phone_number: mergedPhones }, env);
-        // Debounce prevents the eventual RF Updated webhook from re-syncing to Dialpad
-        await env.SYNC_STATE.put(`sync:RF${rfId}`, 'true', { expirationTtl: 60 });
-      } catch (error) {
-        console.error({ message: `[Apollo] RF update failed (non-fatal, continuing) rfId=${rfId}: ${error.message}`, source: 'apollo', rfId });
-      }
-    } else {
-      console.log({ message: `[Apollo] → phone already in RF, skipped RF update`, source: 'apollo', rfId, phone: phoneStr });
-    }
-
-    // Patch Dialpad directly too — don't wait for RF webhook (hours of delay)
-    // Non-fatal: contact may not exist yet if extension creation failed or is still in progress
-    try {
-      await patchDialpadContact(rfId, { phones: [phoneStr] }, env);
-    } catch (dialpadErr) {
-      console.error({ message: `[Apollo] Dialpad patch failed (non-fatal)`, source: 'apollo', rfId, error: dialpadErr.message });
-    }
-
-    // Update cache with new phone
-    const cached = await getCachedCandidate(rfId, env);
-    if (cached) {
-      await cacheCandidate({ ...cached, phone_number: phoneStr }, env);
-    }
-
-    return new Response('OK', { status: 200 });
+    // Propagate the ORIGINATING flow's trace id (set on the reveal callback URL by the
+    // extension-add flow) through to any waterfall re-run, so every async pass links back
+    // to the same originating flow rather than drifting to each hop's own trace.
+    const originTraceId = readInboundTraceLink(request)?.traceId || null;
+    const { ok } = await applyApolloEnrichment(rfId, person, env, originTraceId);
+    return new Response(ok ? 'OK' : 'Write failed — retry', { status: ok ? 200 : 500 });
 
   } catch (error) {
     // Inline the actual error into the message so it surfaces in CF Logs metadata.
@@ -1434,18 +1554,20 @@ async function processExistingRFCandidate(existing, ext, label, env) {
     }
   }
 
-  // Apollo phone enrichment — only if Dialpad contact has no phone and no prior attempt
+  // Apollo phone enrichment — fire on EVERY extension add (not gated on "no Dialpad
+  // phone"): the waterfall may surface a better number even when one already exists,
+  // and the merge engine preserves existing numbers. The 120s `apollo_enrich:` flag is
+  // kept purely as a double-submit guard against rapid duplicate adds.
   let phoneRequested = false;
-  const hasDialpadPhone = dialpadContact?.phones?.length > 0;
 
-  if (!hasDialpadPhone && ext.linkedinUrl) {
+  if (ext.linkedinUrl) {
     const apolloFlag = await env.SYNC_STATE.get(`apollo_enrich:${rfId}`);
     if (!apolloFlag) {
       try {
         const apolloPerson = await enrichPerson({ linkedin_url: ext.linkedinUrl }, {}, env);
         if (apolloPerson) {
-          const webhookUrl = buildApolloWebhookUrl(rfId, env);
-          await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, webhook_url: webhookUrl }, env);
+          const webhookUrl = makeAsyncCallbackUrl(buildApolloWebhookUrl(rfId, env), {});
+          await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, run_waterfall_phone: true, webhook_url: webhookUrl }, env);
           await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
             apolloPersonId: apolloPerson.id,
             timestamp: new Date().toISOString(),
@@ -1572,7 +1694,7 @@ async function processOneCandidate(ext, i, total, env, consultantRfUserId) {
       try {
         const apolloPerson = await enrichPerson({ linkedin_url: rfCandidate.linkedin_profile }, {}, env);
         if (apolloPerson) {
-          const webhookUrl = buildApolloWebhookUrl(rfId, env);
+          const webhookUrl = makeAsyncCallbackUrl(buildApolloWebhookUrl(rfId, env), {});
           await enrichPerson({ id: apolloPerson.id }, { reveal_phone_number: true, run_waterfall_phone: true, webhook_url: webhookUrl }, env);
           await env.SYNC_STATE.put(`apollo_enrich:${rfId}`, JSON.stringify({
             apolloPersonId: apolloPerson.id,

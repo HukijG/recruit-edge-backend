@@ -155,7 +155,7 @@ export async function enrichCandidate(candidate, fullCandidate, env) {
 	const webhookUrl = makeAsyncCallbackUrl(buildApolloWebhookUrl(rfId, env), {});
 	await enrichPerson(
 		{ id: apolloPerson.id },
-		{ reveal_phone_number: true, webhook_url: webhookUrl },
+		{ reveal_phone_number: true, run_waterfall_phone: true, webhook_url: webhookUrl },
 		env
 	);
 

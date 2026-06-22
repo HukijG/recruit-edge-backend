@@ -122,7 +122,8 @@ This file does NOT duplicate that material. References below use the Access auth
 | `src/extension-calls.js` | Extension Call/Hangup webhook dispatcher. `processExtensionCallEvent` filters Dialpad webhook payloads (outbound + monitored target), routes `calling`/`hangup` events to the per-user `ExtCallState` DO. |
 | `src/extension-call-do.js` | `ExtCallState` Durable Object class. Per-user store, one instance per Dialpad user (`idFromName(dialpadUserId)`). RPC: `setCallId`, `getCallId`, `clearCallIdIfMatch`. 20-min self-clearing alarm on `setCallId`. |
 | `src/apollo-client.js` | Apollo API client: enrichment, search, verification, scoring. |
-| `src/enrichment.js` | Enrichment orchestration: ownership check (sourced from `users.js`), LinkedIn verify, fallback search, phone reveal. |
+| `src/enrichment.js` | Legacy enrichment orchestration (RF Created Joel-gated + manual webhook): ownership check (sourced from `users.js`), LinkedIn verify, fallback search, phone reveal. The primary enrichment path is the extension add flow + the Apollo webhook handler in `index.js`. |
+| `src/phone-merge.js` | Pure phone merge + ranking engine for the Apollo webhook: exclusion (work_*/ext/invalid), source attribution from the waterfall block, region detection, best-first ordering, and the re-run decision signals. No I/O — `applyApolloEnrichment` (index.js) owns the I/O. |
 | `src/mcp/router.js` | `/mcp/*` dispatcher. Resolves consultant from body field — prefers verified `consultantEmail` (forwarded by `rf-mcp-remote` from the Access JWT); transitional `consultantFirstName` fallback for legacy callers (logs `[mcp] legacy consultantFirstName fallback`, drops when Spec B Phase 3 lands). No header auth — only callable over the service binding. |
 | `src/mcp/{cache-status,candidate-get,candidate-search,candidate-move-stage,candidate-log-interview,job-pipeline,job-candidates-filter,candidate-call-notes}.js` | Per-tool middleware handlers. |
 | `src/mcp/{resolvers,fuzzy,projection,linkedin,d1-read,snapshot,handlers-registry,concurrency}.js` | Shared middleware infrastructure. `concurrency.js` provides `pMapLimit` for bounded parallel RF `/candidate/get` fan-out in pipeline hydration. |
@@ -207,7 +208,7 @@ Every worker emits OTel traces + logs to LaunchDarkly Observability. The pipelin
 | `/webhook/krisp` | POST | `X-Krisp-Webhook-Token` header | Krisp meeting note webhooks |
 | `/webhook/dialpad/calls` | POST | JWT Bearer (HS256) | Dialpad call transcription/voicemail webhooks |
 | `/webhook/dialpad/extension-calls` | POST | JWT Bearer (HS256) | Dialpad call-state (`calling`/`hangup`) webhook driving the extension button |
-| `/webhook/apollo` | POST | `?token=` query param (`APOLLO_WEBHOOK_SECRET`) | Async phone reveal delivery from Apollo |
+| `/webhook/apollo` | POST | `?token=` query param (`APOLLO_WEBHOOK_SECRET`) | Async phone-reveal delivery from Apollo. Merges all desirable numbers into RF + Dialpad (ranked), re-runs the waterfall for better numbers. See "Apollo phone enrichment (multi-number waterfall)". |
 | `/candidates` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | LinkedIn extension batch upsert (sets `lead_owner_id`) |
 | `/candidates/add-to-job` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Add candidates to a job + write `consultant_id` custom field |
 | `/candidate-details` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Sidepanel data: rfId, phone (E.164), picked job, cold-call activities |
@@ -560,7 +561,10 @@ Extension → POST /candidates (consultantFirstName, candidates[])
       If existing → processExistingRFCandidate (no lead_owner_id touched):
           → GET Dialpad contact
           → If missing: full Dialpad creation; if present: PATCH company/title only
-          → Apollo phone reveal if no Dialpad phone + linkedin URL + no prior attempt
+          → Apollo phone reveal on EVERY add with a linkedin URL (NOT gated on "no
+            Dialpad phone" — the waterfall can surface a better number even when one
+            exists; the merge engine preserves existing numbers). 120s apollo_enrich:{rfId}
+            flag is a double-submit guard only.
 
       If new:
           → mapExtensionToRFCandidate(ext, consultantRfUserId)
@@ -570,11 +574,50 @@ Extension → POST /candidates (consultantFirstName, candidates[])
             new candidates have no email/phone yet)
           → syncCandidateToDialpad → cacheCandidate
           → Apollo phone reveal (LinkedIn URL → enrichPerson, request reveal with
-            run_waterfall_phone, write apollo_enrich:{rfId} flag, 15-min TTL)
+            reveal_phone_number + run_waterfall_phone, write apollo_enrich:{rfId} flag)
+
+  See "Apollo phone enrichment (multi-number waterfall)" below for the webhook side.
 
   → listOpenJobs → response includes { total, created, updated, skipped, errors,
                                        results, jobs }
 ```
+
+### Apollo phone enrichment (multi-number waterfall)
+
+The request side (above) is fire-and-forget: the extension add returns immediately. Apollo
+delivers revealed numbers asynchronously to `/webhook/apollo?token=…&rfId=…` (seconds to
+minutes later). The webhook handler (`handleApolloWebhook` → `applyApolloEnrichment` in
+`src/index.js`) reconciles **all** desirable numbers into **both** RF and Dialpad, in one
+ranked order, and decides whether to re-run the waterfall for a better number.
+
+```
+/webhook/apollo (people[0] = { id, phone_numbers[], waterfall })
+  → GET existing numbers from BOTH RF (getRFCandidate) and Dialpad (getDialpadContact)
+      — existing numbers kept as ORIGINAL strings (never normalized-away → no data loss)
+  → load apollo_reveal_state:{rfId} (KV, 1h TTL: { seen, added, rerunCount })
+  → buildPhoneOrder (pure, src/phone-merge.js):
+      • exclude entirely: type_cd work_* (HQ/direct), extension numbers, status_cd invalid_number
+        (`other` is KEPT — most non-Apollo numbers are `other`)
+      • attribute source per number by digit-matching people[0].waterfall.phone_numbers[].vendors[]
+      • rank best-first as ARRAY ORDER (RF `type` stays 1; no source proxy):
+          - pre-existing manual numbers stay at top
+          - apollo_weak region (non-US/CA): non-Apollo (ContactOut) source wins [0]
+          - apollo_strong region (US/CA): mobile type wins; non-Apollo breaks ties
+      • status_cd/confidence_cd are NOT ranking signals; DNC is ignored
+  → write ordered set to RF + Dialpad, each only if its current digit-sequence differs
+      (idempotent across Apollo retries). A failed write → 500 so Apollo retries; the
+      seq-skip re-attempts only the still-stale side (self-heal, no divergence).
+  → invalidateCandidateDetailsCache(rfId)  — kills the up-to-20-min stale window
+  → re-run decision (bounded by APOLLO_RERUN_CAP, loop-safety only — credits not a constraint):
+      • only excluded types came back            → re-run (go deeper)
+      • apollo_weak & best number still Apollo    → store it AND re-run (seek ContactOut)
+      • stop when a pass surfaces nothing new (waterfall exhausted) or cap reached
+  → re-run fires enrichPerson({id}, {reveal_phone_number, run_waterfall_phone, webhook_url})
+      → its own webhook lands and repeats the loop
+```
+
+The extension dial path is unchanged: `/candidate-details` returns `phone_number[0]`, which
+is now the best number because ordering is applied at write time.
 
 ### `POST /candidates/add-to-job` — add to job + write consultant_id
 

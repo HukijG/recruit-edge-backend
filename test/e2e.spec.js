@@ -1197,11 +1197,13 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 		const rfUpdateBody = JSON.parse(rfUpdateCalls[0].opts.body);
 		expect(rfUpdateBody.phone_number).toEqual([{ phone_number: '+15555550100', type: 1 }]);
 
-		// Dialpad PATCH should only contain the phone — nothing else
+		// Dialpad: GET existing phones (to merge, not clobber) then PATCH the full set
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
-		expect(dialpadCalls.length).toBe(1);
-		const dialpadBody = JSON.parse(dialpadCalls[0].opts.body);
-		expect(dialpadBody).toEqual({ phones: ['+15555550100'] });
+		expect(dialpadCalls.length).toBe(2);
+		const dialpadGet = dialpadCalls.find(c => (c.opts.method || 'GET') === 'GET');
+		const dialpadPatch = dialpadCalls.find(c => c.opts.method === 'PATCH');
+		expect(dialpadGet).toBeDefined();
+		expect(JSON.parse(dialpadPatch.opts.body)).toEqual({ phones: ['+15555550100'] });
 
 		// Cache should be updated with phone
 		const cached = await env.SYNC_STATE.get('candidate:12345');
@@ -1253,21 +1255,26 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 		expect(rfUpdateCalls.length).toBe(1);
 		expect(JSON.parse(rfUpdateCalls[0].opts.body).phone_number).toEqual([{ phone_number: '+15555550100', type: 1 }]);
 
-		// Dialpad PATCH carries only the phone
+		// Dialpad GET (merge) + PATCH (full set)
 		const dialpadCalls = findCalls(calls, 'dialpad.com');
-		expect(dialpadCalls.length).toBe(1);
-		expect(JSON.parse(dialpadCalls[0].opts.body)).toEqual({ phones: ['+15555550100'] });
+		expect(dialpadCalls.length).toBe(2);
+		const dialpadPatch = dialpadCalls.find(c => c.opts.method === 'PATCH');
+		expect(JSON.parse(dialpadPatch.opts.body)).toEqual({ phones: ['+15555550100'] });
 	});
 
-	it('returns 200 when no valid phone numbers in payload', async () => {
-		const calls = mockFetch([]);
+	it('stores nothing when the only number is invalid_number (no RF update, no Dialpad PATCH)', async () => {
+		const calls = mockFetch([
+			rfGetCandidateRoute(buildFullRFCandidate({ phone_number: [] })),
+			dialpadContactRoute(),
+		]);
 
+		await env.SYNC_STATE.delete('apollo_reveal_state:12345');
 		await env.SYNC_STATE.put('apollo_enrich:12345', JSON.stringify({
 			apolloPersonId: 'apollo-123',
 		}), { expirationTtl: 900 });
 
 		const apolloWebhookPayload = {
-			people: [{ id: 'apollo-123', status: 'success', phone_numbers: [{ sanitized_number: '+10000000000', status_cd: 'invalid_number' }] }],
+			people: [{ id: 'apollo-123', status: 'success', phone_numbers: [{ sanitized_number: '+10000000000', type_cd: 'mobile', status_cd: 'invalid_number' }] }],
 		};
 
 		const request = new Request(
@@ -1285,9 +1292,97 @@ describe('E2E: Apollo webhook (phone delivery)', () => {
 
 		expect(response.status).toBe(200);
 
-		// No Dialpad or RF calls
-		const dialpadCalls = findCalls(calls, 'dialpad.com');
-		expect(dialpadCalls.length).toBe(0);
+		// The invalid number is excluded → nothing stored. We still GET context from
+		// both systems, but no RF update and no Dialpad PATCH happen.
+		const rfUpdateCalls = findCalls(calls, 'recruiterflow.com').filter(c => c.url.includes('/candidate/update'));
+		expect(rfUpdateCalls.length).toBe(0);
+		const dialpadPatch = findCalls(calls, 'dialpad.com').filter(c => c.opts.method === 'PATCH');
+		expect(dialpadPatch.length).toBe(0);
+	});
+
+	it('returns 500 when a write fails, so Apollo retries (self-heal contract)', async () => {
+		// RF GET + UPDATE succeed; the Dialpad PATCH fails. The RF side is written, but the
+		// half-write must surface as a 500 so Apollo redelivers and the seq-skip re-attempts
+		// only the still-stale Dialpad side.
+		const calls = mockFetch([
+			rfGetCandidateRoute(buildFullRFCandidate({ phone_number: [] })),
+			rfUpdateCandidateRoute(),
+			{
+				match: 'dialpad.com/api/v2/contacts',
+				response: (url, opts) => {
+					if (opts.method === 'PATCH') {
+						return new Response(JSON.stringify({ error: 'boom' }), { status: 500 });
+					}
+					return new Response(JSON.stringify({ id: 'shared_contact_pool_Company:0000000000000000_uid_RF12345' }), { status: 200 });
+				},
+			},
+		]);
+
+		await env.SYNC_STATE.delete('apollo_reveal_state:12345');
+
+		const apolloWebhookPayload = {
+			people: [{ id: 'apollo-123', status: 'success', phone_numbers: [
+				{ sanitized_number: '+15555550100', type_cd: 'mobile', status_cd: 'valid_number', raw_number: '(978) 555-0146' },
+			] }],
+		};
+
+		const request = new Request(
+			`http://example.com/webhook/apollo?token=${env.APOLLO_WEBHOOK_SECRET}&rfId=12345`,
+			{ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(apolloWebhookPayload) }
+		);
+
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		// The half-write surfaces as a retryable 500.
+		expect(response.status).toBe(500);
+
+		// The succeeded side (RF) was written; the failed side (Dialpad PATCH) was attempted.
+		const rfUpdateCalls = findCalls(calls, 'recruiterflow.com').filter(c => c.url.includes('/candidate/update'));
+		expect(rfUpdateCalls.length).toBe(1);
+		const dialpadPatch = findCalls(calls, 'dialpad.com').filter(c => c.opts.method === 'PATCH');
+		expect(dialpadPatch.length).toBe(1);
+	});
+
+	it('propagates the originating flow trace id onto a waterfall re-run (async stays in-flow)', async () => {
+		// A work_direct-only payload is fully excluded → the handler re-runs the waterfall.
+		// The re-run reveal must carry the ORIGINATING flow's trace id (passed in via the
+		// inbound webhook URL) so every async pass links back to the same flow.
+		const originTrace = 'a'.repeat(32);
+		const calls = mockFetch([
+			rfGetCandidateRoute(buildFullRFCandidate({ phone_number: [] })),
+			dialpadContactRoute(),
+			{ match: 'apollo.io/api/v1/people/match', response: { person: { id: 'apollo-123' } } },
+		]);
+
+		await env.SYNC_STATE.delete('apollo_reveal_state:12345');
+
+		const apolloWebhookPayload = {
+			people: [{
+				id: 'apollo-123',
+				status: 'success',
+				phone_numbers: [{ sanitized_number: '+17035550153', type_cd: 'work_direct', status_cd: 'valid_number', raw_number: '+1 703-555-0153' }],
+			}],
+		};
+
+		const request = new Request(
+			`http://example.com/webhook/apollo?token=${env.APOLLO_WEBHOOK_SECRET}&rfId=12345&_otel_trace=${originTrace}`,
+			{ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(apolloWebhookPayload) }
+		);
+
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+
+		// The re-run reveal fired, and its callback URL carries the origin trace id.
+		const revealCalls = findCalls(calls, 'apollo.io/api/v1/people/match');
+		expect(revealCalls.length).toBe(1);
+		const revealBody = JSON.parse(revealCalls[0].opts.body);
+		expect(revealBody.run_waterfall_phone).toBe(true);
+		expect(revealBody.webhook_url).toContain(`_otel_trace=${originTrace}`);
 	});
 });
 

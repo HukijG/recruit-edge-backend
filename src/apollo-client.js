@@ -13,7 +13,7 @@ const FETCH_TIMEOUT_MS = 10_000;
  * Enrich a person via Apollo People Enrichment API.
  *
  * @param {Object} params - Lookup params: { linkedin_url, first_name, last_name, organization_name, id }
- * @param {Object} options - Optional: { reveal_phone_number, webhook_url }
+ * @param {Object} options - Optional: { reveal_phone_number, run_waterfall_phone, webhook_url }
  * @param {Object} env - Worker env with APOLLO_API_KEY
  * @returns {Object|null} The person object, or null if not found / error
  */
