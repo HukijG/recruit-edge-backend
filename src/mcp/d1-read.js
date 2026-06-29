@@ -183,3 +183,33 @@ export async function getCallsForCandidate(env, targetDialpadId, rfCandidateId, 
     .all();
   return results;
 }
+
+/**
+ * Historical cancelled / missed cold calls for a candidate, from the
+ * `missed_cold_calls` backfill table (RF_MCP_CACHE). Owner-only at the call
+ * site — the /candidate-details endpoint merges these into the cold-call list
+ * for the owner so the count reflects calls that never reached RF.
+ *
+ * Indexed by rf_candidate_id (idx_missed_cold_calls_candidate) — no full scan.
+ * Returns [] (not throw) if the table is absent (e.g. a D1 instance the 0005
+ * migration hasn't reached) so the endpoint degrades to the RF-only list.
+ *
+ * @param {object} env
+ * @param {number} rfCandidateId
+ * @returns {Promise<{call_id: string, date_started_ms: number, outcome: string, duration_ms: number|null}[]>}
+ */
+export async function getMissedColdCallsForCandidate(env, rfCandidateId) {
+  try {
+    const { results } = await session(env)
+      .prepare(`SELECT call_id, date_started_ms, outcome, duration_ms
+                FROM missed_cold_calls
+                WHERE rf_candidate_id = ?
+                ORDER BY date_started_ms DESC`)
+      .bind(Number(rfCandidateId))
+      .all();
+    return results || [];
+  } catch (err) {
+    console.error({ message: `[d1-read] missed_cold_calls read failed: ${err.message}`, source: 'd1-read', rfCandidateId });
+    return [];
+  }
+}

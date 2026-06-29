@@ -37,6 +37,7 @@ RF is the source of truth for candidate records. The KV `SYNC_STATE` cache provi
 │    D1  USERS_DB         — team registry (writes via migrations; reads via src/users.js, async cache)     │
 │    D1  RF_MCP_CACHE     — thin-immutable cache (READ-ONLY here; cache worker writes)                      │
 │    DO  EXT_CALL_STATE   — per-user active Dialpad call_id (ExtCallState class, idFromName(dialpadId))   │
+│    DO  COLD_CALL_ARBITER— per-call cancelled-vs-transcript grace arbiter (ColdCallArbiter, idFromName(callId)) │
 │    AI  Workers AI       — cold-call classifier (Llama 3.3 70B) + summary extractor (Llama 3.1 8B)       │
 │    Svc SYNC_WORKER      — service binding to rf-mcp-cache-sync (hangup forwarding → /internal/calls/upsert)│
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -118,13 +119,15 @@ This file does NOT duplicate that material. References below use the Access auth
 | `src/dialpad-aliases.js` | Opaque caller-ID alias signing/verifying (HS256 JWT via jose, audience `dialpad-caller-id`, 7-day TTL). Keeps raw E.164 numbers off the wire. |
 | `src/rate-limit.js` | Rolling-window rate-limit + cheap dedup gate for `/dialpad-call`. Pure decision function + KV-backed `checkAndRecordCall`. 5 calls/60s rolling per Dialpad user_id, plus a 3s per-(user,phone) dedup window for double-clicks. |
 | `src/krisp.js` | Krisp helpers: note formatting (HTML), and `resolveKrispAttribution` — resolves the consultant (note author) + candidate from meeting participants by team membership. |
-| `src/cold-call.js` | Cold call detection: monitored-user filter (registry-driven), Dialpad transcript fetch, Workers AI classification (Llama 3.3 70B), per-outcome summary extraction (Llama 3.1 8B), RF custom activity + tag/source update + Sourced→Replied stage move, generic `mergeTag(tags, value)` helper, `parseColdCallActivity` for the extension shape. |
+| `src/cold-call.js` | Cold call detection: monitored-user filter (registry-driven), **Sourced gate (`selectSourcedJob`) before any AI**, Dialpad transcript fetch, Workers AI classification (Llama 3.3 70B), per-outcome summary extraction (Llama 3.1 8B), RF custom activity + tag/source update + Sourced→Replied stage move, generic `mergeTag(tags, value)` helper, `parseColdCallActivity` for the extension shape, `finalizeCancelledColdCall` (mechanical no-AI cancelled-call write, called by the arbiter DO). |
 | `src/extension-calls.js` | Extension Call/Hangup webhook dispatcher. `processExtensionCallEvent` filters Dialpad webhook payloads (outbound + monitored target), routes `calling`/`hangup` events to the per-user `ExtCallState` DO. |
 | `src/extension-call-do.js` | `ExtCallState` Durable Object class. Per-user store, one instance per Dialpad user (`idFromName(dialpadUserId)`). RPC: `setCallId`, `getCallId`, `clearCallIdIfMatch`. 20-min self-clearing alarm on `setCallId`. |
+| `src/cold-call-arbiter.js` | Dispatches Dialpad call webhook events to the per-call `ColdCallArbiter` DO: `signalTranscriptToArbiter` (transcript states) and `routeHangupToArbiter` (never-connected outbound hangups). Mirrors `extension-calls.js`. |
+| `src/cold-call-arbiter-do.js` | `ColdCallArbiter` Durable Object — per-call (`idFromName(call_id)`) grace-timer arbiter giving transcripts priority over cancelled calls. Pure state-machine fns (`arbiterMarkCancelled`/`arbiterMarkTranscript`/`arbiterAlarm`) + thin DO shell. `alarm()` finalizes via the SELF binding → `/internal/coldcall/finalize-cancelled`. |
 | `src/apollo-client.js` | Apollo API client: enrichment, search, verification, scoring. |
-| `src/enrichment.js` | Legacy enrichment orchestration (RF Created Joel-gated + manual webhook): ownership check (sourced from `users.js`), LinkedIn verify, fallback search, phone reveal. The primary enrichment path is the extension add flow + the Apollo webhook handler in `index.js`. |
-| `src/phone-merge.js` | Pure phone merge + ranking engine for the Apollo webhook: exclusion (work_*/ext/invalid), type-based best-first ordering (mobile > home > other, pre-existing manual numbers stay at top). No I/O — `applyApolloEnrichment` (index.js) owns the I/O. |
-| `src/mcp/router.js` | `/mcp/*` dispatcher. Resolves consultant from body field — prefers verified `consultantEmail` (forwarded by `rf-mcp-remote` from the Access JWT); transitional `consultantFirstName` fallback for legacy callers (logs `[mcp] legacy consultantFirstName fallback`, drops when Spec B Phase 3 lands). No header auth — only callable over the service binding. |
+| `src/enrichment.js` | Legacy enrichment orchestration (RF Created owner-gated + manual webhook): ownership check (sourced from `users.js`), LinkedIn verify, fallback search, phone reveal. The primary enrichment path is the extension add flow + the Apollo webhook handler in `src/handlers/apollo-enrichment.js`. |
+| `src/phone-merge.js` | Pure phone merge + ranking engine for the Apollo webhook: exclusion (work_*/ext/invalid), type-based best-first ordering (mobile > home > other, pre-existing manual numbers stay at top). No I/O — `applyApolloEnrichment` (`src/handlers/apollo-enrichment.js`) owns the I/O. |
+| `src/mcp/router.js` | `/mcp/*` dispatcher. Resolves consultant from body field — prefers verified `consultantEmail` (forwarded by `rf-mcp-remote` from the Access JWT); transitional `consultantFirstName` fallback for legacy callers (logs `[mcp] legacy consultantFirstName fallback`, drops at the auth Phase 3 cutover). No header auth — only callable over the service binding. |
 | `src/mcp/{cache-status,candidate-get,candidate-search,candidate-move-stage,candidate-log-interview,job-pipeline,job-candidates-filter,candidate-call-notes}.js` | Per-tool middleware handlers. |
 | `src/mcp/{resolvers,fuzzy,projection,linkedin,d1-read,snapshot,handlers-registry,concurrency}.js` | Shared middleware infrastructure. `concurrency.js` provides `pMapLimit` for bounded parallel RF `/candidate/get` fan-out in pipeline hydration. |
 | `src/webhook/dialpad-hangup-forwarder.js` | Forwards Dialpad hangup webhook payloads to cache-worker via service binding for live `calls` table insertion. Fire-and-forget inside `ctx.waitUntil`; cron backstop catches any drops. |
@@ -156,8 +159,9 @@ This file does NOT duplicate that material. References below use the Access auth
 | `cache-worker/migrations/0001_init.sql` | Initial schema: legacy `candidates`, `candidate_jobs`, `jobs`, `sync_state`. |
 | `cache-worker/migrations/0002_job_pipelines.sql` | Legacy `job_pipelines` table. |
 | `cache-worker/migrations/0003_v2_tables.sql` | **Thin-immutable schema:** `candidates_v2`, `jobs_v2`, `calls`. Coexists with legacy tables during dual-write cutover. |
+| `cache-worker/migrations/0005_missed_cold_calls.sql` | `missed_cold_calls` — owner-only historical cancelled/missed cold-call backfill store. Populated once by `scripts/backfill-cancelled-cold-calls.mjs`; read by the main worker's `/candidate-details` join. |
 | `cache-worker/migrations-pending/0004_drop_legacy.sql` | **Staged out of the migrations dir until cutover step 6.** Moved back to `cache-worker/migrations/` and applied at step 6 only. Drops `candidates`, `candidate_jobs`, `jobs`, `job_pipelines`. |
-| `cache-worker/wrangler.cache.jsonc` | Cache-worker config: RF_MCP_CACHE (rw) + USERS_DB (ro) D1 bindings, KV, Workflow bindings (`REBUILD_WORKFLOW`, `PIPELINE_REBUILD_WORKFLOW`, `CACHE_SEED_WORKFLOW`), `workers_dev: false` (closes public workers.dev subdomain), `CRON_THIN_ENABLED` env var (default `"false"` — flip to `"true"` to activate additive cron). Cron block currently commented out. |
+| `cache-worker/wrangler.cache.jsonc` | Cache-worker config: RF_MCP_CACHE (rw) + USERS_DB (ro) D1 bindings, KV, Workflow bindings (`REBUILD_WORKFLOW`, `PIPELINE_REBUILD_WORKFLOW`, `CACHE_SEED_WORKFLOW`), `workers_dev: false` (closes public workers.dev subdomain), `CRON_THIN_ENABLED` env var (set `"true"` since 2026-05-12 to run the additive cron; code-level fallback `"false"` when unset) plus `CRON_LEGACY_ENABLED` `"false"` (legacy writers inert). Cron trigger active (`*/15 * * * *`). |
 | `cache-worker/vitest.config.js` | Vitest config for cache-worker tests. |
 | `cache-worker/test/{admin,d1-write,normalize,pipeline-normalize,pipeline-workflow,rf-list-client,sync-state,tail-sync,workflow,internal-calls-upsert,cache-worker}.spec.js` | Cache-worker tests. `internal-calls-upsert.spec.js` covers the service-binding endpoint idempotency; `index.spec.js` covers cron e2e against mocked RF + Dialpad. |
 
@@ -206,8 +210,9 @@ Every worker emits OTel traces + logs to LaunchDarkly Observability. The pipelin
 | `/webhook/dialpad` | POST | JWT Bearer (HS256) | Dialpad contact Updated events |
 | `/webhook/calendar` | POST | `X-Calendar-Webhook-Token` header | Calendar booking events (from Apps Script) |
 | `/webhook/krisp` | POST | `X-Krisp-Webhook-Token` header | Krisp meeting note webhooks |
-| `/webhook/dialpad/calls` | POST | JWT Bearer (HS256) | Dialpad call transcription/voicemail webhooks |
+| `/webhook/dialpad/calls` | POST | JWT Bearer (HS256) | Dialpad call `transcription`/`call_transcription` (→ AI cold-call flow) + `hangup` (→ cancelled-call arbiter DO) |
 | `/webhook/dialpad/extension-calls` | POST | JWT Bearer (HS256) | Dialpad call-state (`calling`/`hangup`) webhook driving the extension button |
+| `/internal/coldcall/finalize-cancelled` | POST | `X-Internal-Token` header (timing-safe, `INTERNAL_SECRET`) | Internal-only — the `ColdCallArbiter` DO's grace-alarm finalize callback (via SELF binding). Writes the mechanical cancelled cold-call activity. |
 | `/webhook/apollo` | POST | `?token=` query param (`APOLLO_WEBHOOK_SECRET`) | Async phone-reveal delivery from Apollo. Merges all desirable numbers into RF + Dialpad (ranked). See "Apollo phone enrichment (multi-number waterfall)". |
 | `/candidates` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | LinkedIn extension batch upsert (sets `lead_owner_id`) |
 | `/candidates/add-to-job` | POST | Cloudflare Access Bearer JWT or `X-Extension-Token` (legacy) | Add candidates to a job + write `consultant_id` custom field |
@@ -461,19 +466,31 @@ and double-post — an accepted residual window, traded for the at-least-once
 
 ## Data Flow: Dialpad Calls → RF (Cold Call Detection)
 
-**Trigger**: Dialpad fires `call_transcription` or `transcription` (voicemail) webhook event after a call ends and the transcript is ready. Cold-call contacts are always pre-linked via the LinkedIn extension, so the call payload arrives with an RF candidate UID embedded in `contact.id`.
+**Trigger**: Dialpad fires `call_transcription` / `transcription` (voicemail) when a transcript is ready, OR `hangup` when a call ends. Cold-call contacts are always pre-linked via the LinkedIn extension, so the call payload arrives with an RF candidate UID embedded in `contact.id`. The webhook handler routes by `state`: transcript states run the AI classification flow below (and signal the arbiter); `hangup` routes to the cancelled-call path (see "Cancelled calls").
 
 ```
 Dialpad call event (call_transcription or transcription state)
   → POST /webhook/dialpad/calls
   → Verify JWT (HS256, DIALPAD_WEBHOOK_SECRET)
+  → signalTranscriptToArbiter(call_id) — tell the per-call ColdCallArbiter DO a
+    transcript exists, so any pending cancelled for the same call is suppressed
+    (transcript always wins).
 
   → Pre-LLM filters (cheap, fail-fast, exit before any KV / Dialpad / AI call):
       - target.id must be in USERS_DB (registry-driven via isMonitoredDialpadUser)
       - direction must be "outbound"
       - contact.id must contain an RF UID (uid_RF regex, String() coerced)
 
-  → Set KV dedup: coldcall:{call_id} = "true" (5-min TTL) BEFORE transcript fetch
+  → Set KV dedup: coldcall:{call_id} = "true" (5-min TTL) BEFORE candidate/transcript fetch
+
+  → Sourced gate (applies to ALL outcomes — voicemail/connected/cancelled):
+      - GET /candidate/get?id=X (fetched once here, reused for the tag merge)
+      - selectSourcedJob(candidate, activityUserId, env): the candidate must be
+        in 'Sourced' on the consultant's relevant open job (consultant-matched
+        via resolveJobConsultantId, jobs[0] fallback). If not Sourced → skip
+        entirely (no activity/tag/source, no AI). This is what stops in-process
+        candidates being run through cold-call classification.
+
   → Get transcript:
       - transcription state: transcription_text from payload (voicemails)
       - call_transcription state: GET /api/v2/transcripts/{call_id}
@@ -482,9 +499,8 @@ Dialpad call event (call_transcription or transcription state)
   → If not cold call → log + done
 
   → Cold call detected:
-      1. GET /candidate/get?id=X — required because RF /candidate/update REPLACES
-         array fields (including tags), so we must read existing tags before
-         writing the merged set back. Logs raw `existingTags` for shape verification.
+      1. Reuse the candidate fetched at the Sourced gate (RF /candidate/update
+         REPLACES array fields including tags, so we merge onto existing tags).
       2. Build activity_text = "Cold call with {contactName} — {outcomeLabel}"
          For connected_positive: append "\n\nNext steps:\n{bullets}" (Llama 3.1 8B,
            1500-char transcript tail, ACTION_ITEMS_PROMPT).
@@ -516,6 +532,49 @@ Dialpad call event (call_transcription or transcription state)
          → For the matched (or fallback) job, POST /candidate/move-to-stage with
            user_id = recruiter.
 ```
+
+### Cancelled calls (ColdCallArbiter DO)
+
+A Dialpad outbound call that rang but never connected (`hangup` with no talk
+time — `duration` is 0/absent; the call object has **no** `date_connected` field)
+produces no transcript, so the AI flow above never sees it and the cold count is
+understated. (Connected calls and outbound voicemails-left both have `duration > 0`
+and produce a transcript, so they're handled by the AI flow.) These are recorded
+**mechanically (no AI)**
+as cancelled cold calls — but a transcript, if one ever arrives for the same
+call, must win (a call where Dialpad detected speech is a voicemail, not a
+cancel), and call-state webhooks can arrive out of order. RF has no
+activity-delete, so we can't write-then-undo. The coordinator is a per-call
+**`ColdCallArbiter` Durable Object** (`COLD_CALL_ARBITER`, `idFromName(call_id)`):
+
+```
+hangup (outbound, duration 0/absent = never connected, monitored, RF-mapped)
+  → routeHangupToArbiter → DO.markCancelled(payload)  → arm GRACE_MS alarm (~2min)
+call_transcription / transcription
+  → signalTranscriptToArbiter → DO.markTranscript()   → suppress cancelled (now or later)
+
+DO.alarm() (grace elapsed, no transcript seen):
+  → SELF.fetch POST /internal/coldcall/finalize-cancelled  (X-Internal-Token)
+     → finalizeCancelledColdCall: Sourced gate → type-1002 activity
+       "Cold call with {name} — Cancelled" + source/tag update. NO stage move.
+  → mark finalized; CLEANUP_MS alarm (~1h) then deleteAll (dedup duplicate deliveries)
+```
+
+Both webhook branches hit the **same** DO instance, so its single-threaded
+execution serializes them — no race, strong read-after-write (KV's cross-PoP
+eventual consistency is unreliable here, same reason ExtCallState is a DO). The
+DO holds 2-3 flags for the grace+cleanup window then self-deletes — a grace-timer,
+not call-state tracking. The `alarm()` finalize routes back through the worker's
+own instrumented fetch handler via the **SELF** service binding so the mechanical
+write is fully traced (`flow.name = ColdCallCancelledFinalize`) and span-linked to
+the originating webhook (via `_otel_trace` in the callback URL). `GRACE_MS` is
+tuned to exceed the observed hangup→`call_transcription` lag (p99 + margin); a
+transcript arriving *after* the grace is the one residual edge (a rare,
+owner-only-visible cancelled+voicemail duplicate that can't be deleted).
+
+> **Dialpad-side step**: the cancelled path only fires once Outbound `hangup` is
+> added to the `/webhook/dialpad/calls` subscription. Until then the `hangup`
+> branch is inert — safe to deploy ahead of the Dialpad change.
 
 ### Key design decisions
 
@@ -670,12 +729,25 @@ Extension → POST /candidate-details (consultantFirstName, profileUrl)
 
   → normalizeToE164(first phone_number entry) → E.164 string or null
 
-  → activities.filter(type.id === 1002).map(parseColdCallActivity).sort(asc time)
+  → cold-call activities: activities.filter(type.id === 1002).map(parseColdCallActivity)
+      → isOwner = consultantRfUserId === getUserByEmail(env, OWNER_EMAIL).rfUserId
+      → NON-owner: filter out outcome === 'cancelled' (preserves today's list —
+        voicemail + connected only)
+      → OWNER: also merge getMissedColdCallsForCandidate(env, rfId) — the
+        historical cancelled/missed calls from the RF_MCP_CACHE `missed_cold_calls`
+        backfill table — into the activity list (outcome 'cancelled'/'voicemail')
+      → sort asc by time
 
   → Fire-and-forget: ctx.waitUntil(handleNeighborPrewarm(rfId, jobId, recruiterRfId, env))
 
-  → Response: { rfId, fullName, phoneNumber, job, activities }
+  → Response: { rfId, fullName, phoneNumber, job, activities }   // activities may now carry outcome 'cancelled'
 ```
+
+> Cancelled cold calls are owner-only at the read layer for now: forward ones are
+> written to RF as type-1002 activities for everyone, but non-owner reads filter
+> them out — the data accrues for the future team-wide extension feature. The
+> `missed_cold_calls` join supplies the historical (pre-deploy) backfill, deduped
+> against RF on ingest (see `scripts/backfill-cancelled-cold-calls.mjs`).
 
 ### `POST /candidate-mark-invalid` — tag-only invalidation
 
@@ -1126,6 +1198,7 @@ After cutover step 6 + the follow-up cleanups noted in the merge handover § 5, 
 | `candidates_v2` | Active (thin-immutable) | Fuzzy search seed + id index | `id` PK; UNIQUE index on `linkedin_profile WHERE NOT NULL`; index on `added_time_ms DESC`. Columns: `id`, `name`, `linkedin_profile`, `added_time_ms`, `current_title_at_cache_time`, `current_company_at_cache_time`, `cached_at_ms`. **No body blob, no mutable fields.** |
 | `jobs_v2` | Active (thin-immutable) | Job name/company fuzzy index + stage list snapshot | `id` PK; index on `client_company_name`, `added_time_ms DESC`. Columns: `id`, `name`, `client_company_name`, `added_time_ms`, `canonical_pipeline_json` (stage list at first-sight, never updated), `cached_at_ms`. |
 | `calls` | Active (new) | Immutable call history per consultant | `call_id` PK; composite index on `(target_dialpad_id, rf_candidate_id, date_started_ms DESC) WHERE rf_candidate_id IS NOT NULL` (MCP read path); index on `(target_dialpad_id, date_started_ms DESC)` (cron head pointer). Columns: `call_id`, `target_dialpad_id`, `dialpad_contact_id`, `rf_candidate_id`, `date_started_ms`, `duration_ms`, `direction`, `cached_at_ms`. |
+| `missed_cold_calls` | Active (0005) | Owner-only historical cancelled/missed cold calls that never reached RF (backfill). Read by `/candidate-details`'s owner join. Immutable, one row per `call_id`. | `call_id` PK; index on `(rf_candidate_id, date_started_ms DESC)` (the per-candidate join). Columns: `call_id`, `rf_candidate_id`, `target_dialpad_id`, `date_started_ms`, `outcome` ('cancelled'\|'voicemail'\|'connected'), `duration_ms`, `cached_at_ms`. |
 | `sync_state` | Permanent | KV-style store for cursor + metadata | `key` PK. Keys: `last_full_rebuild_at`, `last_tail_sync_at`, `last_candidates_added_cursor` (new thin cursor), `in_flight`, RF user/activity-type/custom-field caches. |
 
 **Thin-immutable principle:** `candidates_v2` and `jobs_v2` store only immutable (or quasi-immutable) fields. Mutable fields (`current_title`, `current_organization`, `primary_email`, `lead_owner_id`, pipeline membership, stage_name) are **never cached** — MCP reads go live to RF. `calls` is inherently immutable history.

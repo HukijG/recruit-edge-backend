@@ -22,6 +22,7 @@ export const FLOWS = Object.freeze({
   WEBHOOK_DIALPAD_GENERAL: 'WebhookDialpadGeneral',
   WEBHOOK_DIALPAD_CALL: 'WebhookDialpadCall',
   WEBHOOK_DIALPAD_EXT_CALL: 'WebhookDialpadExtensionCall',
+  COLD_CALL_CANCELLED_FINALIZE: 'ColdCallCancelledFinalize',
   WEBHOOK_KRISP: 'WebhookKrisp',
   WEBHOOK_CALENDAR: 'WebhookCalendar',
   WEBHOOK_APOLLO_ENRICHMENT: 'WebhookApolloEnrichment',

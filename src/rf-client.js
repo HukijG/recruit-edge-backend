@@ -1321,40 +1321,80 @@ export async function moveToCallBooked(candidateId, candidateData, env) {
  * @param {boolean} [filters.openOnly=true]     Only act on open jobs
  * @param {object} env
  */
+/**
+ * Pick the single job relevant to `recruiterRfUserId` among the candidate's
+ * jobs matching `predicate(job) => bool`.
+ *
+ * Selection rule (shared by every "which job for this consultant" decision):
+ *   1. If recruiterRfUserId is a number AND env is provided, resolve consultant_id
+ *      for each matching job in parallel and return the first whose consultant_id
+ *      equals recruiterRfUserId.
+ *   2. Else (or no consultant match) fall back to jobs[0] iff it matches.
+ *   3. Else null.
+ *
+ * The jobs[0] fallback preserves today's behavior during the transition window
+ * where existing job-candidate links lack a consultant_id custom field. Returns
+ * the raw job object (caller maps to whatever shape it needs), or null.
+ *
+ * @param {object} candidate
+ * @param {number|null} recruiterRfUserId
+ * @param {(job: object) => boolean} predicate
+ * @param {object} env
+ */
+export async function selectConsultantJob(candidate, recruiterRfUserId, predicate, env) {
+  const jobs = Array.isArray(candidate?.jobs) ? candidate.jobs : [];
+  if (jobs.length === 0) return null;
+
+  if (typeof recruiterRfUserId === 'number' && env) {
+    const matching = jobs.filter(predicate);
+    if (matching.length > 0) {
+      const resolved = await Promise.all(
+        matching.map(async job => ({
+          job,
+          consultantId: await resolveJobConsultantId(candidate.id, job.job_id, env),
+        }))
+      );
+      const match = resolved.find(r => r.consultantId === recruiterRfUserId);
+      if (match) return match.job;
+    }
+  }
+
+  return predicate(jobs[0]) ? jobs[0] : null;
+}
+
+/**
+ * Find the candidate's `Sourced` job relevant to `recruiterRfUserId`.
+ *
+ * This is the cold-call gate: an outbound call is only a *cold* call when the
+ * candidate is still in `Sourced` on the consultant's relevant open job. A
+ * candidate already in-process (Replied, CV Sent, Interview, …) calling or
+ * being called is NOT cold-call activity. "Sourced" is identical across every
+ * job's pipeline, so a bare name check is safe once the right job is selected.
+ *
+ * @returns {Promise<object|null>} the raw Sourced job, or null if none.
+ */
+export async function selectSourcedJob(candidate, recruiterRfUserId, env, options = {}) {
+  const { openOnly = true } = options;
+  const predicate = (job) =>
+    (!openOnly || !!job?.is_open) && job?.stage_name === 'Sourced';
+  return selectConsultantJob(candidate, recruiterRfUserId, predicate, env);
+}
+
 export async function findJobsForStageMove(candidate, filters, env) {
   const { currentStage, targetStage, recruiterRfUserId, openOnly = true } = filters || {};
   if (!currentStage || !targetStage) return [];
 
-  const jobs = Array.isArray(candidate?.jobs) ? candidate.jobs : [];
-  if (jobs.length === 0) return [];
-
-  const eligibleEntry = (job) => {
-    if (openOnly && !job?.is_open) return null;
-    if (job?.stage_name !== currentStage) return null;
-    const target = job?.stages?.find(s => s.name === targetStage);
-    if (!target) return null;
-    return { job_id: job.job_id, targetStage: { id: target.id, name: target.name } };
+  const predicate = (job) => {
+    if (openOnly && !job?.is_open) return false;
+    if (job?.stage_name !== currentStage) return false;
+    return !!job?.stages?.find(s => s.name === targetStage);
   };
 
-  if (typeof recruiterRfUserId === 'number' && env) {
-    const eligibleJobs = jobs
-      .map(j => ({ raw: j, entry: eligibleEntry(j) }))
-      .filter(x => x.entry !== null);
+  const job = await selectConsultantJob(candidate, recruiterRfUserId, predicate, env);
+  if (!job) return [];
 
-    if (eligibleJobs.length > 0) {
-      const resolved = await Promise.all(
-        eligibleJobs.map(async x => ({
-          ...x,
-          consultantId: await resolveJobConsultantId(candidate.id, x.raw.job_id, env),
-        }))
-      );
-      const match = resolved.find(r => r.consultantId === recruiterRfUserId);
-      if (match) return [match.entry];
-    }
-  }
-
-  const firstEntry = eligibleEntry(jobs[0]);
-  return firstEntry ? [firstEntry] : [];
+  const target = job.stages.find(s => s.name === targetStage);
+  return [{ job_id: job.job_id, targetStage: { id: target.id, name: target.name } }];
 }
 
 /**

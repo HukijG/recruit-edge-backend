@@ -21,6 +21,8 @@ import { checkAndRecordCall } from './rate-limit.js';
 import { processExtensionCallEvent } from './extension-calls.js';
 import { ExtCallState } from './extension-call-do.js';
 export { ExtCallState };
+import { ColdCallArbiter } from './cold-call-arbiter-do.js';
+export { ColdCallArbiter };
 import {
   extractRFIdFromDialpadContact, updateRFCandidate, convertDialpadContactToRFUpdate,
   isValidLinkedInUrl, normalizeLinkedInUrl, getRFCandidate, searchRFCandidateByLinkedIn,
@@ -40,7 +42,10 @@ import {
   getPrewarmState, setPrewarmState,
   getDailyCallCount,
 } from './cache.js';
-import { processCallEvent, parseColdCallActivity, mergeTag } from './cold-call.js';
+import { processCallEvent, parseColdCallActivity, mergeTag, finalizeCancelledColdCall } from './cold-call.js';
+import { routeHangupToArbiter, signalTranscriptToArbiter } from './cold-call-arbiter.js';
+import { getMissedColdCallsForCandidate } from './mcp/d1-read.js';
+import { timingSafeEqual } from './lib/timing-safe-equal.js';
 import { isJoelCandidate, enrichCandidate, buildApolloWebhookUrl, APOLLO_ENRICH_COOLDOWN_SEC } from './enrichment.js';
 import { enrichPerson } from './apollo-client.js';
 import { buildPhoneOrder, digitsOnly } from './phone-merge.js';
@@ -139,6 +144,13 @@ const handler = {
       if (url.pathname === '/webhook/dialpad/extension-calls' && request.method === 'POST') {
         trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.WEBHOOK_DIALPAD_EXT_CALL);
         return await handleDialpadExtensionCallsWebhook(request, env, ctx);
+      }
+
+      if (url.pathname === '/internal/coldcall/finalize-cancelled' && request.method === 'POST') {
+        trace.getActiveSpan()?.setAttribute('flow.name', FLOWS.COLD_CALL_CANCELLED_FINALIZE);
+        const link = readInboundTraceLink(request);
+        if (link) trace.getActiveSpan()?.addLink({ context: link });
+        return await handleColdCallFinalizeCancelled(request, env);
       }
 
       if (url.pathname === '/webhook/apollo' && request.method === 'POST') {
@@ -1176,6 +1188,42 @@ async function handleDialpadCallWebhook(request, env) {
       transcriptionPreview: payload.transcription_text ? payload.transcription_text.substring(0, 200) : null,
     });
 
+    const state = payload.state;
+
+    // Cancelled (never-connected) outbound calls produce no transcript, so the
+    // classification flow never sees them. Route the hangup to the per-call
+    // ColdCallArbiter DO, which records it as a cancelled cold call after a grace
+    // window — unless a transcript for the same call supersedes it first.
+    if (state === 'hangup') {
+      let arb = { armed: false, reason: 'error' };
+      try {
+        arb = await routeHangupToArbiter(payload, env);
+      } catch (err) {
+        // Missing one cancelled is low-stakes; don't 500 (avoids retry storms).
+        console.error({ message: `[Dialpad/calls] hangup arbiter failed: ${err.message}`, source: 'dialpad-calls', callId: payload.call_id });
+      }
+      // Surface armed-vs-suppressed on the webhook span (the suppressed/armed
+      // decision for a call that never finalizes is otherwise console-only).
+      trace.getActiveSpan()?.setAttribute('coldcall.arbiter_state', arb.state || arb.reason || 'error');
+      console.log({
+        message: `[Dialpad/calls] → hangup ${arb.armed ? 'armed cancelled-call grace' : `ignored (${arb.reason || arb.state})`}`,
+        source: 'dialpad-calls', callId: payload.call_id, armed: arb.armed, reason: arb.reason, arbiterState: arb.state,
+      });
+      return new Response('Call webhook processed', { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // A transcript for this call means it reached transcription → tell the
+    // arbiter so any pending cancelled for the same call is suppressed
+    // (transcript always wins). Secondary to the classification below — a DO
+    // hiccup must not block it.
+    if (state === 'transcription' || state === 'call_transcription') {
+      try {
+        await signalTranscriptToArbiter(payload, env);
+      } catch (err) {
+        console.error({ message: `[Dialpad/calls] transcript arbiter signal failed: ${err.message}`, source: 'dialpad-calls', callId: payload.call_id });
+      }
+    }
+
     const result = await processCallEvent(payload, env);
 
     const outcomeStr = result.outcome ? ` [${result.outcome}]` : '';
@@ -1197,6 +1245,36 @@ async function handleDialpadCallWebhook(request, env) {
   } catch (error) {
     console.error({ message: `[Dialpad/calls] unhandled error: ${error.message}`, source: 'dialpad-calls', stack: error.stack });
     return new Response('Internal Server Error', { status: 500 });
+  }
+}
+
+/**
+ * POST /internal/coldcall/finalize-cancelled — internal-only (X-Internal-Token).
+ * Called by the ColdCallArbiter DO via the SELF binding once a cancelled call's
+ * grace window elapses with no transcript. Runs inside the worker's instrumented
+ * fetch handler so the mechanical finalize is fully traced and span-linked back
+ * to the originating webhook (via the _otel_trace param in the callback URL).
+ */
+async function handleColdCallFinalizeCancelled(request, env) {
+  const presented = request.headers.get('X-Internal-Token');
+  if (!env.INTERNAL_SECRET || !presented || !timingSafeEqual(presented, env.INTERNAL_SECRET)) {
+    return new Response(JSON.stringify({ ok: false, error: 'Unauthorized' }), {
+      status: 401, headers: { 'Content-Type': 'application/json' },
+    });
+  }
+  try {
+    const payload = await request.json();
+    if (payload?.callId != null) trace.getActiveSpan()?.setAttribute('coldcall.call_id', String(payload.callId));
+    const result = await finalizeCancelledColdCall(payload, env);
+    console.log({ message: `[ColdCall/cancelled] finalize: ${result.reason}`, source: 'cold-call-finalize', callId: payload?.callId, recorded: result.recorded, reason: result.reason });
+    return new Response(JSON.stringify({ ok: true, ...result }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    console.error({ message: `[ColdCall/cancelled] finalize error: ${error.message}`, source: 'cold-call-finalize', stack: error.stack });
+    return new Response(JSON.stringify({ ok: false, error: 'Internal Server Error' }), {
+      status: 500, headers: { 'Content-Type': 'application/json' },
+    });
   }
 }
 
@@ -2115,11 +2193,38 @@ async function handleCandidateDetailsEndpoint(request, env, ctx, corsHeaders, au
       phoneNumber = normalizeToE164(raw);
     }
 
-    // Filter + map + sort cold-call activities (ASC by time)
-    const coldCalls = activities
+    // Cold-call activities (type 1002), ASC by time. Non-owners get the
+    // historical list (voicemail + connected). The owner (Joel) additionally
+    // gets cancelled calls: forward ones are type-1002 activities in RF;
+    // historical ones live in the missed_cold_calls backfill table and are
+    // merged in here. The backfill deduped against RF on ingest, so no
+    // read-time dedup is needed.
+    const owner = await getUserByEmail(env, OWNER_EMAIL);
+    const isOwner = !!owner && consultantRfUserId != null && consultantRfUserId === owner.rfUserId;
+    trace.getActiveSpan()?.setAttribute('coldcall.is_owner', isOwner);
+
+    let coldCalls = activities
       .filter(a => a?.type?.id === 1002)
-      .map(parseColdCallActivity)
-      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      .map(parseColdCallActivity);
+
+    if (isOwner) {
+      const missed = await getMissedColdCallsForCandidate(env, rfIdNum);
+      for (const row of missed) {
+        coldCalls.push({
+          id: `missed:${row.call_id}`,
+          type: 'cold_call',
+          name: 'Cold call',
+          description: '',
+          createdAt: new Date(row.date_started_ms).toISOString(),
+          outcome: row.outcome,
+        });
+      }
+    } else {
+      // Never expose cancelled calls to non-owners — preserves today's list.
+      coldCalls = coldCalls.filter(c => c.outcome !== 'cancelled');
+    }
+
+    coldCalls.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 
     const fullName = candidate.name || `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim();
 

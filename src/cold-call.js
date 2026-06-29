@@ -6,10 +6,11 @@
  * and logs detected cold calls as RF custom activities.
  */
 
-import { extractRFIdFromDialpadContact, updateRFCandidate, createRFCustomActivity, getRFCandidate, moveJobsToStage } from './rf-client.js';
+import { extractRFIdFromDialpadContact, updateRFCandidate, createRFCustomActivity, getRFCandidate, moveJobsToStage, selectSourcedJob } from './rf-client.js';
 import { isMonitoredDialpadUser, getRFUserIdByDialpadId } from './users.js';
 import { DialpadHttpError } from './dialpad-client.js';
 import { runAI } from './lib/ai-instrument.js';
+import { trace } from '@opentelemetry/api';
 
 // --- Constants ---
 
@@ -111,6 +112,7 @@ export function formatOutcomeLabel(outcome) {
     case 'voicemail': return 'Voicemail';
     case 'connected_positive': return 'Connected (Positive)';
     case 'connected_negative': return 'Connected (Negative)';
+    case 'cancelled': return 'Cancelled';
     default: return null;
   }
 }
@@ -278,6 +280,16 @@ export async function processCallEvent(payload, env) {
     return { processed: false, isColdCall: false, outcome: null, reason: 'no RF candidate' };
   }
 
+  // Only transcript states drive the AI classification flow. Guard BEFORE the
+  // dedup key is set: if the call webhook subscription ever broadens beyond
+  // transcription/call_transcription/hangup, an unexpected non-transcript state
+  // must not claim coldcall:{callId} and then suppress the real transcript's
+  // classification. (hangup is routed to the arbiter by the webhook handler and
+  // never reaches here.)
+  if (state !== 'transcription' && state !== 'call_transcription') {
+    return { processed: false, isColdCall: false, outcome: null, reason: 'unsupported state' };
+  }
+
   // Dedup — set BEFORE expensive operations to prevent retry storms hitting AI
   const dedupeKey = `coldcall:${callId}`;
   const alreadyProcessed = await env.SYNC_STATE.get(dedupeKey);
@@ -285,6 +297,31 @@ export async function processCallEvent(payload, env) {
     return { processed: false, isColdCall: false, outcome: null, reason: 'already processed' };
   }
   await env.SYNC_STATE.put(dedupeKey, 'true', { expirationTtl: 300 });
+
+  // --- Sourced gate ---
+  // A call is only a *cold* call when the candidate is still in Sourced on the
+  // consultant's relevant open job. A candidate already in-process (Replied,
+  // CV Sent, Interview, …) being called is normal recruiter activity, not a
+  // cold call. Gate BEFORE the transcript fetch + AI so in-process candidates
+  // never get a cold-call activity/tag/source (and we don't spend the AI call).
+  // Fetch the candidate once here and reuse it for the tag merge below.
+  const activityUserId = await getRFUserIdByDialpadId(env, payload.target?.id);
+
+  let candidate;
+  try {
+    candidate = await getRFCandidate(rfCandidateId, env);
+  } catch (error) {
+    console.error({ message: `[ColdCall] candidate fetch failed: ${error.message}`, source: 'cold-call', step: 'fetch_candidate', callId, rfCandidateId });
+    return { processed: false, isColdCall: false, outcome: null, reason: `candidate fetch failed: ${error.message}` };
+  }
+
+  const sourcedJob = await selectSourcedJob(candidate, activityUserId, env);
+  if (!sourcedJob) {
+    trace.getActiveSpan()?.setAttribute('coldcall.sourced_gate', 'skip');
+    console.log({ message: `[ColdCall] → skipped: candidate not in Sourced`, source: 'cold-call', step: 'sourced_gate', callId, rfCandidateId, activityUserId });
+    return { processed: true, isColdCall: false, outcome: null, reason: 'not in Sourced' };
+  }
+  trace.getActiveSpan()?.setAttribute('coldcall.sourced_gate', 'pass');
 
   // --- Get transcript ---
 
@@ -335,19 +372,11 @@ export async function processCallEvent(payload, env) {
     return { processed: true, isColdCall: false, outcome: null, reason: classification.reasoning };
   }
 
-  // --- Cold call detected: fetch candidate, then write activity + tag/source update ---
-
-  // RF /candidate/update REPLACES arrays, so we must read existing tags first
-  // and send back the full merged set. Synchronous chain: any failure aborts —
-  // we'd rather lose an event than risk silently wiping tags or duplicating writes.
-  let candidate;
-  try {
-    candidate = await getRFCandidate(rfCandidateId, env);
-  } catch (error) {
-    console.error({ message: `[ColdCall] candidate fetch failed: ${error.message}`, source: 'cold-call', step: 'fetch_candidate', callId, rfCandidateId });
-    return { processed: true, isColdCall: true, outcome: classification.outcome, reason: `classified as cold call but candidate fetch failed: ${error.message}` };
-  }
-
+  // --- Cold call detected: write activity + tag/source update ---
+  // RF /candidate/update REPLACES arrays, so we merge onto the tags from the
+  // candidate fetched at the Sourced gate above. Synchronous chain: any failure
+  // aborts — we'd rather lose an event than risk silently wiping tags or
+  // duplicating writes.
   const existingTags = candidate?.tags;
   const mergedTags = mergeTag(existingTags, COLD_CALL_TAG);
 
@@ -373,7 +402,6 @@ export async function processCallEvent(payload, env) {
     }
   }
 
-  const activityUserId = await getRFUserIdByDialpadId(env, payload.target?.id);
   // RF's activity_text only honours <br> for line breaks; bare \n collapses
   // to a space at render time. Convert just before sending.
   const formattedActivityText = addHtmlLineBreaks(activityText);
@@ -443,9 +471,11 @@ export function parseColdCallActivity(activity) {
 
   // Outcome via regex on the header
   let outcome = null;
-  const m = text.match(/—\s*(Voicemail|Connected)/);
+  const m = text.match(/—\s*(Voicemail|Connected|Cancelled)/);
   if (m) {
-    outcome = m[1] === 'Voicemail' ? 'voicemail' : 'connected';
+    if (m[1] === 'Voicemail') outcome = 'voicemail';
+    else if (m[1] === 'Cancelled') outcome = 'cancelled';
+    else outcome = 'connected';
   }
 
   // Description = text after the first double-<br>; strip remaining <br>
@@ -473,5 +503,58 @@ export function parseColdCallActivity(activity) {
     createdAt,
     outcome,
   };
+}
+
+/**
+ * Record a cancelled (never-connected) cold call in RF — the mechanical, non-AI
+ * counterpart to processCallEvent's transcript path. Invoked by the
+ * ColdCallArbiter DO via POST /internal/coldcall/finalize-cancelled, after the
+ * grace window elapses with no transcript for the call (transcript always wins).
+ *
+ * Same Sourced gate, tag, and source semantics as a voicemail; no AI, no
+ * action-item extraction, and NO stage move (a cancelled call is not a reply).
+ *
+ * @param {object} payload { rfCandidateId, dialpadUserId, callId, callTimeMs, contactName }
+ * @param {object} env
+ * @returns {Promise<{recorded: boolean, reason: string}>}
+ */
+export async function finalizeCancelledColdCall(payload, env) {
+  const { rfCandidateId, dialpadUserId, callId, callTimeMs, contactName } = payload || {};
+  const span = trace.getActiveSpan();
+  span?.setAttribute('coldcall.outcome', 'cancelled');
+  if (callId != null) span?.setAttribute('coldcall.call_id', String(callId));
+
+  if (!rfCandidateId) {
+    return { recorded: false, reason: 'missing rfCandidateId' };
+  }
+
+  const activityUserId = await getRFUserIdByDialpadId(env, dialpadUserId);
+
+  // RF /candidate/update REPLACES arrays — read existing tags first, merge, send back.
+  const candidate = await getRFCandidate(rfCandidateId, env);
+
+  const sourcedJob = await selectSourcedJob(candidate, activityUserId, env);
+  if (!sourcedJob) {
+    span?.setAttribute('coldcall.sourced_gate', 'skip');
+    console.log({ message: `[ColdCall/cancelled] → skipped: candidate not in Sourced`, source: 'cold-call', step: 'sourced_gate', callId, rfCandidateId, activityUserId });
+    return { recorded: false, reason: 'not in Sourced' };
+  }
+  span?.setAttribute('coldcall.sourced_gate', 'pass');
+
+  const activityText = `Cold call with ${contactName || 'Unknown'} — ${formatOutcomeLabel('cancelled')}`;
+
+  await createRFCustomActivity({
+    activity_text: addHtmlLineBreaks(activityText),
+    activity_time: formatActivityTime(callTimeMs || Date.now()),
+    activity_type_id: COLD_CALL_ACTIVITY_TYPE_ID,
+    activity_user_id: activityUserId,
+    associated_entities: { candidates: [parseInt(rfCandidateId, 10)] },
+    mentions: [],
+  }, env);
+
+  await updateRFCandidate(rfCandidateId, { source: 'Cold Call', tags: mergeTag(candidate?.tags, COLD_CALL_TAG) }, env);
+
+  console.log({ message: `[ColdCall/cancelled] recorded cancelled cold call`, source: 'cold-call', step: 'rf_write', callId, rfCandidateId, activityUserId });
+  return { recorded: true, reason: 'recorded' };
 }
 

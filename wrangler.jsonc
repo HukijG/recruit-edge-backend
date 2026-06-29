@@ -54,11 +54,17 @@
     "crons": ["7 * * * *"]
   },
   "services": [
-    { "binding": "SYNC_WORKER", "service": "rf-mcp-cache-sync" }
+    { "binding": "SYNC_WORKER", "service": "rf-mcp-cache-sync" },
+    // Self-binding: the ColdCallArbiter DO alarm calls back into this worker's
+    // instrumented fetch handler (POST /internal/coldcall/finalize-cancelled) so
+    // the cancelled-cold-call finalize runs in a fully-traced context, span-linked
+    // to the originating webhook. DO alarms aren't OTLP-instrumented on their own.
+    { "binding": "SELF", "service": "rf-dialpad-sync-dev" }
   ],
   "durable_objects": {
     "bindings": [
-      { "name": "EXT_CALL_STATE", "class_name": "ExtCallState" }
+      { "name": "EXT_CALL_STATE", "class_name": "ExtCallState" },
+      { "name": "COLD_CALL_ARBITER", "class_name": "ColdCallArbiter" }
     ]
   },
   "migrations": [
@@ -73,6 +79,10 @@
     {
       "tag": "v3",
       "new_sqlite_classes": ["ExtCallState"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["ColdCallArbiter"]
     }
   ]
 }
