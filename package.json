@@ -3,7 +3,11 @@
 	"version": "0.0.0",
 	"private": true,
 	"workspaces": [
-		"vendor/otel-cf-workers"
+		"vendor/otel-cf-workers",
+		"cache-worker",
+		"mcp-remote",
+		"metrics-poller",
+		"music-worker"
 	],
 	"scripts": {
 		"deploy": "wrangler deploy",
