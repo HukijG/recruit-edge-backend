@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Cancel superseded runs on the same ref (keeps PR pushes tidy).
+# Only cancel PR runs — never a master run, so every deployed commit keeps its test signal.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Worker test suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Main worker tests
+        run: npm test -- --run --testTimeout=30000
+
+      - name: cache-worker tests
+        run: npm test --workspace=cache-worker -- --testTimeout=30000
+
+      - name: mcp-remote tests
+        run: npm test --workspace=mcp-remote -- --testTimeout=30000
+
+      - name: metrics-poller tests
+        run: npm test --workspace=metrics-poller -- --testTimeout=30000
+
+      - name: music-worker tests
+        run: npm test --workspace=music-worker -- --testTimeout=30000
